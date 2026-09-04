@@ -1,0 +1,140 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:
+// Engineer:
+//
+// Create Date: 2026/08/29 02:38:18
+// Design Name:
+// Module Name: mcu_top
+// Project Name:
+// Target Devices:
+// Tool Versions:
+// Description:
+//
+// Dependencies:
+//
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+//
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module mcu_top(
+    input clk, rst,
+    input rx,
+    output tx
+    );
+
+    wire [31:0] bus_addr_f_cpu;
+    wire [31:0] bus_data_f_cpu;
+    wire [3:0] bus_be_f_cpu;
+    wire bus_we_f_cpu;
+    wire [31:0] bus_data_b_cpu;
+    wire [31:0] bus_addr_uart_f;
+    wire [31:0] bus_data_uart_f;
+    wire bus_we_uart_f;
+    wire [3:0] bus_be_uart_f;
+    wire [31:0] bus_data_uart_b;
+    wire bus_loaded_out;
+    wire [31:0] ibus_addr_w;
+    wire ibus_re_w;
+    wire rst_cpu;
+    wire [31:0] bus_addr_plic_f;
+    wire [31:0] bus_data_plic_f;
+    wire bus_we_plic_f;
+    wire [3:0] bus_be_plic_f;
+    wire [31:0] bus_data_plic_b;
+    wire plic_exti;
+    wire uart_rx_irq;
+    wire [31:0] ibus_data_w;
+    wire ibus_req_valid_w;
+    wire ibus_busy_w;
+
+    rst_buf u_rst_buf (
+        .clk(clk),
+        .rst_n(rst),
+        .rst_stable(rst_cpu)
+    );
+
+    cpu_top u_cpu_top (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_out(bus_addr_f_cpu),
+        .bus_data_out(bus_data_f_cpu),
+        .bus_be_out(bus_be_f_cpu),
+        .bus_we_out(bus_we_f_cpu),
+        .bus_data_in_ext(bus_data_b_cpu),
+        .bus_loaded_in(bus_loaded_out),
+        .exti(plic_exti),
+        .ibus_addr_out(ibus_addr_w),
+        .ibus_re_out(ibus_re_w),
+        .ibus_req_valid(ibus_req_valid_w),
+        .ibus_data_in(ibus_data_w),
+        .ibus_addr_in(16'd0),
+        .ibus_we_in(1'b0),
+        .i_busy(ibus_busy_w)
+    );
+
+    icache u_icache (
+        .clk(clk),
+        .rst(rst_cpu),
+        .ibus_addr_in(ibus_addr_w),
+        .ibus_re_in(ibus_re_w),
+        .req_valid(ibus_req_valid_w),
+        .ibus_data_out(ibus_data_w),
+        .cache_hit(),
+        .busy(ibus_busy_w),
+        .mem_req(),
+        .mem_addr(),
+        .mem_ready(1'b0),
+        .mem_valid(1'b0),
+        .mem_data(32'd0)
+    );
+
+    bus_arb u_bus_arb (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_f_cpu(bus_addr_f_cpu),
+        .bus_data_f_cpu(bus_data_f_cpu),
+        .bus_be_f_cpu(bus_be_f_cpu),
+        .bus_we_f_cpu(bus_we_f_cpu),
+        .bus_data_b_cpu(bus_data_b_cpu),
+        .bus_addr_uart_f(bus_addr_uart_f),
+        .bus_data_uart_f(bus_data_uart_f),
+        .bus_we_uart_f(bus_we_uart_f),
+        .bus_be_uart_f(bus_be_uart_f),
+        .bus_data_uart_b(bus_data_uart_b),
+        .bus_addr_plic_f(bus_addr_plic_f),
+        .bus_data_plic_f(bus_data_plic_f),
+        .bus_we_plic_f(bus_we_plic_f),
+        .bus_be_plic_f(bus_be_plic_f),
+        .bus_data_plic_b(bus_data_plic_b),
+        .bus_loaded_out(bus_loaded_out)
+    );
+
+    uart_top u_uart (
+        .clk(clk),
+        .rst(rst_cpu),
+        .rx(rx),
+        .tx(tx),
+        .rx_irq(uart_rx_irq),
+        .bus_addr_in(bus_addr_uart_f),
+        .bus_data_in(bus_data_uart_f),
+        .bus_be_in(bus_be_uart_f),
+        .bus_we_in(bus_we_uart_f),
+        .bus_data_out(bus_data_uart_b)
+    );
+
+    plic u_plic (
+        .clk(clk),
+        .rst(rst_cpu),
+        .irq_sources({30'd0, uart_rx_irq, 1'b0}),
+        .exti(plic_exti),
+        .bus_addr_in(bus_addr_plic_f),
+        .bus_data_in(bus_data_plic_f),
+        .bus_be_in(bus_be_plic_f),
+        .bus_we_in(bus_we_plic_f),
+        .bus_data_out(bus_data_plic_b)
+    );
+endmodule
