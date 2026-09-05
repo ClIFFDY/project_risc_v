@@ -67,27 +67,33 @@ module csr(
 //根据不同的csr写地址写入不同的csr寄存器
             if (csr_wr_en) begin
                 case (csr_addr)
+//全局使能设定
                 12'h300: begin
                     irq_en_reg <= csr_data_in[3];
                     irq_en_post_reg <= csr_data_in[7];
                 end
+//三类型中断分别使能
                 12'h304: begin
                     eirq_en <= csr_data_in[3];
                     tirq_en <= csr_data_in[7];
                     sirq_en <= csr_data_in[11];
                 end
+//isr跳转目标设定
                 12'h305: begin
                     isr_addr_reg1 <= csr_data_in;
                     isr_addr_reg2 <= csr_data_in + 4'd4;
                 end
+//isr返回目标设定
                 12'h341: begin
                     iret_addr1 <= csr_data_in;
                     iret_addr2 <= csr_data_in + 4'd4;
                 end
                 12'h342: begin
+//中断/异常原因寄存器
                     mcause_reg <= csr_data_in;
                 end
                 12'h344: begin
+//软件中断挂起
                     if (csr_data_in[11]) sirq_pend <= 1'd0;
                 end
                 endcase

@@ -34,6 +34,7 @@ module forw(
 
 //alu后方数据及地址旁路前送逻辑，防止读写冒险
     always @(*) begin
+//对ld/st指令数据旁路进行延迟仲裁
         if (!stalled) begin
             result_back2_final = (loaded) ? ld_data : result_back2;
             r1_data_final_dec = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2 != 5'd0 && r1 == rd_back2) ? result_back2_final : r1_data_in_dec);

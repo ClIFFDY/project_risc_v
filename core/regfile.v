@@ -37,7 +37,7 @@ module regfile(
     STALL = 2'd3;
 
 //同步读写型通用寄存器组，节省lut资源
-    reg [31:0] regs [0:31];
+    (* ram_style = "block" *) reg [31:0] regs [0:31];
     reg [31:0] wdata_final;
 
     integer i;
@@ -47,6 +47,7 @@ module regfile(
         end
     end
 
+//对alu/访存写入数据进行仲裁
     always @(*) begin
         if (loaded) wdata_final = ld_data;
         else wdata_final = rd_data;
