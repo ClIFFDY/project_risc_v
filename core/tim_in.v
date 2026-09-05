@@ -31,6 +31,7 @@ module tim_in(
     output reg loaded
     );
 
+//内部时钟定时器，独占timi内部中断
     reg [31:0] cnt_set, cnt;
 
     always @(posedge clk) begin
@@ -51,6 +52,7 @@ module tim_in(
             else begin
                 cnt <= cnt + 1'd1;
             end
+//字节使能写重装值设定
             if (bus_addr_in[31:24] == 8'd0 && bus_addr_in[23:20] == 4'd1) begin
                 if (bus_addr_in[3:0] == 4'd1) begin
                     if (bus_we_in) begin
@@ -70,6 +72,7 @@ module tim_in(
                         loaded <= 1'd1;
                     end
                 end
+//写指令清除中断挂起
                 else if (bus_addr_in[3:0] == 4'd3) begin
                     if (bus_we_in) timi <= 1'd0;
                 end

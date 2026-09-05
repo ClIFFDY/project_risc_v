@@ -52,7 +52,7 @@ module alu(
         CSRRSI = 3'b110,
         CSRSCI = 3'b111;
         
-
+//SYSTEM类指令：cs_data源于csr寄存器，result_csr写回csr寄存器，result返回rd
     always @(*) begin
         if (we_in && cs_wr_en) begin
             rd_out = rd_in;
@@ -65,12 +65,14 @@ module alu(
             default: result_csr = cs_data;
             endcase
         end
+//链接跳转类指令：将pc作为result输出存入rd
         else if (we_in && (jal_flag | jalr_flag)) begin
             result = aux_addr_in;
             rd_out = rd_in;
             we = we_in;
             result_csr = r2_data;
         end
+//ALU/I类指令：直接进行运算，result存入rd
         else if (we_in) begin
             case (alu_func4)
                 ADD: result = r1_data + r2_data;

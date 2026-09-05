@@ -38,6 +38,7 @@ module pc(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//程序计数器，传递取指地址
     always @(posedge clk) begin
         if (rst) begin
             pc_addr <= 16'd0;

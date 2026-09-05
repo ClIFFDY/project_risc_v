@@ -42,6 +42,7 @@ module decoder(
     output reg [31:0] csr_data,
     output reg [31:0] aux_addr_out
     );
+//RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;
     localparam OPCODE_JAL    = 7'b1101111;
@@ -82,6 +83,7 @@ module decoder(
             beq_off_q2 <= 32'd0;
         end
         else begin
+//在EXE状态下根据不同的opcode对指令进行二次解码
             if (stage == EXE) begin
                 r1_data_out <= 32'd0;
                 r2_data_out <= 32'd0;
@@ -122,12 +124,14 @@ module decoder(
                     alu_func4 <= {func10[8], func10[2:0]};
                     we <= 1'd1;
                 end
+//jal存储pc值传递
                 OPCODE_JAL: begin
                     rd_out <= rd_in;
                     we <= 1'd1;
                     aux_addr_out <= aux_addr_in;
                     jal_flag <= 1'd1;
                 end
+//jalr指令实际跳转目标计算
                 OPCODE_JALR: begin
                     jalr <= 1'd1;
                     rd_out <= rd_in;
@@ -136,6 +140,7 @@ module decoder(
                     aux_addr_out <= aux_addr_in;
                     jalr_target_q <= r1_data_final + offset_jalr0;
                 end
+//分支跳转预测结果判定
                 OPCODE_BRANCH: begin
                     beq_off_q1 <= offset_beq0_aux;
                     beq_off_q2 <= offset_beq0_aux - 4'd4;
@@ -183,6 +188,7 @@ module decoder(
                     alu_func4 <= 4'd0;
                     we <= 1'd1;
                 end
+//SYSTEM类指令读写赋能，地址计算
                 OPCODE_SYSTEM: begin
                     rd_out <= rd_in;
                     rd_back1 <= rd_in;

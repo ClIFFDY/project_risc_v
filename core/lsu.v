@@ -57,6 +57,7 @@ module lsu(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//ld/st读写类指令总线地址处理逻辑
     always @(posedge clk) begin
         if (rst) begin
             bus_addr_out <= 30'd0;
@@ -158,11 +159,13 @@ module lsu(
         end
     end
 
+//stall信号拉起逻辑
     always @(*) begin
         st_addr = r1_data_final + offset_store0;
         stall = (opcode == OPCODE_LOAD) && ((rd_in == r1_fast) | (rd_in == r2_fast)) && !(rd_del2 == rd_in);
     end
 
+//读数据写回处理逻辑，字节使能、访问宽度延迟处理
     always @(posedge clk) begin
         if (rst) begin
             ld_valid_a <= 1'b0;

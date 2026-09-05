@@ -46,14 +46,17 @@ module itcm(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//指令TCM紧耦合内存，1clk读延迟，1clk写延迟，无命中判定
     (* ram_style = "block" *) reg [31:0] itcm [0:4095];
     initial begin
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
+//pc地址itcm/icache仲裁
     reg is_ibus;
     always @(*) is_ibus = |fetch_addr[31:12];
 
+//读写逻辑处理（写逻辑目前无意义）
     always @(posedge clk) begin
         if (rst) begin
             inst_raw_out <= 32'd0;
@@ -72,6 +75,7 @@ module itcm(
         end
     end
 
+//跳转类地址透传处理，减少取值冲刷空窗
     always @(*) begin
         if (rst) begin
             fetch_addr = 32'd0;

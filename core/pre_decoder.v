@@ -40,6 +40,7 @@ module pre_decoder(
     output reg jal, dec, lsu, br_en, jalr
     );
 
+//根据is_bus信号对来自itcm或icache的指令进行仲裁
     reg [31:0] inst_effective;
     always @(*) inst_effective = is_ibus_in ? ibus_data_in : inst_raw_in;
 
@@ -60,6 +61,7 @@ module pre_decoder(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//提取不同类型指令立即数的函数块
     function [31:0] immI;
         input [31:0] inst;
         immI = {{20{inst[31]}}, inst[31:20]};
@@ -85,6 +87,9 @@ module pre_decoder(
         immU = {inst[31:12], 12'd0};
     endfunction
 
+
+//根据不同指令类型对输入的指令进行opcode、function字段、地址和立即数拆分
+//func10是RV32I指令集funct7和funct3字段的组合
     always @(posedge clk) begin
         if (rst) begin
             func10_dec <= 10'd0;
@@ -264,6 +269,7 @@ module pre_decoder(
         end
     end
 
+//组合透传jal、jalr和分支类预跳转地址，减少流水线空窗
     always @(*) begin
         if (rst) begin
             br_en = 1'd0;

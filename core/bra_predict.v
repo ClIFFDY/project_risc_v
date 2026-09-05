@@ -39,6 +39,7 @@ module bra_predict(
     reg pv_q [0:1], wr_ptr, rd_ptr, jwp, jrp, predict_en;
     integer i;
 
+//BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
         if (rst) predict_en = 1'b0;
         else predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
@@ -46,6 +47,7 @@ module bra_predict(
 
     always @(posedge clk) begin
         if (rst) begin
+//初始BHT回到弱不跳转
             for (i = 0; i < 64; i = i + 1) bht[i] <= 2'd1;
             for (i = 0; i < 64; i = i + 1) btb[i] <= 32'd0;
             jalr_pc_q <= 16'd0;
@@ -61,9 +63,11 @@ module bra_predict(
             jrp <= 1'b0;
         end
         else begin
+//jalr实际目标在 EX 期解析：按上一拍取指PC(jalr_pc_q)索引回写 BTB
             jalr_pc_q <= pc_addr_in;
             if (jalr_real_target != 32'd0)
                 btb[jalr_pc_q[8:3]] <= jalr_real_target;
+//分支在 EX 期判定，对记录槽队首判定并弹出
             if (success) begin
                 if (bht[br_pc_q[rd_ptr][8:3]] < 2'd3)
                     bht[br_pc_q[rd_ptr][8:3]] <= bht[br_pc_q[rd_ptr][8:3]] + 1'd1;
@@ -81,21 +85,25 @@ module bra_predict(
                 jrp <= 1'b0;
             end
             else begin
+//预取到分支：pc与预判标志一起压入两级记录槽
                 if (br_en) begin
                     br_pc_q[wr_ptr] <= pc_addr_in;
                     pv_q[wr_ptr] <= predict_en;
                     wr_ptr <= ~wr_ptr;
                 end
+//预取到jalr：把 BTB 预测目标压入jt_q环形队列
                 if (pre_jalr) begin
                     jt_q[jwp] <= btb[pc_addr_in[8:3]];
                     jwp <= ~jwp;
                 end
+//实际目标解析：弹出 jt_q 队首
                 if (jalr_real_target != 32'd0)
                     jrp <= ~jrp;
             end
         end
     end
 
+//组合输出：当前取指PC的预测结果 + 队首待解析项的fail
     always @(*) begin
         if (rst) begin
             br_addr1 = 16'd0;

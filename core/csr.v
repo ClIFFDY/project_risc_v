@@ -53,6 +53,7 @@ module csr(
             sirq_pend <= 1'd0;
             irq_process <= 1'd0;
         end
+//默认情况中断地址/使能/状态寄存器保持
         else begin
             irq_en_reg <= irq_en_reg;
             irq_en_post_reg <= irq_en_post_reg;
@@ -63,6 +64,7 @@ module csr(
             tirq_en <= tirq_en;
             sirq_en <= sirq_en;
             irq_process <= irq_process;
+//根据不同的csr写地址写入不同的csr寄存器
             if (csr_wr_en) begin
                 case (csr_addr)
                 12'h300: begin
@@ -90,6 +92,7 @@ module csr(
                 end
                 endcase
             end
+//三种中断的挂起逻辑
             if (irq_en_reg) begin
                 if (eirq_en && eirq_pend) begin
                     mcause_reg <= 32'h8000000B;
@@ -101,6 +104,7 @@ module csr(
                     mcause_reg <= 32'h80000003;
                 end
             end
+//trap信号控制的系统异常处理
             if (trap) begin
                 iret_addr1 <= pc_addr_in - 4'd12;
                 iret_addr2 <= pc_addr_in - 4'd8;
@@ -109,6 +113,7 @@ module csr(
                 irq_en_reg <= 1'd0;
                 irq_process <= 1'd1;
             end
+//非isr状态下触发中断，保存上下文并使能受理信号
             else if (irq_act && !irq_process) begin
                 iret_addr1 <= pc_addr_in - irq_bubble;
                 iret_addr2 <= pc_addr_in - irq_bubble + 4'd4;
@@ -116,6 +121,7 @@ module csr(
                 irq_en_reg <= 1'd0;
                 irq_process <= 1'd1;
             end
+//isr返回（目前只支持机器模式）
             if (iret) begin
                 irq_en_reg <= irq_en_post_reg;
                 irq_process <= 1'd0;
@@ -123,6 +129,7 @@ module csr(
         end
     end
 
+//指令退役逻辑，主要用于调试和性能测试
     always @(posedge clk) begin
         if (rst) begin
             mcycle_reg <= 32'd0;
@@ -134,6 +141,7 @@ module csr(
         end
     end
 
+//csr读操作逻辑
     always @(*) begin
         if (rst) begin
             global_pend = 1'd0;
@@ -157,6 +165,7 @@ module csr(
         end
     end
 
+//根据不同的csr读地址返回相应的csr寄存器数据
     always@ (*) begin
         csr_data_out = 32'd0;
         case (csr_addr)

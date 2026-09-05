@@ -36,6 +36,7 @@ module wb_reg(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//写回级缓冲寄存器
     always @(posedge clk) begin
         if (rst) begin
             we_out <= 1'd0;

@@ -30,12 +30,14 @@ module dtcm(
     output reg loaded
     );
 
+//TCM紧耦合内存，1clk读延迟，1clk写延迟，无需判定命中
     (* ram_style = "block" *) reg [31:0] dtcm [0:4095];
     integer i;
     initial begin
         for (i = 0; i < 4096; i = i + 1) dtcm[i] = 32'd0;
     end
 
+//字节使能逻辑处理
     function [31:0] merge_word;
         input [31:0] oldw;
         input [31:0] din;
@@ -49,6 +51,7 @@ module dtcm(
         end
     endfunction
 
+//读写逻辑处理
     always @(posedge clk) begin
         loaded <= 1'd0;
         bus_data_out <= 31'd0;

@@ -31,6 +31,8 @@ module forw(
     );
     reg [31:0] result_back2_final;
     reg stalled;
+
+//alu后方数据及地址旁路前送逻辑，防止读写冒险
     always @(*) begin
         if (!stalled) begin
             result_back2_final = (loaded) ? ld_data : result_back2;

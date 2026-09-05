@@ -41,12 +41,14 @@ module controller(
     wire irq_act_i, irq_processing_i;
     wire [31:0] iret_addr1_i, iret_addr2_i;
 
+//组合透传4种状态信号，非时序逻辑fsm
     localparam [1:0]
     IDLE = 2'd0,
     EXE = 2'd1,
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//csr异常/中断寄存器
     csr u_csr (
         .clk(clk),
         .rst(rst),
@@ -88,18 +90,21 @@ module controller(
         iret_addr2 = iret_addr2_i;
     end
 
+//中断空窗计数器：作用为填充冲刷后流水线预取空窗
     always @(posedge clk) begin
         if (rst) irq_bubble <= 4'd12;
         else if (stage == FLUSH) irq_bubble <= 4'd4;
         else if (irq_bubble < 4'd12) irq_bubble <= irq_bubble + 4'd4;
     end
 
+//预测retire计数器：提前跳转发生但指令未retire时屏蔽irq受理
     always @(posedge clk) begin
         if (rst) ird_tmr <= 2'd0;
         else if (jal | jalr_pred | br1) ird_tmr <= 2'd3;
         else if (ird_tmr != 2'd0) ird_tmr <= ird_tmr - 2'd1;
     end
 
+//状态透传控制：跳转/中断冲刷优先，其次为ld/st_stall信号
     always @(*) begin
         if (rst) begin
             stage = EXE;

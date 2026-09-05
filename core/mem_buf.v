@@ -63,6 +63,7 @@ module mem_buf(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//指令缓冲级，对齐寄存器组数据访问
     always @(posedge clk) begin
         if (rst) begin
             func10_out <= 10'd0;

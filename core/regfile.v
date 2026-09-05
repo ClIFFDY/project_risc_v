@@ -36,16 +36,14 @@ module regfile(
     FLUSH = 2'd2,
     STALL = 2'd3;
 
+//同步读写型通用寄存器组，节省lut资源
     reg [31:0] regs [0:31];
-    reg [15:0] irq_buf [0:31];
-    reg [4:0] irq_str;
     reg [31:0] wdata_final;
 
     integer i;
     initial begin
         for (i = 0; i < 32; i = i + 1) begin
             regs[i] = 32'd0;
-            irq_buf[i] = 16'd0;
         end
     end
 
@@ -54,6 +52,7 @@ module regfile(
         else wdata_final = rd_data;
     end
 
+//读数据进行读写旁路仲裁并输出
     always @(posedge clk) begin
         if (rst) begin
             r1_data_dec <= 32'd0;
@@ -85,6 +84,7 @@ module regfile(
         end
     end
 
+//写数据直接进入寄存器组
     always @(posedge clk) begin
         if ((loaded || we) && rd != 5'd0) regs[rd] <= wdata_final;
     end
