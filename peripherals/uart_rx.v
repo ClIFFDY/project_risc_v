@@ -21,12 +21,12 @@
 
 
 module uart_rx(
-    input wire clk,
-    input wire rst,
-    input wire rx,
-    input wire [13:0] mcnt,
-    input wire [13:0] mcnt_half,
-    input wire [13:0] mcnt_3q,
+    input clk,
+    input rst,
+    input rx,
+    input [13:0] mcnt,
+    input [13:0] mcnt_half,
+    input [13:0] mcnt_3q,
     output reg rx_done,
     output reg [7:0] rx_data
     );

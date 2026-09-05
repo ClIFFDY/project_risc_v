@@ -3,13 +3,13 @@
 module cpu_top(
     input clk, rst,
     //
-    output [31:0] bus_addr_out,
-    output [31:0] bus_data_out,
-    output [3:0] bus_be_out,
-    output bus_we_out,
-    output [31:0] ibus_addr_out,
-    output ibus_re_out,
-    output ibus_req_valid,
+    output reg [31:0] bus_addr_out,
+    output reg [31:0] bus_data_out,
+    output reg [3:0] bus_be_out,
+    output reg bus_we_out,
+    output reg [31:0] ibus_addr_out,
+    output reg ibus_re_out,
+    output reg ibus_req_valid,
     input [31:0] ibus_data_in,
     input [15:0] ibus_addr_in,
     input [31:0] bus_data_in_ext,
@@ -68,17 +68,37 @@ module cpu_top(
     wire [31:0] result_5, result_back2;
     wire we_5;
 
-    wire csr_wr_en, timi, softi, irq_act, irq_processing, irq;
+    wire csr_wr_en, timi, irq_act, irq_processing, irq;
     wire [2:0] csr_func3;
     wire [31:0] csr_data_wr, csr_data_rd, mcause, csr_result;
-    wire [31:0] dtcm_data_out, tim_data_out, bus_data_in_final;
-    wire dtcm_loaded, tim_loaded, retire_w;
-    wire btb_hit, jalr_pred;
+    wire [31:0] dtcm_data_out, tim_data_out;
+    wire dtcm_loaded, tim_loaded;
+    wire btb_hit;
 
-    assign jalr_pred = pre_jalr & btb_hit;
-    assign bus_data_in_final = bus_data_in_ext | dtcm_data_out | tim_data_out;
-    assign softi = 1'b0;
-    assign retire_w = (stage == 2'd1);
+    reg softi, retire_w, jalr_pred;
+    reg [31:0] bus_data_in_final;
+    wire [31:0] bus_addr_out_i, bus_data_out_i;
+    wire [3:0] bus_be_out_i;
+    wire bus_we_out_i;
+    wire [31:0] ibus_addr_out_i;
+    wire ibus_re_out_i, ibus_req_valid_i;
+
+    always @(*) begin
+        jalr_pred = pre_jalr & btb_hit;
+        bus_data_in_final = bus_data_in_ext | dtcm_data_out | tim_data_out;
+        softi = 1'b0;
+        retire_w = (stage == 2'd1);
+    end
+
+    always @(*) begin
+        bus_addr_out = bus_addr_out_i;
+        bus_data_out = bus_data_out_i;
+        bus_be_out = bus_be_out_i;
+        bus_we_out = bus_we_out_i;
+        ibus_addr_out = ibus_addr_out_i;
+        ibus_re_out = ibus_re_out_i;
+        ibus_req_valid = ibus_req_valid_i;
+    end
 
     pc u_pc (
         .clk(clk),
@@ -92,7 +112,6 @@ module cpu_top(
         .irq(irq),
         .irq_ret(irq_ret),
         .stage(stage),
-        .irq_bubble(irq_bubble),
         .offset_jal2(offset_jal2),
         .offset_jalr2(jalr_predict_offset + 4'd4),
         .offset_beq2(offset_beq2),
@@ -126,11 +145,10 @@ module cpu_top(
         .jalr_target_q(jalr_target_q),
         .beq_off_q2(beq_off_q2),
         .br_addr1(br_addr1),
-        .irq_bubble(irq_bubble),
         .inst_raw_out(inst_raw),
         .is_ibus_q(is_ibus_q),
-        .fetch_addr(ibus_addr_out),
-        .ibus_re_out(ibus_re_out),
+        .fetch_addr(ibus_addr_out_i),
+        .ibus_re_out(ibus_re_out_i),
         .ibus_addr_in(ibus_addr_in),
         .ibus_data_in(ibus_data_in),
         .ibus_we_in(ibus_we_in)
@@ -267,10 +285,10 @@ module cpu_top(
         .bus_data_in(bus_data_in_final),
         .dtcm_loaded(dtcm_loaded | tim_loaded),
         .bus_loaded_in(bus_loaded_in),
-        .bus_addr_out(bus_addr_out),
-        .bus_data_out(bus_data_out),
-        .bus_be_out(bus_be_out),
-        .bus_we_out(bus_we_out),
+        .bus_addr_out(bus_addr_out_i),
+        .bus_data_out(bus_data_out_i),
+        .bus_be_out(bus_be_out_i),
+        .bus_we_out(bus_we_out_i),
         .we(lsu_we_3),
         .rd_out(lsu_rd_3),
         .ld_data_out(ld_data_final),
@@ -309,6 +327,7 @@ module cpu_top(
         .success(success),
         .br_fail(br_fail),
         .br_en(br_en),
+        .pre_jalr(pre_jalr),
         .br_addr1(br_addr1),
         .br_addr2(br_addr2),
         .br1(br1),
@@ -399,6 +418,9 @@ module cpu_top(
         .br2(br2),
         .br3(br3),
         .jalr_fail(jalr_fail),
+        .jal(jal),
+        .jalr_pred(jalr_pred),
+        .br1(br1),
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
@@ -422,7 +444,7 @@ module cpu_top(
         .iret_addr2(iret_addr2),
         .irq_bubble(irq_bubble),
         .stage(stage),
-        .req_valid(ibus_req_valid)
+        .req_valid(ibus_req_valid_i)
     );
 
 

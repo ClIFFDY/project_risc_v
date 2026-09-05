@@ -27,6 +27,8 @@ module csr(
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
     input retire,
+    input [3:0] irq_bubble,
+    input irq_gate, jalr_fail, br2, br3,
     output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause, iret_addr1, iret_addr2,
     output reg irq_act, irq_processing
     );
@@ -108,8 +110,8 @@ module csr(
                 irq_process <= 1'd1;
             end
             else if (irq_act && !irq_process) begin
-                iret_addr1 <= pc_addr_in - 4'd12;
-                iret_addr2 <= pc_addr_in - 4'd12;
+                iret_addr1 <= pc_addr_in - irq_bubble;
+                iret_addr2 <= pc_addr_in - irq_bubble + 4'd4;
                 irq_en_post_reg <= irq_en_reg;
                 irq_en_reg <= 1'd0;
                 irq_process <= 1'd1;
@@ -147,7 +149,7 @@ module csr(
             tirq_pend = timi;
             eirq_pend = exti;
             global_pend = (eirq_pend && eirq_en) | (tirq_pend && tirq_en) | (sirq_pend && sirq_en);
-            irq_act = irq_en_reg && global_pend && !irq_process;
+            irq_act = irq_en_reg && global_pend && !irq_process && !irq_gate && !(iret | trap | jalr_fail | br2 | br3);
             irq_processing = irq_process;
             mcause = mcause_reg;
             isr_addr1 = isr_addr_reg1;

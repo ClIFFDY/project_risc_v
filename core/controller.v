@@ -22,18 +22,24 @@
 
 module controller(
     input clk, rst, jalr_fail, br2, br3, irq_ret, trap, ebreak, stall,
+    input jal, jalr_pred, br1,
     input csr_wr_en, exti, timi, softi,
     input retire,
     input [11:0] csr_addr,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
-    output [31:0] csr_data_out, isr_addr1, isr_addr2, mcause,
-    output irq_act, irq_processing, irq,
-    output [31:0] iret_addr1, iret_addr2,
+    output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause,
+    output reg irq_act, irq_processing, irq,
+    output reg [31:0] iret_addr1, iret_addr2,
     output reg [1:0] stage,
     output reg req_valid,
     output reg [3:0] irq_bubble
     );
+
+    reg [1:0] ird_tmr;
+    wire [31:0] csr_data_out_i, isr_addr1_i, isr_addr2_i, mcause_i;
+    wire irq_act_i, irq_processing_i;
+    wire [31:0] iret_addr1_i, iret_addr2_i;
 
     localparam [1:0]
     IDLE = 2'd0,
@@ -55,31 +61,43 @@ module controller(
         .csr_data_in(csr_data_in),
         .pc_addr_in(pc_addr_in),
         .retire(retire),
-        .csr_data_out(csr_data_out),
-        .isr_addr1(isr_addr1),
-        .isr_addr2(isr_addr2),
-        .mcause(mcause),
-        .irq_act(irq_act),
-        .irq_processing(irq_processing),
-        .iret_addr1(iret_addr1),
-        .iret_addr2(iret_addr2)
+        .irq_bubble(irq_bubble),
+        .irq_gate(ird_tmr != 2'd0),
+        .jalr_fail(jalr_fail),
+        .br2(br2),
+        .br3(br3),
+        .csr_data_out(csr_data_out_i),
+        .isr_addr1(isr_addr1_i),
+        .isr_addr2(isr_addr2_i),
+        .mcause(mcause_i),
+        .irq_act(irq_act_i),
+        .irq_processing(irq_processing_i),
+        .iret_addr1(iret_addr1_i),
+        .iret_addr2(iret_addr2_i)
     );
 
-    assign irq = (!(irq_ret | trap | jalr_fail | br2 | br3) && irq_act);
+    always @(*) begin
+        csr_data_out = csr_data_out_i;
+        isr_addr1 = isr_addr1_i;
+        isr_addr2 = isr_addr2_i;
+        mcause = mcause_i;
+        irq_act = irq_act_i;
+        irq_processing = irq_processing_i;
+        irq = irq_act_i;
+        iret_addr1 = iret_addr1_i;
+        iret_addr2 = iret_addr2_i;
+    end
 
     always @(posedge clk) begin
-        if (rst) irq_bubble <= 4'd0;
-        else if (!irq_act && !irq_processing) begin
-            case (stage)
-            FLUSH: irq_bubble <= 4'd8;
-            default: begin 
-                if (irq_act != 4'd0) irq_bubble <= irq_bubble - 4'd4;
-            end
-            endcase
-        end
-        else begin
-            irq_bubble <= irq_bubble;
-        end
+        if (rst) irq_bubble <= 4'd12;
+        else if (stage == FLUSH) irq_bubble <= 4'd4;
+        else if (irq_bubble < 4'd12) irq_bubble <= irq_bubble + 4'd4;
+    end
+
+    always @(posedge clk) begin
+        if (rst) ird_tmr <= 2'd0;
+        else if (jal | jalr_pred | br1) ird_tmr <= 2'd3;
+        else if (ird_tmr != 2'd0) ird_tmr <= ird_tmr - 2'd1;
     end
 
     always @(*) begin

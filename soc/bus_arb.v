@@ -40,7 +40,7 @@ module bus_arb(
     output reg [3:0] bus_be_plic_f,
     input [31:0] bus_data_plic_b,
     //
-    output bus_loaded_out
+    output reg bus_loaded_out
     );
 
     localparam [1:0]
@@ -64,7 +64,7 @@ module bus_arb(
         else per_sel <= !bus_we_f_cpu ? per_decode : PER_NONE;
     end
 
-    assign bus_loaded_out = (per_sel != PER_NONE);
+    always @(*) bus_loaded_out = (per_sel != PER_NONE);
 
     always @(*) begin
         bus_addr_uart_f = 32'd0;

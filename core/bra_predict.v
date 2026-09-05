@@ -25,18 +25,18 @@ module bra_predict(
     input [1:0] stage,
     input [31:0] pc_addr_in,
     input [31:0] jalr_target_q,
-    input success, br_fail, br_en,
+    input success, br_fail, br_en, pre_jalr,
     output reg [31:0] br_addr1, br_addr2,
     output reg [31:0] jalr_predict_offset,
     output reg br1, br2, br3, jalr, jalr_fail
     );
 
-    wire [31:0] jalr_real_target;
-    assign jalr_real_target = jalr_target_q;
+    reg [31:0] jalr_real_target;
+    always @(*) jalr_real_target = jalr_target_q;
 
     reg [1:0] bht [0:63];
-    reg [31:0] btb [0:63], br_pc_q [0:1], jalr_pc_q, jalr_pred_q;
-    reg pv_q [0:1], wr_ptr, rd_ptr, predict_en;
+    reg [31:0] btb [0:63], br_pc_q [0:1], jalr_pc_q, jt_q [0:1];
+    reg pv_q [0:1], wr_ptr, rd_ptr, jwp, jrp, predict_en;
     integer i;
 
     always @(*) begin
@@ -49,17 +49,19 @@ module bra_predict(
             for (i = 0; i < 64; i = i + 1) bht[i] <= 2'd1;
             for (i = 0; i < 64; i = i + 1) btb[i] <= 32'd0;
             jalr_pc_q <= 16'd0;
-            jalr_pred_q <= 32'd0;
+            jt_q[0] <= 32'd0;
+            jt_q[1] <= 32'd0;
             br_pc_q[0] <= 16'd0;
             br_pc_q[1] <= 16'd0;
             pv_q[0] <= 1'b0;
             pv_q[1] <= 1'b0;
             wr_ptr <= 1'b0;
             rd_ptr <= 1'b0;
+            jwp <= 1'b0;
+            jrp <= 1'b0;
         end
         else begin
             jalr_pc_q <= pc_addr_in;
-            jalr_pred_q <= btb[pc_addr_in[8:3]];
             if (jalr_real_target != 32'd0)
                 btb[jalr_pc_q[8:3]] <= jalr_real_target;
             if (success) begin
@@ -75,6 +77,8 @@ module bra_predict(
             if (stage == 2'd2) begin
                 wr_ptr <= 1'b0;
                 rd_ptr <= 1'b0;
+                jwp <= 1'b0;
+                jrp <= 1'b0;
             end
             else begin
                 if (br_en) begin
@@ -82,6 +86,12 @@ module bra_predict(
                     pv_q[wr_ptr] <= predict_en;
                     wr_ptr <= ~wr_ptr;
                 end
+                if (pre_jalr) begin
+                    jt_q[jwp] <= btb[pc_addr_in[8:3]];
+                    jwp <= ~jwp;
+                end
+                if (jalr_real_target != 32'd0)
+                    jrp <= ~jrp;
             end
         end
     end
@@ -105,7 +115,7 @@ module bra_predict(
             br3 = br_fail & pv_q[rd_ptr];
             jalr_predict_offset = btb[pc_addr_in[8:3]];
             jalr = (btb[pc_addr_in[8:3]] != 32'd0);
-            jalr_fail = (jalr_real_target != 32'd0) & (jalr_real_target != jalr_pred_q);
+            jalr_fail = (jalr_real_target != 32'd0) & (jalr_real_target != jt_q[jrp]);
         end
     end
 

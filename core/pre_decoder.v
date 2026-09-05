@@ -40,7 +40,8 @@ module pre_decoder(
     output reg jal, dec, lsu, br_en, jalr
     );
 
-    wire [31:0] inst_effective = is_ibus_in ? ibus_data_in : inst_raw_in;
+    reg [31:0] inst_effective;
+    always @(*) inst_effective = is_ibus_in ? ibus_data_in : inst_raw_in;
 
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;

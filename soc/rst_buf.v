@@ -21,7 +21,7 @@
 
 
 module rst_buf(
-    input wire clk, rst_n,
+    input clk, rst_n,
     output reg rst_stable = 1'b0
     );
 

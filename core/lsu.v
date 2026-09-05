@@ -38,7 +38,7 @@ module lsu(
     output reg [4:0] rd_out,
     output reg [31:0] ld_data_out,
     output reg loaded,
-    output wire stall
+    output reg stall
     );
 
     reg [2:0] ld_size_a, ld_size_q;
@@ -46,8 +46,7 @@ module lsu(
     reg ld_valid_a, ld_valid_q;
     reg [4:0] rd_del, rd_del2;
 
-    wire [31:0] st_addr;
-    assign st_addr = r1_data_final + offset_store0;
+    reg [31:0] st_addr;
 
     localparam OPCODE_LOAD  = 7'b0000011;
     localparam OPCODE_STORE = 7'b0100011;
@@ -159,7 +158,10 @@ module lsu(
         end
     end
 
-    assign stall = (opcode == OPCODE_LOAD) && ((rd_in == r1_fast) | (rd_in == r2_fast)) && !(rd_del2 == rd_in);
+    always @(*) begin
+        st_addr = r1_data_final + offset_store0;
+        stall = (opcode == OPCODE_LOAD) && ((rd_in == r1_fast) | (rd_in == r2_fast)) && !(rd_del2 == rd_in);
+    end
 
     always @(posedge clk) begin
         if (rst) begin

@@ -24,7 +24,6 @@ module itcm(
     input clk, rst,
     input br1, br2, br3,
     input jal, jalr, jalr_fail, irq, irq_ret,
-    input [3:0] irq_bubble,
     input [1:0] stage,
     input [31:0] pc_addr,
     input [31:0] offset_jal1, offset_jalr1,
@@ -52,7 +51,8 @@ module itcm(
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
-    wire is_ibus = |fetch_addr[31:12];
+    reg is_ibus;
+    always @(*) is_ibus = |fetch_addr[31:12];
 
     always @(posedge clk) begin
         if (rst) begin
@@ -96,7 +96,7 @@ module itcm(
             default: fetch_addr = 16'd0;
             endcase
             if (stage == FLUSH && irq) fetch_addr = isr_addr1 >>> 2;
-            else if (stage == FLUSH && irq_ret) fetch_addr = (isr_ret_addr1 - irq_bubble) >>> 2;
+            else if (stage == FLUSH && irq_ret) fetch_addr = isr_ret_addr1 >>> 2;
         end
     end
 endmodule

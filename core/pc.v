@@ -24,7 +24,6 @@ module pc(
     input clk, rst,
     input br1, br2, br3,
     input jal, jalr, jalr_fail, irq, irq_ret,
-    input [3:0] irq_bubble,
     input [1:0] stage,
     input [31:0] offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
@@ -82,8 +81,8 @@ module pc(
                     aux_addr <= isr_addr2;
                 end
                 else if (irq_ret) begin
-                    pc_addr <= isr_ret_addr2 - irq_bubble;
-                    aux_addr <= isr_ret_addr2 - irq_bubble;
+                    pc_addr <= isr_ret_addr2;
+                    aux_addr <= isr_ret_addr2;
                 end
             end
             STALL: begin

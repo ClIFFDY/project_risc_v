@@ -21,11 +21,11 @@
 
 
 module uart_tx(
-    input wire clk,
-    input wire rst,
-    input wire tx_en,
-    input wire [7:0] tx_data,
-    input wire [13:0] mcnt,
+    input clk,
+    input rst,
+    input tx_en,
+    input [7:0] tx_data,
+    input [13:0] mcnt,
     output reg tx,
     output reg busy
     );
