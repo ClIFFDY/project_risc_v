@@ -30,26 +30,36 @@ module mcu_top(
     wire [31:0] bus_data_f_cpu;
     wire [3:0] bus_be_f_cpu;
     wire bus_we_f_cpu;
+
+    wire [31:0] bus_addr_out;
+    wire [31:0] bus_data_out;
+    wire [3:0] bus_be_out;
+    wire bus_we_out;
+    wire [31:0] bus_sel_out;
+
     wire [31:0] bus_data_b_cpu;
-    wire [31:0] bus_addr_uart_f;
-    wire [31:0] bus_data_uart_f;
-    wire bus_we_uart_f;
-    wire [3:0] bus_be_uart_f;
-    wire [31:0] bus_data_uart_b;
+    wire [1023:0] bus_data_b;
+
+    localparam
+    PER_UART = 1,
+    PER_PLIC = 2;
+
     wire bus_loaded_out;
     wire [31:0] ibus_addr_w;
     wire ibus_re_w;
     wire rst_cpu;
-    wire [31:0] bus_addr_plic_f;
-    wire [31:0] bus_data_plic_f;
-    wire bus_we_plic_f;
-    wire [3:0] bus_be_plic_f;
-    wire [31:0] bus_data_plic_b;
     wire plic_exti;
     wire uart_rx_irq;
     wire [31:0] ibus_data_w;
     wire ibus_req_valid_w;
     wire ibus_busy_w;
+
+    reg bus_we_uart;
+    reg bus_we_plic;
+    always @(*) begin
+        bus_we_uart = bus_we_out & bus_sel_out[PER_UART];
+        bus_we_plic = bus_we_out & bus_sel_out[PER_PLIC];
+    end
 
     rst_buf u_rst_buf (
         .clk(clk),
@@ -83,7 +93,6 @@ module mcu_top(
         .ibus_re_in(ibus_re_w),
         .req_valid(ibus_req_valid_w),
         .ibus_data_out(ibus_data_w),
-        .cache_hit(),
         .busy(ibus_busy_w),
         .mem_req(),
         .mem_addr(),
@@ -100,16 +109,12 @@ module mcu_top(
         .bus_be_f_cpu(bus_be_f_cpu),
         .bus_we_f_cpu(bus_we_f_cpu),
         .bus_data_b_cpu(bus_data_b_cpu),
-        .bus_addr_uart_f(bus_addr_uart_f),
-        .bus_data_uart_f(bus_data_uart_f),
-        .bus_we_uart_f(bus_we_uart_f),
-        .bus_be_uart_f(bus_be_uart_f),
-        .bus_data_uart_b(bus_data_uart_b),
-        .bus_addr_plic_f(bus_addr_plic_f),
-        .bus_data_plic_f(bus_data_plic_f),
-        .bus_we_plic_f(bus_we_plic_f),
-        .bus_be_plic_f(bus_be_plic_f),
-        .bus_data_plic_b(bus_data_plic_b),
+        .bus_addr_out(bus_addr_out),
+        .bus_data_out(bus_data_out),
+        .bus_be_out(bus_be_out),
+        .bus_we_out(bus_we_out),
+        .bus_sel_out(bus_sel_out),
+        .bus_data_b(bus_data_b),
         .bus_loaded_out(bus_loaded_out)
     );
 
@@ -119,11 +124,11 @@ module mcu_top(
         .rx(rx),
         .tx(tx),
         .rx_irq(uart_rx_irq),
-        .bus_addr_in(bus_addr_uart_f),
-        .bus_data_in(bus_data_uart_f),
-        .bus_be_in(bus_be_uart_f),
-        .bus_we_in(bus_we_uart_f),
-        .bus_data_out(bus_data_uart_b)
+        .bus_addr_in(bus_addr_out),
+        .bus_data_in(bus_data_out),
+        .bus_be_in(bus_be_out),
+        .bus_we_in(bus_we_uart),
+        .bus_data_out(bus_data_b[PER_UART * 32 +: 32])
     );
 
     plic u_plic (
@@ -131,10 +136,10 @@ module mcu_top(
         .rst(rst_cpu),
         .irq_sources({30'd0, uart_rx_irq, 1'b0}),
         .exti(plic_exti),
-        .bus_addr_in(bus_addr_plic_f),
-        .bus_data_in(bus_data_plic_f),
-        .bus_be_in(bus_be_plic_f),
-        .bus_we_in(bus_we_plic_f),
-        .bus_data_out(bus_data_plic_b)
+        .bus_addr_in(bus_addr_out),
+        .bus_data_in(bus_data_out),
+        .bus_be_in(bus_be_out),
+        .bus_we_in(bus_we_plic),
+        .bus_data_out(bus_data_b[PER_PLIC * 32 +: 32])
     );
 endmodule

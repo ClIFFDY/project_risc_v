@@ -28,7 +28,7 @@ module itcm(
     input [31:0] pc_addr,
     input [31:0] offset_jal1, offset_jalr1,
     input [31:0] offset_beq1, isr_addr1, isr_ret_addr1,
-    input [31:0] jalr_target_q, beq_off_q2,
+    input [31:0] jalr_target_q, beq_off_q1,
     input [31:0] br_addr1,
     output reg [31:0] inst_raw_out,
     output reg is_ibus_q,
@@ -92,7 +92,7 @@ module itcm(
                 else fetch_addr = pc_addr >>> 2;
             end
             FLUSH: begin
-                if (br2) fetch_addr = (br_addr1 + beq_off_q2) >>> 2;
+                if (br2) fetch_addr = (br_addr1 + beq_off_q1) >>> 2;
                 else if (br3) fetch_addr = br_addr1 >>> 2;
                 else if (jalr_fail) fetch_addr = jalr_target_q >>> 2;
                 else fetch_addr = pc_addr >>> 2;

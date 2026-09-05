@@ -22,7 +22,7 @@
 
 module csr(
     input clk, rst,
-    input csr_wr_en, iret, exti, timi, softi, trap, ebreak,
+    input csr_wr_en, stall, iret, exti, timi, softi, trap, ebreak,
     input [11:0] csr_addr,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
@@ -65,7 +65,7 @@ module csr(
             sirq_en <= sirq_en;
             irq_process <= irq_process;
 //根据不同的csr写地址写入不同的csr寄存器
-            if (csr_wr_en) begin
+            if (csr_wr_en && !stall) begin
                 case (csr_addr)
 //全局使能设定
                 12'h300: begin
@@ -81,12 +81,12 @@ module csr(
 //isr跳转目标设定
                 12'h305: begin
                     isr_addr_reg1 <= csr_data_in;
-                    isr_addr_reg2 <= csr_data_in + 4'd4;
+                    isr_addr_reg2 <= csr_data_in;
                 end
 //isr返回目标设定
                 12'h341: begin
                     iret_addr1 <= csr_data_in;
-                    iret_addr2 <= csr_data_in + 4'd4;
+                    iret_addr2 <= csr_data_in;
                 end
                 12'h342: begin
 //中断/异常原因寄存器
@@ -113,7 +113,7 @@ module csr(
 //trap信号控制的系统异常处理
             if (trap) begin
                 iret_addr1 <= pc_addr_in - 4'd12;
-                iret_addr2 <= pc_addr_in - 4'd8;
+                iret_addr2 <= pc_addr_in - 4'd12;
                 mcause_reg <= (ebreak) ? 32'h80000003 : 32'h8000000B;
                 irq_en_post_reg <= irq_en_reg;
                 irq_en_reg <= 1'd0;
@@ -122,7 +122,7 @@ module csr(
 //非isr状态下触发中断，保存上下文并使能受理信号
             else if (irq_act && !irq_process) begin
                 iret_addr1 <= pc_addr_in - irq_bubble;
-                iret_addr2 <= pc_addr_in - irq_bubble + 4'd4;
+                iret_addr2 <= pc_addr_in - irq_bubble;
                 irq_en_post_reg <= irq_en_reg;
                 irq_en_reg <= 1'd0;
                 irq_process <= 1'd1;

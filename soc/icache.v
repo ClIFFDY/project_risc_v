@@ -26,7 +26,7 @@ module icache(
     input ibus_re_in,
     input req_valid,
     output reg [31:0] ibus_data_out,
-    output reg cache_hit,
+    output reg cache_miss,
     output reg busy,
 
     output reg mem_req,
@@ -36,6 +36,7 @@ module icache(
     input [31:0] mem_data
     );
 
+    reg cache_hit;
     reg [20:0] tag;
     reg [6:0] idx;
     reg [3:0] word;
@@ -48,7 +49,7 @@ module icache(
     reg lru [0:127];
 
     reg stage;
-    reg commit;
+    reg fill_end;
     reg [3:0] miss_word;
     reg [3:0] fill_cnt;
     reg [31:0] fill_addr;
@@ -76,15 +77,16 @@ module icache(
         hit_way[0] = valid[0][idx] && (tag_ram[0][idx] == tag);
         hit_way[1] = valid[1][idx] && (tag_ram[1][idx] == tag); 
         cache_hit = hit_way[0] || hit_way[1];
-        busy = (stage == 1'd1) || (stage == 1'd0 && !cache_hit && ibus_re_in);
-        mem_req = (stage == 1'd1) && !commit;
+        cache_miss = (stage == 1'd0) && busy;
+        busy = (stage == 1'd1 && !fill_end) || (stage == 1'd0 && !cache_hit && ibus_re_in);
+        mem_req = (stage == 1'd1) && !fill_end;
         mem_addr = fill_addr + (fill_cnt << 2);
     end
 
     always @(posedge clk) begin
-        if (rst)
+        if (rst) 
             ibus_data_out <= 32'd0;
-        else if (commit && ((ibus_addr_in & 32'hFFFFFFF0) == (fill_addr >> 2)))
+        else if (fill_end && ((ibus_addr_in & 32'hFFFFFFF0) == (fill_addr >> 2)))
             ibus_data_out <= fill_buf[miss_word];
         else if (req_valid) begin
             if (hit_way[0])
@@ -99,7 +101,7 @@ module icache(
     always @(posedge clk) begin
         if (rst) begin
             stage <= 1'd0;
-            commit <= 1'b0;
+            fill_end <= 1'b0;
             fill_cnt <= 4'd0;
             for (i = 0; i < 128; i = i + 1) begin
                 valid[0][i] <= 1'b0;
@@ -111,7 +113,7 @@ module icache(
         end
         else begin
             if (stage == 1'd0) begin
-                commit <= 1'b0;
+                fill_end <= 1'b0;
                 if (cache_hit)
                     lru[idx] <= ~hit_way[1];
                 else if (ibus_re_in) begin
@@ -125,21 +127,33 @@ module icache(
                 end
             end
             else begin
-                if (mem_valid && !commit) begin
+                if (mem_valid && !fill_end) begin
                     fill_buf[fill_cnt] <= mem_data;
                     if (fill_cnt == 4'd15)
-                        commit <= 1'b1;
+                        fill_end <= 1'b1;
                     else
                         fill_cnt <= fill_cnt + 1;
                 end
-                if (commit) begin
+                if (fill_end) begin
                     tag_ram[fill_way][fill_idx] <= fill_tag;
                     valid[fill_way][fill_idx] <= 1'b1;
                     for (i = 0; i < 16; i = i + 1)
                         iram[fill_way][fill_idx][i] <= fill_buf[i];
                     lru[fill_idx] <= ~lru[fill_idx];
-                    stage <= 1'd0;
-                    commit <= 1'b0;
+                    if (!cache_hit && ibus_re_in) begin
+                        stage <= 1'd1;
+                        miss_word <= word;
+                        fill_cnt <= 4'd0;
+                        fill_addr <= (ibus_addr_in & 32'hFFFFFFF0) << 2;
+                        fill_tag <= tag;
+                        fill_idx <= idx;
+                        fill_way <= lru[idx];
+                        fill_end <= 1'b0;
+                    end
+                    else begin
+                        stage <= 1'd0;
+                        fill_end <= 1'b0;
+                    end
                 end
             end
         end

@@ -24,10 +24,11 @@ module pc(
     input clk, rst,
     input br1, br2, br3,
     input jal, jalr, jalr_fail, irq, irq_ret,
+    input ext_target,
     input [1:0] stage,
     input [31:0] offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
-    input [31:0] jalr_target_q, beq_off_q1,
+    input [31:0] jalr_target_q, beq_off_q2,
     input [31:0] br_addr2,
     output reg [31:0] pc_addr, aux_addr
     );
@@ -66,24 +67,24 @@ module pc(
             end
             FLUSH: begin
                 if (br2) begin
-                    pc_addr <= br_addr2 + beq_off_q1 - 4'd4;
-                    aux_addr <= br_addr2 + beq_off_q1 - 4'd4;
+                    pc_addr <= br_addr2 + beq_off_q2;
+                    aux_addr <= br_addr2 + beq_off_q2;
                 end
                 else if (br3) begin
                     pc_addr <= br_addr2;
                     aux_addr <= br_addr2;
                 end
                 else if (jalr_fail) begin
-                    pc_addr <= jalr_target_q + 4'd4;
-                    aux_addr <= jalr_target_q + 4'd4;
+                    pc_addr <= jalr_target_q + (ext_target ? 4'd0 : 4'd4);
+                    aux_addr <= jalr_target_q + (ext_target ? 4'd0 : 4'd4);
                 end
                 else if (irq) begin
-                    pc_addr <= isr_addr2;
-                    aux_addr <= isr_addr2;
+                    pc_addr <= isr_addr2 + (ext_target ? 4'd0 : 4'd4);
+                    aux_addr <= isr_addr2 + (ext_target ? 4'd0 : 4'd4);
                 end
                 else if (irq_ret) begin
-                    pc_addr <= isr_ret_addr2;
-                    aux_addr <= isr_ret_addr2;
+                    pc_addr <= isr_ret_addr2 + (ext_target ? 4'd0 : 4'd4);
+                    aux_addr <= isr_ret_addr2 + (ext_target ? 4'd0 : 4'd4);
                 end
             end
             STALL: begin

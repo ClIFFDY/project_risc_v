@@ -22,6 +22,7 @@
 
 module wb_reg(
     input clk, rst,
+    input [1:0] stage,
     input we_in,
     input [4:0] rd_in,
     input [31:0] result_in,
@@ -46,7 +47,7 @@ module wb_reg(
             result_back2 <= 32'd0;
         end
         else begin
-            if (we_in) begin
+            if (we_in && stage != STALL) begin
                 we_out <= we_in;
                 rd_out <= rd_in;
                 rd_back2 <= rd_in;

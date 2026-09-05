@@ -29,7 +29,7 @@ module cpu_top(
     wire [31:0] jalr_predict_offset;
     wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
     wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
-    wire [31:0] jalr_target_q, beq_off_q1, beq_off_q2;
+    wire [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2;
     wire br1, br2, br3, jalr_fail, is_ibus_q;
 
     wire [4:0] rs1_1, rs2_1, rd_1;
@@ -109,14 +109,15 @@ module cpu_top(
         .jal(jal),
         .jalr(jalr_pred),
         .jalr_fail(jalr_fail),
+        .ext_target(ibus_re_out_i),
         .irq(irq),
         .irq_ret(irq_ret),
         .stage(stage),
         .offset_jal2(offset_jal2),
         .offset_jalr2(jalr_predict_offset + 4'd4),
         .offset_beq2(offset_beq2),
-        .jalr_target_q(jalr_target_q),
-        .beq_off_q1(beq_off_q1),
+        .jalr_target_q(jalr_target_q2),
+        .beq_off_q2(beq_off_q2),
         .br_addr2(br_addr2),
         .isr_addr2(isr_addr2),
         .isr_ret_addr2(iret_addr2),
@@ -142,8 +143,8 @@ module cpu_top(
         .jalr_fail(jalr_fail),
         .irq(irq),
         .irq_ret(irq_ret),
-        .jalr_target_q(jalr_target_q),
-        .beq_off_q2(beq_off_q2),
+        .jalr_target_q(jalr_target_q1),
+        .beq_off_q1(beq_off_q1),
         .br_addr1(br_addr1),
         .inst_raw_out(inst_raw),
         .is_ibus_q(is_ibus_q),
@@ -249,7 +250,8 @@ module cpu_top(
         .offset_beq0_aux(offset_beq0_aux_2),
         .pc_operand_in(pc_operand_2),
         .aux_addr_in(aux_addr_2),
-        .jalr_target_q(jalr_target_q),
+        .jalr_target_q1(jalr_target_q1),
+        .jalr_target_q2(jalr_target_q2),
         .beq_off_q1(beq_off_q1),
         .beq_off_q2(beq_off_q2),
         .jalr(jalr),
@@ -323,7 +325,7 @@ module cpu_top(
         .rst(rst),
         .stage(stage),
         .pc_addr_in(pc_addr),
-        .jalr_target_q(jalr_target_q),
+        .jalr_target_q(jalr_target_q2),
         .success(success),
         .br_fail(br_fail),
         .br_en(br_en),
@@ -360,6 +362,7 @@ module cpu_top(
     wb_reg u_wb_reg (
         .clk(clk),
         .rst(rst),
+        .stage(stage),
         .we_in(we_4),
         .rd_in(rd_4),
         .result_in(result_4),

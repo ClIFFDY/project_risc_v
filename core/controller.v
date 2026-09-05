@@ -53,6 +53,7 @@ module controller(
         .clk(clk),
         .rst(rst),
         .csr_wr_en(csr_wr_en),
+        .stall(stall),
         .iret(irq_ret),
         .exti(exti),
         .timi(timi),

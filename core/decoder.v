@@ -32,7 +32,7 @@ module decoder(
     input [31:0] offset_jalr0, offset_beq0_aux, pc_operand_in,
     input [31:0] aux_addr_in,
     output reg [31:0] r1_data_out, r2_data_out,
-    output reg [31:0] jalr_target_q, beq_off_q1, beq_off_q2,
+    output reg [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2,
     output reg [4:0] rd_out, rd_back1, csr_addr_back1,
     output reg [3:0] alu_func4,
     output reg [2:0] csr_func3,
@@ -78,14 +78,15 @@ module decoder(
             ebreak <= 1'b0;
             jal_flag <= 1'b0;
             jalr_flag <= 1'd0;
-            jalr_target_q <= 32'd0;
+            jalr_target_q1 <= 32'd0;
+            jalr_target_q2 <= 32'd0;
             beq_off_q1 <= 32'd0;
             beq_off_q2 <= 32'd0;
         end
         else begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
             if (stage == EXE) begin
-                r1_data_out <= 32'd0;
+                    r1_data_out <= 32'd0;
                 r2_data_out <= 32'd0;
                 rd_out <= 5'd0;
                 rd_back1 <= 5'd0;
@@ -103,7 +104,8 @@ module decoder(
                 ebreak <= 1'b0;
                 jal_flag <= 1'b0;
                 jalr_flag <= 1'b0;
-                jalr_target_q <= 32'd0;
+                jalr_target_q1 <= 32'd0;
+                jalr_target_q2 <= 32'd0;
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
                 aux_addr_out <= 16'd0;
@@ -138,11 +140,12 @@ module decoder(
                     we <= 1'd1;
                     jalr_flag <= 1'b1;
                     aux_addr_out <= aux_addr_in;
-                    jalr_target_q <= r1_data_final + offset_jalr0;
+                    jalr_target_q1 <= r1_data_final + offset_jalr0;
+                    jalr_target_q2 <= r1_data_final + offset_jalr0;
                 end
 //分支跳转预测结果判定
                 OPCODE_BRANCH: begin
-                    beq_off_q1 <= offset_beq0_aux;
+                    beq_off_q1 <= offset_beq0_aux - 4'd4;
                     beq_off_q2 <= offset_beq0_aux - 4'd4;
                     case (func10[2:0])
                         3'b000: begin
@@ -241,27 +244,6 @@ module decoder(
                 endcase
             end
             else if (stage == STALL) begin
-                r1_data_out <= 32'd0;
-                r2_data_out <= 32'd0;
-                rd_out <= 5'd0;
-                rd_back1 <= 5'd0;
-                alu_func4 <= 4'd0;
-                we <= 1'b0;
-                csr_wr_en <= 1'b0;
-                csr_addr <= 12'd0;
-                csr_data <= 32'd0;
-                jalr <= 1'b0;
-                br_fail <= 1'b0;
-                success <= 1'b0;
-                irq_ret <= 1'b0;
-                trap <= 1'b0;
-                ebreak <= 1'b0;
-                jal_flag <= 1'b0;
-                jalr_flag <= 1'b0;
-                jalr_target_q <= 32'd0;
-                beq_off_q1 <= 32'd0;
-                beq_off_q2 <= 32'd0;
-                aux_addr_out <= 32'd0;
             end
             else begin
                 r1_data_out <= 32'd0;
@@ -281,7 +263,8 @@ module decoder(
                 ebreak <= 1'b0;
                 jal_flag <= 1'd0;
                 jalr_flag <= 1'd0;
-                jalr_target_q <= 32'd0;
+                jalr_target_q1 <= 32'd0;
+                jalr_target_q2 <= 32'd0;
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
             end
