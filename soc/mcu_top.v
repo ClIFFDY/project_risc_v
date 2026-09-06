@@ -39,10 +39,14 @@ module mcu_top(
 
     wire [31:0] bus_data_b_cpu;
     wire [1023:0] bus_data_b;
-
     localparam
     PER_UART = 1,
     PER_PLIC = 2;
+
+    wire [31:0] bus_ready;
+    wire uart_ld_ready, plic_ld_ready;
+    assign bus_ready[PER_UART] = uart_ld_ready;
+    assign bus_ready[PER_PLIC] = plic_ld_ready;
 
     wire bus_loaded_out;
     wire [31:0] ibus_addr_w;
@@ -115,6 +119,7 @@ module mcu_top(
         .bus_we_out(bus_we_out),
         .bus_sel_out(bus_sel_out),
         .bus_data_b(bus_data_b),
+        .bus_ready(bus_ready),
         .bus_loaded_out(bus_loaded_out)
     );
 
@@ -128,6 +133,7 @@ module mcu_top(
         .bus_data_in(bus_data_out),
         .bus_be_in(bus_be_out),
         .bus_we_in(bus_we_uart),
+        .ld_ready(uart_ld_ready),
         .bus_data_out(bus_data_b[PER_UART * 32 +: 32])
     );
 
@@ -140,6 +146,7 @@ module mcu_top(
         .bus_data_in(bus_data_out),
         .bus_be_in(bus_be_out),
         .bus_we_in(bus_we_plic),
+        .ld_ready(plic_ld_ready),
         .bus_data_out(bus_data_b[PER_PLIC * 32 +: 32])
     );
 endmodule

@@ -29,6 +29,7 @@ module uart_top(
     input [3:0] bus_be_in,
     input bus_we_in,
     output reg [31:0] bus_data_out,
+    output reg ld_ready,
     output reg rx_irq
     );
 
@@ -112,18 +113,23 @@ module uart_top(
     always @(posedge clk) begin
         if (rst) begin
             bus_data_out <= 32'd0;
+            ld_ready <= 1'b0;
             rx_read <= 1'b0;
         end
         else begin
+            ld_ready <= 1'b0;
             rx_read <= 1'b0;
-            if (bus_addr_in[23:20] == 4'b0001 && !bus_we_in) begin
+            if (bus_addr_in[31:24] == 8'd1 && bus_addr_in[23:20] == 4'b0001 && !bus_we_in) begin
+                ld_ready <= 1'b1;
                 bus_data_out <= rx_buf[rd_ptr_rx + 1'b1];
                 rx_read <= 1'b1;
             end
-            else if (bus_addr_in[23:20] == 4'b0010 && !bus_we_in) begin
+            else if (bus_addr_in[31:24] == 8'd1 && bus_addr_in[23:20] == 4'b0010 && !bus_we_in) begin
+                ld_ready <= 1'b1;
                 bus_data_out <= {30'd0, tx_busy, rx_cont};
             end
-            else if (bus_addr_in[23:20] == 4'b0011 && !bus_we_in) begin
+            else if (bus_addr_in[31:24] == 8'd1 && bus_addr_in[23:20] == 4'b0011 && !bus_we_in) begin
+                ld_ready <= 1'b1;
                 bus_data_out <= {18'd0, mcnt};
             end
         end

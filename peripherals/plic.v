@@ -30,7 +30,8 @@ module plic(
     input [31:0] bus_data_in,
     input [3:0] bus_be_in,
     input bus_we_in,
-    output reg [31:0] bus_data_out
+    output reg [31:0] bus_data_out,
+    output reg ld_ready
     );
 
     reg [2:0] irq_prio [1:31];
@@ -68,6 +69,8 @@ module plic(
         if (rst) begin
             pending <= 31'd0;
             bus_data_out <= 32'd0;
+            ld_ready <= 1'b0;
+            ld_ready <= (bus_addr_in[31:24] == 8'd2) && !bus_we_in;
             threshold <= 3'd0;
             for (i = 1; i < 32; i = i + 1) begin
                 irq_prio[i] <= 3'd0;

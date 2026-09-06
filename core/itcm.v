@@ -83,24 +83,15 @@ module itcm(
         end
         else begin
             ibus_re_out = is_ibus;
-            fetch_addr = 32'd0;
-            case (stage)
-            EXE, STALL: begin
-                if (br1) fetch_addr = (pc_addr + offset_beq1) >>> 2;
-                else if (jal) fetch_addr = (pc_addr + offset_jal1) >>> 2;
-                else if (jalr) fetch_addr = offset_jalr1 >>> 2;
-                else fetch_addr = pc_addr >>> 2;
-            end
-            FLUSH: begin
-                if (br2) fetch_addr = (br_addr1 + beq_off_q1) >>> 2;
-                else if (br3) fetch_addr = br_addr1 >>> 2;
-                else if (jalr_fail) fetch_addr = jalr_target_q >>> 2;
-                else fetch_addr = pc_addr >>> 2;
-            end
-            default: fetch_addr = 16'd0;
-            endcase
-            if (stage == FLUSH && irq) fetch_addr = isr_addr1 >>> 2;
-            else if (stage == FLUSH && irq_ret) fetch_addr = isr_ret_addr1 >>> 2;
+            if (irq) fetch_addr = isr_addr1 >>> 2;
+            else if (irq_ret) fetch_addr = isr_ret_addr1 >>> 2;
+            else if (br2) fetch_addr = (br_addr1 + beq_off_q1) >>> 2;
+            else if (br3) fetch_addr = br_addr1 >>> 2;
+            else if (jalr_fail) fetch_addr = jalr_target_q >>> 2;
+            else if (br1) fetch_addr = (pc_addr + offset_beq1) >>> 2;
+            else if (jal) fetch_addr = (pc_addr + offset_jal1) >>> 2;
+            else if (jalr) fetch_addr = offset_jalr1 >>> 2;
+            else fetch_addr = pc_addr >>> 2;
         end
     end
 endmodule

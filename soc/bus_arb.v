@@ -35,6 +35,7 @@ module bus_arb(
     output reg [31:0] bus_sel_out,
     //
     input [1023:0] bus_data_b,
+    input [31:0] bus_ready,
     //
     output reg bus_loaded_out
     );
@@ -54,7 +55,10 @@ module bus_arb(
         else per_sel <= !bus_we_f_cpu ? per_decode : 5'd0;
     end
 
-    always @(*) bus_loaded_out = (per_sel != 5'd0);
+    always @(*) begin
+        if (per_sel != 5'd0) bus_loaded_out = bus_ready[per_sel];
+        else bus_loaded_out = 1'b0;
+    end
 
     always @(*) begin
         bus_addr_out = bus_addr_f_cpu;
