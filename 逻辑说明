@@ -1,0 +1,470 @@
+# 逻辑说明 —— RISC-V 6 级流水：指令 data 在流水线中的逐拍位置
+
+> 参考文档。所有时序均对照 RTL（sources_1/new/core/*.v）并用 iverilog 探针 tb 逐拍核对
+> （探针记录见工程历史，不再保留；下文中“clk0..clkN”即该逐拍记法：clk0 = 该指令被 itcm 锁存的那一拍）。
+> 格式约定见 §0。写日期 2026-09-04。
+
+---
+
+## §0 读法与约定
+
+### 0.1 时间轴记法
+
+CPU 全部为上升沿触发。本文档称 **“clkN 拍”** 为第 N 个时钟窗口，即第 N 个上升沿之后的
+半个周期（与探针 tb 在下降沿采样到的值一致）。“某一拍的上升沿”= 该窗口开头的那个上升沿。
+
+每类指令的表格都以**它自己的取指拍为 clk0**（各表互相独立，方便单看一类）：
+
+- **clk0 取指沿**：该上升沿 itcm 按 pc 取指，`inst_raw_out` 锁存本指令；同一沿 pc 已更新为
+  本指令地址 +4（顺序下一条地址）。
+- clk0 拍内：`pre_decoder` 的**纯组合译码**（jal / br_en / jalr_pre / 各 offset）看到的就是本指令
+  （它此刻在 itcm 输出上）→ 决定 clk1 上升沿 pc / 取指是否重定向。
+
+### 0.2 模块边界与位置说法
+
+- 本工程用“**指令在 XX 与 YY 之间**”表示位置 = “指令数据已被 XX 锁存（在其输出寄存器里），
+  YY 将在下一上升沿采样它”。下文表格里直接写成“XX 锁存/未锁存”或“在 XX↔YY 之间”。
+
+模块链与锁存边界（一条普通指令经过的全部边界，+1 表示比前一边界晚 1 拍）：
+
+| 边界（模块） | 相对取指 | 该处锁存的内容 | 备注 |
+| --- | --- | --- | --- |
+| itcm（取指） | +0 (clk0) | inst_raw_out = 原指令字 | 同一沿 pc/aux 更新 |
+| pre_decoder | +1 | rs1/rs2/rd、opcode_dec、func10、imm、各 offset、dec/lsu 标志、aux_addr_out、pc_operand | 它的**组合**输出(jal/br_en)在 clk0 就被本指令驱动 |
+| mem_buf | +2 | 上述全部字段的纯透传缓冲 | STALL/FLUSH 时冻结或清零 |
+| decoder（ID/EX） | +3 | r1/r2_data_out(操作数)、rd_out、we、alu_func4、csr_* 、jalr_target_q、success/br_fail/irq_ret/trap、jalr 等 | **操作数在此拍定型**；本拍组合出 alu 结果 |
+| wb_reg | +4 | result、rd、we | alu 无寄存器，wb_reg 是 EX 结果寄存器 |
+| regfile 写 | +5 | regs[rd] ← wdata | we/loaded 门控，x0 不写 |
+
+即对无冲突指令：**取指 clk0 → 预译码 clk1 → 缓冲 clk2 → 译码/EX clk3 → wb_reg clk4 → 写回 clk5**。
+
+寄存器堆读口在 pre_decoder 侧（r1/r2 = rs 字段）；regfile 读 + forw 前递产生的
+`r1/r2_data_final` 供给 decoder（及 lsu），decoder 在 clk3 才把它们锁进自己的输出寄存器。
+因此两条相邻 ALU 指令（后一条的 rs=前一条的 rd）靠 forw 直接解决，见 §2。
+
+### 0.3 stage 状态机（controller，组合输出，不是寄存器）
+
+| stage | 产生条件 | 行为要点 |
+| --- | --- | --- |
+| EXE | 默认 | 各模块正常锁存 |
+| FLUSH | irq / irq_ret / irq_act / trap / jalr_fail / br2 / br3 任一 | 该沿 pc/itcm 重定向取指；pre_decoder/mem_buf/decoder 清零（冲刷未提交指令）；irq_bubble 计数 |
+| STALL | stall（lsu load-use）或 i_busy | pc/itcm/pre_decoder/mem_buf 冻结；decoder/lsu 保持；forw `stalled` 拍后一级前递 |
+
+> IDLE(2'd0) 实际上**没有定义**：controller 的组合输出只可能取 EXE/STALL/FLUSH，从不置 IDLE；
+> 各模块 localparam 与分支里的 IDLE、以及 itcm 的 `stage==IDLE && ibus_we_in` 写口
+> （原本留给 icache 回填）是历史遗留的死代码，当前不会触发（icache 未启用）。
+>
+> **2026-09-06·itcm 取指去 stage 化**：itcm.v 的 `fetch_addr` 组合选择不再按 `case(stage)`
+> （EXE,STALL / FLUSH / IDLE）分类，改为纯事件信号优先级 mux：
+> `irq > irq_ret > br2 > br3 > jalr_fail > br1 > jal > jalr > 顺序 pc_addr>>2`。
+> 依据：stage 是这些信号（+stall）的函数（见上表），pre_decoder 组合块又已按
+> `stage∈{EXE,STALL}` 把 jal/jalr/br_en 关零、controller 保证权威冲刷信号同拍必 FLUSH，
+> 故两组信号永不同拍互斥，拼成单级优先级后在可达状态上与旧 case 严格等价；
+> STALL 冻结下无事件信号 → 落回 `pc_addr>>2`，同旧 EXE/STALL 分支。STALL 保持与
+> `stage==IDLE` 写口属 itcm 读寄存块的时序门控，仍用 `stage` 输入，端口未删。
+> 附带作用：切断综合 time-loop 里 `stage→fetch_addr→icache.busy→stall→stage`
+> 的 `stage→fetch_addr` 直连边。
+
+### 0.4 本文五类
+
+按与数据路径的关系分五节：ALU 运算(§2)、分支预测(§3)、跳转 JAL/JALR(§4)、
+访存 load/store(§5)、CSR/中断(§6)。每节：先给典型程序，再给逐拍表（行=流水位，
+列=clk），关键控制信号单独成行。clk 用 `c0 c1 …` 缩写表头。
+
+---
+
+## §1 流水线总览（一段混合代码的背靠背位置）
+
+例：5 条不同类指令连续取指时，各自相对取指拍的位置（假设无冲突/无预测错误）：
+
+```
+c0:   addi 取指
+c1:   addi→predec      jalr 取指(若 B 是分支则本拍被 br1 重定向)
+c2:   addi→mem_buf     (上条)→predec     br 取指
+c3:   addi→decoder     (上条)→mem_buf    (上条)→predec     ld 取指
+c4:   addi→wb_reg      …                                     (上条)→predec  st 取指
+c5:   addi→regs写回    …                                                  st→mem_buf(lw→lsu)
+...
+```
+
+即任意时刻流水里最多 5 条未提交指令，指令按“取指→…→写回”每拍推进一位。
+下面各节单独看每类的边界与冲突。
+
+---
+
+## §2 ALU 运算类（R 型 / I 型 / LUI / AUIPC）
+
+例：
+```
+0x00 addi x1,x0,7    00700093
+0x04 add  x2,x1,x1   00108133   ← 后一条的 rs1=x1 依赖前一条 rd
+0x08 addi x3,x1,1    ...
+```
+
+### 2.1 addi x1,x0,7 逐拍位置
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pc | 0x04 | 0x08 | 0x0c | 0x10 | 0x14 | 0x18 | … |
+| itcm 锁存 | addi(本指令) | add | addi x3 | … | … | … | … |
+| pre_decoder | — | addi（itcm↔predec 之间已无）→ **本拍 predec 锁存** | add | … |  |  |  |
+| mem_buf |  |  | addi 锁存 | add |  |  |  |
+| decoder |  |  |  | **addi 锁存**：rs=x0，imm=7 → alu 组合 result=7 | add |  |  |
+| wb_reg |  |  |  |  | **addi：rd=1 result=7** | add |  |
+| regs[1] | 0 | 0 | 0 | 0 | 0 | **写 7** | 7 |
+
+要点：decoder 输出寄存器就是 EX 级操作数寄存器；alu 是纯组合，结果在 decoder 锁存后的
+**同一拍**（c3）就有效，wb_reg 于 c4 沿收下。regs 写回在 c5 沿。
+
+### 2.2 相邻依赖 add x2,x1,x1（x1 由上一条 addi 产生）
+
+add 取指 c0=addi 取指后 1 拍。add 在 decoder 锁存时（=addi decoder 锁存的下一拍），
+addi 的 alu 结果已经组合有效并挂在 `result_back1`。forw 依 `rd_back1(=1) == rs1_1` 把
+`result_back1` 送进 add 的 r1_data_final → **相邻 ALU 依赖 0 停顿**。
+
+前递优先级（forw）：
+1. `loaded`：ld 数据 `ld_data` 优先（§5）
+2. back1：上一条已在 decoder 的指令（alu 组合结果 result_back1）
+3. back2：wb_reg 里的结果 result_back2
+4. 否则用 regfile 读值 r1_data_in_dec
+
+另外 regfile 读口自身带写回旁路：`(we||loaded) && rd!=0 && rs==rd ? wdata_final : regs[rs]`
+（rd==x0 绝不旁路，这是修过的 bug，见工程记忆）。
+
+### 2.3 AUIPC / LUI 特殊点
+
+- AUIPC：pre_decoder 把 `pc_operand = aux_addr − 4` 传给 decoder，当作 r1 走 alu ADD。
+  （aux_addr 始终 = 顺序后继 pc；减 4 得本指令自身地址。）
+- LUI：直接 immU 作 r2，alu ADD(r1=0)。
+
+---
+
+## §3 分支 branch（含预测 / 冲刷）
+
+例（分支在 0x1c，目标 0x18，计数 3 次，第三轮不跳）：
+```
+0x14 addi x5,x0,3          # 计数
+0x18 addi x5,x5,-1         # loop 体
+0x1c bne  x5,x0,0x18       # 实际跳(前2轮) / 不跳(第3轮)
+0x20 …                     # 出口
+```
+
+### 3.1 预测器怎么工作（信号）
+
+- BHT 64×2bit，复位=1。`predict_en = bht[pc 低位索引] > 1`：初值 1 ⇒ **首轮不预测跳**。
+- 在 itcm 取到 branch 的那一拍（c0），bra_predict 组合输出：`br1 = br_en & predict_en`。
+  - `br1=1`：预判跳 → c1 上升沿 pc/itcm 直接按 offset 取目标（**提前一拍**，见 3.3）。
+  - `br1=0`：预判不跳 → 照常顺序取。
+- branch 进入 decoder 时（c3，取指+3）才算真结果：`success`（真跳）/`br_fail`（真不跳）。
+  bra_predict 再组合：`br2 = success & !pv`（判跳但预判不跳→冲刷取目标）；
+  `br3 = br_fail & pv`（判不跳但预判跳→冲刷取顺序下一条）。`pv` 是该分支过 pre_decoder
+  时记录的 predict_en（预判值，两级记录槽 rd_ptr/wr_ptr）。
+- 命中正确则 br2/br3=0，不冲刷。
+
+### 3.2 情形 A：预判不跳 + 实际不跳（首轮且真不跳）＝ 无惩罚
+
+分支照常流过（decoder c3 判 br_fail，但 pv=0 ⇒ br3=0），不需要表。
+
+### 3.3 情形 B：预判跳 + 实际跳（BHT 饱和后稳态）＝ 零惩罚（br1 提前跳）
+
+bne 取指拍=c0 时 `br1=1`：
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 |
+| --- | --- | --- | --- | --- | --- |
+| pc | 0x20 | **0x1c**（目标+4） | 0x20 | … | … |
+| itcm | bne@1c | **0x18(loop体) 已被 br1 重定向取到** | bne@1c(下一轮) | … |  |
+| pre_decoder | — | bne 锁存（pv=1 记录） | 0x18 |  |  |
+| mem_buf |  |  | bne | 0x18 |  |
+| decoder |  |  |  | bne 判决：x5≠0 success=1；pv=1 ⇒ br2=0 ⇒ 不冲刷 | 0x18 |
+| stage | EXE | EXE | EXE | EXE | … |
+
+即稳态循环每轮 1 条指令/IPC=1，预测跳正确时目标指令在 **c1** 就进入 itcm（与顺序流同速），
+decoder 判决只是确认、不打断。
+
+### 3.4 情形 C：预判不跳 + 实际跳（br2 冲刷，取目标）
+
+bne 首轮（BHT=1，br1=0）实际却跳：顺序取的下一条及其后指令全是错误路径。
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| pc | 0x20 | 0x24 | 0x28 | 0x2c | **0x1c**（目标 0x18+4） | 0x20 |
+| itcm | bne@1c | lui@0x20(错) | addi@0x24(错) | sw@0x28(错) | **addi@0x18=目标**（br2 重定向取到） | bne@1c(下一轮) |
+| pre_decoder | — | bne（记 pv=0） | lui(错) | addi(错) | **清零** | addi@0x18 |
+| mem_buf |  |  | bne | lui(错) | **清零** | （恢复填充） |
+| decoder |  |  |  | **bne 判决 success=1；br2=success&!pv=1** | 清零 |  |
+| stage | EXE | EXE | EXE | **FLUSH**（组合） | 正常 | EXE |
+| regs[x5] | … | … | … | 写 2 |  |  |
+
+要点：
+- 真结果在 **c3**（decoder 拍）出来 → 该拍 stage=FLUSH；错误路径指令被冲掉；
+  **c4** 上升沿重定向取目标（目标在 itcm 出现于 c4）。
+- 相对“预判跳且真跳”（目标 c1 到），此路径目标晚 **3 拍**：净损失 ≈3 拍。
+- 注意冲刷后第一拍取到的目标指令，其流水推进比稳态慢 1 拍（FLUSH 沿后各缓冲重排），
+  表中 c5 标“恢复填充”；此后回到每拍一条。
+
+### 3.5 情形 D：预判跳 + 实际不跳（br3 冲刷，取顺序下一条）
+
+循环末轮（BHT=2，br1=1）实际不跳：c1 错误地重定向去取 0x18 目标路径。
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| pc | 0x20 | 0x1c | 0x20 | 0x1c | **0x24**（出口） | 0x28 |
+| itcm | bne@1c | addi@0x18(错,目标路径) | bne@1c(错,再取) | addi@0x18(错) | **lui@0x20=出口**（br3 重定向） | addi x7 |
+| pre_decoder | — | bne（pv=1） | addi(错) | bne(错) | **清零** | lui@0x20 |
+| decoder |  |  |  | **bne 判决 br_fail=1；br3=br_fail&pv=1** | 清零 |  |
+| stage | EXE | EXE | EXE | **FLUSH** | 正常 | EXE |
+
+要点：预判跳会连续“自我循环”多取 1~2 条目标路径指令（上表 c1/c2 都是错误取的），
+c3 判决不跳 → FLUSH，c4 重定向取真出口 0x20。净损失同样 ≈3 拍。
+
+### 3.6 小结（分支代价）
+
+| 情形 | 何时知道 | 冲刷? | 目标到 itcm 拍 | 相对理想损失 |
+| --- | --- | --- | --- | --- |
+| 预判不跳·真不跳 | c3 | 无 | — | 0 |
+| 预判跳·真跳（br1） | c3 | 无 | c1 | 0 |
+| 预判不跳·真跳（br2） | c3 | 有 | c4 | ≈3 拍 |
+| 预判跳·真不跳（br3） | c3 | 有 | c4 | ≈3 拍 |
+
+冲刷细节：冲刷沿 FLUSH，pc 按 bra_predict 的 br_addr2/beq_off 计算、itcm 按
+br_addr1+beq_off_q2 取指（pc 与 itcm 差 +4，见 §7 公式表）；被冲的是
+“在 decoder 之后尚未锁存的”所有指令——decoder 已锁存的（含 branch 自己）属已提交不冲。
+
+---
+
+## §4 跳转 JAL / JALR
+
+### 4.1 JAL（直接跳，永不预测失败）
+
+```
+0x08 jal x3, fn     008001ef   # rd=x3, link=pc+4=0x0c, 目标 fn=0x10
+0x0c nop                       # 死顺延（永远不会被取到）
+0x10 fn: addi x4,x0,1
+```
+
+JAL 在取指拍 c0 就被 pre_decoder 组合译出（jal=1），**c1 上升沿 pc/itcm 即重定向到目标**，
+中间不插入任何 fall-through 指令——nop@0x0c 从未被取（目标指令 c1 进 itcm）。
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pc | 0x0c | **0x14**（目标 0x10+4） | 0x18 | … |  |  |  |
+| itcm | jal@0x08 | **addi x4@0x10(目标)** | addi x5 |  |  |  |  |
+| pre_decoder | —(组合 jal=1) | jal 锁存（aux=0x0c 即 link 值） | addi x4 |  |  |  |  |
+| mem_buf |  |  | jal |  |  |  |  |
+| decoder |  |  |  | jal：jal_flag=1，alu result=aux=**0x0c** | addi x4 |  |  |
+| wb_reg |  |  |  |  | jal：rd=x3 |  |  |
+| regs[x3] |  |  |  |  |  | **写 0x0c** |  |
+
+要点：JAL 不像分支要等 decoder 判决——**跳转在 c1 生效**（比分支 br1 还提前一拍的原因：
+JAL offset 是立即数，无需预测）。link=pc+4 用 pre_decoder 锁存时的 aux_addr（=c0 拍 pc，
+即 jal+4）。JAL 不触发 FLUSH（stage 保持 EXE）。
+
+### 4.2 JALR（寄存器间接，BTB 预测）
+
+```
+0x04 jalr x2,0(x1)     # 目标=rs1(x1)+imm0，link=pc+4=0x08
+```
+
+- **预测命中（BTB 有表项）**：c0 取指拍 `jalr_pred = pre_jalr & btb_hit` 组合为 1 ⇒
+  与 br1/情形 3.3 相同的提前重定向（pc/itcm 按 BTB 存的预测偏移走）。c3 decoder 算真目标
+  `jalr_target_q = r1_data_final + offset`；相等 ⇒ 不冲刷，零惩罚。
+- **预测未命中 / 预测错误（BTB 空或目标变了）**：不提前跳，顺序取指推进（同分支 br2 流程），
+  decoder 拍 c3 `jalr_fail=1` → FLUSH，c4 重定向取 `jalr_target_q`（真目标），pc 置目标+4。
+
+> **校验判据（重要）**：c0 取指拍预测是否命中/命中值多少，被推入 bra_predict 的 **2 项环形队列
+> `jt_q`**（入队事件 = pre_jalr，值 = `btb[取指拍pc]`；出队 = decoder 出现真目标；FLUSH 时
+> 读写指针清零，与分支 pv 队列同构）。c3 校验用的“预测值”是**队首 jt_q[jrp]**——取指那一刻
+> 的 BTB 值，而不是 decode 时刻按已漂移的 pc 重采样 btb。若拿后者做判据，pc 逐拍 +4，decode
+> 时读到的可能是**别的槽**里第一次执行留下的旧目标（G 场景里 isr 紧贴 ret，旧值 0x38 撞上真值
+> 0x38 → jalr_fail 误判 0 → 错误路径 isr 代码被当真指令执行）。此改动即修 G。
+
+未命中情形（BTB 空，探针实测）逐拍：
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 |
+| --- | --- | --- | --- | --- | --- |
+| pc | 0x08 | 0x0c | 0x10 | 0x14 | 0x14（=目标 0x10+4） |
+| itcm | jalr@0x04 | nop@0x08(错) | addi@0x0c(错) | addi@0x10(错) | **目标 addi@0x10 重取** |
+| pre_decoder | — | jalr | nop(错) | addi(错) | 清零 |
+| decoder |  |  |  | **jalr 锁存：jalr_target_q=0x10，jalr_fail=1** | 清零 |
+| wb_reg |  |  |  |  | jalr：rd=x2，result=aux=**0x08**(link) |
+| stage | EXE | EXE | EXE | FLUSH | 正常 |
+
+要点：JALR 真目标来自**寄存器操作数**（c3 才由 forw/regfile 定型），所以即使 BTB 未命中
+也必须把已顺序取错的指令冲掉——未命中惩罚与分支错判同量级（≈3 拍）。link 值走 jalr_flag
+路径（同 JAL，aux=pc+4），rd 写回仍对齐 regs 拍。
+
+---
+
+## §5 访存 load / store（lsu，字节使能）
+
+lsu 与 decoder 同拍（都读 mem_buf 输出）。总线侧信号全部经 lsu 锁存后输出：
+
+| 信号 | 含义 |
+| --- | --- |
+| bus_addr_out | **字地址**（lsu 里 `(基址+imm)>>2`；dtcm/外设按 [23:20] 译码） |
+| bus_be_out | 字节使能：sb=`0001<<a[1:0]`，sh=`0011<<(2*a[1])`，sw=`1111` |
+| bus_data_out | 写数据（sh/sb 已按 a[1:0] 移到目标字节槽） |
+| bus_we_out | 1=写 |
+| loaded / dtcm_loaded / tim_loaded / bus_loaded_in | 读数据有效（`loaded = dtcm_loaded | tim_loaded | bus_loaded_in`） |
+| ld_data | 回读数据（按 func3 符号/零扩展；字节槽从地址低位取） |
+| we/rd_out | lsu 要写回的 rd 使能/号（喂 alu 的 we_in/rd_in 合并线） |
+| stall | `opcode==LOAD && (rd_in==r1_fast | r2_fast) && rd_del2!=rd_in`（load-use 保护） |
+
+地址译码：dtcm 字地址 [23:20]==2（字节 0x0080_0000 区，mtb 判 mark 在 dtcm[0xfff]）；
+tim_in [23:20]==1 且 [3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)。见 dtcm.v/tim_in.v。
+
+### 5.1 store sw（写，不写回 rd）
+
+```
+0x20 li x6,0x00800000    lui x6,0x800   00800337
+0x24 addi x7,x0,0x123
+0x28 sw x7,0(x6)                        # dtcm[0] = 0x123
+```
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| itcm | sw | (下条) |  |  |  |  |
+| pre_decoder | — | sw（lsu 标志=1） |  |  |  |  |
+| mem_buf |  |  | sw（opcode_lsu=STORE 挂上） |  |  |  |
+| **lsu**（=decoder 拍） |  |  |  | **锁存总线写请求**：bus_addr_out=0x00800000>>2=0x00200000；be=1111；we=1；data=0x123（x7 经 forw 到） |  |  |
+| dtcm |  |  |  |  | **dtcm 写沿**：dtcm[0]←0x123 |  |
+| regs |  |  |  |  |  | （无写回） |
+
+要点：store 的基址/数据在 c3 前由 regfile+forw 定型（基址 x6 由 2 条前的 lui 来，走 back1/back2
+前递）。lsu 于 c3 锁存总线请求，dtcm 在 c4 沿把写数据 merge 进 RAM（字节使能只改目标字节）。
+store 不产生 we，不写 regs。无访存依赖时不 stall。
+
+### 5.2 load lw + 紧邻使用（load-use，2 拍 stall）
+
+```
+0x2c lw x8,0(x6)        # 读 dtcm[0]=0x123
+0x30 add x9,x8,x8       # 紧邻使用 x8 —— 触发 stall
+```
+
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| itcm/pc | lw 取指 | add 取指 | (冻结) |  |  |  |  |
+| pre_decoder |  | lw | add | （STALL 冻结） |  |  |  |
+| mem_buf |  |  | lw | lw(冻结) | lw(冻结) |  |  |
+| **lsu** |  |  |  | c3 锁存**读请求**：busA=0x00200000, we=0, rd_out=x8, we=1 | **c4：dtcm 读回** loaded=1, ld_data=0x123；stall 仍持 | c5 stall 释放 |  |
+| decoder |  |  |  | add 被挡在门外（rd_in=x8==r1_fast=x8 ⇒ **stall=1, stage=STALL**） |  | c5 恢复 EXE，add 之后正常推进（membuf→decoder 多 1 拍重排） |  |
+| regs[x8] |  |  |  |  |  | **c5 沿写 0x123**（loaded 旁路 ld_data 进 regfile/forw） | c6 后 x8=0x123 |
+
+要点（对照探针实测）：
+- 紧邻 load 的指令若用其 rd，会 **STALL 2 拍**（pc/itcm/predec/membuf 冻结、decoder 挡在
+  lsu 外侧），原因是 lsu 的 `rd_del2` 两级延时要在数据回来后第 2 拍才释放；stall 释放后再用
+  1 拍把缓冲重排回来。实测：add(取指 c0) 在 c6 附近才译码，比理想晚 ≈3 拍。
+- 数据回读时序：读请求在 c3 发出（总线字地址），**dtcm 于下一沿 c4 返回**（bus_data_out /
+  loaded=1），regfile 写仍对齐回原 c5 沿——靠 `loaded` 把 `ld_data` 选成 wdata_final，
+  无需额外气泡。
+- **中间隔 1 条无关指令再用**（如 lw; nop; add）不触发 stall：此时 rd_del2 已追上 rd_in，
+  forw 用 loaded/ld_data 前递即可。
+- 外部总线（ibus/uart/SoC）：数据返回由 `bus_loaded_in`/`i_busy` 驱动，i_busy 进 controller
+  的 stall（冻结）——时序同上，只是 loaded 的拍数随外部等待延后。
+
+字节扩展：lb/lbu/lh/lhu 的符号/零扩展与字节槽选择都由 `ld_size/ld_off`（func10 + 地址低 2 位）
+在 lsu 组合完成；数据回到 `ld_data_out` 已按 32 位对齐。
+
+---
+
+## §6 CSR / 中断（system）
+
+### 6.1 CSR 读写（CSRRW/CSRRS/CSRRC/I 类）
+
+CSR 走“decoder 出地址和 r1(zimm)，CSR 读数据直接进 alu，alu 按 func3 算结果”的结构：
+
+| 数据路径 | 拍 | 说明 |
+| --- | --- | --- |
+| 取指 | c0 | 同普通指令 |
+| pre_decoder | c1 | 锁存 imm12_csr(地址) / imm5_csr(zimm, I 类) / rs1 |
+| mem_buf | c2 | 透传 |
+| decoder | c3 | 锁存 csr_addr、csr_wr_en、func3（csr_func3），r1_data_out=rs1 或 zimm；**同一拍**组合：alu 收到 csr 读数据 cs_data(=csr_data_out 按 csr_addr) → rd 值=cs_data，写回值 result_csr 按语义（CSRRW:r1；CSRRS:r1\ | cs；CSRRC:cs&~r1 …） |
+| csr 寄存器 | **c4 沿** | csr.v 在 c3 拍的 csr_wr_en 下写（300/304/305/341/342/344），data=alu.result_csr（组合直达 u_csr.csr_data_in） |
+| rd 写回 | c5 | 与 ALU 相同（rd=csr 旧值） |
+
+注意：forw **没有** CSR 前递。背靠背 `csrw mstatus; csrr …` 时，csrr 的 decoder 拍 = csrw
+decoder 拍 +1，而 csr 写沿 = csrw decoder 拍 +1 —— csrr 读到的已是**已提交新值**（这正是之前
+修 RMW 陈旧读问题的结构，见工程记忆）。
+
+### 6.2 中断（exti/timi/softi → 取指改向 isr / 返回 mret）
+
+信号链（csr.v）：pend 为**电平**（eirq_pend=exti, tirq_pend=timi）→
+`global_pend = (eirq_en&eirq_pend)|(tirq_en&tirq_pend)|(sirq_en&sirq_pend)`
+→ `irq_act = MIE(irq_en_reg) && global_pend && !irq_process`。
+门控：`irq = !(irq_ret|trap|jalr_fail|br2|br3) && irq_act` —— 跳转冲刷拍不响应中断。
+
+受理（irq_act 且非 process）当拍：
+- stage→FLUSH；mstatus.MIE 清 0、MPIE=旧 MIE、irq_process=1；
+- `iret_addr1 = pc_addr_in − irq_bubble`、`iret_addr2 = iret_addr1 + 4`（稳态 bubble=12 →
+  pc−12，即最老未提交指令；bubble 语义见下）；pc→`isr_addr2`（mtvec+4），itcm 取 `isr_addr1`
+  （mtvec），cause 写 mcause（11/7/3）。
+
+返回 mret（decoder irq_ret）：
+- stage→FLUSH；MIE←MPIE、irq_process=0；
+- pc/itcm 取指回绕（固定）：pc→`iret_addr2`，itcm→`iret_addr1 >> 2`（取 iret_addr1 执行、
+  pc 续 iret_addr1+4）。**pc/itcm 不再减 bubble**（2026-09-05 定稿）。
+
+**受理时机控制（2026-09-05，controller/csr，G 与嵌套/紧贴双中断全绿的机制）**：
+- **irq_bubble（controller，4bit）**：复位=12；`stage==FLUSH` 时清 0；否则每拍 +4 直到 12。
+  它是"取指 pc − 提交边界"的偏移代理：稳态=12；FLUSH 置 4（冲刷目标刚被取、pc=目标+4、边界=目标 → 受理应读 pc−4），此后每拍 +4 到 12。回填任意拍受理 pc−bubble 都等于边界。
+- **ird_tmr（controller，2bit）**：`jal | jalr_pred | br1`（**预判型**早跳：目标可能错、且边界还停在跳转指令上，bubble 盖不住远端）
+  置 3，否则每拍 −1；非 0 输出 `irq_gate`。br2/br3/jalr_fail/irq_ret 是**权威冲刷**，靠 FLUSH 置 4 的 bubble 即可在回填中正确受理，不再进 tmr。
+- **csr 受理三重门控**：`irq_act = MIE && global_pend && !irq_process && !irq_gate
+  && !(iret|trap|jalr_fail|br2|br3)`；controller 的 `irq = irq_act`（不再单独再门控）。
+  含义：① 定时器非 0（刚发生预判型早跳）不响应；② 控制转移解析同拍（jalr_fail/br2/br3/mret/trap）不响应——否则会按投机 pc 采 iret。
+- 这样 iret_addr1 只在"稳定拍"采，pc−12 一定落在最老未提交指令上。G(单)、双中断(分开/紧贴 mret)、
+  带访存 ISR 均过，coremark 不变。
+
+中断流程（无重叠、单 exti）粗拍：
+
+| 拍 | 事件 |
+| --- | --- |
+| cX | 普通指令流；exti 有效但受 ird_tmr/门控，等稳定拍才 act=1 |
+| cX+1(FLUSH) | pc→isr+4，itcm 取 mtvec 首条；MIE 清；iret_addr1=pc_addr_in−bubble(12) |
+| 之后 | ISR 按普通指令流跑（嵌套由 MIE/MPIE 管理） |
+| ISR 尾 mret | FLUSH；MIE 还原；pc/itcm 用 iret_addr1/2 固定回跳；ird_tmr 置 3 抑制紧贴的二次受理 |
+
+---
+
+## §7 附：pc / itcm 取指重定向公式对照（写错落点排查用）
+
+| 事件 | pc 模块（pc.v, 本拍沿） | itcm 取指（itcm.v, 本拍沿） | 触发条件 |
+| --- | --- | --- | --- |
+| 顺序 | pc_addr = pc_addr+4 | pc_addr>>2 | EXE 无跳转 |
+| jal | pc_addr + offset_jal2 | (pc_addr + offset_jal1)>>2 | predec 组合 jal（c0→c1 生效） |
+| jalr 预测 | offset_jalr2(=预测+4) | offset_jalr1(=预测)>>2 | jalr_pred（c0→c1 生效） |
+| br1 预测跳 | pc_addr+offset_beq2 | (pc_addr+offset_beq1)>>2 | br1（c0→c1 生效） |
+| br2(br_fail 错) | br_addr2+beq_off_q1−4 | (br_addr1+beq_off_q2)>>2 | FLUSH 且 br2 |
+| br3(br_fail 对错) | br_addr2 | br_addr1>>2 | FLUSH 且 br3 |
+| jalr_fail | jalr_target_q+4 | jalr_target_q>>2 | FLUSH 且 jalr_fail |
+| 中断 | isr_addr2(=mtvec+4) | isr_addr1(=mtvec)>>2 | FLUSH 且 irq |
+| mret | iret_addr2−irq_bubble | (iret_addr1−irq_bubble)>>2 | FLUSH 且 irq_ret |
+
+公式里的 +4/−4 差：pc 寄存器保存的是“顺序后继地址”（下一条），itcm 取指保存的是
+“本指令地址”，两者恒差 4；pre_decoder 的 offset_jal1/beq1 已预减 4（imm−4），pc 用未减的
+offset_jal2/beq2，配合实现单拍重定向时 pc/itcm 各自落点一致。排查跳转落点错误时，
+先分清“pc 侧落点”与“itcm 取指侧落点”各是多少、是否差 4/8/12，再看触发条件是 br2/br3/
+jalr_fail/irq 中的哪一路。
+
+---
+
+## §8 关键信号归属速查
+
+| 信号 | 归属模块 | 是寄存器还是组合 | 一拍含义 |
+| --- | --- | --- | --- |
+| pc_addr / aux_addr | pc | reg | 顺序后继地址 / 同步镜像 |
+| inst_raw_out | itcm | reg | 当前已取指令 |
+| dec / lsu | pre_decoder | reg | 该指令走 decoder 侧还是 lsu 侧 |
+| jal / br_en / jalr_pre(预测) | pre_decoder 组合 | comb | 基于 itcm 当前指令 |
+| br1/br2/br3 / jalr_fail | bra_predict | comb | 分支/跳转预测与纠错 |
+| success / br_fail | decoder | reg | c3 分支真结果 |
+| r1/r2_data_final_dec/lsu | forw | comb | 给 decoder/lsu 的已前递操作数 |
+| jalr_target_q | decoder | reg | c3 真目标 |
+| bus_addr/be/data/we | lsu | reg | c3 锁存的总线请求 |
+| loaded / ld_data | lsu/dtcm/tim_in | reg/comb | 读数据有效/数据 |
+| we_3/rd_3, we_4/rd_4, we_5/rd_5 | decoder/alu 输出/wb_reg | reg | 各写回级 |
+| csr_wr_en/csr_addr/csr_data_in | decoder / alu.result_csr | reg/comb | CSR 写请求与数据 |
+| irq_act/irq_processing/irq | csr.v / controller | comb | 中断请求 |
+| irq_bubble | controller | reg | mret 回绕气泡计数 |
+
+（RTL 以 sources_1/new/core/ 下文件为准；本文如与代码冲突，以代码为准。）
