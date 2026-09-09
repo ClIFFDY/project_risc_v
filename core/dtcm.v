@@ -27,7 +27,7 @@ module dtcm(
     input [3:0] bus_be_in,
     input bus_we_in,
     output reg [31:0] bus_data_out,
-    output reg loaded
+    output reg ready
     );
 
 //TCM紧耦合内存，1clk读延迟，1clk写延迟，无需判定命中
@@ -53,7 +53,7 @@ module dtcm(
 
 //读写逻辑处理
     always @(posedge clk) begin
-        loaded <= 1'd0;
+        ready <= 1'd0;
         bus_data_out <= 31'd0;
         if (bus_addr_in[31:24] == 8'd0 && bus_addr_in[23:20] == 4'd2) begin
             if (bus_we_in) begin
@@ -61,7 +61,7 @@ module dtcm(
             end
             else begin
                 bus_data_out <= dtcm[bus_addr_in[11:0]];
-                loaded <= 1'd1;
+                ready <= 1'd1;
             end
         end
     end

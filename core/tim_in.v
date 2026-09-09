@@ -28,7 +28,7 @@ module tim_in(
     input bus_we_in,
     output reg [31:0] bus_data_out,
     output reg timi,
-    output reg loaded
+    output reg ready
     );
 
 //内部时钟定时器，独占timi内部中断
@@ -40,11 +40,11 @@ module tim_in(
             cnt <= 32'd0;
             timi <= 1'd0;
             bus_data_out <= 32'd0;
-            loaded <= 1'd0;
+            ready <= 1'd0;
         end
         else begin
             bus_data_out <= 32'd0;
-            loaded <= 1'd0;
+            ready <= 1'd0;
             if (cnt + 1'd1 == cnt_set) begin
                 timi <= 1'd1;
                 cnt <= 32'd0;
@@ -63,13 +63,13 @@ module tim_in(
                     end
                     else begin
                         bus_data_out <= cnt_set;
-                        loaded <= 1'd1;
+                        ready <= 1'd1;
                     end
                 end
                 else if (bus_addr_in[3:0] == 4'd2) begin
                     if (!bus_we_in) begin
                         bus_data_out <= cnt;
-                        loaded <= 1'd1;
+                        ready <= 1'd1;
                     end
                 end
 //写指令清除中断挂起

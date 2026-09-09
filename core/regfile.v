@@ -23,9 +23,13 @@
 module regfile(
     input clk, rst,
     input [1:0] stage,
-    input [4:0] r1, r2, rd,
-    input [31:0] rd_data, ld_data,
-    input we, loaded,
+    input [4:0] r1, r2,
+    input [4:0] rd_alu,
+    input [31:0] rd_data_alu,
+    input we_alu,
+    input [4:0] rd_ld,
+    input [31:0] ld_data_ld,
+    input we_ld,
     input dec, lsu,
     output reg [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu
     );
@@ -38,7 +42,6 @@ module regfile(
 
 //同步读写型通用寄存器组，节省lut资源
     (* ram_style = "block" *) reg [31:0] regs [0:31];
-    reg [31:0] wdata_final;
 
     integer i;
     initial begin
@@ -47,13 +50,7 @@ module regfile(
         end
     end
 
-//对alu/访存写入数据进行仲裁
-    always @(*) begin
-        if (loaded) wdata_final = ld_data;
-        else wdata_final = rd_data;
-    end
-
-//读数据进行读写旁路仲裁并输出
+//读数据进行双写口(alu/ld)旁路仲裁并输出
     always @(posedge clk) begin
         if (rst) begin
             r1_data_dec <= 32'd0;
@@ -68,12 +65,12 @@ module regfile(
             r2_data_lsu <= 32'd0;
             if (stage != STALL) begin
                 if (dec) begin
-                    r1_data_dec <= (((loaded || we) && rd != 5'd0 && r1 == rd) ? wdata_final : regs[r1]);
-                    r2_data_dec <= (((loaded || we) && rd != 5'd0 && r2 == rd) ? wdata_final : regs[r2]);
+                    r1_data_dec <= bypass(r1);
+                    r2_data_dec <= bypass(r2);
                 end
                 else if (lsu) begin
-                    r1_data_lsu <= (((loaded || we) && rd != 5'd0 && r1 == rd) ? wdata_final : regs[r1]);
-                    r2_data_lsu <= (((loaded || we) && rd != 5'd0 && r2 == rd) ? wdata_final : regs[r2]);
+                    r1_data_lsu <= bypass(r1);
+                    r2_data_lsu <= bypass(r2);
                 end
             end
             else begin
@@ -85,8 +82,18 @@ module regfile(
         end
     end
 
-//写数据直接进入寄存器组
+//双写口：ALU(rd_alu) 与 load(rd_ld) 各自写回，同拍互不影响
     always @(posedge clk) begin
-        if ((loaded || we) && rd != 5'd0) regs[rd] <= wdata_final;
+        if (we_alu && rd_alu != 5'd0) regs[rd_alu] <= rd_data_alu;
+        if (we_ld && rd_ld != 5'd0) regs[rd_ld] <= ld_data_ld;
     end
+
+    function [31:0] bypass;
+        input [4:0] rx;
+        begin
+            if (we_alu && rd_alu != 5'd0 && rx == rd_alu) bypass = rd_data_alu;
+            else if (we_ld && rd_ld != 5'd0 && rx == rd_ld) bypass = ld_data_ld;
+            else bypass = regs[rx];
+        end
+    endfunction
 endmodule

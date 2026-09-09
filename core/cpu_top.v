@@ -51,9 +51,9 @@ module cpu_top(
     wire [31:0] offset_jalr0_2, offset_beq0_aux_2, offset_load0_2, offset_store0_2;
     wire [31:0] aux_addr_2;
 
-    wire [4:0] rd_3, lsu_rd_3;
+    wire [4:0] rd_3;
     wire [31:0] r1_data_3, r2_data_3, aux_addr_3;
-    wire we_3, lsu_we_3;
+    wire we_3;
     wire [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu;
     wire [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu;
     wire [31:0] ld_data_final;
@@ -72,7 +72,8 @@ module cpu_top(
     wire [2:0] csr_func3;
     wire [31:0] csr_data_wr, csr_data_rd, mcause, csr_result;
     wire [31:0] dtcm_data_out, tim_data_out;
-    wire dtcm_loaded, tim_loaded;
+    wire dtcm_ready, tim_ready;
+    wire [4:0] rd_load;
     wire btb_hit;
 
     reg softi, retire_w, jalr_pred;
@@ -278,24 +279,22 @@ module cpu_top(
         .opcode(opcode_lsu_2),
         .func10(func10_lsu_2),
         .rd_in(rd_2),
-        .r1_fast(rs1_1),
-        .r2_fast(rs2_1),
+        .r1_post(rs1_2),
+        .r2_post(rs2_2),
         .r1_data_final(r1_data_final_lsu),
         .r2_data_final(r2_data_final_lsu),
         .offset_load0(offset_load0_2),
         .offset_store0(offset_store0_2),
         .bus_data_in(bus_data_in_final),
-        .dtcm_loaded(dtcm_loaded | tim_loaded),
-        .bus_loaded_in(bus_loaded_in),
+        .ready_in(dtcm_ready | tim_ready | bus_loaded_in),
         .bus_addr_out(bus_addr_out_i),
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
         .bus_we_out(bus_we_out_i),
-        .we(lsu_we_3),
-        .rd_out(lsu_rd_3),
         .ld_data_out(ld_data_final),
         .loaded(loaded),
-        .stall(stall)
+        .stall(stall),
+        .rd_load(rd_load)
     );
 
     forw u_forw (
@@ -307,6 +306,7 @@ module cpu_top(
         .r2(rs2_2),
         .rd_back1(rd_back1),
         .rd_back2(rd_back2),
+        .rd_load(rd_load),
         .ld_data(ld_data_final),
         .loaded(loaded),
         .stall(stall),
@@ -341,11 +341,11 @@ module cpu_top(
     );
 
     alu u_alu (
-        .we_in(we_3 | lsu_we_3),
+        .we_in(we_3),
         .jal_flag(jal_flag),
         .jalr_flag(jalr_flag),
         .cs_wr_en(csr_wr_en),
-        .rd_in(rd_3 | lsu_rd_3),
+        .rd_in(rd_3),
         .alu_func4(alu_func4),
         .aux_addr_in(aux_addr_3),
         .csr_func3(csr_func3),
@@ -379,11 +379,12 @@ module cpu_top(
         .stage(stage),
         .r1(rs1_1),
         .r2(rs2_1),
-        .rd(rd_5),
-        .rd_data(result_5),
-        .ld_data(ld_data_final),
-        .we(we_5),
-        .loaded(loaded),
+        .rd_alu(rd_5),
+        .rd_data_alu(result_5),
+        .we_alu(we_5),
+        .rd_ld(rd_load),
+        .ld_data_ld(ld_data_final),
+        .we_ld(loaded),
         .dec(dec),
         .lsu(lsu),
         .r1_data_dec(r1_data_dec),
@@ -400,7 +401,7 @@ module cpu_top(
         .bus_be_in(bus_be_out),
         .bus_we_in(bus_we_out),
         .bus_data_out(dtcm_data_out),
-        .loaded(dtcm_loaded)
+        .ready(dtcm_ready)
     );
 
     tim_in u_tim_in (
@@ -412,7 +413,7 @@ module cpu_top(
         .bus_we_in(bus_we_out),
         .bus_data_out(tim_data_out),
         .timi(timi),
-        .loaded(tim_loaded)
+        .ready(tim_ready)
     );
 
     controller u_controller (

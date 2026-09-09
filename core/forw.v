@@ -24,30 +24,35 @@ module forw(
     input clk, rst,
     input [31:0] result_back1, result_back2,
     input [4:0] r1, r2,
-    input [4:0] rd_back1, rd_back2,
+    input [4:0] rd_back1, rd_back2, rd_load,
     input [31:0] r1_data_in_dec, r2_data_in_dec, r1_data_in_lsu, r2_data_in_lsu, ld_data,
     input loaded, stall,
     output reg [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu
     );
     reg [31:0] result_back2_final;
+    reg [4:0] rd_back2_sel;
     reg stalled;
 
 //alu后方数据及地址旁路前送逻辑，防止读写冒险
     always @(*) begin
+        rd_back2_sel = (loaded) ? rd_load : rd_back2;
+    end
+
+    always @(*) begin
 //对ld/st指令数据旁路进行延迟仲裁
         if (!stalled) begin
             result_back2_final = (loaded) ? ld_data : result_back2;
-            r1_data_final_dec = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2 != 5'd0 && r1 == rd_back2) ? result_back2_final : r1_data_in_dec);
-            r2_data_final_dec = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2 != 5'd0 && r2 == rd_back2) ? result_back2_final : r2_data_in_dec);
-            r1_data_final_lsu = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2 != 5'd0 && r1 == rd_back2) ? result_back2_final : r1_data_in_lsu);
-            r2_data_final_lsu = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2 != 5'd0 && r2 == rd_back2) ? result_back2_final : r2_data_in_lsu);
+            r1_data_final_dec = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_dec);
+            r2_data_final_dec = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_dec);
+            r1_data_final_lsu = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_lsu);
+            r2_data_final_lsu = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_lsu);
         end
         else begin
             result_back2_final = (loaded) ? ld_data : result_back2;
-            r1_data_final_dec = ((rd_back2 != 5'd0 && r1 == rd_back2) ? result_back2_final : r1_data_in_dec);
-            r2_data_final_dec = ((rd_back2 != 5'd0 && r2 == rd_back2) ? result_back2_final : r2_data_in_dec);
-            r1_data_final_lsu = ((rd_back2 != 5'd0 && r1 == rd_back2) ? result_back2_final : r1_data_in_lsu);
-            r2_data_final_lsu = ((rd_back2 != 5'd0 && r2 == rd_back2) ? result_back2_final : r2_data_in_lsu);
+            r1_data_final_dec = ((rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_dec);
+            r2_data_final_dec = ((rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_dec);
+            r1_data_final_lsu = ((rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_lsu);
+            r2_data_final_lsu = ((rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_lsu);
         end
     end
 
