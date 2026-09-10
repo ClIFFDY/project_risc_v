@@ -334,33 +334,32 @@ tim_in [23:20]==1 且 [3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)。见 dtc
 前递）。lsu 于 c3 锁存总线请求，dtcm 在 c4 沿把写数据 merge 进 RAM（字节使能只改目标字节）。
 store 不产生 we，不写 regs。无访存依赖时不 stall。
 
-### 5.2 load lw + 紧邻使用（load-use，2 拍 stall）
+### 5.2 load lw + 紧邻使用（load-use，1 拍 stall）
 
 ```
 0x2c lw x8,0(x6)        # 读 dtcm[0]=0x123
 0x30 add x9,x8,x8       # 紧邻使用 x8 —— 触发 stall
 ```
 
-| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| itcm/pc | lw 取指 | add 取指 | (冻结) |  |  |  |  |
-| pre_decoder |  | lw | add | （STALL 冻结） |  |  |  |
-| mem_buf |  |  | lw | lw(冻结) | lw(冻结) |  |  |
-| **lsu** |  |  |  | c3 锁存**读请求**：busA=0x00200000, we=0, rd_out=x8, we=1 | **c4：dtcm 读回** loaded=1, ld_data=0x123；stall 仍持 | c5 stall 释放 |  |
-| decoder |  |  |  | add 被挡在门外（rd_in=x8==r1_fast=x8 ⇒ **stall=1, stage=STALL**） |  | c5 恢复 EXE，add 之后正常推进（membuf→decoder 多 1 拍重排） |  |
-| regs[x8] |  |  |  |  |  | **c5 沿写 0x123**（loaded 旁路 ld_data 进 regfile/forw） | c6 后 x8=0x123 |
+| 位置 \ 拍 | c0 | c1 | c2 | c3 | c4 |
+| --- | --- | --- | --- | --- | --- |
+| itcm/pc | lw 取指 | add 取指 | (冻结) |  |  |
+| pre_decoder |  | lw | add | （STALL 冻结） |  |
+| mem_buf |  |  | lw | lw(冻结) |  |
+| **lsu** |  |  |  | c2 锁存读请求（bus_addr），c3 dtcm 返回 loaded=1 | c4 释放 |
+| decoder |  |  |  | add 被挡（rd==rs ⇒ STALL） | c4 恢复 EXE |
+| regs[x8] |  |  |  |  | **c4 沿写 0x123**（loaded 旁路 ld_data） |
 
 要点（对照探针实测）：
-- 紧邻 load 的指令若用其 rd，会 **STALL 2 拍**（pc/itcm/predec/membuf 冻结、decoder 挡在
-  lsu 外侧），原因是 lsu 的 `rd_del2` 两级延时要在数据回来后第 2 拍才释放；stall 释放后再用
-  1 拍把缓冲重排回来。实测：add(取指 c0) 在 c6 附近才译码，比理想晚 ≈3 拍。
-- 数据回读时序：读请求在 c3 发出（总线字地址），**dtcm 于下一沿 c4 返回**（bus_data_out /
-  loaded=1），regfile 写仍对齐回原 c5 沿——靠 `loaded` 把 `ld_data` 选成 wdata_final，
-  无需额外气泡。
-- **中间隔 1 条无关指令再用**（如 lw; nop; add）不触发 stall：此时 rd_del2 已追上 rd_in，
-  forw 用 loaded/ld_data 前递即可。
-- 外部总线（ibus/uart/SoC）：数据返回由 `bus_loaded_in`/`i_busy` 驱动，i_busy 进 controller
-  的 stall（冻结）——时序同上，只是 loaded 的拍数随外部等待延后。
+- 紧邻 load 的指令若用其 rd，**STALL 1 拍**。stall 由 `(opcode_post==LOAD)&&(rd_1==r1_post|rd_1==r2_post)`
+  （lsu）判；`loaded` 返回即释放（`rd_1` 是派发拍锁存的 load 目的 rd，`:loaded` 表示该 load
+  数据回到，`rd_load=rd_2` 与 data 同拍同源旁路给 forw/regfile）。
+- 数据回读：总线读请求于 c2 锁存，**dtcm 于下一沿 c3 返回**（bus_data_out / `loaded=1`），
+  regfile 写对齐到 c4 沿——`loaded` 把 `ld_data` 选成写回数据，无需额外气泡。
+- **中间隔 1 条无关指令再用**（如 lw; nop; add）不触发 stall：此时 forw 用
+  `loaded ? rd_load : rd_back2` 前递即可（旁路命中）。
+- 外部总线（SoC 外设）：数据返回由 `bus_loaded_in` 驱动，`ready_in = dtcm_ready|tim_ready|bus_loaded_in`；
+  i_busy 走 controller 的 `stall | i_busy`（冻结流水线）——时序同上，只是 `loaded` 的拍数随外部等待延后。
 
 字节扩展：lb/lbu/lh/lhu 的符号/零扩展与字节槽选择都由 `ld_size/ld_off`（func10 + 地址低 2 位）
 在 lsu 组合完成；数据回到 `ld_data_out` 已按 32 位对齐。

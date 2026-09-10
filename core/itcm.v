@@ -47,14 +47,14 @@ module itcm(
     STALL = 2'd3;
 
 //指令TCM紧耦合内存，1clk读延迟，1clk写延迟，无命中判定
-    (* ram_style = "block" *) reg [31:0] itcm [0:4095];
+    (* ram_style = "block" *) reg [31:0] itcm [0:8191];
     initial begin
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
 //pc地址itcm/icache仲裁
     reg is_ibus;
-    always @(*) is_ibus = |fetch_addr[31:12];
+    always @(*) is_ibus = |fetch_addr[31:13];
 
 //读写逻辑处理（写逻辑目前无意义）
     always @(posedge clk) begin
@@ -63,14 +63,14 @@ module itcm(
             is_ibus_q <= 1'd0;
         end
         else if (stage == IDLE && ibus_we_in) begin
-            itcm[ibus_addr_in[13:2]] <= ibus_data_in;
+            itcm[ibus_addr_in[14:2]] <= ibus_data_in;
         end
         else if (stage == STALL) begin
             inst_raw_out <= inst_raw_out;
             is_ibus_q <= is_ibus_q;
         end
         else begin
-            inst_raw_out <= itcm[fetch_addr[11:0]];
+            inst_raw_out <= itcm[fetch_addr[12:0]];
             is_ibus_q <= is_ibus;
         end
     end
