@@ -98,6 +98,7 @@ module mcu_top(
         .req_valid(ibus_req_valid_w),
         .ibus_data_out(ibus_data_w),
         .busy(ibus_busy_w),
+        .cache_miss(),
         .mem_req(),
         .mem_addr(),
         .mem_ready(1'b0),

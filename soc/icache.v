@@ -140,7 +140,7 @@ module icache(
                     for (i = 0; i < 16; i = i + 1)
                         iram[fill_way][fill_idx][i] <= fill_buf[i];
                     lru[fill_idx] <= ~lru[fill_idx];
-                    if (!cache_hit && ibus_re_in) begin
+                    if (!cache_hit && ibus_re_in && !(fill_idx == idx && fill_tag == tag)) begin
                         stage <= 1'd1;
                         miss_word <= word;
                         fill_cnt <= 4'd0;

@@ -33,7 +33,7 @@ module decoder(
     input [31:0] aux_addr_in,
     output reg [31:0] r1_data_out, r2_data_out,
     output reg [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2,
-    output reg [4:0] rd_out, rd_back1, csr_addr_back1,
+    output reg [4:0] rd_out, rd_back1,
     output reg [3:0] alu_func4,
     output reg [2:0] csr_func3,
     output reg we, jalr, br_fail, success, irq_ret, trap, ebreak, jal_flag, jalr_flag,

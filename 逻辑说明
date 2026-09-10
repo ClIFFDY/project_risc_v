@@ -467,3 +467,25 @@ jalr_fail/irq 中的哪一路。
 | irq_bubble | controller | reg | mret 回绕气泡计数 |
 
 （RTL 以 sources_1/new/core/ 下文件为准；本文如与代码冲突，以代码为准。）
+
+---
+
+## §9 icache：fill_end 链式再回填的同一行排除（2026-09-10）
+
+**问题**：`icache.v` 在 `stage` 由 1'd1 回 1'd0 的那一拍（`fill_end` 有效）判断是否链式发起下一次回填，
+判据原为 `!cache_hit && ibus_re_in`。`cache_hit` 是由 `valid`/`tag_ram` 组合算出的，
+而这一行刚填好的 `valid`/`tag_ram` 要到同一时钟沿才写入 —— 即在本 `fill_end` 有效期间，
+`cache_hit` 取到的仍是写入之前的值，于是"刚填完的同一行"被判成 miss，对同一行**再回填一次**。
+
+**后果**：① 每次 miss 多等一整行回填时间（探针观测：同一行出现两次 `fill_cnt` 0→15）；
+② 第二次 `fill_end` 有效时，`ibus_data_out` 仍按 `fill_buf[miss_word]` 输出该行首字，
+而此时 `ibus_addr_in`（即取指地址）已前推到下一个字，于是同一个指令字被送进
+pre_decoder 两次 —— 微测 `alu_refill` 的观察即为 `addi t0,t0,1` 被 `li t0,0` 覆盖，累加结果少 2。
+
+**修法**：判据加"排除刚填完的同一行"：
+`if (!cache_hit && ibus_re_in && !(fill_idx == idx && fill_tag == tag))`。
+即只有本拍取指不在刚填的这一行时才链式再发起回填；同一行填完直接按命中路径供字。
+
+**验证**：`alu_refill` 结果 0x000000fd、`addi t0` 退休 24 次、耗时 99→67 拍；
+`icache_mt` inst=64 err=0；`mini` marker=1、中断受理 1 次、75→41 拍；`mtirq2d` 0x0000600d（纯 itcm，不受影响）；
+`mcu_bus_tb` 0x0000600d。
