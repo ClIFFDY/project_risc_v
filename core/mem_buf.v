@@ -33,6 +33,8 @@ module mem_buf(
     input [31:0] offset_beq0_aux_in,
     input [31:0] pc_operand_in,
     input [31:0] aux_addr_in,
+    input br_pred_taken_in,
+    input [31:0] jalr_pred_addr_in,
     input [6:0] opcode_lsu_in,
     input [9:0] func10_lsu_in,
     input [31:0] offset_load0_in,
@@ -49,6 +51,8 @@ module mem_buf(
     output reg [31:0] offset_beq0_aux_out,
     output reg [31:0] pc_operand_out,
     output reg [31:0] aux_addr_out,
+    output reg br_pred_taken_out,
+    output reg [31:0] jalr_pred_addr_out,
     output reg [6:0] opcode_lsu_out,
     output reg [9:0] func10_lsu_out,
     output reg [31:0] offset_load0_out,
@@ -82,6 +86,8 @@ module mem_buf(
             offset_store0_out <= 32'd0;
             r1_out <= 5'd0;
             r2_out <= 5'd0;
+            br_pred_taken_out <= 1'd0;
+            jalr_pred_addr_out <= 32'd0;
         end
         else if (stage == STALL) begin
             func10_out <= func10_out;
@@ -100,6 +106,8 @@ module mem_buf(
             offset_store0_out <= offset_store0_out;
             r1_out <= r1_out;
             r2_out <= r2_out;
+            br_pred_taken_out <= br_pred_taken_out;
+            jalr_pred_addr_out <= jalr_pred_addr_out;
         end
         else if (stage == FLUSH) begin
             func10_out <= 10'd0;
@@ -118,6 +126,8 @@ module mem_buf(
             offset_store0_out <= 32'd0;
             r1_out <= 5'd0;
             r2_out <= 5'd0;
+            br_pred_taken_out <= 1'd0;
+            jalr_pred_addr_out <= 32'd0;
         end
         else begin
             func10_out <= func10_in;
@@ -136,6 +146,8 @@ module mem_buf(
             offset_store0_out <= offset_store0_in;
             r1_out <= r1_in;
             r2_out <= r2_in;
+            br_pred_taken_out <= br_pred_taken_in;
+            jalr_pred_addr_out <= jalr_pred_addr_in;
         end
     end
 endmodule

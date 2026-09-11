@@ -58,17 +58,6 @@ module icache(
     reg [31:0] fill_buf [0:15];
 
     integer i;
-    reg [31:0] init_prog [0:15];
-    integer p;
-
-    initial begin
-        $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/icache_prog.hex", init_prog);
-        for (p = 0; p < 16; p = p + 1)
-            iram[0][0][p] = init_prog[p];
-        #1000;
-        tag_ram[0][0] = 21'd2;
-        valid[0][0] = 1'b1;
-    end
 
     always @(*) begin
         tag = ibus_addr_in[31:11];

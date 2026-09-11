@@ -27,6 +27,8 @@ module pre_decoder(
     input is_ibus_in,
     input [31:0] ibus_data_in,
     input [31:0] aux_addr_in,
+    input br1_in,
+    input [31:0] jalr_pred_addr_in,
     output reg [4:0] r1, r2, r1_mem, r2_mem, rd,
     output reg [9:0] func10_dec, func10_lsu,
     output reg [31:0] imm_alu_out,
@@ -37,7 +39,9 @@ module pre_decoder(
     output reg [31:0] aux_addr_out,
     output reg [4:0] imm5_csr_out,
     output reg [6:0] opcode_dec, opcode_lsu,
-    output reg jal, dec, lsu, br_en, jalr
+    output reg jal, dec, lsu, br_en, jalr,
+    output reg br_pred_taken_out,
+    output reg [31:0] jalr_pred_addr_out
     );
 
 //根据is_bus信号对来自itcm或icache的指令进行仲裁
@@ -112,6 +116,8 @@ module pre_decoder(
             imm5_csr_out <= 4'd0;
             opcode_dec <= 7'd0;
             opcode_lsu <= 7'd0;
+            br_pred_taken_out <= 1'd0;
+            jalr_pred_addr_out <= 32'd0;
         end
         else if (stage == EXE) begin
             func10_dec <= 10'd0;
@@ -134,6 +140,8 @@ module pre_decoder(
             imm5_csr_out <= 4'd0;
             opcode_dec <= 7'd0;
             opcode_lsu <= 7'd0;
+            br_pred_taken_out <= br1_in;
+            jalr_pred_addr_out <= jalr_pred_addr_in;
             case (inst_effective[6:0])
             OPCODE_OP: begin
                 r2 <= inst_effective[24:20];
@@ -170,6 +178,7 @@ module pre_decoder(
             end
             OPCODE_BRANCH: begin
                 opcode_dec <= OPCODE_BRANCH;
+                aux_addr_out <= aux_addr_in;
                 offset_beq0_aux <= immB(inst_effective);
                 r2 <= inst_effective[24:20];
                 r1 <= inst_effective[19:15];
@@ -244,6 +253,8 @@ module pre_decoder(
             pc_operand <= pc_operand;
             opcode_dec <= opcode_dec;
             opcode_lsu <= opcode_lsu;
+            br_pred_taken_out <= br_pred_taken_out;
+            jalr_pred_addr_out <= jalr_pred_addr_out;
         end
         else begin
             r1 <= 4'd0;
@@ -266,6 +277,8 @@ module pre_decoder(
             imm5_csr_out <= 4'd0;
             opcode_dec <= 7'd0;
             opcode_lsu <= 7'd0;
+            br_pred_taken_out <= 1'd0;
+            jalr_pred_addr_out <= 32'd0;
         end
     end
 

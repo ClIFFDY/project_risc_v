@@ -35,6 +35,7 @@ module dtcm(
     integer i;
     initial begin
         for (i = 0; i < 4096; i = i + 1) dtcm[i] = 32'd0;
+        $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/data.hex", dtcm);
     end
 
 //字节使能逻辑处理

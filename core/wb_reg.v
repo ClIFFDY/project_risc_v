@@ -46,21 +46,26 @@ module wb_reg(
             result_out <= 32'd0;
             result_back2 <= 32'd0;
         end
+        else if (stage == STALL) begin
+            we_out <= we_out;
+            rd_out <= rd_out;
+            rd_back2 <= rd_back2;
+            result_out <= result_out;
+            result_back2 <= result_back2;
+        end
+        else if (we_in) begin
+            we_out <= we_in;
+            rd_out <= rd_in;
+            rd_back2 <= rd_in;
+            result_out <= result_in;
+            result_back2 <= result_in;
+        end
         else begin
-            if (we_in && stage != STALL) begin
-                we_out <= we_in;
-                rd_out <= rd_in;
-                rd_back2 <= rd_in;
-                result_out <= result_in;
-                result_back2 <= result_in;
-            end
-            else begin
-                we_out <= 1'd0;
-                rd_out <= 5'd0;
-                rd_back2 <= 5'd0;
-                result_out <= 32'd0;
-                result_back2 <= 32'd0;
-            end
+            we_out <= 1'd0;
+            rd_out <= 5'd0;
+            rd_back2 <= 5'd0;
+            result_out <= 32'd0;
+            result_back2 <= 32'd0;
         end
     end
 endmodule

@@ -22,21 +22,16 @@
 
 module bra_predict(
     input clk, rst,
-    input [1:0] stage,
-    input [31:0] pc_addr_in,
-    input [31:0] jalr_target_q,
-    input success, br_fail, br_en, pre_jalr,
+    input [31:0] pc_addr_in, jalr_target_q, br_pc_in, jalr_pred_addr_in,
+    input success, br_fail, br_en, jalr_flag, br_pred_taken_in,
     output reg [31:0] br_addr1, br_addr2,
     output reg [31:0] jalr_predict_offset,
     output reg br1, br2, br3, jalr, jalr_fail
     );
 
-    reg [31:0] jalr_real_target;
-    always @(*) jalr_real_target = jalr_target_q;
-
     reg [1:0] bht [0:63];
-    reg [31:0] btb [0:63], br_pc_q [0:1], jalr_pc_q, jt_q [0:1];
-    reg pv_q [0:1], wr_ptr, rd_ptr, jwp, jrp, predict_en;
+    reg [31:0] btb [0:63];
+    reg predict_en;
     integer i;
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
@@ -50,60 +45,23 @@ module bra_predict(
 //初始BHT回到弱不跳转
             for (i = 0; i < 64; i = i + 1) bht[i] <= 2'd1;
             for (i = 0; i < 64; i = i + 1) btb[i] <= 32'd0;
-            jalr_pc_q <= 16'd0;
-            jt_q[0] <= 32'd0;
-            jt_q[1] <= 32'd0;
-            br_pc_q[0] <= 16'd0;
-            br_pc_q[1] <= 16'd0;
-            pv_q[0] <= 1'b0;
-            pv_q[1] <= 1'b0;
-            wr_ptr <= 1'b0;
-            rd_ptr <= 1'b0;
-            jwp <= 1'b0;
-            jrp <= 1'b0;
         end
         else begin
-//jalr实际目标在 EX 期解析：按上一拍取指PC(jalr_pc_q)索引回写 BTB
-            jalr_pc_q <= pc_addr_in;
-            if (jalr_real_target != 32'd0)
-                btb[jalr_pc_q[8:3]] <= jalr_real_target;
-//分支在 EX 期判定，对记录槽队首判定并弹出
+//分支在EX期判定：按随指令流水的载荷PC回写BHT
             if (success) begin
-                if (bht[br_pc_q[rd_ptr][8:3]] < 2'd3)
-                    bht[br_pc_q[rd_ptr][8:3]] <= bht[br_pc_q[rd_ptr][8:3]] + 1'd1;
-                rd_ptr <= ~rd_ptr;
+                if (bht[br_pc_in[8:3]] < 2'd3)
+                    bht[br_pc_in[8:3]] <= bht[br_pc_in[8:3]] + 1'd1;
             end
             else if (br_fail) begin
-                if (bht[br_pc_q[rd_ptr][8:3]] > 2'd0)
-                    bht[br_pc_q[rd_ptr][8:3]] <= bht[br_pc_q[rd_ptr][8:3]] - 1'd1;
-                rd_ptr <= ~rd_ptr;
+                if (bht[br_pc_in[8:3]] > 2'd0)
+                    bht[br_pc_in[8:3]] <= bht[br_pc_in[8:3]] - 1'd1;
             end
-            if (stage == 2'd2) begin
-                wr_ptr <= 1'b0;
-                rd_ptr <= 1'b0;
-                jwp <= 1'b0;
-                jrp <= 1'b0;
-            end
-            else begin
-//预取到分支：pc与预判标志一起压入两级记录槽
-                if (br_en) begin
-                    br_pc_q[wr_ptr] <= pc_addr_in;
-                    pv_q[wr_ptr] <= predict_en;
-                    wr_ptr <= ~wr_ptr;
-                end
-//预取到jalr：把 BTB 预测目标压入jt_q环形队列
-                if (pre_jalr) begin
-                    jt_q[jwp] <= btb[pc_addr_in[8:3]];
-                    jwp <= ~jwp;
-                end
-//实际目标解析：弹出 jt_q 队首
-                if (jalr_real_target != 32'd0)
-                    jrp <= ~jrp;
-            end
+//jalr实际目标在EX期解析：按随指令流水的载荷PC回写BTB
+            if (jalr_flag) btb[br_pc_in[8:3]] <= jalr_target_q;
         end
     end
 
-//组合输出：当前取指PC的预测结果 + 队首待解析项的fail
+//组合输出：当前取指PC的预测结果 + 载荷的预测判定
     always @(*) begin
         if (rst) begin
             br_addr1 = 16'd0;
@@ -116,14 +74,14 @@ module bra_predict(
             jalr_predict_offset = 32'd0;
         end
         else begin
-            br_addr1 = br_pc_q[rd_ptr];
-            br_addr2 = br_pc_q[rd_ptr] + 4'd4;
+            br_addr1 = br_pc_in;
+            br_addr2 = br_pc_in + 4'd4;
             br1 = br_en & predict_en;
-            br2 = success & !pv_q[rd_ptr];
-            br3 = br_fail & pv_q[rd_ptr];
+            br2 = success & !br_pred_taken_in;
+            br3 = br_fail & br_pred_taken_in;
             jalr_predict_offset = btb[pc_addr_in[8:3]];
             jalr = (btb[pc_addr_in[8:3]] != 32'd0);
-            jalr_fail = (jalr_real_target != 32'd0) & (jalr_real_target != jt_q[jrp]);
+            jalr_fail = (jalr_target_q != 32'd0) & (jalr_target_q != jalr_pred_addr_in);
         end
     end
 

@@ -156,9 +156,12 @@ addi 的 alu 结果已经组合有效并挂在 `result_back1`。forw 依 `rd_bac
   - `br1=1`：预判跳 → c1 上升沿 pc/itcm 直接按 offset 取目标（**提前一拍**，见 3.3）。
   - `br1=0`：预判不跳 → 照常顺序取。
 - branch 进入 decoder 时（c3，取指+3）才算真结果：`success`（真跳）/`br_fail`（真不跳）。
-  bra_predict 再组合：`br2 = success & !pv`（判跳但预判不跳→冲刷取目标）；
-  `br3 = br_fail & pv`（判不跳但预判跳→冲刷取顺序下一条）。`pv` 是该分支过 pre_decoder
-  时记录的 predict_en（预判值，两级记录槽 rd_ptr/wr_ptr）。
+  bra_predict 再组合：`br2 = success & !br_pred_taken_in`（判跳但预判不跳→冲刷取目标）；
+  `br3 = br_fail & br_pred_taken_in`（判不跳但预判跳→冲刷取顺序下一条）。
+  `br_pred_taken_in` 是**随指令流水的载荷**：取指拍 `br1 = br_en & predict_en` 算出后，
+  经 pre_decoder → mem_buf → decoder 三级寄存器跟着这条分支一路带到 c3，与 `success`/`br_fail`
+  同拍呈现。**不再有 pv 两级记录槽**（旧方案按索引猜"这颗是不是当初预测跳的那颗"，载荷是把它
+  焊在这条指令上）。
 - 命中正确则 br2/br3=0，不冲刷。
 
 ### 3.2 情形 A：预判不跳 + 实际不跳（首轮且真不跳）＝ 无惩罚
@@ -259,6 +262,12 @@ JAL 在取指拍 c0 就被 pre_decoder 组合译出（jal=1），**c1 上升沿 
 JAL offset 是立即数，无需预测）。link=pc+4 用 pre_decoder 锁存时的 aux_addr（=c0 拍 pc，
 即 jal+4）。JAL 不触发 FLUSH（stage 保持 EXE）。
 
+**link 值的前递（2026-09-11 修，详见 §10）**：`decoder` 的 `OPCODE_JAL` / `OPCODE_JALR`
+分支必须置 `rd_back1 <= rd_in`。否则 forw 的 back1 判据 `rd_back1 != 5'd0 && r1 == rd_back1`
+不成立，link 值送不到**紧邻的下一条**——back2（`wb_reg.rd_back2`）和 regfile 的读旁路
+（`rd_alu`，取自 wb_reg）都比 back1 晚一拍，够不着"紧挨着"的消费者（典型形状：
+`jal f` 下一条就是被调用者的 `mv t0,ra`）。
+
 ### 4.2 JALR（寄存器间接，BTB 预测）
 
 ```
@@ -271,12 +280,14 @@ JAL offset 是立即数，无需预测）。link=pc+4 用 pre_decoder 锁存时�
 - **预测未命中 / 预测错误（BTB 空或目标变了）**：不提前跳，顺序取指推进（同分支 br2 流程），
   decoder 拍 c3 `jalr_fail=1` → FLUSH，c4 重定向取 `jalr_target_q`（真目标），pc 置目标+4。
 
-> **校验判据（重要）**：c0 取指拍预测是否命中/命中值多少，被推入 bra_predict 的 **2 项环形队列
-> `jt_q`**（入队事件 = pre_jalr，值 = `btb[取指拍pc]`；出队 = decoder 出现真目标；FLUSH 时
-> 读写指针清零，与分支 pv 队列同构）。c3 校验用的“预测值”是**队首 jt_q[jrp]**——取指那一刻
-> 的 BTB 值，而不是 decode 时刻按已漂移的 pc 重采样 btb。若拿后者做判据，pc 逐拍 +4，decode
-> 时读到的可能是**别的槽**里第一次执行留下的旧目标（G 场景里 isr 紧贴 ret，旧值 0x38 撞上真值
-> 0x38 → jalr_fail 误判 0 → 错误路径 isr 代码被当真指令执行）。此改动即修 G。
+> **校验判据（重要）**：c3 校验用的“预测值”必须是**取指那一刻**的 BTB 值，而不是 decode 时刻
+> 按已漂移的 pc 重采样 `btb`。现在由**载荷**实现：取指拍 `jalr_predict_offset = btb[取指pc]`
+> 随指令经 pre_decoder → mem_buf → decoder 一路带到 c3（`jalr_pred_addr_in`），
+> `jalr_fail = (jalr_target_q != 32'd0) & (jalr_target_q != jalr_pred_addr_in)`。
+> 旧方案用 bra_predict 里的 **2 项环形队列 `jt_q`**（入队 = pre_jalr，出队 = decoder 出现真目标），
+> 已随载荷化删除。若改回按 decode 时刻的 pc 重采样，pc 逐拍 +4，读到的可能是**别的槽**里第一次
+> 执行留下的旧目标（G 场景里 isr 紧贴 ret，旧值 0x38 撞上真值 0x38 → jalr_fail 误判 0 → 错误
+> 路径 isr 代码被当真指令执行）。此改动即修 G。
 
 未命中情形（BTB 空，探针实测）逐拍：
 
@@ -462,6 +473,7 @@ jalr_fail/irq 中的哪一路。
 | bus_addr/be/data/we | lsu | reg | c3 锁存的总线请求 |
 | loaded / ld_data | lsu/dtcm/tim_in | reg/comb | 读数据有效/数据 |
 | we_3/rd_3, we_4/rd_4, we_5/rd_5 | decoder/alu 输出/wb_reg | reg | 各写回级 |
+| rd_back1 | decoder | reg | ALU 级指令的 rd，供 forw back1 前递；**JAL/JALR 分支也必须置**，否则 link 值送不到紧邻下一条（§10） |
 | csr_wr_en/csr_addr/csr_data_in | decoder / alu.result_csr | reg/comb | CSR 写请求与数据 |
 | irq_act/irq_processing/irq | csr.v / controller | comb | 中断请求 |
 | irq_bubble | controller | reg | mret 回绕气泡计数 |
@@ -489,3 +501,48 @@ pre_decoder 两次 —— 微测 `alu_refill` 的观察即为 `addi t0,t0,1` 被
 **验证**：`alu_refill` 结果 0x000000fd、`addi t0` 退休 24 次、耗时 99→67 拍；
 `icache_mt` inst=64 err=0；`mini` marker=1、中断受理 1 次、75→41 拍；`mtirq2d` 0x0000600d（纯 itcm，不受影响）；
 `mcu_bus_tb` 0x0000600d。
+
+---
+
+## §10 decoder：JAL / JALR 漏置 rd_back1（2026-09-11）
+
+**问题**：`decoder.v` EXE 块开头把 `rd_back1` 清 0，只有 `OPCODE_OP` / `OPCODE_OP_IMM` /
+`OPCODE_LUI` / `OPCODE_AUIPC` / `OPCODE_SYSTEM` 五个分支重新赋 `rd_back1 <= rd_in`，
+**`OPCODE_JAL` 与 `OPCODE_JALR` 没赋**。这两类正是写 link 值（`pc+4`）的指令。
+
+**后果**：`forw` 的 back1 前递判据是 `rd_back1 != 5'd0 && r1 == rd_back1`，`rd_back1=0`
+直接不成立 ⇒ **link 值永远走不了 back1**。而 back2（`wb_reg.rd_back2`）和 regfile 读旁路
+（`rd_alu`，取自 wb_reg）都比 back1 晚一拍，只够着"隔一条"的消费者。
+
+于是**紧邻 `jal` 的下一条若用 `ra`，读到的是寄存器堆里的陈旧值**。典型形状即被调用者第一条
+`mv t0,ra`（`addi t0,ra,0`）：
+
+- 微测 `mt_jalra`（8 条指令）：`jal callee` → `mv t0,ra` 拿到的 `r1_3 = 0x28`（寄存器堆残值），
+  而正确值应是 `jal callee` 刚写回的 `0x0c`；同形状的 `ret` 也因拿不到刚写的 `ra` 而不跳。
+- CoreMark：横幅那条 `ee_printf` 无 `%`，不调 `number`；下一条 `ee_printf("CoreMark Size : %lu\n")`
+  一进来就 `number` → `jal __umodsi3`，而 `__umodsi3` 的第一条正是 `mv t0,ra`。
+  `t0` 拿到旧 `ra`(0xc5c) ⇒ `jr t0` 从 `number` 中间飞回 `ee_printf` 的拷贝循环 ⇒
+  `number` 的收尾 `addi sp,sp,160` 永不执行，sp 停在 0x803AB0 ⇒ `ee_printf` 用错的 sp 走收尾，
+  `lw ra,1148(sp)` 读到 0 ⇒ `ret` 目标 0，被 `jalr_fail = (jalr_target_q != 0) & …` 的直接否掉
+  ⇒ 落到 `d28/d2c j ce4` ⇒ 收尾段无限重复、sp 每轮 +1184，直到某次"恢复 ra"的地址撞进 `.rodata`，
+  `ra` 被字符串覆盖，pc 彻底跑飞。
+
+**修法**：两处各加一行
+
+```
+OPCODE_JAL:  begin ... rd_back1 <= rd_in; ... end
+OPCODE_JALR: begin ... rd_back1 <= rd_in; ... end
+```
+
+**验证**：`mt_jalra` 判据翻绿（`dtcm[0x801000]=0x0000000c`、`jr t0` 执行=2；
+改前为 `0x28` / 0）；`mt_number` 输出 `666\n`、`number` 收尾 `lw_ra/addi_sp160/ret` 全执行；
+`mt_banner` 92 字节三条打印全出、跑到自锁、sp 回归 0x803ff0；全回归 9/9 绿；
+**CoreMark 跑完 10 次迭代并打印完整结果，`crclist/crcmatrix/crcstate` = 0xe714 / 0x1fd7 / 0x8e3a，
+与 `core_main.c` 官方期望表 `[3]`（seedcrc=0xe9f5 → known_id=3）逐一对上**。
+唯一一条 `Errors detected` 来自 `Total time (secs): 0` 触发的"必须跑满 10 秒"报告规则
+（`CLOCKS_PER_SEC=50000000`，10M 拍 = 0.2 s 整数除法得 0），非功能错误。
+
+**排查工具（可重跑）**：`tools/mt_jalra.S` + `project_risc_v.sim/mt_jalra_tb.v`（8 条指令、
+40 拍密集探针 + 全量写口事件）；`tools/mt_number/`、`tools/mt_banner/`（同一份 `ee_printf.c`/
+`link.ld`/`start.S`，`-O1`）。判读 `pc_addr` 时注意：**`pc_addr` 是送 itcm 的地址寄存器，
+恒等于「正在执行的指令地址 + 4」**（itcm 读出打一拍），直接按它读落点会全体偏 4。

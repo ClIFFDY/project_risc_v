@@ -38,21 +38,32 @@ module forw(
         rd_back2_sel = (loaded) ? rd_load : rd_back2;
     end
 
-    always @(*) begin
 //对ld/st指令数据旁路进行延迟仲裁
-        if (!stalled) begin
-            result_back2_final = (loaded) ? ld_data : result_back2;
-            r1_data_final_dec = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_dec);
-            r2_data_final_dec = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_dec);
-            r1_data_final_lsu = ((rd_back1 != 5'd0 && r1 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_lsu);
-            r2_data_final_lsu = ((rd_back1 != 5'd0 && r2 == rd_back1) ? result_back1 : (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_lsu);
+    always @(*) begin
+        result_back2_final = (loaded) ? ld_data : result_back2;
+        if (!stalled && rd_back1 != 5'd0 && r1 == rd_back1) begin
+            r1_data_final_dec = result_back1;
+            r1_data_final_lsu = result_back1;
+        end
+        else if (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) begin
+            r1_data_final_dec = result_back2_final;
+            r1_data_final_lsu = result_back2_final;
         end
         else begin
-            result_back2_final = (loaded) ? ld_data : result_back2;
-            r1_data_final_dec = ((rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_dec);
-            r2_data_final_dec = ((rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_dec);
-            r1_data_final_lsu = ((rd_back2_sel != 5'd0 && r1 == rd_back2_sel) ? result_back2_final : r1_data_in_lsu);
-            r2_data_final_lsu = ((rd_back2_sel != 5'd0 && r2 == rd_back2_sel) ? result_back2_final : r2_data_in_lsu);
+            r1_data_final_dec = r1_data_in_dec;
+            r1_data_final_lsu = r1_data_in_lsu;
+        end
+        if (!stalled && rd_back1 != 5'd0 && r2 == rd_back1) begin
+            r2_data_final_dec = result_back1;
+            r2_data_final_lsu = result_back1;
+        end
+        else if (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) begin
+            r2_data_final_dec = result_back2_final;
+            r2_data_final_lsu = result_back2_final;
+        end
+        else begin
+            r2_data_final_dec = r2_data_in_dec;
+            r2_data_final_lsu = r2_data_in_lsu;
         end
     end
 

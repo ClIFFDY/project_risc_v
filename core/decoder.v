@@ -31,6 +31,8 @@ module decoder(
     input [4:0] imm5_csr_in,
     input [31:0] offset_jalr0, offset_beq0_aux, pc_operand_in,
     input [31:0] aux_addr_in,
+    input br_pred_taken_in,
+    input [31:0] jalr_pred_addr_in,
     output reg [31:0] r1_data_out, r2_data_out,
     output reg [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2,
     output reg [4:0] rd_out, rd_back1,
@@ -40,7 +42,9 @@ module decoder(
     output reg csr_wr_en,
     output reg [11:0] csr_addr,
     output reg [31:0] csr_data,
-    output reg [31:0] aux_addr_out
+    output reg [31:0] aux_addr_out,
+    output reg br_pred_taken_out,
+    output reg [31:0] jalr_pred_addr_out
     );
 //RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
@@ -82,6 +86,8 @@ module decoder(
             jalr_target_q2 <= 32'd0;
             beq_off_q1 <= 32'd0;
             beq_off_q2 <= 32'd0;
+            br_pred_taken_out <= 1'd0;
+            jalr_pred_addr_out <= 32'd0;
         end
         else begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
@@ -109,6 +115,8 @@ module decoder(
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
                 aux_addr_out <= 16'd0;
+                br_pred_taken_out <= br_pred_taken_in;
+                jalr_pred_addr_out <= jalr_pred_addr_in;
                 case (opcode)
                 OPCODE_OP: begin
                     r1_data_out <= r1_data_final;
@@ -129,6 +137,7 @@ module decoder(
 //jal存储pc值传递
                 OPCODE_JAL: begin
                     rd_out <= rd_in;
+                    rd_back1 <= rd_in;
                     we <= 1'd1;
                     aux_addr_out <= aux_addr_in;
                     jal_flag <= 1'd1;
@@ -137,6 +146,7 @@ module decoder(
                 OPCODE_JALR: begin
                     jalr <= 1'd1;
                     rd_out <= rd_in;
+                    rd_back1 <= rd_in;
                     we <= 1'd1;
                     jalr_flag <= 1'b1;
                     aux_addr_out <= aux_addr_in;
@@ -145,6 +155,7 @@ module decoder(
                 end
 //分支跳转预测结果判定
                 OPCODE_BRANCH: begin
+                    aux_addr_out <= aux_addr_in;
                     beq_off_q1 <= offset_beq0_aux - 4'd4;
                     beq_off_q2 <= offset_beq0_aux - 4'd4;
                     case (func10[2:0])
@@ -267,6 +278,8 @@ module decoder(
                 jalr_target_q2 <= 32'd0;
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
+                br_pred_taken_out <= 1'd0;
+                jalr_pred_addr_out <= 32'd0;
             end
         end
     end

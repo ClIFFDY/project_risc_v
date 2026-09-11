@@ -41,6 +41,8 @@ module cpu_top(
     wire [31:0] offset_jalr0_1, offset_beq0_aux_1, offset_load0_1, offset_store0_1;
     wire [31:0] aux_addr_1;
     wire dec, lsu, jal, br_en, pre_jalr;
+    wire br_pred_taken_1, br_pred_taken_2, br_pred_taken_3;
+    wire [31:0] jalr_pred_addr_1, jalr_pred_addr_2, jalr_pred_addr_3;
 
     wire [4:0] rs1_2, rs2_2, rd_2;
     wire [4:0] imm5_csr_2;
@@ -164,6 +166,10 @@ module cpu_top(
         .is_ibus_in(is_ibus_q),
         .ibus_data_in(ibus_data_in),
         .aux_addr_in(aux_addr_0),
+        .br1_in(br1),
+        .jalr_pred_addr_in(jalr_predict_offset),
+        .br_pred_taken_out(br_pred_taken_1),
+        .jalr_pred_addr_out(jalr_pred_addr_1),
         .r1(rs1_1),
         .r2(rs2_1),
         .r1_mem(rs1_1),
@@ -217,6 +223,10 @@ module cpu_top(
         .pc_operand_out(pc_operand_2),
         .aux_addr_in(aux_addr_1),
         .aux_addr_out(aux_addr_2),
+        .br_pred_taken_in(br_pred_taken_1),
+        .br_pred_taken_out(br_pred_taken_2),
+        .jalr_pred_addr_in(jalr_pred_addr_1),
+        .jalr_pred_addr_out(jalr_pred_addr_2),
         .opcode_lsu_in(opcode_lsu_1),
         .opcode_lsu_out(opcode_lsu_2),
         .func10_lsu_in(func10_lsu_1),
@@ -251,6 +261,10 @@ module cpu_top(
         .offset_beq0_aux(offset_beq0_aux_2),
         .pc_operand_in(pc_operand_2),
         .aux_addr_in(aux_addr_2),
+        .br_pred_taken_in(br_pred_taken_2),
+        .jalr_pred_addr_in(jalr_pred_addr_2),
+        .br_pred_taken_out(br_pred_taken_3),
+        .jalr_pred_addr_out(jalr_pred_addr_3),
         .jalr_target_q1(jalr_target_q1),
         .jalr_target_q2(jalr_target_q2),
         .beq_off_q1(beq_off_q1),
@@ -323,13 +337,15 @@ module cpu_top(
     bra_predict u_bra_predict (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
         .pc_addr_in(pc_addr),
         .jalr_target_q(jalr_target_q2),
+        .br_pc_in(aux_addr_3),
+        .jalr_pred_addr_in(jalr_pred_addr_3),
         .success(success),
         .br_fail(br_fail),
         .br_en(br_en),
-        .pre_jalr(pre_jalr),
+        .jalr_flag(jalr_flag),
+        .br_pred_taken_in(br_pred_taken_3),
         .br_addr1(br_addr1),
         .br_addr2(br_addr2),
         .br1(br1),

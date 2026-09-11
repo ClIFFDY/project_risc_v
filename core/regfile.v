@@ -43,6 +43,7 @@ module regfile(
 //同步读写型通用寄存器组，节省lut资源
     (* ram_style = "block" *) reg [31:0] regs [0:31];
 
+    reg [4:0] r1_q, r2_q;
     integer i;
     initial begin
         for (i = 0; i < 32; i = i + 1) begin
@@ -57,32 +58,34 @@ module regfile(
             r2_data_dec <= 32'd0;
             r1_data_lsu <= 32'd0;
             r2_data_lsu <= 32'd0;
+            r1_q <= 5'd0;
+            r2_q <= 5'd0;
+        end
+        else if (stage == STALL) begin
+            r1_data_dec <= bypass(r1_q);
+            r2_data_dec <= bypass(r2_q);
+            r1_data_lsu <= bypass(r1_q);
+            r2_data_lsu <= bypass(r2_q);
         end
         else begin
             r1_data_dec <= 32'd0;
             r2_data_dec <= 32'd0;
             r1_data_lsu <= 32'd0;
             r2_data_lsu <= 32'd0;
-            if (stage != STALL) begin
-                if (dec) begin
-                    r1_data_dec <= bypass(r1);
-                    r2_data_dec <= bypass(r2);
-                end
-                else if (lsu) begin
-                    r1_data_lsu <= bypass(r1);
-                    r2_data_lsu <= bypass(r2);
-                end
+            r1_q <= r1;
+            r2_q <= r2;
+            if (dec) begin
+                r1_data_dec <= bypass(r1);
+                r2_data_dec <= bypass(r2);
             end
-            else begin
-                r1_data_dec <= r1_data_dec;
-                r2_data_dec <= r2_data_dec;
-                r1_data_lsu <= r1_data_lsu;
-                r2_data_lsu <= r2_data_lsu;
+            else if (lsu) begin
+                r1_data_lsu <= bypass(r1);
+                r2_data_lsu <= bypass(r2);
             end
         end
     end
 
-//双写口：ALU(rd_alu) 与 load(rd_ld) 各自写回，同拍互不影响
+//双写口：ALU(rd_alu与load(rd_ld)各自写回，同拍互不影响
     always @(posedge clk) begin
         if (we_alu && rd_alu != 5'd0) regs[rd_alu] <= rd_data_alu;
         if (we_ld && rd_ld != 5'd0) regs[rd_ld] <= ld_data_ld;
