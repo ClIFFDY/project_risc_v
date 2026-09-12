@@ -60,7 +60,7 @@ module cpu_top(
     wire [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu;
     wire [31:0] ld_data_final;
     wire jalr, br_fail, success, jal_flag, jalr_flag, irq_ret, trap, ebreak;
-    wire loaded, stall;
+    wire loaded, ld_we, stall;
 
     wire [4:0] rd_4;
     wire [31:0] result_4, result_back1;
@@ -307,6 +307,7 @@ module cpu_top(
         .bus_we_out(bus_we_out_i),
         .ld_data_out(ld_data_final),
         .loaded(loaded),
+        .ld_we(ld_we),
         .stall(stall),
         .rd_load(rd_load)
     );
@@ -400,7 +401,7 @@ module cpu_top(
         .we_alu(we_5),
         .rd_ld(rd_load),
         .ld_data_ld(ld_data_final),
-        .we_ld(loaded),
+        .we_ld(ld_we),
         .dec(dec),
         .lsu(lsu),
         .r1_data_dec(r1_data_dec),

@@ -36,17 +36,30 @@ module lsu(
     output reg bus_we_out,
     output reg [31:0] ld_data_out,
     output reg loaded,
+    output reg ld_we,
     output reg stall,
     output reg [4:0] rd_load
     );
 
-    reg [4:0] rd_1, rd_2;
-    reg [2:0] size_1, size_2;
-    reg [1:0] off_1, off_2;
+    reg [4:0] rd_1;
     reg [6:0] opcode_post;
     reg stalled;
 
     reg [31:0] st_addr;
+
+    reg [4:0] ld_rd_fifo [0:1];
+    reg [2:0] ld_size_fifo [0:1];
+    reg [1:0] ld_off_fifo [0:1];
+    reg [1:0] ld_wr_ptr, ld_rd_ptr;
+    reg [4:0] ld_hold_rd;
+    reg [31:0] ld_hold_data;
+    reg [31:0] ld_data_cur;
+    reg ld_hold;
+
+    reg ld_fifo_empty, ld_fifo_full, ld_pop, ld_enq, ld_push_eff;
+    reg [4:0] ld_rd_cur;
+    reg [2:0] ld_size_cur;
+    reg [1:0] ld_off_cur;
 
     localparam OPCODE_LOAD  = 7'b0000011;
     localparam OPCODE_STORE = 7'b0100011;
@@ -56,6 +69,18 @@ module lsu(
     EXE = 2'd1,
     FLUSH = 2'd2,
     STALL = 2'd3;
+
+//在途 load 队列的空满、收发条件与队头载荷
+    always @(*) begin
+        ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
+        ld_fifo_full  = (ld_wr_ptr[1] != ld_rd_ptr[1]) && (ld_wr_ptr[0] == ld_rd_ptr[0]);
+        ld_pop        = ready_in && !ld_fifo_empty;
+        ld_enq        = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH);
+        ld_push_eff   = ld_enq && !(ld_fifo_full && !ld_pop);
+        ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[0]];
+        ld_size_cur   = ld_size_fifo[ld_rd_ptr[0]];
+        ld_off_cur    = ld_off_fifo[ld_rd_ptr[0]];
+    end
 
 //ld/st读写类指令总线地址处理逻辑
     always @(posedge clk) begin
@@ -67,17 +92,18 @@ module lsu(
         end
         else begin
             if (stage == STALL) begin
-                if (opcode == OPCODE_LOAD && rd_in != rd_1) begin
+                if (ld_push_eff) begin
                     bus_addr_out <= (r1_data_final + offset_load0) >> 2;
                     bus_we_out <= 1'b0;
                     bus_be_out <= 4'd0;
                     bus_data_out <= 32'd0;
                 end
+//读地址只摆一拍：外设应答是寄存的，下一拍照常到达，重复摆地址只会让它连答
                 else begin
-                    bus_addr_out <= bus_addr_out;
-                    bus_data_out <= bus_data_out;
-                    bus_be_out <= bus_be_out;
-                    bus_we_out <= bus_we_out;
+                    bus_addr_out <= 30'd0;
+                    bus_we_out <= 1'b0;
+                    bus_be_out <= 4'd0;
+                    bus_data_out <= 32'd0;
                 end
             end
         else if (stage == EXE) begin
@@ -88,11 +114,11 @@ module lsu(
             case (opcode)
             OPCODE_LOAD: begin
                 case (func10[2:0])
-                3'b000: bus_addr_out <= (r1_data_final + offset_load0) >> 2;
-                3'b001: bus_addr_out <= (r1_data_final + offset_load0) >> 2;
-                3'b010: bus_addr_out <= (r1_data_final + offset_load0) >> 2;
-                3'b100: bus_addr_out <= (r1_data_final + offset_load0) >> 2;
-                3'b101: bus_addr_out <= (r1_data_final + offset_load0) >> 2;
+                3'b000: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
+                3'b001: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
+                3'b010: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
+                3'b100: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
+                3'b101: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
                 default: bus_addr_out <= 30'd0;
                 endcase
             end
@@ -156,48 +182,70 @@ module lsu(
         end
     end
 
-//读数据写回处理逻辑，字节使能、访问宽度延迟处理（两级移位，loaded 取 _2）
+//在途 load 请求队列：load 发射入队，应答出队，rd/size/off 与应答同源出队
     always @(posedge clk) begin
         if (rst) begin
-            rd_1 <= 5'd0;
-            rd_2 <= 5'd0;
-            size_1 <= 3'd0;
-            off_1 <= 2'd0;
-            size_2 <= 3'd0;
-            off_2 <= 2'd0;
+            ld_wr_ptr <= 2'd0;
+            ld_rd_ptr <= 2'd0;
         end
         else begin
-            if (opcode == OPCODE_LOAD) begin
-                rd_1 <= rd_in;
-                size_1 <= func10[2:0];
-                off_1 <= r1_data_final + offset_load0;
+            if (ld_push_eff) begin
+                ld_rd_fifo[ld_wr_ptr[0]]   <= rd_in;
+                ld_size_fifo[ld_wr_ptr[0]] <= func10[2:0];
+                ld_off_fifo[ld_wr_ptr[0]]  <= r1_data_final + offset_load0;
+                ld_wr_ptr <= ld_wr_ptr + 2'd1;
             end
-            else begin
-                rd_1 <= rd_1;
-                size_1 <= size_1;
-                off_1 <= off_1;
-            end
-            rd_2 <= rd_1;
-            size_2 <= size_1;
-            off_2 <= off_1;
+            if (ld_pop)
+                ld_rd_ptr <= ld_rd_ptr + 2'd1;
         end
     end
 
-//字节使能数据返回输出，loaded 拍 rd 与 data 同拍同源
+//load-use 冒险判定用最近一次发射的 load 目的寄存器
+    always @(posedge clk) begin
+        if (rst) rd_1 <= 5'd0;
+        else if (ld_push_eff) rd_1 <= rd_in;
+        else rd_1 <= rd_1;
+    end
+
+//字节使能数据返回输出：出队拍按 off/size 取字节
     always @(*) begin
-        loaded = ready_in;
-        if (loaded) begin
-            rd_load = rd_2;
-            case (size_2)
-            3'b000: ld_data_out = {{24{bus_data_in[8*off_2 + 7]}}, bus_data_in[8*off_2 +: 8]};
-            3'b001: ld_data_out = {{16{bus_data_in[16*off_2[1] + 15]}}, bus_data_in[16*off_2[1] +: 16]};
-            3'b010: ld_data_out = bus_data_in;
-            3'b100: ld_data_out = {24'd0, bus_data_in[8*off_2 +: 8]};
-            3'b101: ld_data_out = {16'd0, bus_data_in[16*off_2[1] +: 16]};
-            default: ld_data_out = bus_data_in;
-            endcase
+        case (ld_size_cur)
+        3'b000: ld_data_cur = {{24{bus_data_in[8*ld_off_cur + 7]}}, bus_data_in[8*ld_off_cur +: 8]};
+        3'b001: ld_data_cur = {{16{bus_data_in[16*ld_off_cur[1] + 15]}}, bus_data_in[16*ld_off_cur[1] +: 16]};
+        3'b010: ld_data_cur = bus_data_in;
+        3'b100: ld_data_cur = {24'd0, bus_data_in[8*ld_off_cur +: 8]};
+        3'b101: ld_data_cur = {16'd0, bus_data_in[16*ld_off_cur[1] +: 16]};
+        default: ld_data_cur = bus_data_in;
+        endcase
+    end
+
+//应答只摆一拍的话，落在 back2 槽的消费者会取不到，故再保持一拍
+    always @(posedge clk) begin
+        if (rst) ld_hold <= 1'b0;
+        else begin
+            ld_hold <= ld_pop;
+            if (ld_pop) begin
+                ld_hold_rd <= ld_rd_cur;
+                ld_hold_data <= ld_data_cur;
+            end
+        end
+    end
+
+//rd 与 data 同拍同源输出；ld_we 只在应答拍置起（避免保持拍重复写寄存器堆）
+    always @(*) begin
+        ld_we = ld_pop;
+        if (ld_pop) begin
+            loaded = 1'b1;
+            rd_load = ld_rd_cur;
+            ld_data_out = ld_data_cur;
+        end
+        else if (ld_hold) begin
+            loaded = 1'b1;
+            rd_load = ld_hold_rd;
+            ld_data_out = ld_hold_data;
         end
         else begin
+            loaded = 1'b0;
             rd_load = 5'd0;
             ld_data_out = bus_data_in;
         end

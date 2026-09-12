@@ -70,7 +70,6 @@ module plic(
             pending <= 31'd0;
             bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
-            ld_ready <= (bus_addr_in[31:24] == 8'd2) && !bus_we_in;
             threshold <= 3'd0;
             for (i = 1; i < 32; i = i + 1) begin
                 irq_prio[i] <= 3'd0;
@@ -82,6 +81,7 @@ module plic(
                 if (irq_sources[i]) pending[i] <= 1'b1;
             end
             bus_data_out <= 32'd0;
+            ld_ready <= 1'b0;
             if (bus_addr_in[31:24] == 8'd2) begin
                 if (bus_addr_in[23:20] == 4'd0) begin
                     if (bus_addr_in[5:0] >= 1 && bus_addr_in[5:0] <= 31) begin
@@ -90,28 +90,37 @@ module plic(
                         end
                         else if (!bus_addr_in[6] && !bus_we_in) begin
                             bus_data_out <= {29'd0, irq_prio[bus_addr_in[5:0]]};
+                            ld_ready <= 1'b1;
                         end
                         else if (bus_addr_in[6] && bus_we_in && bus_be_in[0]) begin
                             irq_en[bus_addr_in[5:0]] <= bus_data_in[0];
                         end
                         else if (bus_addr_in[6] && !bus_we_in) begin
                             bus_data_out <= {31'd0, irq_en[bus_addr_in[5:0]]};
+                            ld_ready <= 1'b1;
                         end
                     end
                 end
                 else if (bus_addr_in[23:20] == 4'd1) begin
                     if (bus_we_in && bus_be_in[0]) threshold <= bus_data_in[2:0];
-                    else if (!bus_we_in) bus_data_out <= {29'd0, threshold};
+                    else if (!bus_we_in) begin
+                        bus_data_out <= {29'd0, threshold};
+                        ld_ready <= 1'b1;
+                    end
                 end
                 else if (bus_addr_in[23:20] == 4'd2) begin
                     if (bus_addr_in[4:0] >= 1 && bus_addr_in[4:0] <= 31) begin
                         if (bus_we_in && bus_be_in[0]) pending[bus_addr_in[4:0]] <= 1'd0;
-                        else if (!bus_we_in) bus_data_out <= {31'd0, pending[bus_addr_in[4:0]]};
+                        else if (!bus_we_in) begin
+                            bus_data_out <= {31'd0, pending[bus_addr_in[4:0]]};
+                            ld_ready <= 1'b1;
+                        end
                     end
                 end
                 else if (bus_addr_in[23:20] == 4'd3) begin
                     if (!bus_we_in) begin
                         bus_data_out <= super_id;
+                        ld_ready <= 1'b1;
                         if (sel_id != 6'd0) pending[sel_id] <= 1'd0;
                     end
                 end

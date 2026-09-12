@@ -316,13 +316,18 @@ lsu 与 decoder 同拍（都读 mem_buf 输出）。总线侧信号全部经 lsu
 | bus_be_out | 字节使能：sb=`0001<<a[1:0]`，sh=`0011<<(2*a[1])`，sw=`1111` |
 | bus_data_out | 写数据（sh/sb 已按 a[1:0] 移到目标字节槽） |
 | bus_we_out | 1=写 |
-| loaded / dtcm_loaded / tim_loaded / bus_loaded_in | 读数据有效（`loaded = dtcm_loaded | tim_loaded | bus_loaded_in`） |
+| ready_in | 读响应有效，来自 cpu_top 组合：`dtcm_ready | tim_ready | bus_loaded_in` |
+| loaded | lsu 在途队列队头出队那一拍有效；`rd_load` 与 `ld_data` 由队列配对取出，不靠延迟凑（见 §5.3） |
+| ld_we | load 写回寄存器堆使能，只在出队那一拍置起（保持拍不重复写） |
 | ld_data | 回读数据（按 func3 符号/零扩展；字节槽从地址低位取） |
 | we/rd_out | lsu 要写回的 rd 使能/号（喂 alu 的 we_in/rd_in 合并线） |
 | stall | `opcode==LOAD && (rd_in==r1_fast | r2_fast) && rd_del2!=rd_in`（load-use 保护） |
 
 地址译码：dtcm 字地址 [23:20]==2（字节 0x0080_0000 区，mtb 判 mark 在 dtcm[0xfff]）；
 tim_in [23:20]==1 且 [3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)。见 dtcm.v/tim_in.v。
+
+外设槽（`bus_addr[31:24]`）：1=UART 0x0400_0000、2=PLIC 0x0800_0000、3=tim_p 0x0C00_0000、
+4=gpio_group 0x1000_0000，由 bus_arb 按该字段选通（1..31 全归它管，加外设不用改 bus_arb）。见 bus_arb.v。
 
 ### 5.1 store sw（写，不写回 rd）
 
@@ -374,6 +379,29 @@ store 不产生 we，不写 regs。无访存依赖时不 stall。
 
 字节扩展：lb/lbu/lh/lhu 的符号/零扩展与字节槽选择都由 `ld_size/ld_off`（func10 + 地址低 2 位）
 在 lsu 组合完成；数据回到 `ld_data_out` 已按 32 位对齐。
+
+### 5.3 在途 load 队列（rd/size/off 与应答同源出队）
+
+lsu 里有一支 2 槽在途 load 队列：`ld_rd_fifo`/`ld_size_fifo`/`ld_off_fifo`（各 2 项），
+配 `ld_wr_ptr`/`ld_rd_ptr` 两个 2 位指针（低位选槽、高位判空满）。
+
+| 事件 | 条件 | 动作 |
+| --- | --- | --- |
+| 入队（发射） | `ld_enq = (opcode==LOAD) && !stall && (stage!=FLUSH)` | 把 `rd_in`/`func10[2:0]`/`基址+offset_load0` 写进队尾；同时把读地址摆上总线（**只摆这一拍**） |
+| 出队（应答） | `ld_pop = ready_in && !ld_fifo_empty` | 队头的 `rd`/`size`/`off` 与 `bus_data_in` 同拍组合出 `rd_load`/`ld_data`，读指针 +1 |
+| 保持 | `ld_hold`（`ld_pop` 打一拍） | 同一对 `(rd,data)` 再多摆一拍，给落在 back2 槽的消费者 |
+| 写回 | `ld_we = ld_pop` | 只在出队那一拍写寄存器堆 |
+
+- **入队用 `!stall` 而不是"指令刚到达"**：`stall` 正好表示"本拍该指令的操作数还没到"。
+  若在停顿期就入队，基址来自上一条 load 的指令（`lw t6,0(t6)` → `lw sp,0(t6)`）
+  会把**旧操作数**算出的地址锁进队列，整条恢复链全错位。
+- **`stage!=FLUSH` 必须挡**：被冲刷的死槽 load 若入队，会带垃圾操作数算出的地址占住队头，
+  应答永远不来 ⇒ 队头永久卡死、后续所有 load 全部错配。
+- **保持一拍的理由**：load 往后第 2 条指令在 lsu 拍靠 `forw` 的 `loaded ? rd_load : rd_back2`
+  取数，那一拍正好落在出队的**下一拍**；只摆一拍它会取不到（实测该拍 `loaded=0`）。
+- **写回另用 `ld_we`**：若直接用 `loaded` 当 `we_ld`，保持拍会拿同一个 rd 再写一次，
+  把同拍 ALU 写回的结果盖掉。
+
 
 ---
 
@@ -546,3 +574,309 @@ OPCODE_JALR: begin ... rd_back1 <= rd_in; ... end
 40 拍密集探针 + 全量写口事件）；`tools/mt_number/`、`tools/mt_banner/`（同一份 `ee_printf.c`/
 `link.ld`/`start.S`，`-O1`）。判读 `pc_addr` 时注意：**`pc_addr` 是送 itcm 的地址寄存器，
 恒等于「正在执行的指令地址 + 4」**（itcm 读出打一拍），直接按它读落点会全体偏 4。
+
+---
+
+## §11 plic 读不通 + tim_p 外设化 + lsu 在途 load 队列（2026-09-12）
+
+### 11.1 plic：ld_ready 只写在复位分支
+
+**问题**：`plic.v` 的 `ld_ready` 只在 `if (rst)` 分支里赋值（且第 73 行覆盖第 72 行），
+非复位分支从不赋值。
+
+**后果**：读 PLIC 永远等不到应答 ⇒ 该读指令在 lsu 里永久停在 STALL ⇒ 仿真/上板一律挂死。
+这也是此前全工程没有任何程序访问过 PLIC 的原因。
+
+**修法**：复位分支删掉那行；非复位分支先 `ld_ready <= 1'b0;` 打底，
+5 个读命中分支（priority / enable / threshold / pending / claim）各置 `ld_ready <= 1'b1;`，
+与 `bus_data_out` 同沿。
+
+**验证**：`plic_tb` 8 项全过（复位后读 `PRIO(2)` 必须 `ld_ready==1`，修复前必挂）；
+`tim_p_irq` 闭环里 claim 读通、源号=2。
+
+### 11.2 tim_p：按规范改成合规外设，挂索引 3
+
+移植来的 `tim_p.v` 原是 16 位地址 / 8 位数据 / `bus_sig_in` 的自定义接口，
+**读是组合透传**、**中断会自动清 0** —— 两条都违反《总线说明规范》§6。
+
+按 §5 接口重写：`bus_addr_in[31:0]` / `bus_data_in[31:0]` / `bus_be_in[3:0]` / `bus_we_in` /
+`bus_data_out` / `ld_ready`（后两者均为 reg）。**读改寄存输出**（与 uart / plic / dtcm 同形）；
+**中断只置 1**，只有写 `IRQ_CLR` 才清（原 `irq_mode` 位重定义为 0=单次 / 1=周期）；
+4 个 8 位级联计数器拼回单个 32 位 `cnt`；PWM 改寄存输出消毛刺。
+
+寄存器映射（字偏移 = `bus_addr_in[3:0]`，字节基址 0x0C00_0000）：
+
+| 偏移 | 名称 | 访问 | 语义 |
+| --- | --- | --- | --- |
+| +0x00 | CNT_SET | RW | 目标值，逐字节受 `bus_be_in` 保护 |
+| +0x04 | CNT | RO | 当前计数值 |
+| +0x08 | MODE | RW | bit0：0=单次、1=周期 |
+| +0x0C | IRQ_CLR | W | 任意写清中断（唯一清中断途径） |
+| +0x10/+0x14 | PWM_DUTY1/2 | RW | 门限 |
+| +0x18 | PWM_EN | RW | bit0/bit1 = 两路使能 |
+| +0x1C | IRQ_STAT | RO | bit0=中断、bit1=停止 |
+
+未实现地址仍返回 `ld_ready=1`（读不挂死）。接入：`mcu_top.v` 加 `PER_TIM=3`、`bus_ready[3]`、
+`bus_we_tim_p`、顶层 `pwm1/pwm2`；`plic` 的 `irq_sources` 改成 `{29'd0, tim_p_irq, uart_rx_irq, 1'b0}`
+（tim_p = 源 2）。`bus_arb.v` 不用动。
+
+**验证**：`tim_p_tb` 11 项全过（含"中断粘滞性"——置位后不写就应一直为 1，原代码必挂）；
+`tim_p_irq` 闭环 PASS @cyc=479：ISR 4 次、mcause 0x8000000B、claim 源号 2、
+CNT_SET 回读 200、pwm1 高低都出现过。
+
+### 11.3 lsu：在途 load 队列
+
+见 §5.3 的机制描述。**问题**：原 lsu 用 `rd_1`/`rd_2` 两级移位 + `loaded = ready_in`（电平）
+凑对齐 —— `loaded` 是电平、`rd_2` 是自由移位，二者靠拍数凑；背靠背 load 时会把
+**上一笔应答配到下一笔的 rd 上**（FreeRTOS 里 `lw ra,off(sp)` 拿到别的 load 的数据
+⇒ `ret` 飞向 DTCM ⇒ 重跑 main）。根因即"rd/size/off 没有和应答绑在一起，靠延迟对齐"。
+
+**验证**：
+- 微测 `mt_ldfifo`（`tools/mt_ldfifo.S` + `project_risc_v.sim/mt_ldfifo_tb.v`，判据写 dtcm 0xFFC~0xFFF）：
+  ①连发 27 条 load；②load-use 停顿后紧邻 load；③store 紧邻 load 读写同址；
+  ④32 轮 `jalr` 冲刷窗口里塞死槽 load —— **4/4 PASS**，入队=出队=157、溢出/孤儿/越界全 0。
+- 新旧 RTL 对拍：FreeRTOS 全跑 9000 拍，DTCM 写口 **1645 笔逐字节完全一致**
+  （改前第 1156 笔即分叉）。
+- FreeRTOS 菜单恢复 **225 字节**（Function1 / Function2 都能进、都能回主菜单）。
+- 全回归 **13/13 绿**。
+
+---
+
+## §12 gpio_group：32 脚 GPIO 外设化 + 中断聚合（2026-09-12）
+
+### 12.1 模块功能
+
+32 根双向脚，**每脚一个 4 位 mode**决定这脚接什么：
+
+| mode | 值 | 脚方向 | 说明 |
+| --- | --- | --- | --- |
+| UNUSE | 0 | 高阻 | 默认 |
+| OUT | 1 | 输出 | 值取 `gpio_output[i]` |
+| IN | 2 | 输入 | 电平进 GPIO_IN |
+| IRQ | 3 | 输入 | 边沿/电平检测进中断状态位 |
+| TX | 5 | 输出 | 透传模块的 `tx` 输入 |
+| RX | 6 | 输入 | 电平透到模块的 `rx` 输出 |
+| PWM1 / PWM2 | 7 / 8 | 输出 | 透传 `pwm1`/`pwm2` 输入（本 SoC 里接 tim_p 的 PWM 输出） |
+| SCL | 9 | 输出 | 透传 `scl` 输入（I2C 预留） |
+| SDA | 10 | 开漏双向 | `sda_oe` 时拉低、否则高阻；电平回读进 `sda_in` |
+
+**`mcu_top` 顶层只留 `clk` / `rst` / `gpio_pin_bus[31:0]`** —— 所有需要出去的外设信号都经
+gpio 引脚复用，不再有独立顶层端口：
+
+| 外设信号 | 接到哪 | 怎么出到引脚 |
+| --- | --- | --- |
+| UART `tx` | `gpio_group.tx` | 某脚配成 TX 模式即把串口引出去 |
+| UART `rx` | ← `gpio_group.rx` | 某脚配成 RX 模式，该脚电平进 UART 接收端；无 RX 脚时 `rx` 恒 1（空闲） |
+| tim_p `pwm1`/`pwm2` | `gpio_group.pwm1`/`pwm2` | 某脚配成 PWM1/PWM2 模式 |
+| I2C `scl`/`sda_oe`/`sda_in` | 暂时接 `1'b1` / `1'b0` / 悬空 | I2C 空闲态（SCL 高、SDA 释放）；`i2c.v` 移植进来后按同样方式接上 |
+
+`tx`/`rx`/`scl`/`sda_oe`/`sda_in` 这几个 `gpio_group` 端口名和语义按移植来的原样没动。
+
+### 12.2 总线适配与寄存器映射
+
+按规范 §5 换接口：`bus_addr_in[31:0]`（索引 `[31:24]==4`，内部偏移 `[5:0]`）/ `bus_data_in[31:0]` /
+`bus_be_in[3:0]` / `bus_we_in` / `bus_data_out[31:0]`(reg) / `ld_ready`(reg) / `gpio_irq`(reg)。
+**读全走时序逻辑**、与 data 同沿出 `ld_ready`；写严格 1 拍；未实现偏移读仍返回 `ld_ready=1` 不挂死。
+
+| 字偏移 | 名称 | 访问 | 说明 |
+| --- | --- | --- | --- |
+| 0x00 | GPIO_OUT | RW | 32 位输出值，逐字节受 `bus_be_in`，只对 OUT 模式脚生效 |
+| 0x04 | GPIO_IN | RO | **32 脚实际电平全回**（含 OUT 脚驱动出去的值；mode 不限制回读范围） |
+| 0x08/0x0C/0x10/0x14 | GPIO_MODE0..3 | RW | 脚 0..7 / 8..15 / 16..23 / 24..31，每脚 4 位 |
+| 0x18 | GPIO_IRQ_STATUS | RW | 每脚 1 位，**sticky，写 1 清** |
+| 0x1C/0x20 | GPIO_IRQ_TYPE0/1 | RW | 脚 0..15 / 16..31，每脚 2 位：0=下降沿 1=上升沿 2=任意边沿 3=低电平 |
+
+字节地址 = 字偏移 `<< 2`（CPU 发字节地址，lsu 右移 2 位后才是这里的 `bus_addr_in`）。
+例：MODE0 是字节 `0x1000_0020`。
+
+### 12.3 中断聚合（按 PLIC 能力定的方案）
+
+PLIC 内部只认**源 1..31 共 31 个**（源 0 保留），已占 1=UART rx、2=tim_p，本次 **gpio 占源 3**。
+32 根脚**聚合成 1 根 `gpio_irq`**（`gpio_irq = |gpio_irq_status`），具体是哪几根脚触发由软件读
+`GPIO_IRQ_STATUS` 定位 —— 不用把 29 个剩余源全吃光，留给后面 I2C/SPI/DMA。
+
+**必须是 sticky、只能写清**，不能让引脚直接驱动 irq 线，两个原因：
+① 规范 §6 规定外设中断只能置 1、只能由写操作清 0；
+② PLIC 是**每拍从电平重新锁存** pending 的（`if (irq_sources[i]) pending[i] <= 1'b1;`），
+电平线一撤就丢中断、一保持就无限重入。
+
+对应的 ISR 顺序（本工程闭环程序 `tools/gpio_test.S` 就是这么写的）：
+**① 写 `GPIO_IRQ_STATUS` 清状态（源撤掉）→ ② 读 PLIC claim → ③ 写回 complete → ④ mret**。
+顺序反了（先 claim 后清）会出现：claim 清的 pending 在下一拍被仍然为高的源重新锁存 → mret 后立刻重入。
+
+低电平触发（TYPE=3）是特例：写清时若源仍为低，下一拍会重新置位 —— 这是电平语义本身，软件得先消掉源。
+
+### 12.4 顺带修掉的原代码问题
+
+移植来的 `gpio_group.v` 是 8 脚、`bus_addr_in[15:0]`/`bus_data_in[7:0]`/`bus_sig_in[3:0]` 的旧接口：
+
+1. **脚 0 是死的** —— 数据寄存器那三段循环全写 `for (i = 1; i < 8; ...)`，跳过 i=0，脚 0 设 OUT 写不进输出值、设 IN 读不回来。
+2. **中断是电平、每拍刷新**（`gpio_irq <= 2'b0;` 再条件置 1）—— 违反规范 §6，上板必丢中断。
+3. **读是组合透传**（`always @(*)` 直接给 `bus_data_out`）—— 违反规范 §6。
+4. **`sda_in` 在 for 循环里反复赋值** —— 多驱动、最后一个 i 赢。
+5. **`UNUSE = 4'bz`** —— z 参与 `==` 比较恒为假；原来只当默认值用侥幸没炸，现在方向判断要比较 mode，改成 `4'b0000`。
+6. **`initial` 初始化** —— 改走复位分支。
+7. **`GPIO_IN` 只回 IN 模式脚** —— 改成 32 脚实际电平全回：32 根脚本来就该都能读回来，
+   而且 OUT 脚能读到自己驱动的值（回读校验用）。
+
+### 12.5 验证
+
+- 模块级 `gpio_group_tb.v`（51 项）：寄存器读写、字节使能、8 种复用透传、SDA 开漏、
+  四种触发类型各自正反例、**中断粘滞性**、写 1 清、**低电平写清后源仍在会重新置位**、
+  非 IRQ 模式脚不产生中断、高 16 脚、未映射偏移读有 ready 且回 0、空闲期 `ld_ready` 恒 0。
+- 闭环 `gpio_irq_tb.v` + `tools/gpio_test.S`：脚0=OUT(输出高)、脚1=IN、脚2=IRQ(下降沿)，
+  tb 把脚2 拉低 → `gpio_irq` → PLIC 源3 → CPU ISR。
+  **PASS @cyc=74**：ISR 次数=1、mcause=0x8000000B、claim 源号=3、清后状态回读=0、
+  IN 回读=7（脚0 OUT 驱动高 + 脚1/脚2 外部高）、OUT 回读=1、MODE0 回读=0x321、脚0 实测高。
+- 全回归 **15/15 绿**。
+
+### 12.6 顶层收敛：只留 clk / rst / 32 位 GPIO
+
+`mcu_top` 的端口从 `clk/rst/rx/tx/pwm1/pwm2/...` 收敛成 **`clk` + `rst` + `gpio_pin_bus[31:0]`**，
+外设信号全部内部互连后经 gpio 复用出脚（接法见 §12.1 的表）。改动只有两条内部线：
+
+```
+uart_top   .rx(uart_rx_w)  .tx(uart_tx_w)
+tim_p      .pwm1(pwm1_w)   .pwm2(pwm2_w)
+gpio_group .tx(uart_tx_w)  .pwm1(pwm1_w)  .pwm2(pwm2_w)  .rx(uart_rx_w)
+           .sda_oe(1'b0)   .scl(1'b1)     .sda_in()
+```
+
+**影响面**：例化 `mcu_top` 的 5 个 tb 都要跟着改端口（`mcu_bus_tb` / `tim_p_irq_tb` /
+`mt_ldfifo_tb` / `gpio_irq_tb` / `uart_addr_probe`）。其中 **`tim_p_irq_tb` 的 PWM 观测点从
+顶层 `pwm1` 端口改成了 GPIO 引脚**：程序 `tools/tim_p_test.S` 开头加一句把脚0/脚1 配成
+PWM1/PWM2 模式（`li t1, 0x87; sw t1, 0x20(gpio基址)`），tb 改为看 `gpio_pin[0]` 的高低。
+这样 PWM 的观测变成端到端（tim_p → gpio 复用 → 引脚），比原来的顶层直连更有意义。
+
+`rtos_menu_tb` 不受影响 —— 它自己拼 SoC（cpu_top + uart + plic），不例化 `mcu_top`。
+
+**验证**：全回归 **15/15 绿**；`tim_p_irq` **PASS @cyc=482**（pwm1 高/低都从引脚上看到）。
+
+---
+
+## §13 i2c：总线规范适配 + 从机 + 开漏 SCL（2026-09-12）
+
+移植来的 `i2c.v` 只有主机发送、且接口是旧式（`bus_addr_in[15:0]`/`bus_data_in[7:0]`/`bus_sig_in[3:0]`）
+外加一套 DMA 并口仲裁。本轮按"代码风格 / 资源优化 / 功能"三项要求重做。
+
+### 13.1 总线接口与寄存器
+
+外设索引 **5**（字节基址 **0x1400_0000**），按规范 §5：`bus_addr_in[31:0]` / `bus_data_in[31:0]` /
+`bus_be_in[3:0]` / `bus_we_in` / `bus_data_out`(reg) / `ld_ready`(reg)。**原模块完全没有读通路**
+（无 `bus_data_out` 也无 `ld_ready`），本轮补齐。
+
+| 偏移 | 名称 | 访问 | 说明 |
+| --- | --- | --- | --- |
+| 0x00 | DATA | RW | 写=入 TX FIFO；**读=出 RX FIFO**（读操作自己弹队） |
+| 0x04 | CTRL | RW | bit0 start、bit1 stop、bit2 清中断、**bit3 主/从** |
+| 0x08 | CFG | RW | [2:1] `frq_mode`(100k/400k/1M)、[0] `ack_mode`、[3] 拉伸使能 |
+| 0x0c | SLV_ADDR | RW | [6:0] 从机地址、[14:8] **地址掩码**、[15] 从机使能 |
+| 0x10 | STATUS | RO | bit0 busy、bit1 err、bit2 RX 非空、bit3 TX 满、bit4 RX 满、bit5 被寻址 |
+| 0x14 | IRQ_STAT | RW | 写 1 清：bit0 err、bit1 rx_ready、bit2 tx_done、bit3 stop_det |
+
+中断出 1 根 `i2c_irq` → PLIC **源 4**（`irq_sources[4]`）。中断只置 1、只由写清 ✓。
+
+### 13.2 去掉 DMA 仲裁
+
+删掉 `bus_addr_dma`/`bus_data_dma`/`bus_sig_dma` 三个端口、`dma_oc` 判据和
+`bus_addr_final`/`bus_data_final`/`bus_sig_final` 三根仲裁 mux，内部直接用 `bus_*_in`。
+
+### 13.3 从机
+
+从机不能和主机共用一套状态机：**主机自计时推进**（`cnt` 数到 `cnt_l`/`cnt_h` 才走一步），
+**从机必须由外部 SCL 边沿驱动**。所以是两套 FSM，用 `mode` 位切换，共用同一对开漏引脚：
+
+```
+S_IDLE --(起始位)--> S_ADDR --(8 个上升沿移位)--> S_ADDR_ACK
+   |                                                   |
+   |                           匹配且 R/W=1 --> S_TX --(8 位)--> S_TX_ACK
+   |                           匹配且 R/W=0 --> S_RX --(8 位)--> S_RX_ACK
+   |                           不匹配        --> S_DONE
+   +--(停止位)-------------------------------------------------+
+```
+
+三条关键设计：
+
+1. **ACK 必须在整个 SCL 高电平期保持**。第一版把 ACK 写在 `scl_rise` 分支里，结果是
+   SCL 一升高就把 SDA 放开 —— 从机收不到自己的 ACK，主机采到的是 NACK。改成用 `ack_ph`
+   两相：**第 1 个下降沿拉低、第 2 个下降沿才释放**，状态切换放在释放那一拍。
+2. **从机自己释放 SDA 会伪造成停止位**。从机放开 ACK 时 SDA 上升，若此时 SCL 仍高，
+   全局的 `stop_det` 就会命中，从机刚进 S_RX 就被清回 IDLE。修 ACK 时序（在下降沿释放）后
+   这个窗口自然消失 —— 释放发生在 SCL 低电平期，后面那个高电平期里 `sda_q2` 早已跟上。
+   （第一版曾用 4 位"刚驱动过"计时器回避，修好时序后已删除，省 4 个 FF。）
+3. **收到的字节要在第 8 个上升沿当场锁存**（`s_rx_byte <= slv_recv`）。若等到 `S_RX_ACK`
+   再取 `slv_recv`，那时移位寄存器已经移完、取到的是错位值。
+
+**地址比较**：`slv_match = ((recv[7:1] ^ slv_reg[6:0]) & slv_reg[14:8]) == 0`，
+掩码位写 0 表示"该位不比较"。掩码全 0 就是完全匹配。
+
+**时钟拉伸**：`CFG[3]=1` 时，`S_RX_ACK` 若遇上 RX FIFO 满，就拉低 SCL 不放，等 CPU 把
+FIFO 读空了再放并回 ACK；关掉拉伸时直接回 NACK。
+
+### 13.4 代码风格与资源
+
+- 全部改成 `reg` + `always @(*)` 阻塞赋值（见 [[rtl-code-style]]）。
+  原来 `wr_ptr = wr_ptr + 1;` 用阻塞赋值混在时钟块里、复位段 `cnt` 被赋值两次（9 位和 1 位并存）
+  这类问题一并清掉。
+- **FIFO 指针与中断状态都收成单一写口**：`tx_rd` 由 `m_pop || s_pop` 单独一块写，
+  `irq_stat` 单独一块写，`irq_clr` 做成组合掩码（写清赢）。
+- **资源**：分频计数 25→16 位（最大只用到 300）；`cfg_reg` 32→4 位；TX/RX FIFO 深度
+  16→8（指针 5→4 位、索引 `[2:0]`）；删掉 `s_drv_tmr`。合计省约 **190 个 FF**。
+- `$readmemh` 之外没有任何 `initial`，全部走复位分支。
+
+### 13.5 顶层接线
+
+`mcu_top` 例化 `u_i2c`（`PER_I2C=5`、`bus_we_i2c`、`bus_ready[5]`），
+`i2c` 的 `scl_oe`/`sda_oe`/`scl_in`/`sda_in` **直接接 `gpio_group` 的同名端口** ——
+这四个端口当初就是为它预留的。`gpio_group` 的 SCL 模式相应从"纯输出"改成
+**开漏双向**（`scl` 输入换成 `scl_oe` 输入 + 新增 `scl_in` 输出），SDA 本来就是开漏。
+顶层仍然只有 `clk` / `rst` / `gpio_pin_bus[31:0]`。
+
+### 13.6 验证
+
+`project_risc_v.sim/i2c_tb.v`（已并入 `tools/run_reg.sh`），**28 项全过**：
+
+| 段 | 覆盖 |
+| --- | --- |
+| 1 寄存器 | 读写、字节使能（SLV_ADDR 需两个字节使能）、未映射偏移读有 ready 且回 0 |
+| 2 主机发送 | 外部从机模型收 2 字节 0xa5/0x5a、ACK 相位、TX FIFO 排空、busy 落下 |
+| 3 从机接收 | 地址 0x50 匹配回 ACK、两字节 0x11/0x22 进 RX FIFO、读 DATA 弹队、rx_ready/stop_det 中断、写 1 清 |
+| 4 从机发送 | 地址 0x51(R) 回 ACK、两次读事务分别取回 0xc3 / 0xd4、发完后 TX FIFO 空 |
+| 5 地址掩码 | mask=0x7E 时同地址仍 ACK、地址不符则不 ACK |
+| 6 ld_ready | 空闲期恒 0 |
+
+**外部设备模型全部用 50MHz 时钟驱动（不用 `#delay`）**，SCL 半周期 = `HALF` 拍，
+并且严格遵守"**SDA 只在 SCL 低电平期改变**"。这一点踩了很深的坑：早先的 tb 在 SCL 还高的
+时候就改 SDA，等效于在错误时刻摆 Start/Stop；而 `wr`/`rd` 任务在任意时刻进入、与时钟沿竞争，
+地址有时整整一个周期都没被 DUT 采到 —— 表现成"随机几项不过"。**改成先 `@(negedge clk)` 对齐、
+再摆信号、撤信号也在 negedge**，全部确定。
+
+**全回归 16/16 绿**。
+
+### 13.8 闭环：i2c -> gpio 引脚 -> PLIC 源 4 -> CPU ISR
+
+`tools/i2c_test.S` + `project_risc_v.sim/i2c_irq_tb.v`，**例化真正的 `mcu_top`**
+（含 bus_arb / uart / plic / tim_p / gpio_group / i2c），tb 在引脚上挂一个外部 I2C 从机模型。
+
+程序流程：把脚0 配成 SDA、脚1 配成 SCL（`MODE0 = 0x9A`）→ i2c 配主机（CFG=0x3：400kHz、
+ack_mode=1）→ PLIC `prio(4)=1`/`en(4)=1`/`thresh=0` → 往 TX FIFO 压 `0xa5`、`0x5a` →
+写 `CTRL.start` → 自旋等 ISR。ISR 里先写 `IRQ_STAT` 清 i2c 中断（源撤掉 PLIC 才不会重新锁存），
+再 claim、读 STATUS、complete。
+
+**tb 侧引脚用"谁拉低谁赢"建模**：SDA/SCL 两边都是开漏，tb 把引脚驱到
+`dut_low | tb_low ? 0 : 1` 的结果 —— 既给 DUT 正确电平，又不会和 DUT 的驱动力打架
+（若 tb 硬驱高、DUT 拉低就会冲突成 X）。
+
+**结果**：`PASS @cyc=2556`，ISR 1 次、mcause=0x8000000B、清后 IRQ_STAT=0、
+claim 源号=**4**、外部从机收到 **a5 5a**。
+
+两个踩到的坑：
+
+1. **`gpio_group` 在没有脚配成 SDA/SCL 模式时，把 `sda_in`/`scl_in` 驱成 `1'bz`** ⇒
+   i2c 的同步寄存器收进 X ⇒ sticky 的 `irq_stat` 把 X 锁死（表现为 `irq_stat=x100`）。
+   改成默认 `1'b1`（I2C 空闲电平）。**上板同样会中招**：CPU 还没配引脚之前总线就是 z。
+2. **从机必须在整个 ACK 高电平期保持 SDA 低**。主机是在 M_ACK1 之后的 `cnt` 滚回处
+   （远晚于上升沿）才采 `sda_q1`。tb 若在上升沿就释放 SDA，主机读到的是 NACK ⇒
+   第 2 字节发不出去（实测从机只收到 1 个字节）。
+
+**全回归 17/17 绿**。
