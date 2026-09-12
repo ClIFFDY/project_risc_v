@@ -902,6 +902,11 @@ claim 源号=**4**、外部从机收到 **a5 5a**。
 **gpio 侧**：mode 枚举空着的位置补上 `PWM3 = 4'b1011`、`PWM4 = 4'b1100`，
 `gpio_group` 加 `pwm3`/`pwm4` 输入并透传；`mcu_top` 把 tim_p 的四路接到 gpio 四路。
 
+**复用脚电平镜像**：`gpio_group` 的顺序块把 **TX / PWM1~4** 这五类复用脚的电平镜像进
+`gpio_output`，供 `R_OUT` 回读（只影响回读，引脚驱动走组合块直接透传）。
+补 PWM3/PWM4 时漏了这处，导致这两种模式下 `R_OUT` 读回恒 0，而同为 PWM 的 PWM1/PWM2
+能读回实际电平 —— 已补齐，`gpio_group_tb` 加"PWM3/PWM4 电平镜像进 R_OUT 回读"一项守住。
+
 **验证**：
 - `tim_p_tb` **15 项全过**（新增：pwm3 高低电平都出现过、未使能的 pwm2/pwm4 恒低、
   PWM_EN 回读=0x5、DUTY3 回读=2）

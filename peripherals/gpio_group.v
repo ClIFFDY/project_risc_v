@@ -157,6 +157,8 @@ module gpio_group(
                 if (gpio_mode[i] == TX) gpio_output[i] <= tx;
                 else if (gpio_mode[i] == PWM1) gpio_output[i] <= pwm1;
                 else if (gpio_mode[i] == PWM2) gpio_output[i] <= pwm2;
+                else if (gpio_mode[i] == PWM3) gpio_output[i] <= pwm3;
+                else if (gpio_mode[i] == PWM4) gpio_output[i] <= pwm4;
                 if (gpio_mode[i] == RX) rx <= gpio_pin_bus[i];
 
                 if (gpio_mode[i] == IRQ) begin
