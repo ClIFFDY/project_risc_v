@@ -34,7 +34,7 @@ module gpio_group(
     input sda_oe,
     input scl_oe,
     input tx,
-    input pwm1, pwm2,
+    input pwm1, pwm2, pwm3, pwm4,
     output reg rx, sda_in, scl_in
     );
 
@@ -48,7 +48,9 @@ module gpio_group(
         PWM1 = 4'b0111,
         PWM2 = 4'b1000,
         SCL = 4'b1001,
-        SDA = 4'b1010;
+        SDA = 4'b1010,
+        PWM3 = 4'b1011,
+        PWM4 = 4'b1100;
 
     localparam [5:0]
         R_OUT = 6'h00,
@@ -93,6 +95,14 @@ module gpio_group(
             PWM2: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = pwm2;
+            end
+            PWM3: begin
+                gpio_pin_oe[i] = 1'b1;
+                gpio_pin_out[i] = pwm3;
+            end
+            PWM4: begin
+                gpio_pin_oe[i] = 1'b1;
+                gpio_pin_out[i] = pwm4;
             end
             SCL: begin
                 gpio_pin_oe[i] = scl_oe;

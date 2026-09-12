@@ -612,12 +612,12 @@ OPCODE_JALR: begin ... rd_back1 <= rd_in; ... end
 | +0x04 | CNT | RO | 当前计数值 |
 | +0x08 | MODE | RW | bit0：0=单次、1=周期 |
 | +0x0C | IRQ_CLR | W | 任意写清中断（唯一清中断途径） |
-| +0x10/+0x14 | PWM_DUTY1/2 | RW | 门限 |
-| +0x18 | PWM_EN | RW | bit0/bit1 = 两路使能 |
-| +0x1C | IRQ_STAT | RO | bit0=中断、bit1=停止 |
+| +0x10 / +0x14 / +0x18 / +0x1C | PWM_DUTY1~4 | RW | 四路门限，逐字节受 `bus_be_in` 保护 |
+| +0x20 | PWM_EN | RW | bit0~bit3 = 四路使能 |
+| +0x24 | IRQ_STAT | RO | bit0=中断、bit1=停止 |
 
 未实现地址仍返回 `ld_ready=1`（读不挂死）。接入：`mcu_top.v` 加 `PER_TIM=3`、`bus_ready[3]`、
-`bus_we_tim_p`、顶层 `pwm1/pwm2`；`plic` 的 `irq_sources` 改成 `{29'd0, tim_p_irq, uart_rx_irq, 1'b0}`
+`bus_we_tim_p`、`pwm1~pwm4`；`plic` 的 `irq_sources` 改成 `{29'd0, tim_p_irq, uart_rx_irq, 1'b0}`
 （tim_p = 源 2）。`bus_arb.v` 不用动。
 
 **验证**：`tim_p_tb` 11 项全过（含"中断粘滞性"——置位后不写就应一直为 1，原代码必挂）；
@@ -656,7 +656,7 @@ CNT_SET 回读 200、pwm1 高低都出现过。
 | IRQ | 3 | 输入 | 边沿/电平检测进中断状态位 |
 | TX | 5 | 输出 | 透传模块的 `tx` 输入 |
 | RX | 6 | 输入 | 电平透到模块的 `rx` 输出 |
-| PWM1 / PWM2 | 7 / 8 | 输出 | 透传 `pwm1`/`pwm2` 输入（本 SoC 里接 tim_p 的 PWM 输出） |
+| PWM1 / PWM2 / PWM3 / PWM4 | 7 / 8 / 11 / 12 | 输出 | 透传对应的 `pwm1~pwm4` 输入（本 SoC 里接 tim_p 的四路 PWM 输出） |
 | SCL | 9 | 输出 | 透传 `scl` 输入（I2C 预留） |
 | SDA | 10 | 开漏双向 | `sda_oe` 时拉低、否则高阻；电平回读进 `sda_in` |
 
@@ -667,7 +667,7 @@ gpio 引脚复用，不再有独立顶层端口：
 | --- | --- | --- |
 | UART `tx` | `gpio_group.tx` | 某脚配成 TX 模式即把串口引出去 |
 | UART `rx` | ← `gpio_group.rx` | 某脚配成 RX 模式，该脚电平进 UART 接收端；无 RX 脚时 `rx` 恒 1（空闲） |
-| tim_p `pwm1`/`pwm2` | `gpio_group.pwm1`/`pwm2` | 某脚配成 PWM1/PWM2 模式 |
+| tim_p `pwm1`~`pwm4` | `gpio_group.pwm1`~`pwm4` | 某脚配成 PWM1~PWM4 模式 |
 | I2C `scl`/`sda_oe`/`sda_in` | 暂时接 `1'b1` / `1'b0` / 悬空 | I2C 空闲态（SCL 高、SDA 释放）；`i2c.v` 移植进来后按同样方式接上 |
 
 `tx`/`rx`/`scl`/`sda_oe`/`sda_in` 这几个 `gpio_group` 端口名和语义按移植来的原样没动。
@@ -880,3 +880,51 @@ claim 源号=**4**、外部从机收到 **a5 5a**。
    第 2 字节发不出去（实测从机只收到 1 个字节）。
 
 **全回归 17/17 绿**。
+
+---
+
+## §14 tim_p PWM 扩到 4 路（2026-09-12）
+
+原来是 2 路（`PWM_DUTY1/2`、`PWM_EN` bit0/bit1）。扩到 4 路时顺便把 duty 寄存器排成连续的
+一段，代码里就能用一个循环代替四段重复：
+
+| 字偏移 | 名称 | 说明 |
+| --- | --- | --- |
+| +0x00 / +0x04 / +0x08 / +0x0C | CNT_SET / CNT / MODE / IRQ_CLR | **不变** |
+| +0x10 / +0x14 / +0x18 / +0x1C | PWM_DUTY1 ~ PWM_DUTY4 | 新增 3/4 路，1/2 路地址不变 |
+| +0x20 | PWM_EN | bit0~bit3（**从 +0x18 顺延**） |
+| +0x24 | IRQ_STAT | **从 +0x1C 顺延** |
+
+只有 PWM_EN 和 IRQ_STAT 挪了位置（给 duty 让出连续的一段），`tools/tim_p_test.S` 跟着改。
+内部改成数组：`pwm_duty[0:3]`、`pwm_en[3:0]`，写口用一个 4 次循环按
+`bus_addr_in[3:0] == R_DUTY1 + i` 命中，读口同理。
+
+**gpio 侧**：mode 枚举空着的位置补上 `PWM3 = 4'b1011`、`PWM4 = 4'b1100`，
+`gpio_group` 加 `pwm3`/`pwm4` 输入并透传；`mcu_top` 把 tim_p 的四路接到 gpio 四路。
+
+**验证**：
+- `tim_p_tb` **15 项全过**（新增：pwm3 高低电平都出现过、未使能的 pwm2/pwm4 恒低、
+  PWM_EN 回读=0x5、DUTY3 回读=2）
+- `tim_p_irq` 闭环 **PASS @cyc=484**：程序把脚0/脚1/脚2 配成 PWM1/PWM2/PWM3，
+  tb 在引脚上同时观测到 **pwm1 与 pwm3 的高、低电平**，ISR 4 次、claim 源号 2 不变
+- 全回归 **20/20 绿**（§15 起回归项由 17 增至 20）
+
+---
+
+## §15 测试资产清理（2026-09-12）
+
+一次性的探针 tb 和被取代的调试程序清掉：`project_risc_v.sim/*.v` 71 → **28**、
+`tools/*.S` 63 → **32**，共删 74 个。删的是三类：定位期抓事件的探针（`cm_*.v`、`*_probe.v`）、
+早已语法不通的旧 tb（`coremark_tb`、`mtb`、`mtp`、`mtirq*`）、被后续版本取代的调试程序
+（`post_flush*`、`t2/t3/t5_*`、`ic_*`、`*_flash`、`fwd_h4` 等）。
+
+**三组"钉住过真实根因"的微测保留并并进 `tools/run_reg.sh`**（回归 17 → 20 项）：
+
+| 新增项 | 它钉住的形状 | 出处 |
+| --- | --- | --- |
+| `mt_jalra` | `jal` 后紧邻用 `ra` —— decoder 漏置 `rd_back1` | §10 |
+| `itcm_rd` | 数据通路读不到 ITCM —— `.data` 必须镜像 | §6 |
+| `mt_ldst_stall` | load-use 停顿 + 紧邻 store | §5.3 |
+
+后两项原先只 `$display` 不判定，各补了 PASS/FAIL 行。
+`boundary.S` / `bytetest.S` / `hello.S` / `uart_test.S` 无人引用但保留（边界、字节使能、SoC UART 用例）。

@@ -27,7 +27,7 @@ module mcu_top(
 
     wire uart_rx_w;
     wire uart_tx_w;
-    wire pwm1_w, pwm2_w;
+    wire pwm1_w, pwm2_w, pwm3_w, pwm4_w;
 
     wire [31:0] bus_addr_f_cpu;
     wire [31:0] bus_data_f_cpu;
@@ -167,7 +167,9 @@ module mcu_top(
         .bus_data_out(bus_data_b[PER_TIM * 32 +: 32]),
         .tim_p_irq(tim_p_irq),
         .pwm1(pwm1_w),
-        .pwm2(pwm2_w)
+        .pwm2(pwm2_w),
+        .pwm3(pwm3_w),
+        .pwm4(pwm4_w)
     );
 
     wire gpio_irq;
@@ -187,6 +189,8 @@ module mcu_top(
         .tx(uart_tx_w),
         .pwm1(pwm1_w),
         .pwm2(pwm2_w),
+        .pwm3(pwm3_w),
+        .pwm4(pwm4_w),
         .rx(uart_rx_w),
         .sda_in(i2c_sda_in),
         .scl_in(i2c_scl_in)
