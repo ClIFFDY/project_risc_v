@@ -933,3 +933,277 @@ claim 源号=**4**、外部从机收到 **a5 5a**。
 
 后两项原先只 `$display` 不判定，各补了 PASS/FAIL 行。
 `boundary.S` / `bytetest.S` / `hello.S` / `uart_test.S` 无人引用但保留（边界、字节使能、SoC UART 用例）。
+
+---
+
+## §16 dcache 挂总线（2026-09-12）
+
+队友移植来一份 `soc/dcache.v`，原本面向另一套 valid/ready 握手总线、mem 侧是整套 AXI4 式带通道。
+按 §5 改造成本工程的总线外设，**结构上与 `icache` 同构**，挂在 `bus_arb` 后面。
+
+### 16.1 拓扑与槽位
+
+`svg_graph/source/connected-edges.json` 里本来就画好了：`arb → dcache`（d_addr/d_data）、
+`dcache → ram`（dmem_addr/dmem_wdata/dmem_rdata/dmem_len/dmem_be）、`arb → ctrl`（d_hold）。
+即 dcache 是**挂在仲裁器后面的一台总线设备**，和 `arb → uartplic` 并列。
+
+- 槽位 **6 = 0x1800_0000（字节）→ 字地址 0x0600_0000**（1..5 已占）。`bus_arb.v` 的 `[31:24]` 1..31 是通用解码，**加设备不用改解码**。
+- `dcache.busy` → `bus_arb.d_hold` → `cpu_top.bus_hold_in` → `controller.stall`（框图里的 `d_hold` 线，本次补上）。
+- mem 侧下位是 **flash 控制器**（`peripherals/flash_spi.v` 目前还是空壳），`mcu_top` 里先按 `icache` mem 侧的惯例接常量
+  （`mem_rdata=0`、`mem_valid=0`）。**没实现 flash 控制器之前，访问槽 6 会挂在缺失上** —— 与 icache 外部取指同样的情况。
+
+### 16.2 结构（照 icache 重写）
+
+上一版是 6 态状态机（IDLE/LOOKUP/READ_CMD/REFILL/WRITE_CMD/RELEASE）+ 锁存地址 + 寄存器读数组，
+命中要走 3 拍。现在按 `icache.v` 的形状来：
+
+| 项 | icache | dcache（现在） |
+| --- | --- | --- |
+| 状态 | 1 位 `stage`（0=查/应答、1=回填） | **同** |
+| 地址 | 不锁存，`tag/idx/word` 组合取自 `ibus_addr_in` | **同**（取自 `bus_addr_in`） |
+| 阵列 | `tag_ram[0:1][0:127]`、`iram[0:1][0:127][0:15]`、`valid`/`lru` | `tag_ram[0:1][0:127]`、`data_ram[0:1][0:127][0:3]`、`valid`/`lru` |
+| 回填 | `fill_buf[0:15]` 收齐后整行写入 | `fill_buf[0:3]` 收齐后整行写入 |
+| 命中出数 | `ibus_data_out <= iram[way][idx][word]`，**1 拍** | `bus_data_out <= data_ram[way][idx][word]`，**1 拍** |
+
+几何：2 路 × 128 组 × 4 字 × 4B = **4 KB**，行 16 B。地址约定不变：
+CPU 侧是**字地址**（`[8:2]`=组号、`[31:9]`=tag、`[1:0]`=行内字），mem 侧是**字节地址**（`bus_addr_in << 2`）。
+
+**命中延迟从 3 拍降到 1 拍** —— 和 DTCM 一样：地址脉冲那一拍采到，下一拍 `ld_ready` + 数据，
+正好是 `lsu` 期望的「push 后第 2 拍 ready」。所以**命中时 `busy` 不抬**，CPU 不为此停顿。
+
+### 16.3 请求与写通路
+
+- 本工程总线没有 valid 线，时钟上只有 **1 拍的地址脉冲**（`lsu.v:110-113` 打完就清零）。
+  请求判据按 §5「外设无需识别 `[31:24]` 但需定义」：`bus_addr_in[31:24] == 8'd6` 且 `stage == 0`。
+- **写**：不等状态机，直接由请求组合产生 `mem_req && mem_we`，**当拍打到 mem 侧，零额外周期**；
+  同时若命中就按 `bus_be_in` 逐 lane 更新缓存行（写透 + 写命中更新，无脏位无写回）。
+  写不需要 CPU 应答 —— 本工程 `ready` 只在读分支抬（`dtcm.v:56-67`），`bus_arb` 对写的 `per_sel` 恒 0。
+- **读缺失**：锁 `miss_word/fill_addr/fill_tag/fill_idx/fill_way`，`stage<=1`，4 拍 burst 收进 `fill_buf`，
+  `fill_end` 整行写入并当拍出数。替换先挑无效路，两路都有效才按 `lru`。
+- `busy = (stage==1 && !fill_end) || (rd_req && !cache_hit)` —— **缺失从检出那一拍就把 CPU 按住**。
+
+### 16.4 反压通路（本次唯一动到已验核的地方）
+
+多周期设备必须有停顿线：`lsu` 的在途 load 队列只有 2 槽，队列满时只是不发地址、没有结构性反压，
+背靠背 3 条 load 就会丢掉第 3 条。所以：
+
+- `controller.stall = stall | i_busy | bus_hold_in`
+- `lsu.ld_enq = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH) && !bus_hold_in`
+
+第二条是必需的：停顿期间 `stage == STALL`，若 lsu 级停着一条 LOAD，`ld_enq` 仍为 1 ⇒
+地址脉冲**每拍重复摆**、FIFO 每拍重复入队（`lsu.v:94-100` 的既有性质，对 dtcm 无害是因为它每拍都答），
+对多周期的 dcache 就变成「入队 N 次、只应答 1 次」⇒ 队列失步挂死。门控后停顿期不发，停机解除再按 EXE 发一次。
+（store 不用管：`lsu.v:102-107` 的 STALL 分支本来就把 `we/be/data` 清零。）
+
+**验证没伤到核**：把 HEAD 的 4 个文件（`cpu_top`/`lsu`/`bus_arb`/`mcu_top`）取出来建基线树，同一套 tb 跑一遍，
+**回归输出与改动后逐字一致**（只多出新增的 dcache 项）。`bus_hold_in` 恒 0 时核的行为严格不变。
+
+### 16.5 验证
+
+- `dcache_tb.v` **32 项全过**：读缺失回填 / 读命中 / 同行其余字 / 跨行 / 缺失落在行内第 3 字 /
+  写透 + 写命中更新 / 字节使能写 / 写缺失不分配 / way1 命中取数 / 2 路替换与 LRU（白盒查 `tag_ram`/`valid`）/
+  `ld_ready` 纪律 / `busy` 在 data 前 1 拍落 / 命中延迟 = 1 拍 / 看门狗
+- **变异测试：11 个变异全部被抓**（way1 取数取错、命中不更 LRU、替换恒选 way0、写命中不更新、burst 少一拍、
+  缺失回错字、命中不抬 ld_ready、缺失不抬 busy、写不打到 mem、tag/valid 不写回），无一漏网
+- **回归 21 项**（新增 dcache_tb），与基线逐字一致
+
+### 16.6 `bus_arb` 的 `per_sel` 改成撑得多周期外设（2026-09-12，已应用）
+
+原实现：
+
+```verilog
+else if (!bus_loaded_out) per_sel <= !bus_we_f_cpu ? per_decode : 5'd0;
+```
+
+`per_decode` 取自 `bus_addr_f_cpu[31:24]`，而 `lsu` 的地址**只摆 1 拍就清零** ⇒ 下一拍 `per_decode = 0`
+⇒ `per_sel <= 0`。于是 `per_sel` 只挂 1 拍就掉 0，**多周期外设抬的 `ld_ready` 再也送不到 CPU**。
+对 1 周期的 dtcm/uart 无影响（它们本来就 1 拍应答），只挡住多周期设备。
+
+微测 `project_risc_v.sim/arb_hold_tb.v`（外设模型照 dcache 的形状，第 4 拍抬 1 拍 `ld_ready`）实测：
+**外设抬了 1 次 `ld_ready`，`bus_loaded_out` 抬了 0 次**。
+
+改成「按请求锁存、按住直到应答」：
+
+```verilog
+if (rst) per_sel <= 5'd0;
+else if (per_decode != 5'd0) per_sel <= bus_we_f_cpu ? 5'd0 : per_decode;
+else if (bus_loaded_out)     per_sel <= 5'd0;
+```
+
+- 请求拍：`per_decode != 0` ⇒ 读锁进 `per_sel`，写恒 0（写不应答，与原来一致）
+- 等待期：`per_decode = 0` 且没应答 ⇒ **保持**，不再掉 0
+- 应答拍：`bus_loaded_out = 1` ⇒ 清 0，下一拍回到空闲
+
+验证：微测 `PASS`（`per_sel` 保持 6、`bus_loaded_out` 抬起、`bus_data_b_cpu` 出槽 6 数据、应答后回 0）；
+**全回归 22 项与改这一行之前逐字一致** —— 对所有 1 周期外设行为不变。
+
+---
+
+## §17 flash_spi：外置 flash 控制器（2026-09-12）
+
+外置 SPI flash 控制器。它**有三个上游口**：
+- **dbus 控制口**（§5 总线外设，槽 **7**）—— 只管**擦除和配置**，**读不到也写不到 flash 数据**
+- **icache 的 mem 侧**（只读）
+- **dcache 的 mem 侧**（读 + 写）
+
+SPI 四根线从 `mcu_top` 直出，不经 gpio、不可配置。
+
+### 17.1 统一的 mem 侧接口（8 根）
+
+以 `icache` 原有形状为基准，把两边做成**完全同形**：
+
+```
+output reg        mem_req;      // 请求（读/写），电平保持到被接受
+output reg        mem_we;
+output reg [31:0] mem_addr;     // 字节地址
+output reg [31:0] mem_wdata;
+output reg [3:0]  mem_be;
+input             mem_ready;    // 从机已接受本次命令
+input      [31:0] mem_data;
+input             mem_valid;    // 读数据有效，每字一拍
+```
+
+`icache.v` 补 `mem_we`/`mem_wdata`/`mem_be` 三个输出（恒 0，只读缓存用不到；纯增输出，4 个 tb 零改动）；
+`dcache.v` 的 `mem_rdata` 改名 `mem_data`、新增 `mem_ready`。
+
+### 17.2 flash_spi 本体
+
+- **SPI Mode 0**（SCK 空闲低、上升沿采、下降沿移），`SCK = clk/(2*(SPI_DIV+1))`，`SPI_DIV` 来自 CONFIG 寄存器。
+- 命令：`0x03` 读、`0x02` 页编程、`0x06` WREN、`0x05` RDSR、`0xD8` 扇区擦除。
+- **读**：`CS↓` → `0x03` + 24 位地址 → 之后随 `mem_req` 流式移出，每 32 位抬一拍 `mem_valid`；
+  先收到的字节落在**最低位**（小端，与写路径自洽）。`mem_req` 落就收尾 —— **不需要事先知道 burst 长度**。
+- **写**：`[WREN]` → `[0x02][地址][数据字节]`，`CS↑` 后置 `prog_busy`。
+- **擦除**：`[WREN]` → `[0xD8][扇区地址]`，`CS↑` 后置 `era_busy`。
+- **轮询**：`[0x05]` 收 1 字节状态，WIP 仍为 1 就再来一轮；WIP 落则清 `prog_busy`/`era_busy`。
+- **子事务之间必须留 CS 间隔**（`S_GAP` 状态）：WREN 和主命令是**两段独立事务**，CS 不抬起来 flash 不会认第二个命令字节。
+- **轮询不占住 FSM**：一次扇区擦除在真 flash 上是几十毫秒。若主 FSM 一直卡在轮询里，icache 缺失就无法取指。
+  所以轮询是**后台最低优先级**、夹在缓存事务之间跑：`rd_pick`（缓存读）永远优先，写完/擦完就回 IDLE，
+  靠 `poll_pick` 慢慢确认 WIP 落。`STATUS.busy` 覆盖**整个未完成操作**（含 `prog_busy`/`era_busy`/`era_pend`），
+  不能只看 FSM 状态 —— 否则软件会在两次轮询的间隙误判"擦完了"。
+
+### 17.3 地址映射
+
+**不能用 `mem_addr[23:0]` 当 flash 地址**：dcache 槽 6 首字节 `0x1800_0000` 的低 24 位是 **0**（`8` 在 bit27），
+整个 4MB 窗口会塌到 flash `[0,4MB)`，正好盖住 icache 的代码区。改成每个上游各减区基址、再加各自 flash 基址：
+
+| 上游 | SoC 区首字节 | flash 基址 | 结果 |
+| --- | --- | --- | --- |
+| icache | `0x0000_8000` | `0x000000` | 代码从 **flash 0** 起 |
+| dcache | `0x1800_0000`（低 24 位为 0） | `0x400000` | 数据从 **flash 4MB** 起 |
+
+### 17.4 总线寄存器（槽 7 = 字地址 0x0700_0000 / 字节 0x1C00_0000）
+
+| 偏移(字) | 名称 | 访问 | 语义 |
+| --- | --- | --- | --- |
+| 0 | `ERASE_ADDR` | RW | 写 = **要擦的扇区在 dcache 侧的字节地址**（低 24 位有效，控制器往下取整到 4KB）→ 下发一次 `[0x06][0xD8]`。已有擦除在跑时写入被忽略 |
+| 4 | `STATUS` | RO | bit0=busy（整个操作未完） bit1=flash_wip bit2=prog_busy bit3=era_busy bit4=fifo_full bit5=fifo_empty |
+| 8 | `CONFIG` | RW | bit[1:0] = SPI 分频（SCK = clk/(2*(div+1))），复位值 1 → 12.5MHz@50MHz |
+| 0x0C | `TIMEOUT` | RW | WIP 等待上限（**周期数**，26 位）。复位默认 `26'h3FF_FFFF` ≈ 1.34s@50MHz。**写 0 = 关闭超时** |
+| 0x10 | `IRQ_STAT` | RW(写1清) | bit0 = 超时标志（sticky，只能写清） |
+| 其它 | — | RO | 返回 0 且 `ld_ready` 仍抬（读不挂死） |
+
+`STATUS` bit6 也镜像这个超时标志（只读）。
+
+### 17.4b 超时与中断（走 PLIC 源 5）
+
+真 flash 万一不清 WIP，控制器会一直轮询下去、写 FIFO 填满、CPU 被 `d_hold` 永久挂住 —— 没有自救途径。
+所以加一个**看门狗**：
+
+- 每次下发编程/擦除时把 `tout_cnt` 重装为 `TIMEOUT`；只要还有未完操作（`prog_busy || era_busy`）就每拍减一。
+- 减到 0 → **中止本次操作**（清 `prog_busy`/`era_busy`/`era_pend`）并置 `irq_err`。CPU 因此解锁。
+- `flash_spi_irq = irq_err`，接到 **PLIC 源 5**（源 1=UART 2=tim_p 3=gpio 4=i2c）。
+  按 §6「中断只能置 1」的要求，它是 sticky 的，**只能由写 `IRQ_STAT` 清**。
+- 软件流程：`STATUS.busy` 等 0 或等中断 → ISR 里**先写 `IRQ_STAT` 撤源、再 claim/complete**（顺序同 gpio/i2c）。
+
+**总线碰不到 flash 数据**：总线上只有这三个寄存器。数据读只走 icache/dcache 两条 mem 通路，
+数据写只走 dcache（写透 → `0x02`）。写 `ERASE_ADDR` 之外的总线写不产生任何 SPI 事务。
+
+### 17.5 写反压
+
+SPI 编程一个字要几百拍，而 dcache 写是 1 拍发完不管。解法 = **控制器写 FIFO 深 4** + **dcache 把写保持到被接受**：
+
+- dcache：请求拍锁 `wr_pend`/`wr_addr`/`wr_data`/`wr_be`，`mem_req`/`mem_we` 保持到 `mem_ready`；
+  `busy` 含 `wr_pend && !mem_ready`。
+- flash_spi：`dcache_mem_ready = !FIFO 满`。
+- 于是 **FIFO 不满时写仍 1 拍被接受、CPU 不停**；只有真写不过来才拉 busy → `d_hold` → CPU 停顿，**一笔不丢**。
+
+### 17.6 接入 mcu_top
+
+顶层加 4 个口 `spi_cs_n/spi_sck/spi_mosi/spi_miso`（推挽）；`PER_FLASH = 7`；例化 `u_flash_spi`。
+**xdc 本次仍未动** —— 缺实际 `PACKAGE_PIN`。
+
+### 17.7 验证
+
+- **`flash_spi_tb.v` 65 项全过**：tb 侧是**带 NOR 语义的 flash 从机模型**（WEL 只由 0x06 置、没 WEL 就忽略 program、
+  program 按位与、0xD8 擦 4KB 扇区）。覆盖读写命令/地址/数据流、字节序、字节使能区间、burst 自然收尾、
+  三种并发、FIFO 满→不丢、**总线擦除**、**擦除非对齐地址取整**、**擦除中 STATUS.busy=1**、
+  **擦除中再写 ERASE 被忽略**、CONFIG 分频真的改变 SCK 周期、以及**总线访问不产生 SPI 事务（碰不到 flash）**、
+  **擦除进行中缓存读仍然通**。
+- **`flash_soc_tb.v` 闭环 PASS @cyc=9859**：真 `mcu_top`，程序放 flash 里。icache 经 SPI 取指跑通；
+  再经 dcache 读两行、写一个字（核对真的落进 flash 模型）；**最后经 dbus 写 ERASE 寄存器下发扇区擦除、
+  轮询 STATUS.busy、读回被擦扇区应为全 1** —— 整条控制通路走通。
+- **超时链路**：`flash_spi_tb` 里把从机的 WIP 挂住 → 断言超时后 `flash_spi_irq` 拉高、`era_busy` 清、`STATUS` 镜像位起、写 `IRQ_STAT` 能清；
+  `flash_soc_tb` 闭环里程序把超时调小、使能 PLIC 源 5、下发一次"擦不完"的擦除 → **ISR 恰好 1 次、mcause=0x8000000B、claim 源号=5**。
+- **变异测试 19 个全被抓**（命令字节 ×4、地址高字节、读写字节序、FIFO 不满、写长度、CS 间隔、
+  轮询不清忙、busy 不含擦除、擦除不看忙、擦除地址不对齐、两个区基址、dcache 不映射、CONFIG 写死、仲裁）。
+  头几轮有漏网，是靠**给 tb 补覆盖**抓住的（例如"擦除地址取整"要断言发出的地址 A11:A0 全 0，
+  而不是只看被擦的内容 —— 从机模型自己也会取整，看不出来）。
+- **全回归 26 项**，与加 flash 之前逐字一致（只多出 4 个新项）。
+
+### 17.8 已知未尽
+
+- **icache 陈旧**：CPU 改写了 flash 里的代码区后，icache 没有 invalidate，仍按老内容取指。本次不解决。
+- **`mem_ready` 对 icache 是死输入**（icache 自己把 `mem_req` 保持到 fill 完），统一接口的代价。
+- **不做 Fast Read / 双线四线**：需要把顶层四根线改成 IO0~IO3 双向，本次没做（用户明确不做 QSPI）。
+
+### 17.9 icache 链式再回填时 `busy` 早放一拍 → 丢一条指令（已修，2026-09-13）
+
+**现象**：写 `flash_soc_tb` 的 ISR 时，`flash_spi` 超时中断进来后，ISR 里靠前的一条 `sw` 静默丢失。
+ISR 是 `csrr mcause; sw t0,0x144(s1); ...`，`dtcm[0x144]` 一直保持旧值 0，看起来像"读到了错的中断原因"。
+
+**定位过程**：先做了 4 个微测。前 3 个都是负结果（`mt_csrr` 直线间隔 0/1/2/3 全对 ⇒ 不是 `csrr` 前递缺口；
+`mt_csrr2` ITCM 里的 ISR 入口同形状对 ⇒ 不是陷阱入口；`mt_csrr3` ISR 在外部取指区 + 存储器每 64 拍一拍也对
+⇒ 不是"回填慢"）。第 4 个 `mt_csrr4` 定点命中：**tb 在 icache 正在回填 0x8080 那一行时拉中断**。
+
+**逐拍现场**（干净构建）：
+
+| 拍 | ic.stage | fill_end | fill_addr | ia 字号 | stage | 下一拍 `ibus_data_out` |
+| --- | --- | --- | --- | --- | --- | --- |
+| c01 | 1 | 1 | 0x8080（**旧行，CPU 已不要**） | w0 | **EXE**（放行） | 0（新行 `valid` 还是 0） |
+| c02 | 1 | 1 | 0x8000（真正要的行） | **w1** | EXE | `fill_buf[miss_word=0]` = **w0** |
+| c03 | 0 | 0 | — | **w2** | EXE | `iram[..][2]` = **w2** |
+
+实测 `inst_effective` 序列 = `w0, w2, w3, …` —— **跳过了 w1**。
+（ISR 开头是 `csrr,sw,csrr,sw`，`w0`/`w2` 的 opcode 都是 `0x73`，所以看起来像"第 1 条跑了两遍"，其实是**跳过一个**。）
+
+**根因**（`soc/icache.v` 的 `busy` 组合表达式）：
+
+```verilog
+busy = (stage == 1'd1 && !fill_end) || (stage == 1'd0 && !cache_hit && ibus_re_in);
+```
+
+`fill_end` 那个沿上，icache 顺序块同时做两件事：① 把刚填好的行写进 `valid`/`tag_ram`/`iram`
+（**这些值这一拍还读不到**，`valid` 仍是 0，所以命中路径这一拍出 0）；② 链式条件成立时 `stage` 保持 1、
+**启动下一行**的回填。而 `busy` 只看到 `fill_end=1` 就落 0，**看不见"这一拍还在启动新一行、新行一个字都还没出来"**。
+
+于是流水线提前一拍放行、`ia` 前进一位；等真正那行的 `fill_end` 到来时，`fill_buf[miss_word]` 与 `ia` 已经错开一位，
+下一拍命中路径又按**当时**的 `ia` 取字 —— **中间那个字谁也没给**。
+
+**触发条件 = 链式再回填**（两个背靠背的 `fill_end`），正是 §9 引入的路径。普通单次缺失不错位：
+那时 `ia` 在整个填充分冻结在 `miss_word` 上，`fill_end` 补发的就是 CPU 要的那个字。
+
+**修法**：把 `busy` 的填充项从「只看 `fill_end`」改成「`fill_end` 且**链式条件仍成立**时也算忙」——
+第三项就是 §9 那个链式再回填的判据本身：
+
+```verilog
+busy = (stage == 1'd1 && (!fill_end || (!cache_hit && ibus_re_in &&
+                                         !(fill_idx == idx && fill_tag == tag)))) ||
+       (stage == 1'd0 && !cache_hit && ibus_re_in);
+```
+
+**验证**：
+- `mt_csrr4`：改前 `dtcm[0]=00000000` FAIL，改后 `8000000b` PASS
+- `flash_soc_tb` 闭环：**`flash_app.S` 里的 3 条 `nop` 已去掉**，闭环仍 PASS（@cyc=19583 → 17404）
+- 回归 **28 项**，与改前逐字一致（唯一差异是 `flash_soc_tb` 的拍数与链接告警地址）
+- 顺带：`tools/build_ic.sh` 里 app 的链接地址从陈旧的 `0x4400` 改成 `0x8000`；
+  `mt_csrr4` 用**专用 runner** `tools/run_mt4.sh`（每次都重建 hex，避免被 `run_reg.sh` 覆盖）

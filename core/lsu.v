@@ -30,6 +30,7 @@ module lsu(
     input [31:0] offset_load0, offset_store0,
     input [31:0] bus_data_in,
     input ready_in,
+    input bus_hold_in,
     output reg [31:0] bus_addr_out,
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
@@ -75,7 +76,7 @@ module lsu(
         ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
         ld_fifo_full  = (ld_wr_ptr[1] != ld_rd_ptr[1]) && (ld_wr_ptr[0] == ld_rd_ptr[0]);
         ld_pop        = ready_in && !ld_fifo_empty;
-        ld_enq        = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH);
+        ld_enq        = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH) && !bus_hold_in;
         ld_push_eff   = ld_enq && !(ld_fifo_full && !ld_pop);
         ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[0]];
         ld_size_cur   = ld_size_fifo[ld_rd_ptr[0]];

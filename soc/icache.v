@@ -29,8 +29,9 @@ module icache(
     output reg cache_miss,
     output reg busy,
 
-    output reg mem_req,
-    output reg [31:0] mem_addr,
+    output reg mem_req, mem_we,
+    output reg [31:0] mem_addr, mem_wdata,
+    output reg [3:0] mem_be,
     input mem_ready,
     input mem_valid,
     input [31:0] mem_data
@@ -67,9 +68,14 @@ module icache(
         hit_way[1] = valid[1][idx] && (tag_ram[1][idx] == tag); 
         cache_hit = hit_way[0] || hit_way[1];
         cache_miss = (stage == 1'd0) && busy;
-        busy = (stage == 1'd1 && !fill_end) || (stage == 1'd0 && !cache_hit && ibus_re_in);
+        busy = (stage == 1'd1 && (!fill_end || (!cache_hit && ibus_re_in &&
+                !(fill_idx == idx && fill_tag == tag)))) ||
+               (stage == 1'd0 && !cache_hit && ibus_re_in);
         mem_req = (stage == 1'd1) && !fill_end;
         mem_addr = fill_addr + (fill_cnt << 2);
+        mem_we = 1'b0;
+        mem_wdata = 32'd0;
+        mem_be = 4'd0;
     end
 
     always @(posedge clk) begin

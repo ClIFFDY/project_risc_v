@@ -15,6 +15,7 @@ module cpu_top(
     input [31:0] bus_data_in_ext,
     input ibus_we_in,
     input bus_loaded_in,
+    input bus_hold_in,
     input exti,
     input i_busy
     );
@@ -301,6 +302,7 @@ module cpu_top(
         .offset_store0(offset_store0_2),
         .bus_data_in(bus_data_in_final),
         .ready_in(dtcm_ready | tim_ready | bus_loaded_in),
+        .bus_hold_in(bus_hold_in),
         .bus_addr_out(bus_addr_out_i),
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
@@ -445,7 +447,7 @@ module cpu_top(
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
-        .stall(stall | i_busy),
+        .stall(stall | i_busy | bus_hold_in),
         .csr_wr_en(csr_wr_en),
         .exti(exti),
         .timi(timi),

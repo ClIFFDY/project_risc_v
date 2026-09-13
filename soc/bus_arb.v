@@ -36,8 +36,10 @@ module bus_arb(
     //
     input [1023:0] bus_data_b,
     input [31:0] bus_ready,
+    input [31:0] bus_busy,
     //
-    output reg bus_loaded_out
+    output reg bus_loaded_out,
+    output reg d_hold
     );
 
     reg [4:0] per_decode;
@@ -52,7 +54,8 @@ module bus_arb(
 
     always @(posedge clk) begin
         if (rst) per_sel <= 5'd0;
-        else per_sel <= !bus_we_f_cpu ? per_decode : 5'd0;
+        else if (per_decode != 5'd0) per_sel <= bus_we_f_cpu ? 5'd0 : per_decode;
+        else if (bus_loaded_out)     per_sel <= 5'd0;
     end
 
     always @(*) begin
@@ -71,6 +74,10 @@ module bus_arb(
     always @(*) begin
         if (per_sel != 5'd0) bus_data_b_cpu = bus_data_b[per_sel * 32 +: 32];
         else bus_data_b_cpu = 32'd0;
+    end
+
+    always @(*) begin
+        d_hold = |bus_busy;
     end
 
 endmodule
