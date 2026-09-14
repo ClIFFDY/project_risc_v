@@ -76,8 +76,15 @@ module bus_arb(
         else bus_data_b_cpu = 32'd0;
     end
 
+    reg d_hold_ext;
+
+    always @(posedge clk) begin
+        if (rst) d_hold_ext <= 1'b0;
+        else     d_hold_ext <= |bus_busy;
+    end
+
     always @(*) begin
-        d_hold = |bus_busy;
+        d_hold = |bus_busy || d_hold_ext;
     end
 
 endmodule

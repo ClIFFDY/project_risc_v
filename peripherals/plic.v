@@ -62,7 +62,11 @@ module plic(
         end
         super_id = {27'd0, sel_id[4:0]};
         irq_valid = global_pending && sel_id != 6'd0 && (irq_prio[sel_id] > threshold);
-        exti = irq_valid;
+    end
+
+    always @(posedge clk) begin
+        if (rst) exti <= 1'b0;
+        else     exti <= irq_valid;
     end
 
     always @(posedge clk) begin

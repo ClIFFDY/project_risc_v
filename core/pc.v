@@ -67,12 +67,12 @@ module pc(
             end
             FLUSH: begin
                 if (br2) begin
-                    pc_addr <= br_addr2 + beq_off_q2;
-                    aux_addr <= br_addr2 + beq_off_q2;
+                    pc_addr <= (br_addr2 + beq_off_q2) - (ext_target ? 4'd4 : 4'd0);
+                    aux_addr <= (br_addr2 + beq_off_q2) - (ext_target ? 4'd4 : 4'd0);
                 end
                 else if (br3) begin
-                    pc_addr <= br_addr2;
-                    aux_addr <= br_addr2;
+                    pc_addr <= br_addr2 - (ext_target ? 4'd4 : 4'd0);
+                    aux_addr <= br_addr2 - (ext_target ? 4'd4 : 4'd0);
                 end
                 else if (jalr_fail) begin
                     pc_addr <= jalr_target_q + (ext_target ? 4'd0 : 4'd4);

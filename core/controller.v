@@ -32,6 +32,7 @@ module controller(
     output reg irq_act, irq_processing, irq,
     output reg [31:0] iret_addr1, iret_addr2,
     output reg [1:0] stage,
+    output reg flush,
     output reg req_valid,
     output reg [3:0] irq_bubble
     );
@@ -94,7 +95,7 @@ module controller(
 //中断空窗计数器：作用为填充冲刷后流水线预取空窗
     always @(posedge clk) begin
         if (rst) irq_bubble <= 4'd12;
-        else if (stage == FLUSH) irq_bubble <= 4'd4;
+        else if (flush) irq_bubble <= 4'd4;
         else if (irq_bubble < 4'd12) irq_bubble <= irq_bubble + 4'd4;
     end
 
@@ -107,12 +108,14 @@ module controller(
 
 //状态透传控制：跳转/中断冲刷优先，其次为ld/st_stall信号
     always @(*) begin
+        flush = 1'b0;
         if (rst) begin
             stage = EXE;
             req_valid = 1'b0;
         end
         else begin
-            if (irq || irq_ret || irq_act || trap || jalr_fail || br2 || br3) stage = FLUSH;
+            flush = irq || irq_ret || irq_act || trap || jalr_fail || br2 || br3;
+            if (flush) stage = FLUSH;
             else if (stall) stage = STALL;
             else stage = EXE;
             req_valid = (stage != 2'd3);

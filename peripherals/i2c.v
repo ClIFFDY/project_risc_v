@@ -87,7 +87,7 @@ module i2c(
     reg [7:0] rx_shift;
     reg [7:0] slv_recv;
     reg [7:0] s_rx_byte;
-    reg [3:0] bit_cnt;
+    reg [3:0] bit_cnt, s_bit_cnt;
     reg [15:0] cnt_l, cnt_h, cnt;
     reg phase_h;
     reg [2:0] m_state, s_state;
@@ -98,6 +98,7 @@ module i2c(
     reg slv_match, rw_bit, stretch;
     reg m_pop, s_pop, s_rx_push;
     reg m_err, m_done, s_rx_done;
+    reg m_start_clr, m_stop_clr;
     reg [7:0] reg_sel;
     reg [31:0] rd_data;
     reg [31:0] status;
@@ -293,11 +294,15 @@ module i2c(
             m_pop <= 1'b0;
             m_err <= 1'b0;
             m_done <= 1'b0;
+            m_start_clr <= 1'b0;
+            m_stop_clr <= 1'b0;
         end
         else begin
             m_pop <= 1'b0;
             m_err <= 1'b0;
             m_done <= 1'b0;
+            m_start_clr <= 1'b0;
+            m_stop_clr <= 1'b0;
             if (cnt >= (phase_h ? cnt_h : cnt_l) - 1'b1) cnt <= 16'd0;
             else cnt <= cnt + 16'd1;
             if (mode == 1'b0) begin
@@ -309,7 +314,7 @@ module i2c(
                         if (!tx_empty && ctrl_start) begin
                             m_tx_data <= tx_buf[tx_rd[2:0]];
                             m_pop <= 1'b1;
-                            ctrl_start <= 1'b0;
+                            m_start_clr <= 1'b1;
                             bit_cnt <= 4'd8;
                             phase_h <= 1'b0;
                             m_state <= M_START;
@@ -364,7 +369,7 @@ module i2c(
                             m_state <= M_SEND;
                         end
                         else if (ctrl_stop) begin
-                            ctrl_stop <= 1'b0;
+                            m_stop_clr <= 1'b1;
                             m_state <= M_STOP;
                         end
                         else begin
@@ -411,7 +416,7 @@ module i2c(
             s_tx_data <= 8'hff;
             rx_shift <= 8'd0;
             s_rx_byte <= 8'd0;
-            bit_cnt <= 4'd0;
+            s_bit_cnt <= 4'd0;
             rw_bit <= 1'b0;
             slv_match <= 1'b0;
             stretch <= 1'b0;
@@ -439,21 +444,21 @@ module i2c(
                         s_sda_low <= 1'b0;
                         if (start_det) begin
                             rx_shift <= 8'd0;
-                            bit_cnt <= 4'd8;
+                            s_bit_cnt <= 4'd8;
                             s_state <= S_ADDR;
                         end
                     end
                     S_ADDR: begin
                         if (scl_rise) begin
                             rx_shift <= {rx_shift[6:0], sda_q1};
-                            if (bit_cnt <= 4'd1) begin
+                            if (s_bit_cnt <= 4'd1) begin
                                 slv_match <= ((slv_recv[7:1] ^ slv_reg[6:0]) & slv_reg[14:8]) == 7'd0;
                                 rw_bit <= slv_recv[0];
-                                bit_cnt <= 4'd0;
+                                s_bit_cnt <= 4'd0;
                                 ack_ph <= 1'b0;
                                 s_state <= S_ADDR_ACK;
                             end
-                            else bit_cnt <= bit_cnt - 4'd1;
+                            else s_bit_cnt <= s_bit_cnt - 4'd1;
                         end
                     end
                     S_ADDR_ACK: begin
@@ -467,7 +472,7 @@ module i2c(
                                 s_sda_low <= 1'b0;
                                 if (slv_match) begin
                                     rx_shift <= 8'd0;
-                                    bit_cnt <= 4'd8;
+                                    s_bit_cnt <= 4'd8;
                                     if (rw_bit) begin
                                         if (!tx_empty) begin
                                             s_sda_low <= ~tx_buf[tx_rd[2:0]][7];
@@ -489,13 +494,13 @@ module i2c(
                     S_RX: begin
                         if (scl_rise) begin
                             rx_shift <= {rx_shift[6:0], sda_q1};
-                            if (bit_cnt <= 4'd1) begin
+                            if (s_bit_cnt <= 4'd1) begin
                                 s_rx_byte <= slv_recv;
-                                bit_cnt <= 4'd0;
+                                s_bit_cnt <= 4'd0;
                                 ack_ph <= 1'b0;
                                 s_state <= S_RX_ACK;
                             end
-                            else bit_cnt <= bit_cnt - 4'd1;
+                            else s_bit_cnt <= s_bit_cnt - 4'd1;
                         end
                     end
                     S_RX_ACK: begin
@@ -528,7 +533,7 @@ module i2c(
                                 ack_ph <= 1'b0;
                                 s_sda_low <= 1'b0;
                                 rx_shift <= 8'd0;
-                                bit_cnt <= 4'd8;
+                                s_bit_cnt <= 4'd8;
                                 s_state <= S_RX;
                             end
                         end
@@ -539,11 +544,11 @@ module i2c(
                             s_tx_data <= {s_tx_data[6:0], 1'b0};
                         end
                         if (scl_rise) begin
-                            if (bit_cnt <= 4'd1) begin
-                                bit_cnt <= 4'd0;
+                            if (s_bit_cnt <= 4'd1) begin
+                                s_bit_cnt <= 4'd0;
                                 s_state <= S_TX_ACK;
                             end
-                            else bit_cnt <= bit_cnt - 4'd1;
+                            else s_bit_cnt <= s_bit_cnt - 4'd1;
                         end
                     end
                     S_TX_ACK: begin
@@ -552,7 +557,7 @@ module i2c(
                             if (!sda_q1 && !tx_empty) begin
                                 s_tx_data <= {tx_buf[tx_rd[2:0]][6:0], 1'b0};
                                 s_pop <= 1'b1;
-                                bit_cnt <= 4'd8;
+                                s_bit_cnt <= 4'd8;
                                 s_state <= S_TX;
                             end
                             else s_state <= S_DONE;
@@ -563,7 +568,7 @@ module i2c(
                         s_sda_low <= 1'b0;
                         if (start_det) begin
                             rx_shift <= 8'd0;
-                            bit_cnt <= 4'd8;
+                            s_bit_cnt <= 4'd8;
                             s_state <= S_ADDR;
                         end
                     end

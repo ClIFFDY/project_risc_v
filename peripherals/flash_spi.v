@@ -110,6 +110,7 @@ module flash_spi(
     reg [7:0]  wby0, wby1, wby2, wby3, tx_next, sa_hi, sa_mid, sa_lo;
     reg [23:0] sa_reg;
     reg        master_req, fsm_busy, wr_xact, flash_op_busy;
+    reg        era_taken, err_set;
 
     wire sck_tick = (div_cnt == spi_div);
     wire sck_rise = sck_tick && !sck_r;
@@ -130,7 +131,7 @@ module flash_spi(
         fsm_busy   = (state != S_IDLE) || flash_op_busy || era_pend;
         flash_spi_irq = irq_err;
 
-        rd_pick   = (state == S_IDLE) && rd_req;
+        rd_pick   = (state == S_IDLE) && rd_req && wr_empty && !prog_busy;
         poll_pick = (state == S_IDLE) && !rd_pick && (prog_busy || era_busy) &&
                     (poll_dly == 8'd0);
         era_pick  = (state == S_IDLE) && !rd_pick && !poll_pick && era_pend &&
@@ -287,6 +288,8 @@ module flash_spi(
                 end
                 endcase
             end
+            if (era_taken) era_pend <= 1'b0;
+            if (err_set)   irq_err  <= 1'b1;
         end
     end
 
@@ -317,17 +320,20 @@ module flash_spi(
             rd_word <= 32'd0;
             rd_data <= 32'd0;
             rd_valid <= 1'b0;
+            era_taken <= 1'b0;
+            err_set <= 1'b0;
         end
         else begin
             rd_valid <= 1'b0;
+            era_taken <= 1'b0;
+            err_set <= 1'b0;
             if (poll_dly != 8'd0) poll_dly <= poll_dly - 8'd1;
 
             if (flash_op_busy && tout_reg != 26'd0) begin
                 if (tout_cnt == 26'd0) begin
                     prog_busy <= 1'b0;
                     era_busy  <= 1'b0;
-                    era_pend  <= 1'b0;
-                    irq_err   <= 1'b1;
+                    err_set   <= 1'b1;
                 end
                 else tout_cnt <= tout_cnt - 26'd1;
             end
@@ -476,7 +482,7 @@ module flash_spi(
                 end
                 else if (xact == X_POLL) begin
                     flash_wip <= status_rx[0];
-                    if (status_rx[0]) begin
+                    if (status_rx[0] && (prog_busy || era_busy) && !rd_req) begin
                         tx_sh <= CMD_RDSR;
                         st_bit <= 3'd0;
                         state <= S_GAP;
@@ -492,8 +498,8 @@ module flash_spi(
                     poll_dly <= 8'hFF;
                     tout_cnt <= tout_reg;
                     if (xact == X_ERASE) begin
-                        era_busy <= 1'b1;
-                        era_pend <= 1'b0;
+                        era_busy  <= 1'b1;
+                        era_taken <= 1'b1;
                     end
                     else prog_busy <= 1'b1;
                     state <= S_IDLE;

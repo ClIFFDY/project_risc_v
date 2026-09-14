@@ -23,6 +23,7 @@
 module lsu(
     input clk, rst,
     input [1:0] stage,
+    input flush,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -76,7 +77,7 @@ module lsu(
         ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
         ld_fifo_full  = (ld_wr_ptr[1] != ld_rd_ptr[1]) && (ld_wr_ptr[0] == ld_rd_ptr[0]);
         ld_pop        = ready_in && !ld_fifo_empty;
-        ld_enq        = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH) && !bus_hold_in;
+        ld_enq        = (opcode == OPCODE_LOAD) && !stall && !flush && !bus_hold_in;
         ld_push_eff   = ld_enq && !(ld_fifo_full && !ld_pop);
         ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[0]];
         ld_size_cur   = ld_size_fifo[ld_rd_ptr[0]];

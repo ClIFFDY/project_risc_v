@@ -26,6 +26,7 @@ module cpu_top(
     wire [4:0] rd_back1, rd_back2;
 
     wire [31:0] pc_addr, aux_addr_0, br_addr1, br_addr2;
+    wire flush;
     wire [31:0] inst_raw;
     wire [31:0] jalr_predict_offset;
     wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
@@ -204,6 +205,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .stage(stage),
+        .flush(flush),
         .func10_in(func10_1),
         .func10_out(func10_2),
         .imm_alu_in(imm_alu_1),
@@ -291,6 +293,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .stage(stage),
+        .flush(flush),
         .opcode(opcode_lsu_2),
         .func10(func10_lsu_2),
         .rd_in(rd_2),
@@ -467,6 +470,7 @@ module cpu_top(
         .iret_addr2(iret_addr2),
         .irq_bubble(irq_bubble),
         .stage(stage),
+        .flush(flush),
         .req_valid(ibus_req_valid_i)
     );
 

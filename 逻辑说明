@@ -965,8 +965,9 @@ claim 源号=**4**、外部从机收到 **a5 5a**。
 | 回填 | `fill_buf[0:15]` 收齐后整行写入 | `fill_buf[0:3]` 收齐后整行写入 |
 | 命中出数 | `ibus_data_out <= iram[way][idx][word]`，**1 拍** | `bus_data_out <= data_ram[way][idx][word]`，**1 拍** |
 
-几何：2 路 × 128 组 × 4 字 × 4B = **4 KB**，行 16 B。地址约定不变：
-CPU 侧是**字地址**（`[8:2]`=组号、`[31:9]`=tag、`[1:0]`=行内字），mem 侧是**字节地址**（`bus_addr_in << 2`）。
+几何：**2 路 × 256 组 × 16 字 × 4B = 32 KB，行 64 B**（2026-09-14 扩到 32 KB，原 2 路 × 128 组 × 4 字 = 4 KB，
+见 §21）。地址约定不变：CPU 侧是**字地址**（`[11:4]`=组号、`[31:12]`=tag、`[3:0]`=行内字），
+mem 侧是**字节地址**（`bus_addr_in << 2`）。
 
 **命中延迟从 3 拍降到 1 拍** —— 和 DTCM 一样：地址脉冲那一拍采到，下一拍 `ld_ready` + 数据，
 正好是 `lsu` 期望的「push 后第 2 拍 ready」。所以**命中时 `busy` 不抬**，CPU 不为此停顿。
@@ -1130,7 +1131,19 @@ SPI 编程一个字要几百拍，而 dcache 写是 1 拍发完不管。解法 =
 ### 17.6 接入 mcu_top
 
 顶层加 4 个口 `spi_cs_n/spi_sck/spi_mosi/spi_miso`（推挽）；`PER_FLASH = 7`；例化 `u_flash_spi`。
-**xdc 本次仍未动** —— 缺实际 `PACKAGE_PIN`。
+
+**xdc 已按开发板排针分配**（Microphase Z7-Lite，`constrs_1/new/cpu.xdc`）：
+
+| 信号 | 排针 | Bank / 电平 |
+| --- | --- | --- |
+| `gpio_pin_bus[31:0]` | **JP1** 前 32 个信号脚（JP1-1..36，跳开 11/12/29/30 电源） | Bank34 / LVCMOS33 |
+| `spi_cs_n / spi_sck / spi_mosi / spi_miso` | **JP2-1..4** | Bank35 / LVCMOS33 |
+| `clk` | N18（板上 50MHz 晶振，不在排针上） | Bank34 / LVCMOS33 |
+| `rst` | T12 = JP1-39 `GPIO1_17P`，即板上 **PL KEY2** | Bank34 / LVCMOS33 |
+
+`gpio_pin_bus[i]` 按 JP1 排针顺序取：bit0=JP1-1(N17)、bit1=JP1-2(P18)、…、bit31=JP1-36(U15)。
+JP1 共 36 个信号脚，用掉 33 个（32 GPIO + rst），空出 JP1-37(U13)、38(V13)、40(U12)。
+原先指向已不存在端口 `rx`/`tx` 的两行死约束已删除。
 
 ### 17.7 验证
 
@@ -1207,3 +1220,325 @@ busy = (stage == 1'd1 && (!fill_end || (!cache_hit && ibus_re_in &&
 - 回归 **28 项**，与改前逐字一致（唯一差异是 `flash_soc_tb` 的拍数与链接告警地址）
 - 顺带：`tools/build_ic.sh` 里 app 的链接地址从陈旧的 `0x4400` 改成 `0x8000`；
   `mt_csrr4` 用**专用 runner** `tools/run_mt4.sh`（每次都重建 hex，避免被 `run_reg.sh` 覆盖）
+
+---
+
+## §18 多驱动清理：i2c / flash_spi（2026-09-13）
+
+用户指出 i2c 有多个位置存在多驱动。全工程扫了一遍，**i2c 三处、flash_spi 两处**（flash_spi 是同批写的，同类问题）。
+
+### 18.1 问题
+
+同一个 `reg` 被两个 `always` 块赋值。Verilog 语义**不确定**（同一时间步内按块执行顺序，后者覆盖前者），综合会报 multiple driver。
+仿真里 iverilog 按源码顺序跑，所以 `i2c_tb` 28 项照样过 —— **是碰巧过的**。这两个模块都是 2026-09-12 写的、**从没综合过**，一上综合就会暴露。
+
+| 模块 | 信号 | 写者 A | 写者 B |
+| --- | --- | --- | --- |
+| i2c | `bit_cnt` | 主机 FSM | 从机 FSM |
+| i2c | `ctrl_start` | 总线写块（rst 清 + 写 1 置位） | 主机 FSM（`M_IDLE` 里清） |
+| i2c | `ctrl_stop` | 总线写块（rst 清 + 写 1 置位） | 主机 FSM（进 `M_STOP` 时清） |
+| flash_spi | `era_pend` | 总线块（rst 清 + 写置位） | FSM（擦除开始时清） |
+| flash_spi | `irq_err` | 总线块（rst 清 + 写 1 清） | FSM（超时置位） |
+
+`gpio_group` 的 `i` 也被扫描器报出来，但那是**三个块共用同一个 for 循环下标**，综合会展开，无副作用 —— 不是这类问题。
+
+### 18.2 修法：每个信号收敛到一个写者
+
+- **`bit_cnt`（i2c）**：从机 FSM 改用自己的 `s_bit_cnt`（15 处）。两个 FSM 本来就各跑各的，只是共用了变量名。
+- **`ctrl_start` / `ctrl_stop`（i2c）**：**总线写块当唯一写者**。主机 FSM 只输出一拍脉冲 `m_start_clr` / `m_stop_clr`，
+  总线写块在 `reg_sel` 的 case 之后拿它来清。
+  - 语义不变：以前"消费的那一拍就清"，现在"下一拍由总线块清"。FSM 在中间那一拍已经进了 `M_START`/`M_STOP`，
+    不再读这两个位，所以**不会重复触发**。
+- **`era_pend`（flash_spi）**：总线块当唯一写者；FSM 输出 `era_taken` 脉冲。
+  FSM 超时分支里原来那句 `era_pend <= 1'b0` 是**冗余**（擦除开始时就已经清了，且总线写被 `!era_pend && !era_busy`
+  门控住，期间不会再挂）→ 直接删掉。
+  - 语义不变：`era_pend` 多保持一拍，但那一拍 `era_busy` 已经是 1，`era_pick` 和总线写的门控都挡住了。
+- **`irq_err`（flash_spi）**：总线块当唯一写者；FSM 输出 `err_set` 脉冲。
+
+### 18.3 验证
+
+- 重扫多驱动：**i2c / flash_spi 均为「无多驱动」**（只剩 `gpio_group` 的 benign for 下标）
+- **全回归 28 项输出与改动前逐字一致** —— 这是"纯收敛写者、行为不变"的最强证据
+  （`i2c_tb` 28 项、`i2c_irq` 闭环 @cyc=2556、`flash_spi_tb` 71 项、`flash_soc_tb` @cyc=17404 全部照旧）
+
+---
+
+## §19 条件分支跳到外区丢一条指令：`pc.v` 的 `br2`/`br3` 缺 `ext_target` 调整（2026-09-14）
+
+**现象**：把 dcache 的实验版（写命中失效）接上去跑 `flash_soc_tb`，程序判据从 `0x600D` 变成 `0x0000F000`。
+反汇编对位：`0x8110 lui t1,0xf` 执行了，**紧邻的 `0x8114 addi t1,t1,13` 整条没执行**，
+于是 `t1=0xF000` 被原样存进判据槽。同一组合只要换回原 dcache（写命中更新）就 PASS —— 说明触发点由 dcache 决定，
+故障本身不在 dcache。
+
+**定位**：`0x8110` 是 `bne t5,t4,8110` 的落点，也是新缓存行的**行首**。给闭环加取指探针（`project_risc_v.sim/flash_trace_tb.v`），
+抓到触发那两拍：
+
+| 拍 | pc_addr | itcm.fetch_addr | icache 看到的 | word | miss_word | ctl |
+| --- | --- | --- | --- | --- | --- | --- |
+| 分支重定向拍 | 0x804C | **0x2044**（目标，组合直通） | 0x2044 | 4 | 0（旧值） | FLUSH |
+| 下一拍起 | **0x8114** | **0x2045** | 0x2045 | **5** | **4** | STALL |
+
+`miss_word` 是**分支重定向那一拍**锁的（当时 `ibus_addr_in` 是分支目标本身的字地址 0x2044）；
+流水线稳定后 `pc_addr = 0x8114`，`fetch_addr` 变成 0x2045。
+回填结束那一拍 icache 按 `miss_word` 出数（0x8110 那条），而 CPU 要的是 `fetch_addr` 那个字（0x8114 那条）—— 错开一个字。
+
+**根因**（`core/pc.v` 的 FLUSH 分支）：`jalr_fail` / `irq` / `irq_ret` 都按 `ext_target` 做了 ±4 调整，**`br2` / `br3` 漏了**：
+
+```verilog
+else if (jalr_fail) pc_addr <= jalr_target_q + (ext_target ? 4'd0 : 4'd4);   // 有
+else if (irq)       pc_addr <= isr_addr2      + (ext_target ? 4'd0 : 4'd4);   // 有
+if (br2)            pc_addr <= br_addr2 + beq_off_q2;                        // 漏
+else if (br3)       pc_addr <= br_addr2;                                     // 漏
+```
+
+内区目标要 `+4`（`pc_addr` 相对取指地址多出来的那个字节偏移），外区目标要 `+0`。
+这正是"进外区走 `jalr` 是好的、走条件分支就丢字"的原因：`jalr` 那条调整后 `pc_addr` 正好落在目标本身，
+填充期间 `fetch_addr` 一直等于 `miss_word`。
+
+**修法**：`br2`/`br3` 补上同样的调整。内区 `ext_target=0` 时表达式不变，**itcm 路径零影响**。
+
+**验证**：
+- 新定点微测 `mt_brext`（`tools/ic_boot_bext.S` + `tools/ic_app_bext.S` + `project_risc_v.sim/mt_brext_tb.v`）：
+  起跳点在外区已缓存行、目标是一个**全新的行**，行首起连续 4 条 `addi` 各写一个 dtcm 槽。
+  改前 `dtcm[0..3] = 11 00 33 44` FAIL，并打印 `回填结束：miss_word=0 但当前 word=1`；改后 `11 22 33 44` PASS。窗口约 210 拍。
+- **全回归：与改前逐字一致**，只多出 `mt_brext` 一项 PASS；唯一差异是 `flash_soc_tb` 的拍数 17404 → 17406
+  （分支重定向差 4 字节，后续时序整体挪 2 拍）。
+- 之前必 FAIL 的「dcache 写命中失效 + flash_spi」组合不再丢指令（该 dcache 版本是 BRAM 面积实验，未进树）。
+
+**补充**：§17.9 里"普通单次缺失不错位，因为 `ia` 在整个填充期冻结在 `miss_word` 上"这条前提，
+**只在取指路径同源时成立**。条件分支重定向那一拍，`itcm.fetch_addr`（组合）与 `pc_addr`（寄存）本来就差一个字 ——
+这条路径原先没有任何回归覆盖，所以一直潜伏，直到 dcache 改动换了分支方向才暴露。
+
+---
+
+## §20 dcache 数据阵列进 BRAM：写命中改「失效」＋ `bus_arb.d_hold` 补一拍（2026-09-14）
+
+### 20.1 目的
+
+`dcache` 的 `data`（1K×32）综合出来是**分布式 RAM**：`RAM64X1D × 64 + RAM64M × 320`。
+整体占 `Slice LUT 2798`（其中 `LUT as Memory 1536`）。目标片 xc7z010 只有 6000 LUTRAM / 17600 LUT，这块占比过高。
+
+### 20.2 原来的写法为什么推不成 BRAM
+
+BRAM 只有 **1 个写口**、一拍只能做**一次**写操作。原写法「写透 + 写命中逐 lane 更新缓存行」在 `sb`/`sh` 时会变成最多 4 次独立写操作 → 推不出来。
+试过且都失败的形状：整字单写口 + 字节使能写、4 个子字分别赋值、4 个并行 8 位阵列、`dtcm` 式 `merge_word` 自读改写（组合读又会挡住 BRAM 的同步读规则）。
+
+### 20.3 采用的形状：写命中**失效**，不更新缓存行
+
+写口只留「回填整字写」一路 → 单写口、单操作 → 推成 BRAM。
+写命中时把命中那一路的 `valid` 清 0；写本身照旧写透到 flash。
+下次读该行会缺失、从 flash 回填 —— flash 里已经是新值，取到的仍然正确。
+
+**代价**：每个 `sw` 之后的首次读都要重新缺失回填（一次 4 字 SPI 事务）。功能正确，**性能有明确损失**。
+
+### 20.4 顺带找出并修掉的核缺陷：dcache 缺失 load 紧邻使用
+
+改完 dcache 后闭环挂在 `pc=0x8128 / 判据=0xF00D`。隔离实验证明与 dcache 无关：
+把 app 里那条「读未缓存行（dcache 缺失）」的 load 的消费者从隔 2 条改成**紧邻**（`tools/flash_app_lduse.S`），
+**用未改之前的 RTL** 跑同样挂。逐拍现场（未修，c=8471/8472）：
+
+| 拍 | ctl | `d_hold` | dcache | `ld_ready` | `ld_we` | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| c8471 | EXE | 0 | `fill_end` 那拍，`busy` 已落 | 0 | 0 | `ld_data` 还是上一条的旧值 |
+| c8472 | FLUSH | 0 | 数据这拍才出 | **1** | **1** | `br2=1` —— 分支与写回同拍，用旧值判的 |
+
+**冲突本身**：`dcache.busy` 在 `fill_end` 那一拍就落（「busy 在 data 前 1 拍落」是规范 §6 的要求，`dcache_tb` 也断言这条），
+而 `ld_ready` 下一拍才抬。`bus_arb` 原来是 `d_hold = |bus_busy`，跟着 `busy` 一起落
+→ `bus_hold_in` 比 `bus_loaded_in` **早一拍释放** → 流水线提前一拍前进，紧邻消费者锁到的是 load 落盘前的操作数。
+隔 2 条以上就没事 —— 基线里那三次缺失读恰好都隔 ≥2 条，所以一直潜伏。
+
+**修法**：`bus_arb` 的 `d_hold` 在 `|bus_busy` 落下后再撑一拍（`d_hold_ext` 寄存 `|bus_busy`）。
+单周期外设从不拉 `busy` → 对它**零影响**；只有多周期外设（dcache）会多持一拍。
+
+### 20.5 综合对比（`synth_design -top dcache -part xc7z010clg400-1`）
+
+| | 原 dcache | 写命中失效版 |
+| --- | --- | --- |
+| Slice LUT | 2798 (15.90%) | **1119 (6.36%)** |
+| LUT as Memory | 1536 (25.60%) | **128 (2.13%)** |
+| Slice Registers | 525 | 491 |
+| Block RAM Tile | 0 | **1 × RAMB36E1** |
+
+`data_reg`（1K×32）：原版 `RAM64X1D × 64 + RAM64M × 320`；新版 **`1 K x 32 READ_FIRST / WRITE_FIRST` → 1 块 RAMB36**。
+`tag0`/`tag1`（128×23）两个版本都还是分布式 RAM —— 太小、而且命中判定要两个异步读，不值得改。
+
+### 20.6 验证
+
+- `dcache_tb` 模块级 **40/40 全过**（该 tb 的写路径判据对两种语义都成立）
+- 闭环 `flash_soc_tb` **PASS @cyc=18054**
+- 新增回归项 **`flash_soc_lduse`**（`tools/flash_app_lduse.S`）：**PASS**；
+  把 `bus_arb` 的撑拍撤掉后该项立刻 **FAIL（0xF00D @cyc=9619）** → 守卫确实咬得住
+- **全回归 30 项无 FAIL**
+
+---
+
+## §21 icache / dcache 容量都扩到 32 KB（2026-09-14）
+
+### 21.1 做了什么
+
+两个 cache 现在都是 **2 路 × 256 组 × 16 字（64 B 行）= 32 KB**。
+（**注**：icache 的几何当天晚些又改过一次 —— 256 组 × 16 字 → **128 组 × 32 字（128 B 行）**，容量仍是 32 KB，
+原因与时序有关，见 §22.7。）
+
+| | 原 | §21 当时 | **最终** |
+| --- | --- | --- | --- |
+| icache | 2 路 × 128 组 × 16 字 = 16 KB | 2 路 × 256 组 × 16 字 = 32 KB | 2 路 × **128 组 × 32 字** = **32 KB** |
+| dcache | 2 路 × 128 组 × 4 字 = 4 KB | 2 路 × 256 组 × **16 字** = 32 KB | 2 路 × 256 组 × 16 字 = **32 KB** |
+
+dcache 的**行从 4 字改成 16 字**（与 icache 同形）—— 这一条是关键。
+
+### 21.2 为什么 dcache 选「加长行」而不是「加组数」
+
+加组数 = 加索引位宽 → `valid0`/`valid1`/`lru` 这些 256 位向量、以及 tag 阵列的读选择从 128:1 变 256:1，
+**全是纯 LUT**。实测（隔离对照）：dcache 只加组数（128→256 组、行仍 4 字）要多花 **890 个 LUT** 才换到 **1 块** BRAM。
+
+改成长行则 `idx` 保持 8 位不动、tag 反而从 22 位降到 20 位，数据阵列多出来的部分全落在 BRAM 里 ——
+**多出的 24 KB 基本白送**（实测比「只加 dcache 组数」那版还少 22 个 LUT）。
+
+### 21.3 综合对比（`synth_design -top mcu_top -part xc7z010clg400-1`）
+
+| 配置 | Slice LUT | LUTRAM | FF | RAMB36 |
+| --- | --- | --- | --- | --- |
+| A 原样（16 KB + 4 KB） | 11003 (62.5%) | 300 | 7709 | 17 (28.3%) |
+| C icache 32 KB + dcache 8 KB（行 4 字） | 12624 (71.7%) | 516 | 8524 | 22 (36.7%) |
+| **D icache 32 KB + dcache 32 KB（行 16 字）** | **12602 (71.6%)** | **484** | 8536 | **28 (46.7%)** |
+
+28 块 = itcm 8 + dtcm 4 + icache 8 + dcache 8。报告存 `tools/_syn_32k.rpt`（另有 A / C 两份对照）。
+
+### 21.4 代价
+
+- **LUT 62.5% → 71.6%**（+1599）。索引位宽 7→8 位带来的读选择变贵，这部分**无法避免**。
+- **dcache 一次缺失的回填从 4 字变 16 字**（SPI 事务约 4 倍长）。闭环 `flash_soc_tb` 拍数 18054 → 22020（+22%）。
+  容量大 8 倍、缺失更少，净效果取决于工作负载的局部性。
+- **32 位数据装不满 36 位的 RAMB36**（每块上限 89%），这是结构性的。
+
+### 21.5 验证
+
+- `dcache_tb` **40/40**（替换测试的地址与 tag 期望已按 16 字行更新）
+- `icache_mt` PASS
+- **全回归 30 项无 FAIL**，除闭环拍数外与改前逐字一致
+
+---
+
+## §22 时序优化：WNS -3.236ns → -0.089ns（2026-09-14）
+
+### 22.1 起点与约束
+
+约束 `create_clock -period 20.000`（50 MHz）。cache 扩到 32 KB 后 WNS = **-3.236ns**。
+最差路径 `u_plic/irq_en_reg[2]` → `u_cpu_top/u_regfile/r1_data_dec_reg[13]`，
+26 级、23.134ns（逻辑 5.465ns / **布线 17.669ns = 76%**）。**最差 9 条路径起点全是同一个 PLIC 寄存器。**
+
+### 22.2 诊断：这不是「plic → regfile 的通路」
+
+它俩只是同一条**跨 6 个模块、横贯全芯片的组合锥**的两个端点。链条：
+
+```
+plic 读数据 mux → decoder 操作数选择 → itcm/u_pc 取指地址加法（CARRY4 × 3）
+→ decoder fetch_addr → icache tag 阵列读地址 → tag 的 LUTRAM 读出（cache_hit）
+→ icache busy → cpu_top stall → decoder stage → regfile 读数据 mux
+```
+
+高扇出网（非时钟）：`icache_mem_addr[6]/[7]`、`u_icache/fill_tag_reg[9]_0[*]` **扇出 1110**、
+`u_dcache/lru[255]_i_2_n_0` 772、`u_dcache/fill_idx[4]/[5]` 307。
+
+### 22.3 修法①：PLIC 的 `exti` 打一拍（收益最大，**已应用**）
+
+`mcu_top` 里 `plic.exti` **直连** `cpu_top.exti`，中间无寄存器；`csr.v:164` 的 `eirq_pend = exti` 也是组合的。
+改成在 PLIC 内寄存：`irq_valid` 保持组合，`exti` 打一拍输出。
+
+**中断受理晚一拍，但 `mepc` 一字未变** —— §6.2 那套 `irq_bubble`（FLUSH 置 4、之后 +4/拍到 12）
+本来就是为「受理发生在冲刷后的任意拍」设计的，一拍偏移被它吸收。
+全回归除 `tim_p_irq` 拍数 484→485 外**逐字一致**，全部陷阱微测（mt_csrr2/3/4、mtirq2d、mt_brext）未变。
+
+**WNS -3.236 → -0.298ns。**
+
+### 22.4 修法②：`flush` 从 `stage` 里拆出来（**已应用**）
+
+`stage` 编码 EXE=01 / FLUSH=10 / STALL=11，所以
+
+```
+stage[1] = flush_events | stall
+stage[0] = stall
+```
+
+**`stage[1]` 把「冲刷锥」和「停顿锥」OR 在了一起**，这是扇出 200+ 宽网的根源。
+但 `(stage == FLUSH) ≡ flush_events`（冲刷优先级高于停顿）是**可证等价**的 ——
+只关心冲刷的消费点根本不必经过 `stage[1]`。
+
+改动：`controller.v` 新增 `output reg flush`（那 7 个事件的 OR，`rst` 时恒 0），`stage` 的选择与
+`irq_bubble` 的 FLUSH 判据改用它；`mem_buf.v` 的清零判据 `stage == FLUSH` → `flush`；
+`lsu.v` 的 `ld_enq` 里 `(stage != FLUSH)` → `!flush`。
+
+**WNS -0.298 → -0.089ns**，LUT 12579 → 12551。
+
+### 22.5 试过但失败的（**别重走**）
+
+| 做法 | 结果 |
+| --- | --- |
+| 给 `stage` / `fetch_addr` / `idx` / `fill_idx` / `rd_addr` 加 `(* max_fanout *)` | **-3.236 → -6.017ns**。`max_fanout` 落在**组合网**上是复制整条逻辑锥（级数 26→30、布线 17.7→20.5ns），不是复制寄存器 |
+| 给 `pc_addr` 加 `max_fanout`（它是真寄存器）+ `wb_reg` 换 `!flush && pipe_stall` 判据 | **-0.089 → -0.330ns**，LUT 还涨 150。两个改动捆在一起分不清谁的锅，但净效果为负，已撤 |
+
+**结论：在只剩 0.1ns 余量时，任何改动都会重新洗牌布局、收益不可预测 —— 一次只做一个、每个都实测。**
+
+### 22.6 顺带修掉 flash_spi 一个真 bug：轮询饿死读（**已应用**）
+
+**现象**：icache 行从 16 字改到 32 字后，闭环 `flash_soc_tb` 超时 ——
+`icache: stage=1 fill_cnt=0 busy=1`，ISR 那行的回填永远起不来。
+
+**根因**：`flash_spi` 的状态在 `S_CMD → S_DATA → S_GAP → S_CMD` 里**无限循环、从不回 S_IDLE**：
+
+```verilog
+S_END: ... else if (xact == X_POLL) begin
+    flash_wip <= status_rx[0];
+    if (status_rx[0]) begin                  // 只看器件的 WIP
+        tx_sh <= CMD_RDSR; state <= S_GAP;   // 直接跳 S_GAP，绕过 S_IDLE
+    end
+```
+
+而 `rd_pick` 的条件是 `(state == S_IDLE) && ...` —— **只要擦除的 WIP 挂住、轮询循环一进，
+icache/dcache 的读就被永久饿死**；超时清了 `era_busy` 也救不回来，因为这个分支根本不看它。
+
+**为什么以前没炸**：16 字行时是**时间巧合** —— ISR 的缺失落在轮询开始之前。行加长后每次回填约 2 倍，
+那个缺失正好落进轮询窗口。（与 §19 同一模式：改动只是把潜伏的 bug 换个方向暴露出来。）
+
+**修法**（一行条件）——让轮询循环让位给挂起的读与超时中止：
+
+```verilog
+if (status_rx[0] && (prog_busy || era_busy) && !rd_req) begin
+```
+
+既修掉饿死，又符合原本的设计意图（「读可以穿过擦除」），顺带改善长擦除期间的读延迟。
+
+### 22.7 icache 几何：256 组 × 16 字 → **128 组 × 32 字**（**已应用**）
+
+容量不变（32 KB），但 **tag 阵列 256 项 → 128 项**（LUTRAM bank 4 → 2）→
+关键路径中段那跳的地址译码扇出 93 → ~46。tag 位宽不变（20 位）：`word` 4→5 位、`idx` 8→7 位正好抵消；
+数据阵列仍是 8192 字（13 位地址）→ BRAM 占用不变。
+
+依据：指令是整块搬的，行大命中率更好；而且这条路径中段最贵的一跳（1.538ns、扇出 93）
+正是 §21 扩容到 256 组直接造成的。
+
+代价：行 64 B → 128 B，**每次缺失回填从 16 字变 32 字**，闭环拍数 22020 → 23144。
+
+### 22.8 现状
+
+| 版本 | WNS | 布线 | 级数 | LUT |
+| --- | --- | --- | --- | --- |
+| 起点（32 KB 后） | -3.236ns | 17.669 | 26 | 12579 |
+| ① `exti` 打拍 | -0.298ns | 13.899 | 16 | 12579 |
+| ② `flush` 拆分 | **-0.089ns** | 16.198 | 16 | 12551 |
+| ③ 试错（已撤） | -0.330ns | 14.238 | 24 | 12701 |
+
+**② 那版 P&R 跑过两次，结果完全一致、可复现。**
+
+**未测**：§22.6 + §22.7 之后的 WNS。
+
+**已知的病根（未解决）**：最差路径是
+`pc_addr → itcm.fetch_addr → icache 的 idx/tag → tag 阵列读出 → icache.busy → i_busy → stall → stage → wb_reg.CE`
+—— 这正是 §0.3 记的那个环的**残留**（当年只切断了 `stage → fetch_addr` 的**直连边**）。
+这条锥**功能必需**（取指地址命中与否决定整条流水线停不停），而且**不能寄存**
+（§17.9 / §19 已证明寄存 `busy` 就会早放/晚放一拍、丢指令）。
+
+**下一步可考虑**：把 §22.4 的等价替换推广到其余 `stage == STALL` 消费点
+（`itcm` / `pre_decoder` / `decoder` / `regfile` / `lsu` / `mem_buf`），或做布局引导
+（这条锥 16 级逻辑只花 3.5ns、布线花 16.2ns，瓶颈是**摆位不是逻辑**）。

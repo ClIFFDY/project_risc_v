@@ -37,39 +37,40 @@ module dcache(
     input mem_ready
     );
 
-    reg [22:0] tag;
-    reg [6:0] idx;
-    reg [1:0] word;
+    reg [19:0] tag;
+    reg [7:0] idx;
+    reg [3:0] word;
     reg [1:0] hit_way;
     reg cache_hit;
 
-    reg [22:0] tag_ram [0:1][0:127];
-    (* ram_style = "block" *) reg [31:0] data_ram [0:1][0:127][0:3];
-    reg valid [0:1][0:127];
-    reg lru [0:127];
+    reg [19:0] tag0 [0:255];
+    reg [19:0] tag1 [0:255];
+    (* ram_style = "block" *) reg [31:0] data [0:8191];
+    reg [255:0] valid0, valid1, lru;
 
     reg stage;
     reg fill_end;
-    reg [1:0] miss_word;
-    reg [1:0] fill_cnt;
+    reg [3:0] miss_word;
+    reg [3:0] fill_cnt;
     reg [31:0] fill_addr;
-    reg [22:0] fill_tag;
-    reg [6:0] fill_idx;
-    reg [1:0] fill_way;
-    reg [31:0] fill_buf [0:3];
+    reg [19:0] fill_tag;
+    reg [7:0] fill_idx;
+    reg fill_way;
 
     reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
+    reg [12:0] rd_addr;
+    reg rd_en;
     reg [31:0] wr_addr, wr_data;
     reg [3:0] wr_be;
 
     integer i;
 
     always @(*) begin
-        tag = bus_addr_in[31:9];
-        idx = bus_addr_in[8:2];
-        word = bus_addr_in[1:0];
-        hit_way[0] = valid[0][idx] && (tag_ram[0][idx] == tag);
-        hit_way[1] = valid[1][idx] && (tag_ram[1][idx] == tag);
+        tag = bus_addr_in[31:12];
+        idx = bus_addr_in[11:4];
+        word = bus_addr_in[3:0];
+        hit_way[0] = valid0[idx] && (tag0[idx] == tag);
+        hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
 
         rd_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd6) && !bus_we_in;
@@ -93,64 +94,65 @@ module dcache(
             mem_wdata = bus_data_in;
             mem_be = bus_be_in;
         end
+
+//读口：hit 与 fill_end 合成一个地址/一个使能/一个数据选择（每个 data 只有一个读口）
+        rd_en  = fill_end || rd_req;
+        rd_addr = fill_end ? {fill_way, fill_idx, miss_word} : {hit_way[1], idx, word};
+    end
+
+//写口：只有回填这一路整字写 —— 单写口，所以这个阵列能推成 BRAM
+//字节粒度写会变成多个独立写操作（BRAM 只有 1 个写口），推不成，故不做缓存行更新
+    always @(posedge clk) begin
+        if (stage == 1'd1 && !fill_end && mem_valid)
+            data[{fill_way, fill_idx, fill_cnt}] <= mem_data;
+    end
+
+    always @(posedge clk) begin
+        if (rst)
+            bus_data_out <= 32'd0;
+        else if (rd_en)
+            bus_data_out <= data[rd_addr];
     end
 
     always @(posedge clk) begin
         if (rst) begin
             stage <= 1'd0;
             fill_end <= 1'b0;
-            fill_cnt <= 2'd0;
+            fill_cnt <= 4'd0;
+            fill_way <= 1'b0;
             wr_pend <= 1'b0;
-            bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
-            for (i = 0; i < 128; i = i + 1) begin
-                valid[0][i] <= 1'b0;
-                valid[1][i] <= 1'b0;
-                lru[i] <= 1'b0;
-            end
+            valid0 <= 256'd0;
+            valid1 <= 256'd0;
+            lru <= 256'd0;
         end
         else begin
             ld_ready <= 1'b0;
-            bus_data_out <= 32'd0;
 
             if (rd_req) begin
                 if (hit_way[0]) begin
-                    bus_data_out <= data_ram[0][idx][word];
                     ld_ready <= 1'b1;
                     lru[idx] <= 1'b1;
                 end
                 else if (hit_way[1]) begin
-                    bus_data_out <= data_ram[1][idx][word];
                     ld_ready <= 1'b1;
                     lru[idx] <= 1'b0;
                 end
                 else begin
                     stage <= 1'd1;
                     miss_word <= word;
-                    fill_cnt <= 2'd0;
-                    fill_addr <= (bus_addr_in & 32'hFFFF_FFFC) << 2;
+                    fill_cnt <= 4'd0;
+                    fill_addr <= (bus_addr_in & 32'hFFFFFFF0) << 2;
                     fill_tag <= tag;
                     fill_idx <= idx;
-                    fill_way <= (!valid[0][idx]) ? 1'b0 :
-                                (!valid[1][idx]) ? 1'b1 : lru[idx];
+                    fill_way <= (!valid0[idx]) ? 1'b0 :
+                                (!valid1[idx]) ? 1'b1 : lru[idx];
                 end
             end
 
             if (wr_req) begin
-                if (hit_way[0]) begin
-                    if (bus_be_in[0]) data_ram[0][idx][word][7:0]   <= bus_data_in[7:0];
-                    if (bus_be_in[1]) data_ram[0][idx][word][15:8]  <= bus_data_in[15:8];
-                    if (bus_be_in[2]) data_ram[0][idx][word][23:16] <= bus_data_in[23:16];
-                    if (bus_be_in[3]) data_ram[0][idx][word][31:24] <= bus_data_in[31:24];
-                    lru[idx] <= 1'b1;
-                end
-                else if (hit_way[1]) begin
-                    if (bus_be_in[0]) data_ram[1][idx][word][7:0]   <= bus_data_in[7:0];
-                    if (bus_be_in[1]) data_ram[1][idx][word][15:8]  <= bus_data_in[15:8];
-                    if (bus_be_in[2]) data_ram[1][idx][word][23:16] <= bus_data_in[23:16];
-                    if (bus_be_in[3]) data_ram[1][idx][word][31:24] <= bus_data_in[31:24];
-                    lru[idx] <= 1'b0;
-                end
+                if (hit_way[0])      valid0[idx] <= 1'b0;
+                else if (hit_way[1]) valid1[idx] <= 1'b0;
                 if (!mem_ready) begin
                     wr_pend <= 1'b1;
                     wr_addr <= bus_addr_in << 2;
@@ -161,21 +163,21 @@ module dcache(
 
             if (wr_pend && mem_ready) wr_pend <= 1'b0;
 
-            if (stage == 1'd1 && !fill_end) begin
-                if (mem_valid) begin
-                    fill_buf[fill_cnt] <= mem_data;
-                    if (fill_cnt == 2'd3) fill_end <= 1'b1;
-                    else fill_cnt <= fill_cnt + 2'd1;
-                end
+            if (stage == 1'd1 && !fill_end && mem_valid) begin
+                if (fill_cnt == 4'd15) fill_end <= 1'b1;
+                else fill_cnt <= fill_cnt + 4'd1;
             end
 
             if (fill_end) begin
-                tag_ram[fill_way][fill_idx] <= fill_tag;
-                valid[fill_way][fill_idx] <= 1'b1;
-                for (i = 0; i < 4; i = i + 1)
-                    data_ram[fill_way][fill_idx][i] <= fill_buf[i];
+                if (fill_way) begin
+                    tag1[fill_idx] <= fill_tag;
+                    valid1[fill_idx] <= 1'b1;
+                end
+                else begin
+                    tag0[fill_idx] <= fill_tag;
+                    valid0[fill_idx] <= 1'b1;
+                end
                 lru[fill_idx] <= ~fill_way;
-                bus_data_out <= fill_buf[miss_word];
                 ld_ready <= 1'b1;
                 stage <= 1'd0;
                 fill_end <= 1'b0;

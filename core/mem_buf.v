@@ -23,6 +23,7 @@
 module mem_buf(
     input clk, rst,
     input [1:0] stage,
+    input flush,
     input [9:0] func10_in,
     input [31:0] imm_alu_in,
     input [11:0] imm12_csr_in,
@@ -109,7 +110,7 @@ module mem_buf(
             br_pred_taken_out <= br_pred_taken_out;
             jalr_pred_addr_out <= jalr_pred_addr_out;
         end
-        else if (stage == FLUSH) begin
+        else if (flush) begin
             func10_out <= 10'd0;
             imm_alu_out <= 32'd0;
             imm12_csr_out <= 12'd0;

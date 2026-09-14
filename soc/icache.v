@@ -38,73 +38,78 @@ module icache(
     );
 
     reg cache_hit;
-    reg [20:0] tag;
+    reg [19:0] tag;
     reg [6:0] idx;
-    reg [3:0] word;
+    reg [4:0] word;
     reg [1:0] hit_way;
     reg fill_way;
 
-    (* ram_style = "block" *) reg [20:0] tag_ram [0:1][0:127];
-    (* ram_style = "block" *) reg [31:0] iram [0:1][0:127][0:15];
-    reg valid [0:1][0:127];
-    reg lru [0:127];
+    reg [19:0] tag0 [0:127];
+    reg [19:0] tag1 [0:127];
+    (* ram_style = "block" *) reg [31:0] iram [0:8191];
+    reg [127:0] valid0, valid1, lru;
 
     reg stage;
     reg fill_end;
-    reg [3:0] miss_word;
-    reg [3:0] fill_cnt;
+    reg [4:0] miss_word;
+    reg [4:0] fill_cnt;
     reg [31:0] fill_addr;
-    reg [20:0] fill_tag;
+    reg [19:0] fill_tag;
     reg [6:0] fill_idx;
-    reg [31:0] fill_buf [0:15];
+
+    reg [12:0] rd_addr;
+    reg rd_en, line_match;
 
     integer i;
 
     always @(*) begin
-        tag = ibus_addr_in[31:11];
-        idx = ibus_addr_in[10:4];
-        word = ibus_addr_in[3:0];
-        hit_way[0] = valid[0][idx] && (tag_ram[0][idx] == tag);
-        hit_way[1] = valid[1][idx] && (tag_ram[1][idx] == tag); 
+        tag = ibus_addr_in[31:12];
+        idx = ibus_addr_in[11:5];
+        word = ibus_addr_in[4:0];
+        hit_way[0] = valid0[idx] && (tag0[idx] == tag);
+        hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
         cache_miss = (stage == 1'd0) && busy;
         busy = (stage == 1'd1 && (!fill_end || (!cache_hit && ibus_re_in &&
-                !(fill_idx == idx && fill_tag == tag)))) ||
+                                             !(fill_idx == idx && fill_tag == tag)))) ||
                (stage == 1'd0 && !cache_hit && ibus_re_in);
         mem_req = (stage == 1'd1) && !fill_end;
         mem_addr = fill_addr + (fill_cnt << 2);
         mem_we = 1'b0;
         mem_wdata = 32'd0;
         mem_be = 4'd0;
+
+//读口：把 hit 与 fill_end 两条路合成一个地址/一个使能/一个数据选择，
+//这样每个 iram 只有一个读口，才推得出 BRAM
+        line_match = (ibus_addr_in & 32'hFFFFFFE0) == (fill_addr >> 2);
+        rd_en  = (fill_end && line_match) || req_valid;
+        rd_addr = (fill_end && line_match) ? {fill_way, fill_idx, miss_word}
+                                           : {hit_way[1], idx, word};
+    end
+
+//回填：一拍收一个字直接写进 iram（BRAM 单写口，一拍只写一个地址）
+    always @(posedge clk) begin
+        if (stage == 1'd1 && !fill_end && mem_valid) begin
+            iram[{fill_way, fill_idx, fill_cnt}] <= mem_data;
+        end
     end
 
     always @(posedge clk) begin
-        if (rst) 
+        if (rst)
             ibus_data_out <= 32'd0;
-        else if (fill_end && ((ibus_addr_in & 32'hFFFFFFF0) == (fill_addr >> 2)))
-            ibus_data_out <= fill_buf[miss_word];
-        else if (req_valid) begin
-            if (hit_way[0])
-                ibus_data_out <= iram[0][idx][word]; 
-            else if (hit_way[1])
-                ibus_data_out <= iram[1][idx][word];
-            else
-                ibus_data_out <= 32'd0;
-        end
+        else if (rd_en)
+            ibus_data_out <= iram[rd_addr];
     end
 
     always @(posedge clk) begin
         if (rst) begin
             stage <= 1'd0;
             fill_end <= 1'b0;
-            fill_cnt <= 4'd0;
-            for (i = 0; i < 128; i = i + 1) begin
-                valid[0][i] <= 1'b0;
-                valid[1][i] <= 1'b0;
-                tag_ram[0][i] <= 21'd0;
-                tag_ram[1][i] <= 21'd0;
-                lru[i] <= 1'b0;
-            end
+            fill_cnt <= 5'd0;
+            fill_way <= 1'b0;
+            valid0 <= 128'd0;
+            valid1 <= 128'd0;
+            lru <= 128'd0;
         end
         else begin
             if (stage == 1'd0) begin
@@ -114,8 +119,8 @@ module icache(
                 else if (ibus_re_in) begin
                     stage <= 1'd1;
                     miss_word <= word;
-                    fill_cnt <= 4'd0;
-                    fill_addr <= (ibus_addr_in & 32'hFFFFFFF0) << 2;
+                    fill_cnt <= 5'd0;
+                    fill_addr <= (ibus_addr_in & 32'hFFFFFFE0) << 2;
                     fill_tag <= tag;
                     fill_idx <= idx;
                     fill_way <= lru[idx];
@@ -123,23 +128,26 @@ module icache(
             end
             else begin
                 if (mem_valid && !fill_end) begin
-                    fill_buf[fill_cnt] <= mem_data;
-                    if (fill_cnt == 4'd15)
+                    if (fill_cnt == 5'd31)
                         fill_end <= 1'b1;
                     else
                         fill_cnt <= fill_cnt + 1;
                 end
                 if (fill_end) begin
-                    tag_ram[fill_way][fill_idx] <= fill_tag;
-                    valid[fill_way][fill_idx] <= 1'b1;
-                    for (i = 0; i < 16; i = i + 1)
-                        iram[fill_way][fill_idx][i] <= fill_buf[i];
+                    if (fill_way) begin
+                        tag1[fill_idx] <= fill_tag;
+                        valid1[fill_idx] <= 1'b1;
+                    end
+                    else begin
+                        tag0[fill_idx] <= fill_tag;
+                        valid0[fill_idx] <= 1'b1;
+                    end
                     lru[fill_idx] <= ~lru[fill_idx];
                     if (!cache_hit && ibus_re_in && !(fill_idx == idx && fill_tag == tag)) begin
                         stage <= 1'd1;
                         miss_word <= word;
-                        fill_cnt <= 4'd0;
-                        fill_addr <= (ibus_addr_in & 32'hFFFFFFF0) << 2;
+                        fill_cnt <= 5'd0;
+                        fill_addr <= (ibus_addr_in & 32'hFFFFFFE0) << 2;
                         fill_tag <= tag;
                         fill_idx <= idx;
                         fill_way <= lru[idx];
