@@ -7,6 +7,7 @@ module cpu_top(
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
     output reg bus_we_out,
+    output reg bus_valid_out,
     input [31:0] bus_data_in_ext,
     input bus_loaded_in,
     input bus_hold_in,
@@ -85,6 +86,7 @@ module cpu_top(
     wire [31:0] bus_addr_out_i, bus_data_out_i;
     wire [3:0] bus_be_out_i;
     wire bus_we_out_i;
+    wire bus_valid_out_i;
     wire ibus_req_valid_i;
 
     always @(*) begin
@@ -99,6 +101,7 @@ module cpu_top(
         bus_data_out = bus_data_out_i;
         bus_be_out = bus_be_out_i;
         bus_we_out = bus_we_out_i;
+        bus_valid_out = bus_valid_out_i;
     end
 
     pc u_pc (
@@ -314,6 +317,7 @@ module cpu_top(
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
         .bus_we_out(bus_we_out_i),
+        .bus_valid_out(bus_valid_out_i),
         .ld_data_out(ld_data_final),
         .loaded(loaded),
         .ld_we(ld_we),

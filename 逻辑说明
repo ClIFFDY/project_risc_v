@@ -122,11 +122,16 @@ add 取指 c0=addi 取指后 1 拍。add 在 decoder 锁存时（=addi decoder �
 addi 的 alu 结果已经组合有效并挂在 `result_back1`。forw 依 `rd_back1(=1) == rs1_1` 把
 `result_back1` 送进 add 的 r1_data_final → **相邻 ALU 依赖 0 停顿**。
 
-前递优先级（forw）：
-1. `loaded`：ld 数据 `ld_data` 优先（§5）
-2. back1：上一条已在 decoder 的指令（alu 组合结果 result_back1）
-3. back2：wb_reg 里的结果 result_back2
+前递优先级（forw）—— **三条独立比较支路，`loaded` 不遮蔽 back2**：
+1. back1：`!stalled && rd_back1!=0 && r==rd_back1` → result_back1
+2. `loaded`：`loaded && rd_load!=0 && r==rd_load` → ld_data（§5）
+3. back2：`rd_back2!=0 && r==rd_back2` → result_back2
 4. 否则用 regfile 读值 r1_data_in_dec
+
+（2026-09-18 修：原为 `rd_back2_sel = loaded ? rd_load : rd_back2` 合并成一个比较器，
+`loaded` 一高 back2 整个不可用。基线单拍 `loaded` 时只错 1 拍尚能过 CoreMark；
+§5.3 的 `ld_hold` 把 `loaded` 拉成 2 拍后，落在 back2 槽的消费者彻底取不到值，
+CoreMark 从 10.06M 拍退化到 20M 拍跑不出结果。拆成独立支路后与 09-11 基线逐拍一致。）
 
 另外 regfile 读口自身带写回旁路：`(we||loaded) && rd!=0 && rs==rd ? wdata_final : regs[rs]`
 （rd==x0 绝不旁路，这是修过的 bug，见工程记忆）。
@@ -328,9 +333,13 @@ lsu 与 decoder 同拍（都读 mem_buf 输出）。总线侧信号全部经 lsu
   **不经过 bus_arb**。命中 1 拍应答；缺失按住流水线回填。`dtcm` 是它的后备存储器（流式读出/单拍写入）。
 - **tim_in**：`[23:20]==1` 且 `[3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)`，仍搭在 lsu 出口总线上（在 `cpu_top` 内）。
   它的窗口 `[23:20]==1` 与 dcache 的 `[23:13]==0x100` **严格互斥**，两者按位或合流成 `bus_data_in_final`。
-- **bus_arb 外设槽**（`bus_addr[31:24]`）：1=UART 0x0400_0000、2=PLIC 0x0800_0000、3=tim_p 0x0C00_0000、
+- **bus_arb 外设槽**（`bus_addr[31:24]`）：1=UART 0x0400_0000、2=PLIC 0x0800_0000、
   4=gpio_group 0x1000_0000、5=i2c 0x1400_0000，由 bus_arb 按该字段选通（1..31 全归它管，加外设不用改 bus_arb）。见 bus_arb.v。
-  槽 6/7（dcache、flash_spi）**已停用**。
+  槽 3/6/7（tim_p、dcache、flash_spi）**已停用**。
+  **槽 3 = tim_p（2026-09-19 删）**：`mcu_top` 里的例化、`bus_ready[PER_TIM]`、`bus_we_tim_p`、
+  `plic.irq_sources` 的源 2（tim_p_irq）、`pwm1~pwm4` 连线全部删除；`gpio_group.pwm1~pwm4` 改接 `1'b0`
+  （gpio 的 PWM1~PWM4 模式仍保留，只是输出恒 0）。
+  `peripherals/tim_p.v` **文件保留**，模块级 `tim_p_tb` 仍可单跑；闭环 `tim_p_irq_tb` 因层次引用 `u_tim_p` 已失效。
 
 ### 5.1 store sw（写，不写回 rd）
 
@@ -377,8 +386,8 @@ store 不产生 we，不写 regs。无访存依赖时不 stall。
   流水线、从 dtcm 回填整行后再出数，见 §23.4），
   regfile 写对齐到 c4 沿——`loaded` 把 `ld_data` 选成写回数据，无需额外气泡。
 - **中间隔 1 条无关指令再用**（如 lw; nop; add）不触发 stall：此时 forw 用
-  `loaded ? rd_load : rd_back2` 前递即可（旁路命中）。
-- 外部总线（SoC 外设）：数据返回由 `bus_loaded_in` 驱动，`ready_in = dtcm_ready|tim_ready|bus_loaded_in`；
+  `loaded`（`rd_load` 支路）前递即可（旁路命中）；该拍 back2 支路仍独立可比，见 §2.2。
+- 外部总线（SoC 外设）：数据返回由 `bus_loaded_in` 驱动，`ready_in = dcache_ld_ready|tim_ready|bus_loaded_in`；
   i_busy 走 controller 的 `stall | i_busy`（冻结流水线）——时序同上，只是 `loaded` 的拍数随外部等待延后。
 
 字节扩展：lb/lbu/lh/lhu 的符号/零扩展与字节槽选择都由 `ld_size/ld_off`（func10 + 地址低 2 位）
@@ -401,8 +410,10 @@ lsu 里有一支 2 槽在途 load 队列：`ld_rd_fifo`/`ld_size_fifo`/`ld_off_f
   会把**旧操作数**算出的地址锁进队列，整条恢复链全错位。
 - **`stage!=FLUSH` 必须挡**：被冲刷的死槽 load 若入队，会带垃圾操作数算出的地址占住队头，
   应答永远不来 ⇒ 队头永久卡死、后续所有 load 全部错配。
-- **保持一拍的理由**：load 往后第 2 条指令在 lsu 拍靠 `forw` 的 `loaded ? rd_load : rd_back2`
+- **保持一拍的理由**：load 往后第 2 条指令在 lsu 拍靠 `forw` 的 `loaded` 支路（`rd_load` 比对）
   取数，那一拍正好落在出队的**下一拍**；只摆一拍它会取不到（实测该拍 `loaded=0`）。
+- **保持拍会顶掉 back2（2026-09-18 修）**：`loaded` 拉长到 2 拍后，若 forw 仍把 `loaded`
+  与 back2 合并成一个比较器，保持拍上 back2 通路整个失效。已拆成三条独立支路，见 §2.2。
 - **写回另用 `ld_we`**：若直接用 `loaded` 当 `we_ld`，保持拍会拿同一个 rd 再写一次，
   把同拍 ALU 写回的结果盖掉。
 
@@ -680,7 +691,7 @@ CNT_SET 回读 200、pwm1 高低都出现过。
 | IRQ | 3 | 输入 | 边沿/电平检测进中断状态位 |
 | TX | 5 | 输出 | 透传模块的 `tx` 输入 |
 | RX | 6 | 输入 | 电平透到模块的 `rx` 输出 |
-| PWM1 / PWM2 / PWM3 / PWM4 | 7 / 8 / 11 / 12 | 输出 | 透传对应的 `pwm1~pwm4` 输入（本 SoC 里接 tim_p 的四路 PWM 输出） |
+| PWM1 / PWM2 / PWM3 / PWM4 | 7 / 8 / 11 / 12 | 输出 | 透传对应的 `pwm1~pwm4` 输入（tim_p 已删，2026-09-19 起 `mcu_top` 接 `1'b0`，输出恒 0） |
 | SCL | 9 | 输出 | 透传 `scl` 输入（I2C 预留） |
 | SDA | 10 | 开漏双向 | `sda_oe` 时拉低、否则高阻；电平回读进 `sda_in` |
 
@@ -1676,6 +1687,7 @@ pc_addr <= isr_ret_addr2 + (ext_target ? 4'd0 : 4'd4);   // 同上
 | ④ | `pc.v` 丢 `ext_target` 时连带丢了 `+4`（见 23.6） | `jalr`/中断重定向早 4 字节 | 补回 |
 | ⑤ | **`.data` 的 LMA 仍在 itcm**（`AT(__data_lma)`） | 数据侧读不到 itcm ⇒ `start.s` 的拷贝循环第一条 `lw` 就**永久 STALL**（`ready_in` 永不抬）。**板子上同样挂** | 改 LMA=VMA=DTCM 首址，由 `data.hex` 预装（见 23.11） |
 | ⑥ | **`dcache.bus_data_out` 不每拍清零** | `cpu_top` 把 dcache/tim_in/dtcm 的读数据**按位或**合流；dcache 残留值被或进每一次外部总线读（实测读 UART 状态口拿到上次 dtcm 读的值 → `ee_printf` 轮询死循环） | 每拍先清零（对齐基线 dtcm / `tim_in.v:46` 的形状） |
+| ⑦ | **`dtcm` 的读/写索引用了 `mem_addr[13:2]`（12 位）** | 数组是 `[0:8191]` = 32KB（8192 字，需要 13 位 = `[14:2]`），12 位只有 4096 字 = **16KB 可寻址**，字节 `0x00804000–0x00807FFF` 全别名到低半区。CoreMark 的 `.data` 只 2.4KB，所以一直没暴露 | 改 `mem_addr[14:2]`（读 `raddr` 1 处 + 写口 4 处）。**对照 `itcm` 是 `[15:2]`（64KB）**，两块的"尺寸↔切片"关系要一致 |
 
 > ⑤⑥ 的共性：**`cpu_top` 内那三个读源是"按位或"合流，不是按槽位 mux**。
 > 基线的 dcache 挂在 `bus_arb` 后面（mux），所以它不守"非本窗口输出 0"的规矩也没事；
@@ -1775,3 +1787,161 @@ Errors detected
 
 **顺带确认**：`.text` = 12328 字节，正好落在 icache **way0 的 16KB 锁定段**内 ⇒
 自举一次之后全程序常驻，**取指零缺失**。
+
+## §24 系统总线换 AHB-Lite + APB（2026-09-19）
+
+### 24.1 做了什么
+
+`soc/bus_arb.v` **退役**，换成三个新模块：
+
+| 文件 | 职责 |
+| --- | --- |
+| `soc/lsu_ahb_master.v` | lsu 的"1 拍脉冲"→ AHB 地址相位；读应答转发 |
+| `soc/ahb_interconnect.v` | 仲裁（**按 2 master 设计**，第 2 端口本轮接常量，给 DMA 预留）+ 回程广播 |
+| `soc/ahb_apb_bridge.v` | 槽号译码 + 读数据 mux + 驱动 4 个外设的**现有端口** |
+
+**4 个外设（uart/plic/gpio/i2c）一个信号都没改。**
+
+### 24.2 为什么可行：请求拍 == 地址相位
+
+AHB-Lite 的一次传输：master 在 T 拍驱 `HADDR/HTRANS`（地址相位），从设备在 T→T+1 沿采样，
+`HREADY=1` 时**数据相位**落在 T+1。
+现有外设（`uart_top` 为代表）：T 拍看 `bus_addr_in/bus_we_in/bus_be_in`，T+1 拍输出寄存的
+`bus_data_out` 并抬 1 拍 `ld_ready`。**完全重合。**
+而 `bus_arb.v` 原来的 `per_sel` 锁存（请求拍锁、应答拍清）本来就是这个相位锁存。
+
+### 24.3 三根私有信号（对 ARM AHB-Lite 的显式偏离）
+
+1. **`hwstrb[3:0]`**：AHB-Lite 规范里字节使能是 AHB5 才有的 `HWSTRB`。本工程直接用私有信号
+   透传给外设的 `bus_be_in`，省掉从 `HSIZE+HADDR[1:0]` 反推。
+2. **`rd_valid`**：**只有已映射从设备的读应答才算数**。这是本轮最大的坑，见 24.4。
+3. **`bus_valid_out`**（`lsu` 新增，`cpu_top` 透传）：不能用 `bus_addr_out != 0` 推"有没有请求" ——
+   地址 0 的合法访问、store 到槽 0、未来"地址暂为 0 但请求有效"三类情况会静默失效。
+
+### 24.4 修掉的两个真缺陷（都是本轮自己引入、被 tb 咬出来的）
+
+| # | 缺陷 | 症状 | 修法 |
+| --- | --- | --- | --- |
+| ① | 桥把 `hready` 直接接成**所选中从设备的 `ld_ready`** | `ld_ready` 是只在数据相位有效的一拍脉冲，写事务与空闲期恒 0 ⇒ `hready=0` ⇒ `bus_hold_out` 拉高 ⇒ **CPU 被无端冻住、同一条指令反复重发**。现场：`gpio_irq` 的 `irq_en[3]=0`（PLIC 写没落到）、`mt_ldfifo` 出现 6 个孤儿 | `hready` 在无事务完成时恒 1；只有读的数据相位才由从设备决定 |
+| ② | 桥对**未映射槽/核内窗口**也返回 `hready=1` | `lsu` 会对**所有**访存地址发总线请求，包括 `0x00800000`（dcache 窗口）与 `0x00400000`（tim_in）。原 `bus_arb` 在 `per_decode==0` 时**不产生任何应答**；新桥却照样抬 `bus_ready_out` ⇒ 每次核内访问多出一个**假 ready** ⇒ `ld_pop` 空弹出队 ⇒ **孤儿=6** | 加私有 `rd_valid`：只有 `sel_pend` 是映射槽（1/2/4/5）时才产生读应答 |
+
+> ②的判据已固化进 `project_risc_v.sim/ahb_interconnect_tb.v`：
+> **映射槽读恰好 1 个 `rd_valid`；核内窗口与未映射槽恒 0；写恒 0；一个写脉冲恰好 1 个地址相位。**
+
+### 24.5 `bus_hold_in` 的处置
+
+**恒 0** —— 与原来 `mcu_top` 把 `bus_hold_in` 接常量 `1'b0` 一致。
+因为当前 `hready` 恒 1（所有从设备都是 1 拍应答），主机侧是组合透传，**没有可被反压的队列**，
+`bus_valid_in` 的每一拍当拍就变成地址相位，不存在丢请求。
+
+> **加第二个 master（DMA）时必须补命令锁存**：仲裁一旦可能让 `hready` 拉低，
+> 就必须先把地址相位锁住再等应答（AHB 要求地址相位于 `HREADY=0` 期间保持）。
+
+### 24.6 验证：逐拍等价
+
+| 项 | 基线 | 换总线后 |
+| --- | --- | --- |
+| 回归 9 项 | 全绿 | **全绿，且输出逐字一致** |
+| `mt_ldfifo` | `@cyc=6046 入队=157 出队=157 溢出=0 孤儿=0` | **完全相同** |
+| `gpio_irq` / `i2c_irq` | `@cyc=97` / `@cyc=7085` | **完全相同** |
+| CoreMark `-O2 / ITERATIONS=1` | `Total ticks 1049534`、CRC `0xe714/0x1fd7/0x8e3a`、自锁 `@cyc=3179509` | **完全相同** |
+
+**连周期数都一个不差** —— 说明这是**逐拍等价**的替换，没有引入任何延迟回归
+（方案原本留的余量是"+15% 以内"）。
+
+### 24.7 未做（保留为规划）
+
+- **DMA**：`ahb_interconnect` 已留第 2 master 端口（接常量）、槽 8、PLIC 位 6
+- **NPU（队友的任务）**：留槽 9、PLIC 位 7。接入时直接挂 `ahb_apb_bridge`
+- **DDR / flash 控制器**：**不挂这条系统总线**，将来与 `icache`/`dcache` 的 mem 侧直连（相当于第二套总线）
+- 地址映射**未变**：1=UART / 2=PLIC / 4=gpio / 5=i2c；槽 3/6/7 保留
+
+### 24.8 层次重梳理（2026-09-19，纯结构、零逻辑改动）
+
+`mcu_top` 从例化 7 个模块收敛到 **3 个**：
+
+```
+mcu_top
+ ├── cpu_top                      （core/，未动）
+ ├── bus_con_top                      （soc/，新增）
+ │    ├── rst_buf                 系统复位发生器（原来直接在 mcu_top 里）
+ │    ├── lsu_ahb_master
+ │    ├── ahb_interconnect
+ │    └── ahb_apb_bridge
+ └── io_block_top                     （IO_block/，新增）
+      ├── uart_top（+ uart_rx / uart_tx）
+      ├── plic
+      ├── gpio_group
+      └── i2c
+```
+
+- **`peripherals/` 文件夹已改名为 `IO_block/`**（8 个文件）。`flash_spi.v` 与 `tim_p.v` **保留文件但不例化**
+  （与重梳理前一致 —— 这两个此前就已被停用）。
+- **`rst_buf` 归入 `bus_con_top`**：`bus_con_top` 吃顶层 `rst`，内部产生 `rst_cpu` 往上输出给 `cpu_top` 与 `io_block_top`。
+- **`bus_con_top ↔ io_block_top` 的外设侧接口**与原来 `mcu_top` 里那套完全同形：
+  下行 `bus_addr_out` / `bus_data_out` / `bus_be_out` / `bus_we_out` / `bus_sel_out`（32 位独热），
+  上行 4 组 `(模块)_data` + `(模块)_ready`；`io_block_top` 内部把 4 个外设的 irq 接到 `plic`，
+  `plic_exti` 往上输出给 `cpu_top.exti`。**uart/gpio/i2c 之间的引脚复用连线现在收在 `io_block_top` 内部**。
+
+- **白盒 tb 的层次路径随之变化**（这些都是 tb 侧的引用，不是 RTL 行为）：
+
+| 原路径 | 新路径 | 涉及的 tb |
+| --- | --- | --- |
+| `dut.u_rst_buf` | `dut.u_bus_con.u_rst_buf` | `gpio_irq_tb` / `i2c_irq_tb` / `mt_ldfifo_tb` |
+| `dut.u_gpio` | `dut.u_io_block.u_gpio` | `gpio_irq_tb` / `i2c_irq_tb` |
+| `dut.u_plic` | `dut.u_io_block.u_plic` | `gpio_irq_tb` / `i2c_irq_tb` |
+| `dut.u_i2c` | `dut.u_io_block.u_i2c` | `i2c_irq_tb` |
+| `dut.u_cpu_top.*` | **不变** | 全部 |
+
+- **验证**：回归 9 项输出与重梳理**前逐字一致**（含 `mt_ldfifo` 的 `@cyc=6046`、`gpio_irq @cyc=97`、
+  `i2c_irq @cyc=7085`）；CoreMark 同样一数不差。
+- `tools/run_reg.sh` 的通配路径已同步为 `$RTL/core/ $RTL/IO_block/ $RTL/soc/`。
+
+### 24.9 AHB-Lite 相对原简单总线的优势（理论分析，2026-09-19）
+
+先把"原总线"的规格说准 —— 它不是"低配 AHB"，而是一套**私有非流水协议**：
+
+| 维度 | 原 `bus_arb` | AHB-Lite |
+| --- | --- | --- |
+| 地址相位 | **1 拍脉冲**（地址只存在 1 拍） | 电平，保持到 `HREADY=1` |
+| 与数据相位的关系 | 请求拍 → 下一拍应答，**单未完成事务** | 地址相位与上一笔数据相位**重叠**（流水） |
+| 突发 | **无**。每笔访问 = 1 个地址 + 1 个应答 | `HBURST` INCR4/8/16、WRAP |
+| 多主机 | 无仲裁器（单 `bus_arb` 输入） | `HREADY` 全局广播 + 每从机仲裁（多层）或 `HBUSREQ/HGRANT`（全 AHB） |
+| 从机等待 | `bus_busy` → `d_hold`（本项目里**已空接**） | `HREADY` 拉低，协议规定 |
+| 错误响应 | **无**（未映射地址静默挂死） | `HRESP` = ERROR |
+| 字节使能 | `bus_be_in[3:0]`（自定义） | 规范内是 AHB5 的 `HWSTRB`（本工程仍用私有 `hwstrb`） |
+| 第三方 IP 对接 | 不能，私有 | 可以 |
+
+**核心量化：突发的收益全在"地址相位被摊薄"。**
+
+设一笔事务 = 1 个地址拍 + N 个数据拍。搬运 N 个字：
+
+| 方式 | 拍数 | 效率 |
+| --- | --- | --- |
+| 原总线（逐字） | 每个字 1 地址 + 1 应答 = **2N** | 50% |
+| AHB-Lite 单拍 `SINGLE` | 同样 **2N** | 50% |
+| AHB-Lite `INCR16` 突发 | 1 地址 + 16 数据 = **N+1**（每 16 拍多 1 个地址） | **94%** |
+
+以 icache 的 128B 行为例（32 个字）：
+- 原总线：32 字 × 2 拍 = **64 拍**
+- AHB-Lite：`HBURST` 上限 16 beat ⇒ 拆成 2 个 `INCR16` ⇒ **34 拍** —— **约 1.9×**
+
+若再把 DDR 侧数据通路加宽到 64 位（`mem_ctrl` 的齿轮箱），128B 行变成 16 个 64bit beat ⇒ **17 拍** —— **约 3.7×**。
+
+> **⚠️ 但必须诚实说清：这个收益今天拿不到。**
+> 原因有二：
+> ① **现在挂在系统总线上的 4 个外设全是"单字寄存器访问"**（uart/plic/gpio/i2c），本来就 1 拍一笔，
+>    突发无从施展 ⇒ **本轮换总线对吞吐的净收益是 0**。这一点被实测证实了：CoreMark 的
+>    `Total ticks` 换总线前后**一个数都没变**（`1049534`）。
+> ② **`icache`/`dcache` 的填充不走这条总线**（它们在 `cpu_top` 核内直连 `itcm`/`dtcm`）。
+>    而突发收益最大的恰恰是缓存行填充。按 §24.7 的规划，DDR/flash 控制器将来也与
+>    **cache 的 mem 侧直连**（第二套总线），**不进 `ahb_interconnect`**。
+>
+> ⇒ **AHB-Lite 的真正价值是"接口标准化"而非"当前提速"**：将来 DMA / NPU / 第三方 IP
+> 可以按规范直接挂上来，且 `HRESP` 给了未映射地址一个明确结局（协议规定回 ERROR，
+> 而不是像原总线那样让 CPU 停在 `STALL` 永不退出）。**突发能力是为那一步预留的。**
+
+**AHB 的另一个硬限制（选型时要知道）**：`HBURST` 单次**最多 16 beat**。
+32 位总线下一次突发最多搬 64B，所以 1KB 地址边界每 16 笔就要重新发一次地址；
+这也是 §24.7 里"内存侧不能靠 AHB、必须给 cache 一条独立通路"的判断依据之一
+（AXI 的突发上限是 256 beat，32 位下 1KB、64 位下 2KB）。

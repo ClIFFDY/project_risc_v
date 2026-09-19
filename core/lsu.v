@@ -36,6 +36,7 @@ module lsu(
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
     output reg bus_we_out,
+    output reg bus_valid_out,
     output reg [31:0] ld_data_out,
     output reg loaded,
     output reg ld_we,
@@ -91,6 +92,7 @@ module lsu(
             bus_data_out <= 32'd0;
             bus_be_out <= 4'd0;
             bus_we_out <= 1'b0;
+            bus_valid_out <= 1'b0;
         end
         else begin
             if (stage == STALL) begin
@@ -99,6 +101,7 @@ module lsu(
                     bus_we_out <= 1'b0;
                     bus_be_out <= 4'd0;
                     bus_data_out <= 32'd0;
+                    bus_valid_out <= 1'b1;
                 end
 //读地址只摆一拍：外设应答是寄存的，下一拍照常到达，重复摆地址只会让它连答
                 else begin
@@ -106,6 +109,7 @@ module lsu(
                     bus_we_out <= 1'b0;
                     bus_be_out <= 4'd0;
                     bus_data_out <= 32'd0;
+                    bus_valid_out <= 1'b0;
                 end
             end
         else if (stage == EXE) begin
@@ -113,19 +117,22 @@ module lsu(
             bus_data_out <= 32'd0;
             bus_be_out <= 4'd0;
             bus_we_out <= 1'b0;
+            bus_valid_out <= 1'b0;
             case (opcode)
             OPCODE_LOAD: begin
+                bus_valid_out <= ld_push_eff;
                 case (func10[2:0])
                 3'b000: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
                 3'b001: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
                 3'b010: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
                 3'b100: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
                 3'b101: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 30'd0;
-                default: bus_addr_out <= 30'd0;
+                default: begin bus_addr_out <= 30'd0; bus_valid_out <= 1'b0; end
                 endcase
             end
             OPCODE_STORE: begin
                 bus_we_out <= 1'b1;
+                bus_valid_out <= 1'b1;
                 case (func10[2:0])
                 3'b000: begin
                     bus_addr_out <= st_addr >> 2;
@@ -142,7 +149,7 @@ module lsu(
                     bus_be_out <= 4'b1111;
                     bus_data_out <= r2_data_final;
                 end
-                default: bus_addr_out <= 30'd0;
+                default: begin bus_addr_out <= 30'd0; bus_valid_out <= 1'b0; end
                 endcase
             end
             endcase
@@ -152,6 +159,7 @@ module lsu(
             bus_data_out <= 32'd0;
             bus_be_out <= 4'd0;
             bus_we_out <= 1'b0;
+            bus_valid_out <= 1'b0;
         end
         end
     end

@@ -69,14 +69,14 @@ module dtcm(
             req_d <= mem_req;
 //写：单拍，字节使能直接落到 BRAM 的字节写口
             if (wr_now) begin
-                if (mem_be[0]) dtcm[mem_addr[13:2]][7:0]   <= mem_wdata[7:0];
-                if (mem_be[1]) dtcm[mem_addr[13:2]][15:8]  <= mem_wdata[15:8];
-                if (mem_be[2]) dtcm[mem_addr[13:2]][23:16] <= mem_wdata[23:16];
-                if (mem_be[3]) dtcm[mem_addr[13:2]][31:24] <= mem_wdata[31:24];
+                if (mem_be[0]) dtcm[mem_addr[14:2]][7:0]   <= mem_wdata[7:0];
+                if (mem_be[1]) dtcm[mem_addr[14:2]][15:8]  <= mem_wdata[15:8];
+                if (mem_be[2]) dtcm[mem_addr[14:2]][23:16] <= mem_wdata[23:16];
+                if (mem_be[3]) dtcm[mem_addr[14:2]][31:24] <= mem_wdata[31:24];
             end
 //读：锁行首地址，按行连吐 8 个字
             if (start & ~mem_we) begin
-                raddr  <= mem_addr[13:2];
+                raddr  <= mem_addr[14:2];
                 cnt    <= 4'd8;
                 addr_v <= 1'b1;
             end
