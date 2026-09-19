@@ -37,7 +37,7 @@ module pre_decoder(
     output reg [31:0] aux_addr_out,
     output reg [4:0] imm5_csr_out,
     output reg [6:0] opcode_dec, opcode_lsu,
-    output reg jal, dec, lsu, br_en, jalr,
+    output reg jal, dec, lsu, mul, br_en, jalr,
     output reg br_pred_taken_out,
     output reg [31:0] jalr_pred_addr_out
     );
@@ -103,6 +103,7 @@ module pre_decoder(
             rd <= 5'd0;
             dec <= 1'd0;
             lsu <= 1'd0;
+            mul <= 1'd0;
             imm_alu_out <= 32'd0;
             offset_jalr0 <= 32'd0;
             offset_beq0_aux <= 32'd0;
@@ -127,6 +128,7 @@ module pre_decoder(
             rd <= 5'd0;
             dec <= 1'd0;
             lsu <= 1'd0;
+            mul <= 1'd0;
             imm_alu_out <= 32'd0;
             offset_jalr0 <= 32'd0;
             offset_beq0_aux <= 32'd0;
@@ -150,6 +152,9 @@ module pre_decoder(
                 func10_dec <= {inst_effective[31:25], inst_effective[14:12]};
                 opcode_dec <= OPCODE_OP;
                 dec <= 1'd1;
+//RV32M：funct7==0000001 是乘除法。给 regfile 一条独立的读数据通路（复制副本降扇出），
+//mulu 用它自己那一份，不与其他消费单元共享 _dec/_lsu 的网。
+                if (inst_effective[31:25] == 7'b0000001) mul <= 1'd1;
             end
             OPCODE_OP_IMM: begin
                 imm_alu_out <= immI(inst_effective);
@@ -238,6 +243,7 @@ module pre_decoder(
             rd <= rd;
             dec <= dec;
             lsu <= lsu;
+            mul <= mul;
             func10_dec <= func10_dec;
             func10_lsu <= func10_lsu;
             imm_alu_out <= imm_alu_out;
@@ -262,6 +268,7 @@ module pre_decoder(
             rd <= 5'd0;
             dec <= 1'd0;
             lsu <= 1'd0;
+            mul <= 1'd0;
             func10_dec <= 10'd0;
             func10_lsu <= 10'd0;
             imm_alu_out <= 32'd0;

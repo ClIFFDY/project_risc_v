@@ -46,8 +46,12 @@ module wb_reg(
             result_out <= 32'd0;
             result_back2 <= 32'd0;
         end
+//STALL 期间只保持数据，【写使能拉低】：
+//若跟着保持，被冻住的这条 ALU 指令会每拍往 regfile 重复写一次，把期间更新的
+//load/mulu 结果又盖回去（CoreMark rv32im 里 divu 冻住 wb_reg 34 拍、后面 sb 读到陈旧值）。
+//写使能一拍已在进入本级那拍完成，故此处清零不会丢写。
         else if (stage == STALL) begin
-            we_out <= we_out;
+            we_out <= 1'd0;
             rd_out <= rd_out;
             rd_back2 <= rd_back2;
             result_out <= result_out;

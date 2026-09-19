@@ -122,9 +122,18 @@ module decoder(
                     r1_data_out <= r1_data_final;
                     r2_data_out <= r2_data_final;
                     rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    alu_func4 <= {func10[8], func10[2:0]};
-                    we <= 1'd1;
+//RV32M：写回由 mulu 独立完成，这条路必须让开 —— 否则同一条指令被写两次，
+//而且 alu 会按【撞车的 func3】算出垃圾结果、再经 rd_back1 前递给紧邻的下一条。
+//M 与普通 ALU 共用 OPCODE_OP，只能靠 funct7 区分（func10[9:3]==7'b0000001）。
+                    if (func10[9:3] == 7'b0000001) begin
+                        rd_back1 <= 5'd0;
+                        we <= 1'd0;
+                    end
+                    else begin
+                        rd_back1 <= rd_in;
+                        alu_func4 <= {func10[8], func10[2:0]};
+                        we <= 1'd1;
+                    end
                 end
                 OPCODE_OP_IMM: begin
                     r1_data_out <= r1_data_final;

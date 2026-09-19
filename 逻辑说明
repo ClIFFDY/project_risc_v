@@ -1945,3 +1945,420 @@ mcu_top
 32 位总线下一次突发最多搬 64B，所以 1KB 地址边界每 16 笔就要重新发一次地址；
 这也是 §24.7 里"内存侧不能靠 AHB、必须给 cache 一条独立通路"的判断依据之一
 （AXI 的突发上限是 256 beat，32 位下 1KB、64 位下 2KB）。
+
+## §25 RV32M 乘除法扩展（2026-09-19）
+
+### 25.1 为什么做
+
+CoreMark `-O2` 剖析（`Tools/test/coremark/tb_cm_prof.v`，ITERATIONS=1，总 1,391,245 拍）：
+
+| 项 | 拍数 | 占比 |
+|---|---|---|
+| `__mulsi3`（libgcc 移位-加法软乘法） | 560,778 | 40.3%（9,492 次，约 59 拍/次） |
+| dcache 缺失等待 | 158,652 | 11.4% |
+
+取指**零缺失**、IPC 0.833，所以 CoreMark/MHz 只有 0.952 的**唯一主因就是核里没有硬件乘法器**。
+
+### 25.2 方案：仿 lsu 的独立 mulu + regfile 第三写口
+
+不做"组合乘法塞进 alu"，而是新增 `RTL/core/mulu.v`，**与 `lsu` 流水线行为同步**；
+`regfile` 由 2 写口扩到 3 写口（`we_alu` / `we_ld` / `we_mul`）。
+
+**乘法两级流水**（对齐 lsu 的提交沿；`opcode`/`func10` 取自 `mem_buf` 输出，与 lsu 同源）：
+
+| 拍 | 动作 |
+|---|---|
+| T | 指令在 mulu 级，组合判 `is_mul` |
+| T→T+1 | 锁操作数 `m_a`/`m_b`/`m_op`/`m_rd` |
+| T+1 | 33×33 有符号乘法（`a_ext`/`b_ext` 按 funct3 补符号位或补 0） |
+| T+1→T+2 | 锁乘积 `m_p` |
+| T+2 | `mul_we` / `mul_loaded` 拉高（= lsu 的写沿） |
+| T+3 | `hold`（`mul_loaded` 第二拍，对应 lsu 的 `ld_hold`） |
+
+`MULH/MULHSU/MULHU` 只是取 `m_p[63:32]`，靠两个 33 位扩展实现全部 4 条：
+
+- `a_ext = (funct3==3'b011) ? {1'b0, a} : {a[31], a}` —— 011=MULHU 才无符号
+- `b_ext = (funct3[1])       ? {1'b0, b} : {b[31], b}` —— 010/011=MULHSU/MULHU 无符号
+
+**除法是 32 拍移位-相减迭代 + FSM**（组合除法会直接成为新的最差路径），期间用一个 stall
+冻住取指/预解码/decoder/wb_reg；边界值在 RTL 里**显式**处理：
+除零 → 商全 1、余数=被除数；`INT_MIN/-1` → 商 `INT_MIN`、余数 0。
+
+**`decoder` 必须抑制 M 指令的 ALU 写回**：M 与普通 ALU 共用 `OPCODE_OP`，而
+`alu_func4 = {inst[30], funct3}` 的 8 个码与 M 的 funct3 **全部撞车** ⇒
+`func10[9:3]==7'b0000001` 命中时 `we<=0` 且 `rd_back1<=0`（否则 ALU 的垃圾结果
+会被 back1 前递出去污染紧邻的下一条）。
+
+**独立第三份读数据通路**：`pre_decoder` 出 `mul` 标志，`regfile` 用它单独填
+`r1_data_mul`/`r2_data_mul`（与 `dec`/`lsu` 用**独立 `if`**，因为 M 指令的 `dec` 与 `mul` 同为 1），
+`forw` 复制出第三份镜像链 `r1_data_final_mul`。目的是照 `pc.v` 的 `pc_addr`/`aux_addr`
+手法**按消费者拆扇出**，**不是**给组合网加 `max_fanout`（§22.5 的教训）。
+
+### 25.3 踩到的两个真缺陷
+
+#### 25.3a 除法写口比"程序序在它前面的指令"早（`mulu.v`）
+
+触发形态（`core_main.c` 里的 `TOTAL_DATA_SIZE / 核数`）：
+
+```asm
+2edc:  li   a1,2000        # ALU 指令，程序序在前
+2ee0:  divu a1,a1,a4       # 34 拍长指令
+```
+
+实测写口时序（`$time`，时钟周期 10ns）：
+
+```
+t=47805  mul_we=1  mul_d=0000029a   ← divu 写 x11 = 666
+t=47825  alu_we=1  alu_d=000007d0   ← li  的写，晚 2 拍
+```
+
+`li` 被同一个 `mul_stall` 冻在 c3/c4 共 34 拍；除法却在 `d_done` 当拍**直接写口**，
+解冻后 `li` 才走完 c4→写口 ⇒ 同 rd 时**晚写的赢**，`a1` 最终留下 2000 而不是 666。
+传导下去就是 `results[i].memblock` 全偏 → 越界 load → 无从设备应答 → lsu 在途队列
+指针失步（`wrt=0/rdp=2`，`fifo_full=1` 却无真实请求）→ **PC 永久冻结**。
+
+**修法**：给除法结果加一条 3 拍提交延迟链 `d_cmt_q`，写口脉冲落在 `d_done+3`
+（即 c2 → c3 → c4 → 写口 的正常级数），`mul_loaded` 的前递窗口同步覆盖 `d_done+1..+3`。
+`d_cmt_q` **只由 rst 清、不判 flush**：`d_done` 一旦发出说明这条 div 已即将离级，
+被冲刷不会重执行，结果必须照样提交（与乘法第二级不判 flush 同理）。
+
+#### 25.3b `wb_reg` 在 STALL 期间反复写同一个值（`wb_reg.v`）★
+
+这个更隐蔽，而且是**25.3a 修好之后才暴露出来的**。
+
+形态（rv32im 的 `ee_printf.number()` 十六进制转换循环）：
+
+```asm
+2450: remu a5,a1,a2      ; a5 = num % base
+2464: add  a5,t5,a5      ; a5 = dig + index    ← ALU 写 a5
+2468: lbu  a5,0(a5)      ; a5 = 表里的字节      ← load 写同一个 a5
+246c: divu a1,a1,a2      ; ★ 34 拍长指令夹在中间
+2470: sb   a5,-1(t3)     ; 消费者
+```
+
+`divu` 把 `decoder`/`wb_reg` 连同 `add a5` 的结果一起冻住 34 拍。而 `wb_reg` 在
+`stage == STALL` 时**保持 `we_out` 不放** ⇒ 这条被冻住的 ALU 指令**每拍都往 regfile
+重复写一次**，把期间 load 已经写进去的字节又盖回成**地址**（`dig + index` 的低字节）。
+消费者拿到的是地址 ⇒ 打印出来每个字符都是 `0x54+digit`，而 `0x54` 正是 `digits`
+表的地址低字节。**注意 `stalled` 抑制 back1 那一层本来是对的**（stall 期间确实压住了），
+真正的漏点是 regfile 被反复写。
+
+**修法**：`wb_reg` 的 STALL 分支把 `we_out` 清 0（只保持数据，保持写使能 = 反复写）。
+写使能那一拍已在进入本级那拍完成，所以清零不会丢写。
+
+**为什么微测没抓到**：45 条 RV32M 微测里没有「长指令夹在 load 和它的消费者之间」这一形态。
+已在 `Tools/test/mul/mul.s` 补上 26–44 共 19 条：`div/divu/rem/mul` 前紧邻写同一 rd 的
+ALU 指令、前置写换成 `load`、`add`+`lbu` 同 rd、divu 结果参与地址计算、以及**反面对照**
+（前置无同 rd 写时本就不该出错）。
+
+### 25.4 验证
+
+| 项 | 结果 |
+|---|---|
+| RV32M 微测 `Tools/test/mul/tb_mul.v` | **45/45** |
+| 全量回归 `Tools/test/regression.sh` | **16/16 全绿** |
+| CoreMark rv32im CRC | **与 rv32i 逐位相同**：`seedcrc 0xe9f5` / `crclist 0xe714` / `crcmatrix 0x1fd7` / `crcstate 0x8e3a` |
+| CoreMark 拍数（ITERATIONS=1，含一次性开销） | 1,391,245 → **816,039** |
+| **CoreMark 稳态每迭代拍数**（(总(4次)−总(1次))/3） | 1,050,263 → **482,802** |
+| **CoreMark/MHz** | **0.952 → 2.07**（2.18×） |
+
+> **口径必须用稳态，不能用 `ITERATIONS=1` 的拍数** —— 后者含约 33 万拍一次性开销
+> （`portable_init` / `core_list_init` / `core_init_matrix` / 打印），会把它当成 41% 的每迭代成本，
+> 把结论压到 1.62。正确做法：跑 `ITERATIONS=4` 与 `ITERATIONS=1` 各一次，
+> `每迭代 = (总拍数(4) − 总拍数(1)) / 3`。两个自洽校验：
+> `1e6/1,050,263 = 0.952`（正好是既有基线值）；`1,050,263 − 482,802 = 567,461 ≈ __mulsi3 的 560,778`。
+
+### 25.4b 综合 / 实现实测（Vivado 2019.1，xc7z010clg400-1，50MHz）
+
+| 项 | 基线（无 M） | 加 M 后 |
+|---|---|---|
+| WNS | +0.439 ns | **+0.353 ns（MET，全约束满足）** |
+| 最差路径起点 | `jalr_target_q1_reg` | `u_decoder/jalr_pred_addr_out_reg[15]` |
+| Slice LUTs | 11,505（65.4%） | **12,756（72.5%）** |
+| Slice Registers | 8,054 | 8,257 |
+| Block RAM Tile | 42.5 / 60 | 43.5 / 60 |
+| DSP48E1 | 0 | **4**（33×33 有符号乘法 → 4 个 DSP，Block Arithmetic） |
+
+**关键路径没有被乘法器抢走**：起点仍是 §22.8 那条 jalr 预测地址的组合环，与 `mulu` 无关。
+WNS 相比基线掉 0.086 ns，来源是多出的 1,251 个 LUT 带来的拥塞，不是 DSP 布局竞争。
+
+> **加 `mulu.v` 时必须同步往 `project_risc.xpr` 的 `sources_1` 文件表里加一条**，否则综合报
+> `[Synth 8-439] module mulu not found`。另注意：若同时有另一个 Vivado 进程开着该工程，
+> 它退出时会用自己内存里的旧文件表覆盖 `.xpr`，把手改的条目冲掉。
+
+> **`ITERATIONS=1` 时 CoreMark 必然打印 `Errors detected`** —— 它要求跑满 10 秒才算合法结果，
+> **这不是 CRC 校验失败**：rv32i 版输出同样的行，且两者 `crclist/crcmatrix/crcstate` 完全一致。
+
+### 25.5 已知未尽
+
+- **除法 32 拍全阻塞**：CoreMark 只有 2 次除法，影响可忽略。若将来除法密集，可改成
+  "只冻消费者"（照 lsu 在途队列的形态），而不是冻整条流水线。
+- **`Tools/test/run.sh` 用 `RTL/core/*.v` 通配**，新增 `mulu.v` 自动收编，无需改脚本。
+- **`-march` 已统一为 `rv32im_zicsr`**：`Tools/coremark/Makefile.coremark`、`Tools/test/run.sh`、
+  `Tools/build.sh` 三处。
+
+## §26 dcache：整字 store 命中不再写失效（2026-09-19）
+
+### 26.1 为什么改
+
+M 扩展做完后（§25），CoreMark 稳态每迭代 482,802 拍，其中 **dcache 缺失等待 152,943 拍（31.7%）**，
+是最大单项。加探针量缺失来源：
+
+```
+读缺失        = 13,167 次
+写总数        = 15,325（命中 12,779 / 未命中 2,546）
+其中整字(BE=1111) = 11,311 / 子字 = 1,468
+-> 写命中失效  = 12,779 次
+```
+
+**`写命中失效 12,779 ≈ 读缺失 13,167` —— 97% 的读缺失是写失效策略自己制造的。**
+每次 store 命中都 `valid <= 0`，而 CoreMark 的状态机/矩阵全是原地更新，
+于是「写→失效→下次读又缺失」一直循环。
+
+### 26.2 改法：整字 store 命中走【行内更新】，不失效
+
+关键观察：**写命中里 88.5%（11,311 / 12,779）是整字 store（`sw`，BE=1111）** ——
+整字覆盖整个字，**不需要读-改-写**，直接用现成的单写口写进阵列即可。
+子字 store（`sb`/`sh`，1,468 次）覆盖不了整字，仍走写失效。
+
+写穿照做、缓存与 dtcm 始终一致，所以**不需要脏位与换出**。
+
+### 26.3 坑：两路写必须合成【一条写语句】，否则 BRAM 推断会掉
+
+第一版写成 `if (fill...) data[...] <= mem_data; else if (wr_full_hit) data[...] <= bus_data_in;`
+—— **同一进程内对 `data` 写了两次**，Vivado 判成「同进程内多端口写」：
+
+```
+WARNING: [Synth 8-6849] Infeasible attribute ram_style="block" set for RAM
+         "u_cpu_topi_2/u_dcache/data_reg", trying to implement using LUTRAM
+```
+
+16KB 阵列掉进 LUTRAM ⇒ `Place 30-640`：需要 20,330 个 LUT 位点、器件只有 17,600 ⇒ 布局失败。
+
+**修法**：地址 / 数据 / 使能各算一个表达式，最后只有**一条**写语句：
+
+```verilog
+always @(*) begin
+    is_fill_wr = (stage == 1'd1) && !fill_end && mem_valid;
+    ram_we     = is_fill_wr || wr_full_hit;
+    if (is_fill_wr) begin ram_waddr = {fill_way, fill_idx, fill_cnt}; ram_wdata = mem_data;     end
+    else            begin ram_waddr = {hit_way[1], idx, word};         ram_wdata = bus_data_in; end
+end
+always @(posedge clk) if (ram_we) data[ram_waddr] <= ram_wdata;
+```
+
+两路天然互斥（`wr_req` 要求 `stage==0`，填充时 `stage==1`），写口 mux 无冲突。
+
+> **这条坑与 `regfile` 同源**：Vivado 报 `regs_reg` 时给的理由就是
+> "RAM has multiple writes via different ports in same process"。
+
+### 26.4 验证
+
+| 项 | 结果 |
+|---|---|
+| 新微测 `ldst/tb_ldst_wrhit.v` | **13/13**（同行 store→load、行内 8 字全写全读、跨组跨路、子字 store、子字后整字覆盖；探针确认整字命中 11 次 / 子字 3 次） |
+| 全量回归 | **17/17 全绿**（新增这条已登记进 `Tools/test/regression.sh`） |
+| CoreMark CRC | 仍是 `0xe714 / 0x1fd7 / 0x8e3a` ✓ |
+| CoreMark 拍数（ITER=1） | 816,039 → **678,649** |
+| dcache 缺失（ITER=1） | 13,167 → **1,583**（−88%） |
+| IPC | 0.761 → **0.9155** |
+| **CoreMark 稳态每迭代拍数** | 482,802 → **347,812** |
+| **CoreMark/MHz** | 2.07 → **2.88**（对 rv32i 基线 0.952 共 **3.02×**） |
+| WNS | +0.353 → **+0.581 ns（MET）** |
+| Slice LUTs | 12,756 → 13,129（74.6%） |
+| Block RAM Tile | 43.5 / 60（**不变**，推断保住） |
+
+### 26.5 已知未尽
+
+- **子字 store 仍写失效**：1,468 次/迭代，是剩余缺失的大头。要做得多一次「读-改-写」（读口+写口两拍），收益递减。
+- **写未命中不回填（no-write-allocate）**：保持现状，回填要引入脏数据管理。
+- **未做 write-back**：写穿已保证 dtcm 始终最新，换 write-back 只省 dtcm 写次数，收益小。
+
+## §27 写口合并与 mulu 的 stall 门控（2026-09-19）
+
+### 27.1 起因：regfile 是全设计最大的 LUT 大户
+
+加完 M 扩展后跑 `report_utilization -hierarchical`（实现后）：
+
+| 模块 | Logic LUTs | 占比 |
+|---|---|---|
+| **u_regfile** | **4,223** | **33.1%** |
+| u_icache | 1,357 | 10.6% |
+| u_dcache | 1,325 | 10.4% |
+| u_decoder | 1,167 | 9.1% |
+| u_lsu | 943 | 7.4% |
+| u_uart | 823 | 6.4% |
+| u_bra_predict | 721 | 5.6% |
+| u_mem_buf | 628 | 4.9% |
+| u_mulu | 572 | 4.5% |
+
+`regs` 声明了 `(* ram_style = "block" *)`，但综合明确拒绝：
+
+```
+WARNING: [Synth 8-4767] Trying to implement RAM 'regs_reg' in registers.
+	1: RAM has multiple writes via different ports in same process.
+```
+
+⇒ 32×32 全散成 FF，于是每个写口都要一份 32×32 地址译码、`bypass()` 也要按读侧镜像复制。
+
+### 27.2 一条接口契约：在途单元看到的冻结信号要「减掉自己」
+
+写口能合并的前提是**同拍不撞**。这里踩到一个真缺陷，值得立成契约：
+
+**`mulu` 原来只判自己内部的三类冒险**（div 未发起 / div 进行 / mul-use），
+**看不到 controller 的合成 stall**，也没有 `stage` 输入：
+
+```verilog
+m_push = is_mul && !stall && !flush && !bus_hold_in;   // stall = mulu 自己的输出
+```
+
+所以只要 icache / dcache 有多拍事务把一条 mul 冻在 c2，`m_push` 就**逐拍重发**
+→ `m_v` 恒 1 → `m_pv` 连续拉高 → `we_mul` 连续多拍，写口沿与 alu 彻底错开。
+
+**为什么 CoreMark 测不出来**：它的 `.text` 只有 13,672B，落在 icache way0 锁定的 16KB 内，
+**icache 缺失恰好是 0**。为此专门建了 `Tools/test/mul/tb_icmiss.v`：程序 24.8KB、跨过
+0x4000、6000 条 nop 夹 180 条 mul。实测：
+
+```
+icache 缺失                                   = 67 次
+危险窗口（icache 填充时 M 指令正停在 mulu 级） = 70 拍    ← 就是这条通路
+```
+
+**修复**：`mulu` 增加 `pipe_stall` 输入，把**乘法两级流水、除法提交链 `d_cmt_q`、输出保持 `hold`
+全部按它冻结** —— 与 alu 的写回级同呼吸，写口沿恢复同偏移。
+
+> **坑（自锁）**：喂给 mulu 的信号**必须排掉 `mul_stall`** —— 那正是 mulu 自己的输出
+> （div 进行 / mul-use 冒险）。第一版没排，一冻结就永远等不到 `m_pv`，微测当场挂掉 36 条。
+> 故 `cpu_top` 里分两根：
+> ```verilog
+> wire pipe_stall_w = stall | mul_stall | icache_busy_w | bus_hold_in | d_hold_int;  // 给 controller 定 stage
+> wire mul_freeze_w = stall | icache_busy_w | bus_hold_in | d_hold_int;              // 给 mulu，排掉自己
+> ```
+
+**契约表述**：*已发射的事务（mulu 的乘除、lsu 的在途 load）一旦发起就必须跑完 —— 冻它只会自锁；
+外部停顿必须先冻住它们，否则写口沿会与 alu 错开。所以每个「有在途事务」的单元，
+看到的冻结信号 = 全流水线 stall 减去它自己。*
+
+（`stage` 本身**保留**：它是 `(flush, stall)` 的纯组合函数、无状态，分发与集中信息等价；
+它的价值是「八个流水级同一拍冻结」这个单一广播不变式，改成各模块自判会把它降成八处约定。）
+
+### 27.3 写口合并：3 → 2
+
+| 口 | 承载 | 依据 |
+|---|---|---|
+| **A** | `alu` \| `mul` | 两者写沿都由**流水线偏移**决定（c2+3），且 mulu 的级已按 `mul_freeze_w` 冻结 ⇒ 严格同偏移、永不同拍（三个微测实测 **0 次同拍**） |
+| **B** | `ld` | load 的写沿由**总线事务长度**决定（多拍），与流水线偏移不绑定，**与谁合并都可能撞**，故独占一口，保持「撞上也是两条独立写」 |
+
+**`bypass()` 与写口统一成同一优先级（alu > mul > ld）**：改前 bypass 是 `alu>ld>mul`、
+写口是 `mul>ld>alu`，方向正好相反（§2.2 记的老隐患）。
+
+> **曾经试过 3→1**（三口全合）：LUT 9,622 / WNS +0.751，看着更漂亮，但**同拍时会丢写**
+> —— 靠的是「实测没撞过」这个统计，硬件里没有兜底。**已放弃。**
+
+### 27.4 验证
+
+| 项 | 结果 |
+|---|---|
+| 回归 | **18/18 全绿**（新增 `mul/tb_icmiss.v`） |
+| `mul/tb_mul.v` | **60/60**，含 alu/mul 同拍检测器、`m_push` 重复推送检测器 |
+| CoreMark CRC | `0xe714 / 0x1fd7 / 0x8e3a` ✓ |
+| CoreMark 拍数 | 678,649 —— **与改动前逐拍一致**（无性能损失） |
+| alu/mul 同拍共写口 | **0 次**（三个测试全程） |
+| Slice LUTs | 13,129 → **11,487（−1,642，−12.5%）** |
+| Slice Registers | 8,238 → **7,730（−508）** |
+| WNS | +0.581 → **+0.505 ns（MET）** |
+| Block RAM / DSP | 43.5 / 4（不变） |
+
+### 27.5 已知未尽
+
+- ~~**`u_uart` FIFO 64 → 32**~~：已做（`rx_buf[0:31]` / `tx_buf[0:31]`，指针 6→5 位，零头清零循环 64→32）。
+  **位宽必须跟着一起收**，否则回绕位与满空判定不符。省 512 个 FF；CoreMark 输出与拍数均不变。
+- **`u_mem_buf` 628 LUTs** 对纯流水寄存器偏多，值得单独看。
+- **`icache` 缺失通路现在有测试守着**，但只覆盖了「缺失 + mul 在途」；缺失与其他在途单元的
+  交互（将来若加 FPU/DMA）需照 §27.2 的契约重新评审。
+
+## §28 板级实测：CoreMark 上板（2026-09-19，xc7z010clg400-1 @ 50MHz）
+
+### 28.1 流程
+
+```bash
+ITERATIONS=0 bash Tools/coremark/Makefile.coremark     # 自动标定版 -> Data/ins.hex + data.hex
+vivado -mode batch -source run_board.tcl               # synth -> impl -> write_bitstream
+# 产物: project_risc.runs/impl_1/mcu_top.bit
+```
+
+- **`ITERATIONS=0` 是自动标定**：先跑满 10 秒再定迭代数，**所以上电后有一段完全没有输出的静默期**。
+  为此在 `barebones/core_portme.c` 的 `portable_init()` 里（UART 初始化之后、`main` 任何输出之前）
+  加了一段 banner 打印，避免看起来像卡死。
+- 比特流里的程序来自综合时读的 `Data/ins.hex`（`itcm.v` / `dtcm.v` 的 `$readmemh`）。
+  **重出比特流前必须先重编 CoreMark** —— `Tools/test/run.sh` / `regression.sh` 会覆盖 `Data/ins.hex`。
+
+### 28.2 实测输出
+
+```
+CoreMark Size    : 666
+Total ticks      : 13915
+Total time (secs): 13
+Iterations/Sec   : 153
+Iterations       : 2000
+Compiler version : GCC15.2.0
+Compiler flags   : -O2-HAS_FLOAT=0
+Memory location  : STACK
+seedcrc          : 0xe9f5
+[0]crclist       : 0xe714
+[0]crcmatrix     : 0x1fd7
+[0]crcstate      : 0x8e3a
+[0]crcfinal      : 0x4983
+Correct operation validated.
+```
+
+### 28.3 解读
+
+**① 功能：CoreMark 自校验通过**（`Correct operation validated`）——
+它用 `seedcrc` 从内建表选期望值自查，是最强判据。三个分量与 rv32i 基线**逐位相同**
+（`0xe714 / 0x1fd7 / 0x8e3a`）。
+
+> **`crcfinal = 0x4983` 与仿真里的 `0xe714` 不同是正常的**：`crcfinal` 是 **2000 次迭代的累计** CRC
+> （每次迭代把 list/matrix/state 串进去）；仿真那次只有 1 次迭代，累计值恰好等于 crclist。
+> CoreMark 的校验已覆盖该项，不需要另行解释。
+
+**② 性能：与仿真吻合到 0.02%**
+
+```
+13915 ms / 2000 次 = 6.9575 ms/迭代
+6.9575 ms × 50MHz  = 347,875 拍/迭代
+仿真实测            = 347,812 拍/迭代     ← 差 0.02%
+```
+
+这条吻合同时验证了两件事：**50MHz 时钟假设成立**；**仿真拍数可以直接当板级拍数用**。
+
+**③ 分数**
+
+| 口径 | 值 |
+|---|---|
+| CoreMark 打印的 `Iterations/Sec` | **153**（它用截断的整数秒 13 算） |
+| 按真实 13.915 s | **143.7** |
+| **CoreMark/MHz** | **2.87** |
+
+`Total ticks` 单位是毫秒（`CLOCKS_PER_SEC=1000`）；13.9 s 满足 CoreMark「≥10 秒」的合法性要求。
+
+**④ 对基线的总加速**
+
+| 版本 | 50MHz 得分 | CoreMark/MHz |
+|---|---|---|
+| rv32i（无 M、写失效 dcache、3 写口） | 47.6 | 0.95 |
+| **本版（RV32IM + dcache 写命中修复 + 2 写口）** | **~144** | **2.87** |
+
+**3.0×**。各步贡献：§25 的 M 扩展 2.18×；§26 的 dcache 写命中修复到 2.88×；
+§27 的写口合并 / mulu stall 门控**把 LUT 降了 12.5% 而性能一拍未变**。
+
+### 28.4 本版最终时序与资源（实现后，50MHz，period=20ns）
+
+| 项 | 值 |
+|---|---|
+| **WNS** | **+0.505 ns（MET，全约束满足）** |
+| Slice LUTs | 11,487 / 17,600（65.27%） |
+| Slice Registers | 7,730 / 35,200（21.96%） |
+| Block RAM Tile | 43.5 / 60（72.50%） |
+| DSP48E1 | 4 / 80 |
+| 比特流 | `project_risc.runs/impl_1/mcu_top.bit` |

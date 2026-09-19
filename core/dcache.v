@@ -58,8 +58,12 @@ module dcache(
     reg fill_way;
 
     reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
+    reg wr_full_hit;
     reg [11:0] rd_addr;
     reg rd_en;
+    reg is_fill_wr, ram_we;
+    reg [11:0] ram_waddr;
+    reg [31:0] ram_wdata;
     reg [31:0] wr_addr, wr_data;
     reg [3:0] wr_be;
 
@@ -79,6 +83,9 @@ module dcache(
 
         rd_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
         wr_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
+//整字 store 命中：能整字覆盖行内那个字，故【不失效】，直接行内更新。
+//写穿照做，缓存与后端仍一致。子字 store 覆盖不了整字，维持写失效。
+        wr_full_hit = wr_req && cache_hit && (bus_be_in == 4'b1111);
 
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'd1) && !fill_end;
@@ -104,11 +111,26 @@ module dcache(
         rd_addr = fill_end ? {fill_way, fill_idx, miss_word} : {hit_way[1], idx, word};
     end
 
-//写口：只有回填这一路整字写 —— 单写口，所以这个阵列能推成 BRAM
-//字节粒度写会变成多个独立写操作（BRAM 只有 1 个写口），推不成，故不做缓存行更新
+//写口：两路整字写共用【单写口】，仍能推成 BRAM ——
+//  ① 回填（stage==1）
+//  ② 整字 store 命中（stage==0）
+//两者天然互斥：wr_req 要求 stage==0，填充时 stage==1。
+//字节粒度写会变成多个独立写操作（BRAM 只有 1 个写口），推不成，故子字 store 不做行更新。
+    always @(*) begin
+        is_fill_wr = (stage == 1'd1) && !fill_end && mem_valid;
+        ram_we     = is_fill_wr || wr_full_hit;
+        if (is_fill_wr) begin
+            ram_waddr = {fill_way, fill_idx, fill_cnt};
+            ram_wdata = mem_data;
+        end
+        else begin
+            ram_waddr = {hit_way[1], idx, word};
+            ram_wdata = bus_data_in;
+        end
+    end
+
     always @(posedge clk) begin
-        if (stage == 1'd1 && !fill_end && mem_valid)
-            data[{fill_way, fill_idx, fill_cnt}] <= mem_data;
+        if (ram_we) data[ram_waddr] <= ram_wdata;
     end
 
 //每拍先清零：cpu_top 把 dcache/tim_in/dtcm 的读数据按【位或】合流成一个 bus_data_in_final，
@@ -161,8 +183,14 @@ module dcache(
             end
 
             if (wr_req) begin
-                if (hit_way[0])      valid0[idx] <= 1'b0;
-                else if (hit_way[1]) valid1[idx] <= 1'b0;
+                if (wr_full_hit) begin
+                    if (hit_way[0]) lru[idx] <= 1'b1;
+                    else            lru[idx] <= 1'b0;
+                end
+                else begin
+                    if (hit_way[0])      valid0[idx] <= 1'b0;
+                    else if (hit_way[1]) valid1[idx] <= 1'b0;
+                end
                 if (!mem_ready) begin
                     wr_pend <= 1'b1;
                     wr_addr <= bus_addr_in << 2;

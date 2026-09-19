@@ -65,12 +65,12 @@ module uart_top(
     reg tx_en, rx_read, tx_busy, rx_cont;
     wire rx_done, busy;
 
-    reg [7:0] rx_buf [0:63];
-    reg [7:0] tx_buf [0:63];
-    reg [5:0] wr_ptr_rx, rd_ptr_rx, wr_ptr_tx, rd_ptr_tx;
+    reg [7:0] rx_buf [0:31];
+    reg [7:0] tx_buf [0:31];
+    reg [4:0] wr_ptr_rx, rd_ptr_rx, wr_ptr_tx, rd_ptr_tx;
     integer i;
     initial begin
-        for (i = 0; i < 64; i = i + 1) begin
+        for (i = 0; i < 32; i = i + 1) begin
             rx_buf[i] = 8'b0;
             tx_buf[i] = 8'b0;
         end
@@ -78,12 +78,12 @@ module uart_top(
 
     always @(posedge clk) begin
         if (rst) begin
-            wr_ptr_rx <= 6'd1;
-            rd_ptr_rx <= 6'd0;
-            wr_ptr_tx <= 6'd1;
-            rd_ptr_tx <= 6'd0;
+            wr_ptr_rx <= 5'd1;
+            rd_ptr_rx <= 5'd0;
+            wr_ptr_tx <= 5'd1;
+            rd_ptr_tx <= 5'd0;
             rx_irq <= 1'd0;
-            for (i = 0; i < 64; i = i + 1) begin
+            for (i = 0; i < 32; i = i + 1) begin
                 rx_buf[i] = 8'b0;
                 tx_buf[i] = 8'b0;
             end

@@ -81,6 +81,24 @@ module cpu_top(
     wire [4:0] rd_load;
     wire btb_hit;
 
+//RV32M 乘除法单元（与 lsu 流水线同步，独立第三写口）
+    wire [31:0] mul_data_final;
+    wire        mul_loaded, mul_we, mul_stall;
+    wire [4:0]  rd_mul;
+//整条流水线的合成 stall：给 controller 定 stage，同时【也喂回 mulu】。
+//mulu 自己判的三类冒险看不到它，不喂回去的话，icache/dcache 一有多拍事务把 mul 冻在 c2，
+//m_push 就会逐拍重发 -> we_mul 连续多拍，与 alu 的写回沿错开（详见 mulu.v 端口注释）。
+//无组合环：mul_stall 来自 mulu 的 stall 输出，而它只依赖寄存器（rd_post / m_pv / mstalled）。
+    wire        pipe_stall_w = stall | mul_stall | icache_busy_w | bus_hold_in | d_hold_int;
+//喂给 mulu 的冻结信号【必须排掉 mul_stall】：那正是 mulu 自己的输出（div 进行 / mul-use 冒险），
+//若一并冻结，乘法两级流水就永远等不到 m_pv，自锁。mul-use 那一拍照旧只压 m_push（用 mulu 内部 stall），
+//流水本身继续走，m_pv 才能按时到达。外部多拍事务（icache/dcache/总线）才需要把级真正冻住。
+    wire        mul_freeze_w = stall | icache_busy_w | bus_hold_in | d_hold_int;
+//mulu 专属的读数据通路镜像（照 pc_addr/aux_addr 手法，按消费者拆开降扇出）
+    wire        mul_sel_w;
+    wire [31:0] r1_data_mul_w, r2_data_mul_w;
+    wire [31:0] r1_data_final_mul_w, r2_data_final_mul_w;
+
     reg softi, retire_w, jalr_pred;
     reg [31:0] bus_data_in_final;
     wire [31:0] bus_addr_out_i, bus_data_out_i;
@@ -203,6 +221,7 @@ module cpu_top(
         .aux_addr_out(aux_addr_1),
         .dec(dec),
         .lsu(lsu),
+        .mul(mul_sel_w),
         .jal(jal),
         .br_en(br_en),
         .jalr(pre_jalr)
@@ -325,6 +344,29 @@ module cpu_top(
         .rd_load(rd_load)
     );
 
+//RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
+    mulu u_mulu (
+        .clk(clk),
+        .rst(rst),
+        .flush(flush),
+        .bus_hold_in(bus_hold_in | d_hold_int),
+        .pipe_stall(mul_freeze_w),
+        .opcode(opcode_2),
+        .func10(func10_2),
+        .rd_in(rd_2),
+        .r1_post(rs1_2),
+        .r2_post(rs2_2),
+//用 mulu 自己那一份镜像（_mul）：它由 pre_decoder 的 mul 标志单独填充，
+//既保证 M 指令一定拿到操作数（_dec/_lsu 是按各自的标志填的），又把扇出按消费者拆开。
+        .r1_data_final(r1_data_final_mul_w),
+        .r2_data_final(r2_data_final_mul_w),
+        .mul_data_out(mul_data_final),
+        .mul_loaded(mul_loaded),
+        .mul_we(mul_we),
+        .rd_mul(rd_mul),
+        .stall(mul_stall)
+    );
+
     forw u_forw (
         .clk(clk),
         .rst(rst),
@@ -337,15 +379,22 @@ module cpu_top(
         .rd_load(rd_load),
         .ld_data(ld_data_final),
         .loaded(loaded),
-        .stall(stall),
+        .rd_mul(rd_mul),
+        .mul_data(mul_data_final),
+        .mul_loaded(mul_loaded),
+        .stall(stall | mul_stall),
         .r1_data_in_dec(r1_data_dec),
         .r2_data_in_dec(r2_data_dec),
         .r1_data_in_lsu(r1_data_lsu),
         .r2_data_in_lsu(r2_data_lsu),
+        .r1_data_in_mul(r1_data_mul_w),
+        .r2_data_in_mul(r2_data_mul_w),
         .r1_data_final_dec(r1_data_final_dec),
         .r2_data_final_dec(r2_data_final_dec),
         .r1_data_final_lsu(r1_data_final_lsu),
-        .r2_data_final_lsu(r2_data_final_lsu)
+        .r2_data_final_lsu(r2_data_final_lsu),
+        .r1_data_final_mul(r1_data_final_mul_w),
+        .r2_data_final_mul(r2_data_final_mul_w)
     );
 
     bra_predict u_bra_predict (
@@ -415,12 +464,18 @@ module cpu_top(
         .rd_ld(rd_load),
         .ld_data_ld(ld_data_final),
         .we_ld(ld_we),
+        .rd_mul(rd_mul),
+        .mul_data_mul(mul_data_final),
+        .we_mul(mul_we),
         .dec(dec),
         .lsu(lsu),
+        .mul(mul_sel_w),
         .r1_data_dec(r1_data_dec),
         .r2_data_dec(r2_data_dec),
         .r1_data_lsu(r1_data_lsu),
-        .r2_data_lsu(r2_data_lsu)
+        .r2_data_lsu(r2_data_lsu),
+        .r1_data_mul(r1_data_mul_w),
+        .r2_data_mul(r2_data_mul_w)
     );
 
     dcache u_dcache (
@@ -487,7 +542,7 @@ module cpu_top(
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
-        .stall(stall | icache_busy_w | bus_hold_in | d_hold_int),
+        .stall(pipe_stall_w),
         .csr_wr_en(csr_wr_en),
         .exti(exti),
         .timi(timi),
