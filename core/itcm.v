@@ -9,12 +9,18 @@
 // Project Name:
 // Target Devices:
 // Tool Versions:
-// Description:
+// Description: 取指后备存储器，64KB。icache miss 时按行流出 32 个字。
+//              不再承担取指地址生成（已移入 icache）。
+//
+//              读口必须是"地址寄存器 → RAM → 输出寄存器"的单一形状，否则 Vivado
+//              推不出 BRAM（原写法读地址有两个表达式 mem_addr/ base+n，地址路径上
+//              挂了加法器，实测 64KB 一块 BRAM 都没成、全塌成 8536 个 LUT）。
+//              代价：比原来晚 1 拍出第一个字；mem_valid 与 mem_data 同拍对齐，
+//              上游（icache）按 mem_valid 数拍收字，不受影响。
 //
 // Dependencies:
 //
 // Revision:
-// Revision 0.01 - File Created
 // Additional Comments:
 //
 //////////////////////////////////////////////////////////////////////////////////
@@ -22,76 +28,60 @@
 
 module itcm(
     input clk, rst,
-    input br1, br2, br3,
-    input jal, jalr, jalr_fail, irq, irq_ret,
-    input [1:0] stage,
-    input [31:0] pc_addr,
-    input [31:0] offset_jal1, offset_jalr1,
-    input [31:0] offset_beq1, isr_addr1, isr_ret_addr1,
-    input [31:0] jalr_target_q, beq_off_q1,
-    input [31:0] br_addr1,
-    output reg [31:0] inst_raw_out,
-    output reg is_ibus_q,
-    //
-    output reg [31:0] fetch_addr,
-    output reg ibus_re_out,
-    input [15:0] ibus_addr_in,
-    input [31:0] ibus_data_in,
-    input ibus_we_in
+    input mem_req,
+    input [31:0] mem_addr,
+    output [31:0] mem_data,
+    output mem_valid
     );
 
-    localparam [1:0]
-    IDLE = 2'd0,
-    EXE = 2'd1,
-    FLUSH = 2'd2,
-    STALL = 2'd3;
-
-//指令TCM紧耦合内存，1clk读延迟，1clk写延迟，无命中判定
-    (* ram_style = "block" *) reg [31:0] itcm [0:8191];
+//指令存储 64KB（自举/回填来源）
+    (* ram_style = "block" *) reg [31:0] itcm [0:16383];
+    integer i;
     initial begin
+        for (i = 0; i < 16384; i = i + 1) itcm[i] = 32'd0;
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
-//pc地址itcm/icache仲裁
-    reg is_ibus;
-    always @(*) is_ibus = |fetch_addr[31:13];
+//读口：mem_req 上升沿锁行首地址，随后 32 拍连吐一行
+    reg [13:0] raddr;
+    reg [5:0]  cnt;
+    reg        addr_v;
+    reg [31:0] d_r;
+    reg        v_d;
+    reg        req_d;
 
-//读写逻辑处理（写逻辑目前无意义）
+    wire start = mem_req & ~req_d;
+
     always @(posedge clk) begin
         if (rst) begin
-            inst_raw_out <= 32'd0;
-            is_ibus_q <= 1'd0;
-        end
-        else if (stage == IDLE && ibus_we_in) begin
-            itcm[ibus_addr_in[14:2]] <= ibus_data_in;
-        end
-        else if (stage == STALL) begin
-            inst_raw_out <= inst_raw_out;
-            is_ibus_q <= is_ibus_q;
+            raddr <= 14'd0;
+            cnt <= 6'd0;
+            addr_v <= 1'b0;
+            req_d <= 1'b0;
         end
         else begin
-            inst_raw_out <= itcm[fetch_addr[12:0]];
-            is_ibus_q <= is_ibus;
+            req_d <= mem_req;
+            if (start) begin
+                raddr  <= mem_addr[15:2];
+                cnt    <= 6'd32;
+                addr_v <= 1'b1;
+            end
+            else if (cnt != 6'd0) begin
+                raddr  <= raddr + 14'd1;
+                cnt    <= cnt - 6'd1;
+                addr_v <= 1'b1;
+            end
+            else addr_v <= 1'b0;
         end
     end
 
-//跳转类地址透传处理，减少取值冲刷空窗
-    always @(*) begin
-        if (rst) begin
-            fetch_addr = 32'd0;
-            ibus_re_out = 1'd0;
-        end
-        else begin
-            ibus_re_out = is_ibus;
-            if (irq) fetch_addr = isr_addr1 >>> 2;
-            else if (irq_ret) fetch_addr = isr_ret_addr1 >>> 2;
-            else if (br2) fetch_addr = (br_addr1 + beq_off_q1) >>> 2;
-            else if (br3) fetch_addr = br_addr1 >>> 2;
-            else if (jalr_fail) fetch_addr = jalr_target_q >>> 2;
-            else if (br1) fetch_addr = (pc_addr + offset_beq1) >>> 2;
-            else if (jal) fetch_addr = (pc_addr + offset_jal1) >>> 2;
-            else if (jalr) fetch_addr = offset_jalr1 >>> 2;
-            else fetch_addr = pc_addr >>> 2;
-        end
+//单一地址表达式 + 输出寄存器：BRAM 的可推断模板
+    always @(posedge clk) begin
+        d_r <= itcm[raddr];
+        v_d <= addr_v;
     end
+
+    assign mem_data  = d_r;
+    assign mem_valid = v_d;
+
 endmodule

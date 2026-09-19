@@ -23,9 +23,7 @@
 module pre_decoder(
     input clk, rst,
     input [1:0] stage,
-    input [31:0] inst_raw_in,
-    input is_ibus_in,
-    input [31:0] ibus_data_in,
+    input [31:0] inst_in,
     input [31:0] aux_addr_in,
     input br1_in,
     input [31:0] jalr_pred_addr_in,
@@ -44,9 +42,9 @@ module pre_decoder(
     output reg [31:0] jalr_pred_addr_out
     );
 
-//根据is_bus信号对来自itcm或icache的指令进行仲裁
+//指令来源：icache 为唯一取指源
     reg [31:0] inst_effective;
-    always @(*) inst_effective = is_ibus_in ? ibus_data_in : inst_raw_in;
+    always @(*) inst_effective = inst_in;
 
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;

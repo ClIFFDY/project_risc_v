@@ -15,7 +15,7 @@ CPU 全部为上升沿触发。本文档称 **“clkN 拍”** 为第 N 个时�
 
 每类指令的表格都以**它自己的取指拍为 clk0**（各表互相独立，方便单看一类）：
 
-- **clk0 取指沿**：该上升沿 itcm 按 pc 取指，`inst_raw_out` 锁存本指令；同一沿 pc 已更新为
+- **clk0 取指沿**：该上升沿 icache 按 pc 取指，`inst_out` 锁存本指令；同一沿 pc 已更新为
   本指令地址 +4（顺序下一条地址）。
 - clk0 拍内：`pre_decoder` 的**纯组合译码**（jal / br_en / jalr_pre / 各 offset）看到的就是本指令
   （它此刻在 itcm 输出上）→ 决定 clk1 上升沿 pc / 取指是否重定向。
@@ -29,7 +29,7 @@ CPU 全部为上升沿触发。本文档称 **“clkN 拍”** 为第 N 个时�
 
 | 边界（模块） | 相对取指 | 该处锁存的内容 | 备注 |
 | --- | --- | --- | --- |
-| itcm（取指） | +0 (clk0) | inst_raw_out = 原指令字 | 同一沿 pc/aux 更新 |
+| icache（取指） | +0 (clk0) | inst_out = 指令字（唯一取指源） | 同一沿 pc/aux 更新；缺失时 busy 按住流水线 |
 | pre_decoder | +1 | rs1/rs2/rd、opcode_dec、func10、imm、各 offset、dec/lsu 标志、aux_addr_out、pc_operand | 它的**组合**输出(jal/br_en)在 clk0 就被本指令驱动 |
 | mem_buf | +2 | 上述全部字段的纯透传缓冲 | STALL/FLUSH 时冻结或清零 |
 | decoder（ID/EX） | +3 | r1/r2_data_out(操作数)、rd_out、we、alu_func4、csr_* 、jalr_target_q、success/br_fail/irq_ret/trap、jalr 等 | **操作数在此拍定型**；本拍组合出 alu 结果 |
@@ -51,19 +51,19 @@ CPU 全部为上升沿触发。本文档称 **“clkN 拍”** 为第 N 个时�
 | STALL | stall（lsu load-use）或 i_busy | pc/itcm/pre_decoder/mem_buf 冻结；decoder/lsu 保持；forw `stalled` 拍后一级前递 |
 
 > IDLE(2'd0) 实际上**没有定义**：controller 的组合输出只可能取 EXE/STALL/FLUSH，从不置 IDLE；
-> 各模块 localparam 与分支里的 IDLE、以及 itcm 的 `stage==IDLE && ibus_we_in` 写口
-> （原本留给 icache 回填）是历史遗留的死代码，当前不会触发（icache 未启用）。
+> 各模块 localparam 与分支里的 IDLE 是历史遗留的死代码，当前不会触发。
 >
-> **2026-09-06·itcm 取指去 stage 化**：itcm.v 的 `fetch_addr` 组合选择不再按 `case(stage)`
+> **2026-09-06·取指去 stage 化**：`fetch_addr` 的组合选择不再按 `case(stage)`
 > （EXE,STALL / FLUSH / IDLE）分类，改为纯事件信号优先级 mux：
 > `irq > irq_ret > br2 > br3 > jalr_fail > br1 > jal > jalr > 顺序 pc_addr>>2`。
 > 依据：stage 是这些信号（+stall）的函数（见上表），pre_decoder 组合块又已按
 > `stage∈{EXE,STALL}` 把 jal/jalr/br_en 关零、controller 保证权威冲刷信号同拍必 FLUSH，
 > 故两组信号永不同拍互斥，拼成单级优先级后在可达状态上与旧 case 严格等价；
-> STALL 冻结下无事件信号 → 落回 `pc_addr>>2`，同旧 EXE/STALL 分支。STALL 保持与
-> `stage==IDLE` 写口属 itcm 读寄存块的时序门控，仍用 `stage` 输入，端口未删。
+> STALL 冻结下无事件信号 → 落回 `pc_addr>>2`，同旧 EXE/STALL 分支。
 > 附带作用：切断综合 time-loop 里 `stage→fetch_addr→icache.busy→stall→stage`
 > 的 `stage→fetch_addr` 直连边。
+>
+> **2026-09-19·该 mux 已从 itcm 移入 icache.v**（itcm 退居后备存储器），优先级不变，见 §23。
 
 ### 0.4 本文五类
 
@@ -323,11 +323,14 @@ lsu 与 decoder 同拍（都读 mem_buf 输出）。总线侧信号全部经 lsu
 | we/rd_out | lsu 要写回的 rd 使能/号（喂 alu 的 we_in/rd_in 合并线） |
 | stall | `opcode==LOAD && (rd_in==r1_fast | r2_fast) && rd_del2!=rd_in`（load-use 保护） |
 
-地址译码：dtcm 字地址 [23:20]==2（字节 0x0080_0000 区，mtb 判 mark 在 dtcm[0xfff]）；
-tim_in [23:20]==1 且 [3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)。见 dtcm.v/tim_in.v。
-
-外设槽（`bus_addr[31:24]`）：1=UART 0x0400_0000、2=PLIC 0x0800_0000、3=tim_p 0x0C00_0000、
-4=gpio_group 0x1000_0000，由 bus_arb 按该字段选通（1..31 全归它管，加外设不用改 bus_arb）。见 bus_arb.v。
+地址译码（2026-09-19 起，dtcm/dcache 已不在总线上，见 §23）：
+- **dcache**：字地址 `[31:24]==8'd0 && [23:13]==11'h100`（字节 0x0080_0000 区，32 KB），在 `cpu_top` 内，
+  **不经过 bus_arb**。命中 1 拍应答；缺失按住流水线回填。`dtcm` 是它的后备存储器（流式读出/单拍写入）。
+- **tim_in**：`[23:20]==1` 且 `[3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)`，仍搭在 lsu 出口总线上（在 `cpu_top` 内）。
+  它的窗口 `[23:20]==1` 与 dcache 的 `[23:13]==0x100` **严格互斥**，两者按位或合流成 `bus_data_in_final`。
+- **bus_arb 外设槽**（`bus_addr[31:24]`）：1=UART 0x0400_0000、2=PLIC 0x0800_0000、3=tim_p 0x0C00_0000、
+  4=gpio_group 0x1000_0000、5=i2c 0x1400_0000，由 bus_arb 按该字段选通（1..31 全归它管，加外设不用改 bus_arb）。见 bus_arb.v。
+  槽 6/7（dcache、flash_spi）**已停用**。
 
 ### 5.1 store sw（写，不写回 rd）
 
@@ -343,7 +346,7 @@ tim_in [23:20]==1 且 [3:0]==1(cnt_set 读写)/2(cnt 读)/3(清中断)。见 dtc
 | pre_decoder | — | sw（lsu 标志=1） |  |  |  |  |
 | mem_buf |  |  | sw（opcode_lsu=STORE 挂上） |  |  |  |
 | **lsu**（=decoder 拍） |  |  |  | **锁存总线写请求**：bus_addr_out=0x00800000>>2=0x00200000；be=1111；we=1；data=0x123（x7 经 forw 到） |  |  |
-| dtcm |  |  |  |  | **dtcm 写沿**：dtcm[0]←0x123 |  |
+| dcache→dtcm |  |  |  |  | **写透**：dcache 当拍把写打到 mem 侧，**dtcm 于本沿写** dtcm[0]←0x123（同旧 dtcm 直挂总线时的拍数） |  |
 | regs |  |  |  |  |  | （无写回） |
 
 要点：store 的基址/数据在 c3 前由 regfile+forw 定型（基址 x6 由 2 条前的 lui 来，走 back1/back2
@@ -370,7 +373,8 @@ store 不产生 we，不写 regs。无访存依赖时不 stall。
 - 紧邻 load 的指令若用其 rd，**STALL 1 拍**。stall 由 `(opcode_post==LOAD)&&(rd_1==r1_post|rd_1==r2_post)`
   （lsu）判；`loaded` 返回即释放（`rd_1` 是派发拍锁存的 load 目的 rd，`:loaded` 表示该 load
   数据回到，`rd_load=rd_2` 与 data 同拍同源旁路给 forw/regfile）。
-- 数据回读：总线读请求于 c2 锁存，**dtcm 于下一沿 c3 返回**（bus_data_out / `loaded=1`），
+- 数据回读：总线读请求于 c2 锁存，**dcache 于下一沿 c3 返回**（命中 1 拍；缺失则由 dcache 按住
+  流水线、从 dtcm 回填整行后再出数，见 §23.4），
   regfile 写对齐到 c4 沿——`loaded` 把 `ld_data` 选成写回数据，无需额外气泡。
 - **中间隔 1 条无关指令再用**（如 lw; nop; add）不触发 stall：此时 forw 用
   `loaded ? rd_load : rd_back2` 前递即可（旁路命中）。
@@ -433,14 +437,20 @@ decoder 拍 +1，而 csr 写沿 = csrw decoder 拍 +1 —— csrr 读到的已�
 
 受理（irq_act 且非 process）当拍：
 - stage→FLUSH；mstatus.MIE 清 0、MPIE=旧 MIE、irq_process=1；
-- `iret_addr1 = pc_addr_in − irq_bubble`、`iret_addr2 = iret_addr1 + 4`（稳态 bubble=12 →
-  pc−12，即最老未提交指令；bubble 语义见下）；pc→`isr_addr2`（mtvec+4），itcm 取 `isr_addr1`
-  （mtvec），cause 写 mcause（11/7/3）。
+- `iret_addr1 = iret_addr2 = pc_addr_in − irq_bubble`（**两个寄存器同值**；稳态 bubble=12 →
+  pc−12，即最老未提交指令；bubble 语义见下）；
+- **pc→`isr_addr2 + 4`，icache 取指→`isr_addr1 >> 2`**（即 icache 实际取 mtvec 首条、
+  pc 续 mtvec+4）；cause 写 mcause（11/7/3）。
 
 返回 mret（decoder irq_ret）：
 - stage→FLUSH；MIE←MPIE、irq_process=0；
-- pc/itcm 取指回绕（固定）：pc→`iret_addr2`，itcm→`iret_addr1 >> 2`（取 iret_addr1 执行、
-  pc 续 iret_addr1+4）。**pc/itcm 不再减 bubble**（2026-09-05 定稿）。
+- **pc→`iret_addr2 + 4`，icache 取指→`iret_addr1 >> 2`**（取 iret_addr1 执行、
+  pc 续 iret_addr1+4）。**pc/icache 都不再减 bubble**（2026-09-05 定稿）。
+- `-4/+4` 的来源见 §7 末段：pc 存的是"顺序后继地址"，icache 取指存的是"本指令地址"，两者恒差 4。
+
+> **2026-09-19 补记**：icache 单通道重构时 `pc.v` 的 `ext_target` 被整个删掉，
+> 连带把 `jalr_fail`/`irq`/`irq_ret` 三路的 `+4` 也删了 —— 后果是这三路重定向**全体早 4 字节**
+> （重执行上一条指令）。已按基线 `ext_target=0` 分支补回。见 §23。
 
 **受理时机控制（2026-09-05，controller/csr，G 与嵌套/紧贴双中断全绿的机制）**：
 - **irq_bubble（controller，4bit）**：复位=12；`stage==FLUSH` 时清 0；否则每拍 +4 直到 12。
@@ -466,23 +476,34 @@ decoder 拍 +1，而 csr 写沿 = csrw decoder 拍 +1 —— csrr 读到的已�
 
 ## §7 附：pc / itcm 取指重定向公式对照（写错落点排查用）
 
-| 事件 | pc 模块（pc.v, 本拍沿） | itcm 取指（itcm.v, 本拍沿） | 触发条件 |
+| 事件 | pc 模块（pc.v, 本拍沿） | icache 取指（icache.v, 本拍沿） | 触发条件 |
 | --- | --- | --- | --- |
 | 顺序 | pc_addr = pc_addr+4 | pc_addr>>2 | EXE 无跳转 |
 | jal | pc_addr + offset_jal2 | (pc_addr + offset_jal1)>>2 | predec 组合 jal（c0→c1 生效） |
 | jalr 预测 | offset_jalr2(=预测+4) | offset_jalr1(=预测)>>2 | jalr_pred（c0→c1 生效） |
 | br1 预测跳 | pc_addr+offset_beq2 | (pc_addr+offset_beq1)>>2 | br1（c0→c1 生效） |
-| br2(br_fail 错) | br_addr2+beq_off_q1−4 | (br_addr1+beq_off_q2)>>2 | FLUSH 且 br2 |
+| br2(br_fail 错) | br_addr2+beq_off_q2 | (br_addr1+beq_off_q2)>>2 | FLUSH 且 br2 |
 | br3(br_fail 对错) | br_addr2 | br_addr1>>2 | FLUSH 且 br3 |
-| jalr_fail | jalr_target_q+4 | jalr_target_q>>2 | FLUSH 且 jalr_fail |
-| 中断 | isr_addr2(=mtvec+4) | isr_addr1(=mtvec)>>2 | FLUSH 且 irq |
-| mret | iret_addr2−irq_bubble | (iret_addr1−irq_bubble)>>2 | FLUSH 且 irq_ret |
+| jalr_fail | **jalr_target_q+4** | jalr_target_q>>2 | FLUSH 且 jalr_fail |
+| 中断 | **isr_addr2+4**（=mtvec+4） | isr_addr1(=mtvec)>>2 | FLUSH 且 irq |
+| mret | **iret_addr2+4** | iret_addr1>>2 | FLUSH 且 irq_ret |
 
-公式里的 +4/−4 差：pc 寄存器保存的是“顺序后继地址”（下一条），itcm 取指保存的是
+公式里的 +4/−4 差：pc 寄存器保存的是“顺序后继地址”（下一条），icache 取指保存的是
 “本指令地址”，两者恒差 4；pre_decoder 的 offset_jal1/beq1 已预减 4（imm−4），pc 用未减的
-offset_jal2/beq2，配合实现单拍重定向时 pc/itcm 各自落点一致。排查跳转落点错误时，
-先分清“pc 侧落点”与“itcm 取指侧落点”各是多少、是否差 4/8/12，再看触发条件是 br2/br3/
-jalr_fail/irq 中的哪一路。
+offset_jal2/beq2，配合实现单拍重定向时 pc/icache 各自落点一致。
+
+**排查跳转落点错误时**（先看 §8，再回来对表）：
+1. 先分清“pc 侧落点”与“icache 取指侧落点”各是多少、是否差 4/8/12，再看是 br2/br3/
+   jalr_fail/irq/irq_ret 中的哪一路。
+2. **`pc_addr` 不能直接当"正在执行的指令地址"读** —— 它恒等于「正在执行的指令地址 + 4」
+   （icache 读出打一拍，见 §10 末段）。用 pc 直方图判"跳转落在哪"会**整体偏 +4**，别误判成 bug。
+3. **判定"某路要不要 +4"的规则**：目标信号是不是**真实指令地址**。
+   `jalr_target_q`(decoder 算的 rs1+imm)、`isr_addr1/2`(mtvec)、`iret_addr1/2`(pc−bubble) 都是
+   真实指令地址 → **要 +4**；`br_addr2` 是从流水线里取的、已是 pc 约定 → **不加**。
+   旁证：预测路径 `cpu_top.v` 给 pc 的 `.offset_jalr2(jalr_predict_offset + 4'd4)`。
+
+> **2026-09-19**：`ext_target` 已整个去掉（icache 单通道后不存在"外区取指"，原公式里
+> `ext_target ? 4'd0 : 4'd4` 恒取内区分支）。上表就是内区分支的真值。
 
 ---
 
@@ -490,23 +511,26 @@ jalr_fail/irq 中的哪一路。
 
 | 信号 | 归属模块 | 是寄存器还是组合 | 一拍含义 |
 | --- | --- | --- | --- |
-| pc_addr / aux_addr | pc | reg | 顺序后继地址 / 同步镜像 |
-| inst_raw_out | itcm | reg | 当前已取指令 |
+| pc_addr / aux_addr | pc | reg | 顺序后继地址（= 正在执行的指令地址 +4）/ 同步镜像 |
+| inst_out | icache | reg | 当前已取指令（**唯一取指源**，缺失期由 busy 按住） |
 | dec / lsu | pre_decoder | reg | 该指令走 decoder 侧还是 lsu 侧 |
-| jal / br_en / jalr_pre(预测) | pre_decoder 组合 | comb | 基于 itcm 当前指令 |
+| jal / br_en / jalr_pre(预测) | pre_decoder 组合 | comb | 基于 icache 当前指令 |
 | br1/br2/br3 / jalr_fail | bra_predict | comb | 分支/跳转预测与纠错 |
 | success / br_fail | decoder | reg | c3 分支真结果 |
 | r1/r2_data_final_dec/lsu | forw | comb | 给 decoder/lsu 的已前递操作数 |
 | jalr_target_q | decoder | reg | c3 真目标 |
 | bus_addr/be/data/we | lsu | reg | c3 锁存的总线请求 |
-| loaded / ld_data | lsu/dtcm/tim_in | reg/comb | 读数据有效/数据 |
+| loaded / ld_data | lsu/dcache/dtcm/tim_in | reg/comb | 读数据有效/数据（dcache 命中 1 拍；缺失回填后由 dtcm 供数） |
+| dcache_busy / dcache_busy_d1 | dcache / cpu_top | comb/reg | 数据侧缺失停顿；`d_hold_int` 复刻原 `bus_arb.d_hold_ext` 的 1 拍延拓 |
+| icache_busy | icache | comb | 取指缺失/自举期按住整条流水线 |
+| flush | controller | comb | 7 个冲刷事件的 OR（§22.4 从 `stage` 里拆出来，降扇出） |
 | we_3/rd_3, we_4/rd_4, we_5/rd_5 | decoder/alu 输出/wb_reg | reg | 各写回级 |
 | rd_back1 | decoder | reg | ALU 级指令的 rd，供 forw back1 前递；**JAL/JALR 分支也必须置**，否则 link 值送不到紧邻下一条（§10） |
 | csr_wr_en/csr_addr/csr_data_in | decoder / alu.result_csr | reg/comb | CSR 写请求与数据 |
 | irq_act/irq_processing/irq | csr.v / controller | comb | 中断请求 |
 | irq_bubble | controller | reg | mret 回绕气泡计数 |
 
-（RTL 以 sources_1/new/core/ 下文件为准；本文如与代码冲突，以代码为准。）
+（RTL 以 `RTL/core/` + `RTL/soc/` + `RTL/peripherals/` 下文件为准；本文如与代码冲突，以代码为准。）
 
 ---
 
@@ -938,6 +962,9 @@ claim 源号=**4**、外部从机收到 **a5 5a**。
 
 ## §16 dcache 挂总线（2026-09-12）
 
+> **⚠ 已被 §23（2026-09-19）取代**：dcache 现在在 `cpu_top` 核内、**不经过 bus_arb**，
+> 译码窗口也从总线槽 6 改成 dtcm 窗口。本节保留为历史记录。
+
 队友移植来一份 `soc/dcache.v`，原本面向另一套 valid/ready 握手总线、mem 侧是整套 AXI4 式带通道。
 按 §5 改造成本工程的总线外设，**结构上与 `icache` 同构**，挂在 `bus_arb` 后面。
 
@@ -1041,6 +1068,10 @@ else if (bus_loaded_out)     per_sel <= 5'd0;
 ---
 
 ## §17 flash_spi：外置 flash 控制器（2026-09-12）
+
+> **⚠ 已被 §23（2026-09-19）停用**：`mcu_top` 不再例化 `u_flash_spi`，4 个顶层 SPI 端口
+> 与对应 xdc 约束已删，**文件保留**。本节（含 §17.9 的 `busy` 早放一拍）保留为历史记录 ——
+> 接回 flash 时这些坑仍然成立。
 
 外置 SPI flash 控制器。它**有三个上游口**：
 - **dbus 控制口**（§5 总线外设，槽 **7**）—— 只管**擦除和配置**，**读不到也写不到 flash 数据**
@@ -1374,6 +1405,10 @@ BRAM 只有 **1 个写口**、一拍只能做**一次**写操作。原写法「�
 
 ## §21 icache / dcache 容量都扩到 32 KB（2026-09-14）
 
+> **⚠ 几何已被 §23（2026-09-19）改掉**：icache 现为 **3 路 × 128 组 × 32 字 = 48KB**
+> （way0 锁定 16KB + way1/way2 各 16KB），dcache 现为 **2 路 × 256 组 × 8 字 = 16KB**。
+> 本节的"选加长行而不是加组数"结论仍成立，保留为历史记录。
+
 ### 21.1 做了什么
 
 两个 cache 现在都是 **2 路 × 256 组 × 16 字（64 B 行）= 32 KB**。
@@ -1540,5 +1575,178 @@ if (status_rx[0] && (prog_busy || era_busy) && !rd_req) begin
 （§17.9 / §19 已证明寄存 `busy` 就会早放/晚放一拍、丢指令）。
 
 **下一步可考虑**：把 §22.4 的等价替换推广到其余 `stage == STALL` 消费点
-（`itcm` / `pre_decoder` / `decoder` / `regfile` / `lsu` / `mem_buf`），或做布局引导
+（`icache` / `pre_decoder` / `decoder` / `regfile` / `lsu` / `mem_buf`），或做布局引导
 （这条锥 16 级逻辑只花 3.5ns、布线花 16.2ns，瓶颈是**摆位不是逻辑**）。
+
+---
+
+## §23 取指单通道化 + 数据侧对称重构 + 全面缩容（2026-09-19）
+
+### 23.1 拓扑变化（前后对照）
+
+| | 之前 | 现在 |
+| --- | --- | --- |
+| 取指源 | itcm（低位 32KB）+ icache（外部取指，挂总线） | **icache 一个**（移入 `RTL/core/`，由 `cpu_top` 直接例化） |
+| 取指地址生成 | 在 `itcm.v` 里 | **移到 `icache.v`**，与 §0.3 的优先级 mux 一起 |
+| 数据侧 | lsu → bus_arb → dtcm（槽 6 是 dcache → flash_spi） | **lsu → dcache（在核内）→ dtcm**；dcache **不经过 bus_arb** |
+| `bus_arb` | 7 个槽（含 dcache/flash） | **只服务 5 个外设**（uart/plic/tim_p/gpio/i2c） |
+| `flash_spi` | 例化在 `mcu_top`，4 个顶层 SPI 端口 | **只保留文件，不例化**；顶层端口与 8 行 xdc 约束一并删除 |
+
+`itcm` / `dtcm` 后续会按实际情况酌情换成 DDR / flash 的 IP core，所以本轮把它们都收成
+"**流式后备存储器**"的统一形状（见 23.3 / 23.5），换 IP 时只动读流长度。
+
+### 23.2 icache：唯一取指源（48KB，3 路组相联）
+
+- 几何 **128 组 × 3 路 × 32 字 = 48KB**，每路 16KB。`iram[0:12287]`，
+  `rd_addr = {way[1:0], idx[6:0], word[4:0]}`（14 位，路步长 4096 字）。
+- **way0 锁定**：自举把 itcm 前 128 行（字节 `0x0000–0x3FFF`）装进 way0，`tag0` 恒 `19'd0`，
+  正常路径的 `fill_way` 是常数 `2'd1`、tag 只写 `tag1/valid1` —— **way0 的写通路被物理取消**，
+  不是靠 lock 位仲裁。
+- **way1/way2 两路 LRU**（每组 1 位，`lru[idx]==1` 表示 way1 是 MRU）：
+  失效优先填空位，两路都有效时按 `lru` 淘汰；命中/回填都翻转 `lru`。
+  > 之前只有一路可写（way0 锁死、way1 独占），**等于直接映射**，组相联是坏的 —— 本轮的改动点。
+- **自举（bootloader）**：复位释放后 `busy` 持续拉高，从 itcm 顺序填 128 行 × 32 字
+  （约 4100 拍），填满后 `busy` 落下。功能上等价于"itcm + icache + bootloader"三者。
+- 回填接口接了 `mem_req/mem_addr/mem_wdata/mem_be/mem_valid`，`mem_we` 恒 0。
+- **`is_ibus` 输出已删**（单通道后没有"内/外区"之分，该线本来就悬空无人消费）。
+- `pc.v` 的取指窗口随之从"32KB 内区"放宽到 **64KB**（与 itcm 同尺寸）——
+  否则 tag 只有 {0,1} 两个值，way2 永远空转，3 路白加。
+
+### 23.3 itcm：退居后备存储器（64KB）
+
+不再承担取指地址生成，也不再是"取指源"：去掉 `is_ibus_q` 与写口，只剩
+
+```
+mem_req 上升沿锁行首 → 每拍流出一个字（共 32 拍）→ mem_valid
+```
+
+索引从 `mem_addr[14:2]` 改为 `[15:2]`（64KB）。`$readmemh` 路径仍走
+`Tools/hexpath.sh local|commit` 的双机切换。
+
+### 23.4 dcache：移入 `cpu_top`（16KB）
+
+- **文件从 `RTL/soc/` 移到 `RTL/core/`**（`Tools/test/run.sh` 只通配 `RTL/core/*.v`）。
+- 几何 **256 组 × 2 路 × 8 字 = 16KB**（行从 16 字缩到 8 字）。
+- **译码窗口从"总线槽 6"改成 dtcm 的窗口**：`bus_addr_in[31:24]==8'd0 && bus_addr_in[23:13]==11'h100`。
+  **不能放宽成 `[31:24]==0`** —— 会吞掉 `tim_in` 的 `[23:20]==1`，破坏
+  `bus_data_in_final` 的按位或合流（见 §5 地址译码）。
+- 保持 §20.3 的「**写穿 + 写命中作废**」：单写口（只有回填整字写）才推得出 BRAM；
+  写穿保证 `dtcm` 永远是最新的。**不做 lock**，两路 LRU。
+
+### 23.5 dtcm：退居 dcache 的后备存储器（32KB）
+
+接口从「总线从设备」改成「流式后备」，与 icache↔itcm 同形：
+
+- **读**：`mem_req & ~mem_we` 上升沿锁行首，连吐 **8 字**（= dcache 的行字数）
+- **写**：`mem_req & mem_we` **电平**判据，单拍完成，按 `mem_be` 分字节落进 BRAM
+- `mem_ready` 恒 1（写永远被接受，store 保持零停顿）
+
+> **写必须用电平判据**：原 `flash_spi` 有写 FIFO 兜着，照抄 icache 的"上升沿启动"形状会让
+> **背靠背两条 store 只落一条**（实测 `sw s3,0(s2)` / `sw s4,4(s2)` 丢第二条）。
+
+### 23.6 pc.v：去掉 `ext_target`
+
+icache 单通道后不存在"外区取指"，`ext_target` 恒为内区，于是整个删掉。基线里
+
+```verilog
+pc_addr <= jalr_target_q + (ext_target ? 4'd0 : 4'd4);   // 内区(ext_target=0) → +4
+pc_addr <= isr_addr2     + (ext_target ? 4'd0 : 4'd4);   // 同上
+pc_addr <= isr_ret_addr2 + (ext_target ? 4'd0 : 4'd4);   // 同上
+```
+
+内区分支的 `+4` **必须保留**（理由见 §7 末段）。本轮删除时三处 `+4` 一并丢失，
+症状是 `jalr`/中断重定向**全体早 4 字节**（重执行上一条指令）—— 已补回。
+`br2`/`br3` 的 `−(ext_target ? 4 : 0)` 内区分支本来就是 0，删掉无影响。
+
+### 23.7 三个必须保住的隐性时序契约
+
+1. **`dcache` 的 `fill_end` 拍要再撑一拍 hold**——`busy` 在 `fill_end` 就落，而
+   `ld_ready` 下一拍才抬（§20.4）。原来这 1 拍由 `bus_arb.d_hold_ext` 兜住，
+   dcache 搬进核内后必须在 `cpu_top` 里**复刻**（`dcache_busy_d1` → `d_hold_int`）。
+2. **`dtcm` 的写要用电平判据**（见 23.5）。
+3. **`dcache` 的译码窗口不能放宽**（见 23.4）。
+
+### 23.8 实现过程中挖出并修掉的缺陷
+
+| # | 缺陷 | 症状 | 修法 |
+| --- | --- | --- | --- |
+| ① | `dcache` 的 `rd_en` 在 miss 拍仍拉高 | 未初始化的 `data[]`（x）经**按位或合流**污染整个读回数据 | `rd_en = fill_end \|\| (rd_req && cache_hit)` + `data[]` 零初始化 |
+| ② | `fill_cnt` 位宽没跟着行字数改（行 16→8 字只改了比较值 `4'd15→4'd7`） | 写入口 13 位 `{way,idx,fill_cnt}`、读口 12 位 `{way,idx,miss_word}` → **读写落在不同地址**，load 全 0 | `fill_cnt` 改 `[2:0]` |
+| ③ | `dtcm` 的写用了上升沿判据 | 背靠背 store 丢第二条 | 改电平判据 |
+| ④ | `pc.v` 丢 `ext_target` 时连带丢了 `+4`（见 23.6） | `jalr`/中断重定向早 4 字节 | 补回 |
+| ⑤ | **`.data` 的 LMA 仍在 itcm**（`AT(__data_lma)`） | 数据侧读不到 itcm ⇒ `start.s` 的拷贝循环第一条 `lw` 就**永久 STALL**（`ready_in` 永不抬）。**板子上同样挂** | 改 LMA=VMA=DTCM 首址，由 `data.hex` 预装（见 23.11） |
+| ⑥ | **`dcache.bus_data_out` 不每拍清零** | `cpu_top` 把 dcache/tim_in/dtcm 的读数据**按位或**合流；dcache 残留值被或进每一次外部总线读（实测读 UART 状态口拿到上次 dtcm 读的值 → `ee_printf` 轮询死循环） | 每拍先清零（对齐基线 dtcm / `tim_in.v:46` 的形状） |
+
+> ⑤⑥ 的共性：**`cpu_top` 内那三个读源是"按位或"合流，不是按槽位 mux**。
+> 基线的 dcache 挂在 `bus_arb` 后面（mux），所以它不守"非本窗口输出 0"的规矩也没事；
+> 搬进核内就必须守。新增/搬入核内的总线从设备都要检查这一条。
+
+①的隐蔽性最高：`dcache` 搬进核内后第一次进了 `bus_data_in_final` 的按位或，
+x 会顺着 OR 爬满整条读回路径（`ra` 变 x）。
+
+### 23.9 验证
+
+- **回归 15 项全绿**。新增两项：
+  - `icache/tb_icache_3way.v` —— 四条 tag 全落在**同一组的同一条行**上
+    （`0x0000`/`0x4000`/`0x8000`/`0xC000`），强制 way1/way2 互踢。
+    判据：三处累加值正确 + `way1/way2 都被回填到` + 终态 tag 组合符合 LRU。
+  - `system/tb_isr_ret.v` —— **26 探针**，白盒比对每次 `irq_ret` 的落点是否 `iret_addr2+4`，
+    黑盒查 ISR 标记。**这一项才咬得住 23.6 的缺陷**（`tb_isr` 只查 `dtcm[0]/[1]`，
+    重定向早一条时那两个值照样成立）。
+- **基线 A/B**：`Tools/test/system/tb_base.v` 直接对 `RTL/_bak_20260915/` 跑同类检查，
+  基线 mret 全部落在 `iret_addr2+4`（偏离 0 次）—— 这是"+4 必须保留"的实证。
+- 资源：itcm 64KB + icache 48KB + dtcm 32KB + dcache 16KB = **160KB**（§21 那版是 224KB）。
+  综合 BRAM / WNS **尚未复测**（§22.8 的基线是 WNS −0.089ns）。
+
+### 23.10 已知未尽
+
+- **`itcm` / `dtcm` 换 DDR / flash IP core**：两者已收成统一的流式接口，换的时候只动
+  读流长度与地址窗口。
+- **`flash_spi` 未接回**：文件保留、例化与顶层端口已删。接回时要同时恢复
+  `bus_arb` 的槽 7、4 个顶层端口、xdc 的 8 行约束，以及 `plic.irq_sources` 的 bit5。
+- **icache 无 invalidate**（同 §17.8）。
+- **取指窗口放宽到 64KB 后，超出 itcm 的取指不再有"外区"通路**：程序必须整体落在 itcm 内。
+
+### 23.11 CoreMark 低迭代仿真（2026-09-19）
+
+**目的**：在 iverilog 里跑通 CoreMark 的**功能**（不是性能），验证整条 SoC 路径。
+
+**构建**（`ITERATIONS` 可覆盖，见 `Tools/coremark/Makefile.coremark`）：
+
+```bash
+ITERATIONS=1 bash Tools/coremark/Makefile.coremark   # → Data/ins.hex + Data/data.hex
+iverilog -g2001 -o cm.vvp Tools/test/coremark/tb_coremark.v RTL/core/*.v
+vvp cm.vvp
+```
+
+- **`ITERATIONS=0` 不能用于仿真**：它是 CoreMark 的自动标定，要求跑满 10 秒才定迭代数 ⇒ 永不终止。
+- **生成两个 hex**：`ins.hex`（`--only-section=.text` → itcm）与 `data.hex`（`--only-section=.data` → dtcm）。
+  **必须按段分别导出**——`.data` 的 LMA=VMA=0x0080_0000，裸 `-O binary` 会跨约 8MB。
+- **tb 自带最小 UART 模型**：见 23.8 ⑤ 的说明。判据是"**凡 `bus_addr_out[31:24] != 0` 的读都回 0 并抬 `bus_loaded_in`**"
+  —— dcache（`[31:24]==0 && [23:13]==0x100`）与 tim_in（`[31:24]==0 && [23:20]==1`）都不在此判据内，
+  不会被误应答；写不需要应答。
+
+**结果**（`ITERATIONS=1`，`cyc≈1.56M`，含 4100 拍自举）：
+
+```
+2K performance run parameters for coremark.
+CoreMark Size    : 666
+Iterations       : 1
+seedcrc          : 0xe9f5
+[0]crclist       : 0xe714
+[0]crcmatrix     : 0x1fd7
+[0]crcstate      : 0x8e3a
+[0]crcfinal      : 0xe714
+ERROR! Must execute for at least 10 secs for a valid result!
+Errors detected
+```
+
+- **三个 CRC 与 §10 记的 10 轮跑出来的值逐位相同** —— 印证 CoreMark 的 CRC **只由 seed 和
+  `TOTAL_DATA_SIZE` 决定，与迭代次数无关**，所以 1 轮也能验功能。
+  `seedcrc=0xe9f5` → `known_id=3`（`core_main.c:308`），官方表逐一对上。
+- `ERROR! Must execute for at least 10 secs` 与随之而来的 `Errors detected` 来自
+  `core_main.c:373-378` 的"跑满 10 秒"规则（`Total ticks=24` ⇒ 整数除法得 0），**非功能错误**。
+- 本次只跑到"打完即停"，**没有做性能计数**。
+
+**顺带确认**：`.text` = 12328 字节，正好落在 icache **way0 的 16KB 锁定段**内 ⇒
+自举一次之后全程序常驻，**取指零缺失**。

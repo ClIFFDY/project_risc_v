@@ -7,17 +7,10 @@ module cpu_top(
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
     output reg bus_we_out,
-    output reg [31:0] ibus_addr_out,
-    output reg ibus_re_out,
-    output reg ibus_req_valid,
-    input [31:0] ibus_data_in,
-    input [15:0] ibus_addr_in,
     input [31:0] bus_data_in_ext,
-    input ibus_we_in,
     input bus_loaded_in,
     input bus_hold_in,
-    input exti,
-    input i_busy
+    input exti
     );
 
     wire [1:0] stage;
@@ -27,12 +20,14 @@ module cpu_top(
 
     wire [31:0] pc_addr, aux_addr_0, br_addr1, br_addr2;
     wire flush;
-    wire [31:0] inst_raw;
+    wire [31:0] icache_inst_w, icache_mem_addr_w, icache_mem_wdata_w, icache_mem_data_w;
+    wire [3:0] icache_mem_be_w;
+    wire icache_busy_w, icache_mem_req_w, icache_mem_we_w, icache_mem_valid_w;
     wire [31:0] jalr_predict_offset;
     wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
     wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
     wire [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2;
-    wire br1, br2, br3, jalr_fail, is_ibus_q;
+    wire br1, br2, br3, jalr_fail;
 
     wire [4:0] rs1_1, rs2_1, rd_1;
     wire [4:0] imm5_csr_1;
@@ -75,8 +70,13 @@ module cpu_top(
     wire csr_wr_en, timi, irq_act, irq_processing, irq;
     wire [2:0] csr_func3;
     wire [31:0] csr_data_wr, csr_data_rd, mcause, csr_result;
-    wire [31:0] dtcm_data_out, tim_data_out;
-    wire dtcm_ready, tim_ready;
+    wire [31:0] tim_data_out;
+    wire tim_ready;
+    wire [31:0] dcache_data_w, dcache_mem_addr_w, dcache_mem_wdata_w, dcache_mem_data_w;
+    wire [3:0] dcache_mem_be_w;
+    wire dcache_busy_w, dcache_ld_ready_w, dcache_mem_req_w, dcache_mem_we_w, dcache_mem_valid_w;
+    reg  dcache_busy_d1;
+    wire d_hold_int = dcache_busy_w | dcache_busy_d1;
     wire [4:0] rd_load;
     wire btb_hit;
 
@@ -85,12 +85,11 @@ module cpu_top(
     wire [31:0] bus_addr_out_i, bus_data_out_i;
     wire [3:0] bus_be_out_i;
     wire bus_we_out_i;
-    wire [31:0] ibus_addr_out_i;
-    wire ibus_re_out_i, ibus_req_valid_i;
+    wire ibus_req_valid_i;
 
     always @(*) begin
         jalr_pred = pre_jalr & btb_hit;
-        bus_data_in_final = bus_data_in_ext | dtcm_data_out | tim_data_out;
+        bus_data_in_final = bus_data_in_ext | dcache_data_w | tim_data_out;
         softi = 1'b0;
         retire_w = (stage == 2'd1);
     end
@@ -100,9 +99,6 @@ module cpu_top(
         bus_data_out = bus_data_out_i;
         bus_be_out = bus_be_out_i;
         bus_we_out = bus_we_out_i;
-        ibus_addr_out = ibus_addr_out_i;
-        ibus_re_out = ibus_re_out_i;
-        ibus_req_valid = ibus_req_valid_i;
     end
 
     pc u_pc (
@@ -114,7 +110,6 @@ module cpu_top(
         .jal(jal),
         .jalr(jalr_pred),
         .jalr_fail(jalr_fail),
-        .ext_target(ibus_re_out_i),
         .irq(irq),
         .irq_ret(irq_ret),
         .stage(stage),
@@ -130,10 +125,9 @@ module cpu_top(
         .aux_addr(aux_addr_0)
     );
 
-    itcm u_itcm (
+    icache u_icache (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
         .pc_addr(pc_addr),
         .offset_jal1(offset_jal1),
         .offset_jalr1(jalr_predict_offset),
@@ -151,22 +145,32 @@ module cpu_top(
         .jalr_target_q(jalr_target_q1),
         .beq_off_q1(beq_off_q1),
         .br_addr1(br_addr1),
-        .inst_raw_out(inst_raw),
-        .is_ibus_q(is_ibus_q),
-        .fetch_addr(ibus_addr_out_i),
-        .ibus_re_out(ibus_re_out_i),
-        .ibus_addr_in(ibus_addr_in),
-        .ibus_data_in(ibus_data_in),
-        .ibus_we_in(ibus_we_in)
+        .req_valid(ibus_req_valid_i),
+        .inst_out(icache_inst_w),
+        .busy(icache_busy_w),
+        .mem_req(icache_mem_req_w),
+        .mem_we(icache_mem_we_w),
+        .mem_addr(icache_mem_addr_w),
+        .mem_wdata(icache_mem_wdata_w),
+        .mem_be(icache_mem_be_w),
+        .mem_valid(icache_mem_valid_w),
+        .mem_data(icache_mem_data_w)
+    );
+
+    itcm u_itcm (
+        .clk(clk),
+        .rst(rst),
+        .mem_req(icache_mem_req_w),
+        .mem_addr(icache_mem_addr_w),
+        .mem_data(icache_mem_data_w),
+        .mem_valid(icache_mem_valid_w)
     );
 
     pre_decoder u_pre_decoder (
         .clk(clk),
         .rst(rst),
         .stage(stage),
-        .inst_raw_in(inst_raw),
-        .is_ibus_in(is_ibus_q),
-        .ibus_data_in(ibus_data_in),
+        .inst_in(icache_inst_w),
         .aux_addr_in(aux_addr_0),
         .br1_in(br1),
         .jalr_pred_addr_in(jalr_predict_offset),
@@ -304,8 +308,8 @@ module cpu_top(
         .offset_load0(offset_load0_2),
         .offset_store0(offset_store0_2),
         .bus_data_in(bus_data_in_final),
-        .ready_in(dtcm_ready | tim_ready | bus_loaded_in),
-        .bus_hold_in(bus_hold_in),
+        .ready_in(dcache_ld_ready_w | tim_ready | bus_loaded_in),
+        .bus_hold_in(bus_hold_in | d_hold_int),
         .bus_addr_out(bus_addr_out_i),
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
@@ -415,16 +419,45 @@ module cpu_top(
         .r2_data_lsu(r2_data_lsu)
     );
 
+    dcache u_dcache (
+        .clk(clk),
+        .rst(rst),
+        .bus_addr_in(bus_addr_out_i),
+        .bus_data_in(bus_data_out_i),
+        .bus_be_in(bus_be_out_i),
+        .bus_we_in(bus_we_out_i),
+        .bus_data_out(dcache_data_w),
+        .ld_ready(dcache_ld_ready_w),
+        .busy(dcache_busy_w),
+        .mem_req(dcache_mem_req_w),
+        .mem_we(dcache_mem_we_w),
+        .mem_addr(dcache_mem_addr_w),
+        .mem_wdata(dcache_mem_wdata_w),
+        .mem_be(dcache_mem_be_w),
+        .mem_data(dcache_mem_data_w),
+        .mem_valid(dcache_mem_valid_w),
+        .mem_ready(1'b1)
+    );
+
     dtcm u_dtcm (
         .clk(clk),
         .rst(rst),
-        .bus_addr_in(bus_addr_out),
-        .bus_data_in(bus_data_out),
-        .bus_be_in(bus_be_out),
-        .bus_we_in(bus_we_out),
-        .bus_data_out(dtcm_data_out),
-        .ready(dtcm_ready)
+        .mem_req(dcache_mem_req_w),
+        .mem_we(dcache_mem_we_w),
+        .mem_addr(dcache_mem_addr_w),
+        .mem_wdata(dcache_mem_wdata_w),
+        .mem_be(dcache_mem_be_w),
+        .mem_data(dcache_mem_data_w),
+        .mem_valid(dcache_mem_valid_w),
+        .mem_ready()
     );
+
+//dcache busy 的 1 拍延拓（原 bus_arb.d_hold_ext 的作用）：
+//fill_end 拍 busy 就掉、ld_ready 要再等一拍，这 1 拍空窗必须兜住
+    always @(posedge clk) begin
+        if (rst) dcache_busy_d1 <= 1'b0;
+        else dcache_busy_d1 <= dcache_busy_w;
+    end
 
     tim_in u_tim_in (
         .clk(clk),
@@ -450,7 +483,7 @@ module cpu_top(
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
-        .stall(stall | i_busy | bus_hold_in),
+        .stall(stall | icache_busy_w | bus_hold_in | d_hold_int),
         .csr_wr_en(csr_wr_en),
         .exti(exti),
         .timi(timi),

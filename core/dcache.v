@@ -37,44 +37,48 @@ module dcache(
     input mem_ready
     );
 
-    reg [19:0] tag;
+    reg [20:0] tag;
     reg [7:0] idx;
-    reg [3:0] word;
+    reg [2:0] word;
     reg [1:0] hit_way;
     reg cache_hit;
 
-    reg [19:0] tag0 [0:255];
-    reg [19:0] tag1 [0:255];
-    (* ram_style = "block" *) reg [31:0] data [0:8191];
+    reg [20:0] tag0 [0:255];
+    reg [20:0] tag1 [0:255];
+    (* ram_style = "block" *) reg [31:0] data [0:4095];
     reg [255:0] valid0, valid1, lru;
 
     reg stage;
     reg fill_end;
-    reg [3:0] miss_word;
-    reg [3:0] fill_cnt;
+    reg [2:0] miss_word;
+    reg [2:0] fill_cnt;
     reg [31:0] fill_addr;
-    reg [19:0] fill_tag;
+    reg [20:0] fill_tag;
     reg [7:0] fill_idx;
     reg fill_way;
 
     reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
-    reg [12:0] rd_addr;
+    reg [11:0] rd_addr;
     reg rd_en;
     reg [31:0] wr_addr, wr_data;
     reg [3:0] wr_be;
 
     integer i;
 
+    initial begin
+        for (i = 0; i < 4096; i = i + 1) data[i] = 32'd0;
+    end
+
     always @(*) begin
-        tag = bus_addr_in[31:12];
-        idx = bus_addr_in[11:4];
-        word = bus_addr_in[3:0];
+        tag = bus_addr_in[31:11];
+        idx = bus_addr_in[10:3];
+        word = bus_addr_in[2:0];
         hit_way[0] = valid0[idx] && (tag0[idx] == tag);
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
 
-        rd_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd6) && !bus_we_in;
-        wr_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd6) && bus_we_in && !wr_pend;
+        rd_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
+        wr_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
 
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'd1) && !fill_end;
@@ -96,7 +100,7 @@ module dcache(
         end
 
 //读口：hit 与 fill_end 合成一个地址/一个使能/一个数据选择（每个 data 只有一个读口）
-        rd_en  = fill_end || rd_req;
+        rd_en  = fill_end || (rd_req && cache_hit);
         rd_addr = fill_end ? {fill_way, fill_idx, miss_word} : {hit_way[1], idx, word};
     end
 
@@ -107,18 +111,24 @@ module dcache(
             data[{fill_way, fill_idx, fill_cnt}] <= mem_data;
     end
 
+//每拍先清零：cpu_top 把 dcache/tim_in/dtcm 的读数据按【位或】合流成一个 bus_data_in_final，
+//必须靠"非本窗口时输出 0"来互斥。若只在 rd_en 时更新，残留值会被或进别人的读数据
+//（实测：读 UART 状态口拿到上一次 dtcm 读的值 → ee_printf 的 while 轮询死循环）。
     always @(posedge clk) begin
         if (rst)
             bus_data_out <= 32'd0;
-        else if (rd_en)
-            bus_data_out <= data[rd_addr];
+        else begin
+            bus_data_out <= 32'd0;
+            if (rd_en)
+                bus_data_out <= data[rd_addr];
+        end
     end
 
     always @(posedge clk) begin
         if (rst) begin
             stage <= 1'd0;
             fill_end <= 1'b0;
-            fill_cnt <= 4'd0;
+            fill_cnt <= 3'd0;
             fill_way <= 1'b0;
             wr_pend <= 1'b0;
             ld_ready <= 1'b0;
@@ -141,8 +151,8 @@ module dcache(
                 else begin
                     stage <= 1'd1;
                     miss_word <= word;
-                    fill_cnt <= 4'd0;
-                    fill_addr <= (bus_addr_in & 32'hFFFFFFF0) << 2;
+                    fill_cnt <= 3'd0;
+                    fill_addr <= (bus_addr_in & 32'hFFFFFFF8) << 2;
                     fill_tag <= tag;
                     fill_idx <= idx;
                     fill_way <= (!valid0[idx]) ? 1'b0 :
@@ -164,8 +174,8 @@ module dcache(
             if (wr_pend && mem_ready) wr_pend <= 1'b0;
 
             if (stage == 1'd1 && !fill_end && mem_valid) begin
-                if (fill_cnt == 4'd15) fill_end <= 1'b1;
-                else fill_cnt <= fill_cnt + 4'd1;
+                if (fill_cnt == 4'd7) fill_end <= 1'b1;
+                else fill_cnt <= fill_cnt + 3'd1;
             end
 
             if (fill_end) begin

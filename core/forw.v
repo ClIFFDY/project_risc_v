@@ -29,25 +29,21 @@ module forw(
     input loaded, stall,
     output reg [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu
     );
-    reg [31:0] result_back2_final;
-    reg [4:0] rd_back2_sel;
     reg stalled;
-
-//alu后方数据及地址旁路前送逻辑，防止读写冒险
-    always @(*) begin
-        rd_back2_sel = (loaded) ? rd_load : rd_back2;
-    end
 
 //对ld/st指令数据旁路进行延迟仲裁
     always @(*) begin
-        result_back2_final = (loaded) ? ld_data : result_back2;
         if (!stalled && rd_back1 != 5'd0 && r1 == rd_back1) begin
             r1_data_final_dec = result_back1;
             r1_data_final_lsu = result_back1;
         end
-        else if (rd_back2_sel != 5'd0 && r1 == rd_back2_sel) begin
-            r1_data_final_dec = result_back2_final;
-            r1_data_final_lsu = result_back2_final;
+        else if (loaded && rd_load != 5'd0 && r1 == rd_load) begin
+            r1_data_final_dec = ld_data;
+            r1_data_final_lsu = ld_data;
+        end
+        else if (rd_back2 != 5'd0 && r1 == rd_back2) begin
+            r1_data_final_dec = result_back2;
+            r1_data_final_lsu = result_back2;
         end
         else begin
             r1_data_final_dec = r1_data_in_dec;
@@ -57,9 +53,13 @@ module forw(
             r2_data_final_dec = result_back1;
             r2_data_final_lsu = result_back1;
         end
-        else if (rd_back2_sel != 5'd0 && r2 == rd_back2_sel) begin
-            r2_data_final_dec = result_back2_final;
-            r2_data_final_lsu = result_back2_final;
+        else if (loaded && rd_load != 5'd0 && r2 == rd_load) begin
+            r2_data_final_dec = ld_data;
+            r2_data_final_lsu = ld_data;
+        end
+        else if (rd_back2 != 5'd0 && r2 == rd_back2) begin
+            r2_data_final_dec = result_back2;
+            r2_data_final_lsu = result_back2;
         end
         else begin
             r2_data_final_dec = r2_data_in_dec;
