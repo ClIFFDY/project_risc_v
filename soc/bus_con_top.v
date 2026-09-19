@@ -124,7 +124,6 @@ module bus_con_top(
         .hwstrb(s_hwstrb),
         .hrdata(s_hrdata),
         .hready(s_hready),
-        .hresp(),
         .rd_valid(s_rd_valid),
         .bus_addr_out(bus_addr_out),
         .bus_data_out(bus_data_out),

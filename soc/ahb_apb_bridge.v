@@ -31,7 +31,6 @@ module ahb_apb_bridge(
     input      [3:0]  hwstrb,
     output reg [31:0] hrdata,
     output reg        hready,
-    output reg [1:0]  hresp,
     output reg        rd_valid,
     output reg [31:0] bus_addr_out,
     output reg [31:0] bus_data_out,
@@ -105,7 +104,6 @@ module ahb_apb_bridge(
         default:   hrdata = 32'd0;
         endcase
         hready = 1'b1;
-        hresp  = 2'b00;
         rd_valid = pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready;
     end
 
