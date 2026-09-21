@@ -34,6 +34,12 @@ module itcm(
     output mem_valid
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
 //指令存储 64KB（自举/回填来源）
     (* ram_style = "block" *) reg [31:0] itcm [0:16383];
     integer i;
@@ -54,7 +60,7 @@ module itcm(
     always @(*) start = mem_req & ~req_d;
 
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             raddr <= 14'd0;
             cnt <= 6'd0;
             addr_v <= 1'b0;

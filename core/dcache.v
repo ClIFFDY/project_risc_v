@@ -39,6 +39,12 @@ module dcache(
     output reg [3:0] mem_be
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     reg [20:0] tag;
     reg [7:0] idx;
     reg [2:0] word;
@@ -84,8 +90,8 @@ module dcache(
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
 
-        rd_req = !rst && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
-        wr_req = !rst && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
+        rd_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
+        wr_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
 //整字 store 命中：能整字覆盖行内那个字，故【不失效】，直接行内更新。
 //写穿照做，缓存与后端仍一致。子字 store 覆盖不了整字，维持写失效。
         wr_full_hit = wr_req && cache_hit && (bus_be_in == 4'b1111);
@@ -93,9 +99,9 @@ module dcache(
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'b1) && !fill_end;
 
-        busy = !rst && ((stage == 1'b1 && !fill_end) || (rd_req && !cache_hit) ||
+        busy = !rst_q && ((stage == 1'b1 && !fill_end) || (rd_req && !cache_hit) ||
                         (wr_pend && !mem_ready));
-        mem_req = !rst && (wr_drive || rd_drive);
+        mem_req = !rst_q && (wr_drive || rd_drive);
         mem_we = wr_drive;
         if (wr_pend) begin
             mem_addr = wr_addr;
@@ -140,7 +146,7 @@ module dcache(
 //必须靠"非本窗口时输出 0"来互斥。若只在 rd_en 时更新，残留值会被或进别人的读数据
 //（实测：读 UART 状态口拿到上一次 dtcm 读的值 → ee_printf 的 while 轮询死循环）。
     always @(posedge clk) begin
-        if (rst)
+        if (rst_q)
             bus_data_out <= 32'd0;
         else begin
             bus_data_out <= 32'd0;
@@ -150,7 +156,7 @@ module dcache(
     end
 
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             stage <= 1'b0;
             fill_end <= 1'b0;
             fill_cnt <= 3'd0;
@@ -229,7 +235,7 @@ module dcache(
 //busy 的 1 拍延拓（原 cpu_top 的 d_hold_int，按"顶层不运算"下放到此）：
 //fill_end 拍 busy 就掉、ld_ready 要再等一拍，这 1 拍空窗必须兜住。
     always @(posedge clk) begin
-        if (rst) busy_d1 <= 1'b0;
+        if (rst_q) busy_d1 <= 1'b0;
         else     busy_d1 <= busy;
     end
 

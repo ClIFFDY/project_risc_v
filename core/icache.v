@@ -49,6 +49,12 @@ module icache(
     output reg [3:0] mem_be
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     localparam BOOT_LINES = 7'd127;
 
     reg cache_hit;
@@ -100,7 +106,7 @@ module icache(
 //环头整段消失。代价：每次预测跳转命中多一拍空泡 —— 那拍由下面的 NOP 门刷掉。
     (* max_fanout = 32 *) reg [31:0] fetch_addr;
     always @(*) begin
-        if (rst) fetch_addr = 32'd0;
+        if (rst_q) fetch_addr = 32'd0;
         else     fetch_addr = pc_addr >>> 2;
     end
 
@@ -174,7 +180,7 @@ module icache(
 //与 req_valid 相与：停顿期间 req_valid=0，本来就没有新指令要挡，
 //而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
-        if (rst)                                  inst_out <= 32'd0;
+        if (rst_q)                                  inst_out <= 32'd0;
         else if ((jalr | jalr_fail | br2 | br3 | irq | irq_ret | br1 | jal) && req_valid) inst_out <= 32'd0;
         else if (rd_en)                           inst_out <= iram[rd_addr];
     end
@@ -187,13 +193,13 @@ module icache(
 //复位值必须是 1：复位期间 boot=1 ⇒ busy 恒 1，取 0 会让复位后第一拍 stage 落到 EXE、
 //req_valid 抬起，icache 拿无效 hit_sel 去读 iram 并被 pre_decoder 锁进流水线。
     always @(posedge clk) begin
-        if (rst) busy_q <= 1'b1;
+        if (rst_q) busy_q <= 1'b1;
         else     busy_q <= busy;
     end
 
 //自举序列：复位释放后逐行填充前 16KB（128 行 × 32 字），固定写 way0
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             boot <= 1'b1;
             boot_line <= 7'd0;
             stage <= 1'b0;

@@ -38,6 +38,12 @@ module regfile(
     output reg [31:0] r1_data_mul, r2_data_mul
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
 //同步读写型通用寄存器组，节省lut资源
     (* ram_style = "block" *) reg [31:0] regs [0:31];
 
@@ -77,7 +83,7 @@ module regfile(
 
 //读数据进行双写口(alu/ld)旁路仲裁并输出
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             r1_data_dec <= 32'd0;
             r2_data_dec <= 32'd0;
             r1_data_lsu <= 32'd0;

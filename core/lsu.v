@@ -43,25 +43,30 @@ module lsu(
     output reg [4:0] rd_load
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     localparam OPCODE_LOAD  = 7'b0000011;
     localparam OPCODE_STORE = 7'b0100011;
 
-    reg [4:0] rd_1;
-    reg [6:0] opcode_post;
-    reg stalled;
-
     reg [31:0] st_addr;
 
-    reg [4:0] ld_rd_fifo [0:1];
-    reg [2:0] ld_size_fifo [0:1];
-    reg [1:0] ld_off_fifo [0:1];
-    reg [1:0] ld_wr_ptr, ld_rd_ptr;
+    reg [4:0] ld_rd_fifo [0:3];
+    reg [2:0] ld_size_fifo [0:3];
+    reg [1:0] ld_off_fifo [0:3];
+    reg [2:0] ld_wr_ptr, ld_rd_ptr;
+    reg [3:0] ld_occ;
     reg [4:0] ld_hold_rd;
     reg [31:0] ld_hold_data;
     reg [31:0] ld_data_cur;
     reg ld_hold;
 
     reg ld_fifo_empty, ld_fifo_full, ld_pop, ld_enq, ld_push_eff;
+    reg ld_use_hit;
+    reg [3:0] ld_occ_q;
     reg [4:0] ld_rd_cur;
     reg [2:0] ld_size_cur;
     reg [1:0] ld_off_cur;
@@ -90,18 +95,18 @@ module lsu(
 //在途 load 队列的空满、收发条件与队头载荷
     always @(*) begin
         ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
-        ld_fifo_full  = (ld_wr_ptr[1] != ld_rd_ptr[1]) && (ld_wr_ptr[0] == ld_rd_ptr[0]);
+        ld_fifo_full  = (ld_wr_ptr[2] != ld_rd_ptr[2]) && (ld_wr_ptr[1:0] == ld_rd_ptr[1:0]);
         ld_pop        = ready_in && !ld_fifo_empty;
         ld_enq        = (opcode == OPCODE_LOAD) && !stall && !flush_w && !bus_hold;
         ld_push_eff   = ld_enq && !(ld_fifo_full && !ld_pop);
-        ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[0]];
-        ld_size_cur   = ld_size_fifo[ld_rd_ptr[0]];
-        ld_off_cur    = ld_off_fifo[ld_rd_ptr[0]];
+        ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[1:0]];
+        ld_size_cur   = ld_size_fifo[ld_rd_ptr[1:0]];
+        ld_off_cur    = ld_off_fifo[ld_rd_ptr[1:0]];
     end
 
 //ld/st读写类指令总线地址处理逻辑
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             bus_addr_out <= 32'd0;
             bus_data_out <= 32'd0;
             bus_be_out <= 4'd0;
@@ -184,47 +189,32 @@ module lsu(
         end
     end
 
+//在途 load 请求队列：load 发射入队，应答出队，rd/size/off 与应答同源出队。
+//ld_occ 是与数据阵列并行维护的占用掩码（绝对下标）：出队先清、入队后置，
+//两者撞同一格（队满且本拍既收又发）时后置生效——新入队的那项才是有效的那个。
     always @(posedge clk) begin
-        if (rst) begin
-            opcode_post <= 7'd0;
-            stalled <= 1'b0;
+        if (rst_q) begin
+            ld_wr_ptr <= 3'd0;
+            ld_rd_ptr <= 3'd0;
+            ld_occ    <= 4'd0;
         end
         else begin
-            opcode_post <= opcode;
-            if (stall) stalled <= 1'b1;
-            else if (stalled && loaded) stalled <= 1'b0;
-            else stalled <= stalled;
-        end
-    end
-
-//在途 load 请求队列：load 发射入队，应答出队，rd/size/off 与应答同源出队
-    always @(posedge clk) begin
-        if (rst) begin
-            ld_wr_ptr <= 2'd0;
-            ld_rd_ptr <= 2'd0;
-        end
-        else begin
+            if (ld_pop)      ld_occ[ld_rd_ptr[1:0]] <= 1'b0;
+            if (ld_push_eff) ld_occ[ld_wr_ptr[1:0]] <= 1'b1;
             if (ld_push_eff) begin
-                ld_rd_fifo[ld_wr_ptr[0]]   <= rd_in;
-                ld_size_fifo[ld_wr_ptr[0]] <= func10[2:0];
-                ld_off_fifo[ld_wr_ptr[0]]  <= r1_data_final + offset_load0;
-                ld_wr_ptr <= ld_wr_ptr + 2'd1;
+                ld_rd_fifo[ld_wr_ptr[1:0]]   <= rd_in;
+                ld_size_fifo[ld_wr_ptr[1:0]] <= func10[2:0];
+                ld_off_fifo[ld_wr_ptr[1:0]]  <= r1_data_final + offset_load0;
+                ld_wr_ptr <= ld_wr_ptr + 3'd1;
             end
             if (ld_pop)
-                ld_rd_ptr <= ld_rd_ptr + 2'd1;
+                ld_rd_ptr <= ld_rd_ptr + 3'd1;
         end
-    end
-
-//load-use 冒险判定用最近一次发射的 load 目的寄存器
-    always @(posedge clk) begin
-        if (rst) rd_1 <= 5'd0;
-        else if (ld_push_eff) rd_1 <= rd_in;
-        else rd_1 <= rd_1;
     end
 
 //应答只摆一拍的话，落在 back2 槽的消费者会取不到，故再保持一拍
     always @(posedge clk) begin
-        if (rst) ld_hold <= 1'b0;
+        if (rst_q) ld_hold <= 1'b0;
         else begin
             ld_hold <= ld_pop;
             if (ld_pop) begin
@@ -234,18 +224,24 @@ module lsu(
         end
     end
 
+//load-use 互锁：不按"上一条是 load 吗"做单槽判断，而是扫遍在途队列的每一个占用项。
+//队列现在可同时挂 4 条 load，单槽判断只认最近发射的那一条，更早就在途的那几条会漏判——
+//而漏判不会报错，只会把还没回来的数据当成已经回来的用。
+//本拍就要出队的那一项排除在外：它的数据这拍已经从总线上取回、可以同拍前递，不该再压流水线。
+    always @(*) begin
+        ld_occ_q   = ld_occ;
+        ld_use_hit = 1'b0;
+        if (ld_pop) ld_occ_q[ld_rd_ptr[1:0]] = 1'b0;
+        if (ld_occ_q[0] && ((ld_rd_fifo[0] == r1_post) | (ld_rd_fifo[0] == r2_post))) ld_use_hit = 1'b1;
+        if (ld_occ_q[1] && ((ld_rd_fifo[1] == r1_post) | (ld_rd_fifo[1] == r2_post))) ld_use_hit = 1'b1;
+        if (ld_occ_q[2] && ((ld_rd_fifo[2] == r1_post) | (ld_rd_fifo[2] == r2_post))) ld_use_hit = 1'b1;
+        if (ld_occ_q[3] && ((ld_rd_fifo[3] == r1_post) | (ld_rd_fifo[3] == r2_post))) ld_use_hit = 1'b1;
+    end
+
 //stall信号拉起逻辑
     always @(*) begin
         st_addr = r1_data_final + offset_store0;
-        if ((opcode_post == OPCODE_LOAD) && ((rd_1 == r1_post) | (rd_1 == r2_post))) begin
-            if (stalled && loaded)
-                stall = 1'b0;
-            else
-                stall = 1'b1;
-        end
-        else begin
-            stall = 1'b0;
-        end
+        stall   = ld_use_hit;
     end
 
 //字节使能数据返回输出：出队拍按 off/size 取字节

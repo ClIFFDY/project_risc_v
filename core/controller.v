@@ -38,6 +38,12 @@ module controller(
     output reg [3:0] irq_bubble
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     reg [1:0] ird_tmr;
     reg jalr_pred;
     wire [31:0] csr_data_out_i, isr_addr1_i, isr_addr2_i, mcause_i;
@@ -62,7 +68,7 @@ module controller(
         req_valid = !(stall_d || stall_i);
         flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i};
 //复位期按原 stage = EXE / req_valid = 0 的口径给：只有 exec 抬、其余落下
-        if (rst) begin
+        if (rst_q) begin
             flush_irq = 1'b0;
             flush_jump = 1'b0;
             stall_d = 1'b0;
@@ -75,7 +81,7 @@ module controller(
 //csr异常/中断寄存器
     csr u_csr (
         .clk(clk),
-        .rst(rst),
+        .rst(rst_q),
         .csr_wr_en(csr_wr_en),
         .stall_d(stall_d),
         .stall_i(stall_i),
@@ -118,19 +124,19 @@ module controller(
 
 //中断空窗计数器：作用为填充冲刷后流水线预取空窗
     always @(posedge clk) begin
-        if (rst) irq_bubble <= 4'd12;
+        if (rst_q) irq_bubble <= 4'd12;
         else if (flush_w) irq_bubble <= 4'd4;
         else if (irq_bubble < 4'd12) irq_bubble <= irq_bubble + 4'd4;
     end
 
     always @(posedge clk) begin
-        if (rst) ird_tmr <= 2'd0;
+        if (rst_q) ird_tmr <= 2'd0;
         else if ((jal | jalr_pred | br1) && !flush_w) ird_tmr <= 2'd3;
         else if (ird_tmr != 2'd0) ird_tmr <= ird_tmr - 2'd1;
     end
 
     always @(posedge clk) begin
-        if (rst) exec <= 1'b1;
+        if (rst_q) exec <= 1'b1;
         else exec <= exec;
     end
 

@@ -59,6 +59,12 @@ module mulu(
     output reg stall
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     localparam OPCODE_OP = 7'b0110011;
 
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
@@ -194,7 +200,7 @@ module mulu(
 //===============================================================
 //乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与 alu 的写回级同呼吸。
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             m_v <= 1'b0;
             m_a <= 32'd0;  m_b <= 32'd0;  m_rd <= 5'd0;  m_op <= 3'd0;
         end
@@ -212,7 +218,7 @@ module mulu(
 //乘法第二级：锁乘积。同样按 pipe_stall 冻结。这一级【不判 flush】—— 能走到这里的乘法，
 //发起它的那条指令一定比正在冲刷的那条更老，必须照样提交（与 lsu 在途队列语义一致）。
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             m_pv <= 1'b0;
             m_p <= 64'd0;  m_rd_q <= 5'd0;  m_op_q <= 3'd0;
         end
@@ -226,7 +232,7 @@ module mulu(
 
 //除法迭代
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             d_busy <= 1'b0;
             d_issued <= 1'b0;
             d_cnt  <= 5'd0;
@@ -277,7 +283,7 @@ module mulu(
     end
 
     always @(posedge clk) begin
-        if (rst || flush_w) d_done <= 1'b0;
+        if (rst_q || flush_w) d_done <= 1'b0;
         else              d_done <= d_last;
     end
 
@@ -285,7 +291,7 @@ module mulu(
     always @(posedge clk) begin
 //【只由 rst 清】不能判 flush：d_done 一旦发出，说明这条 div 已在 c2 完成并即将离级，
 //此时被冲刷不会重执行，结果必须照样提交（与乘法第二级不判 flush 同理）。
-        if (rst) begin
+        if (rst_q) begin
             d_cmt_q <= 3'd0;
         end
         else if (!pipe_stall) begin
@@ -298,7 +304,7 @@ module mulu(
     end
 
     always @(posedge clk) begin
-        if (rst) hold <= 1'b0;
+        if (rst_q) hold <= 1'b0;
         else if (!pipe_stall) begin
             hold <= m_pv;
             if (m_pv) begin
@@ -310,7 +316,7 @@ module mulu(
 
 //冒险用的载荷寄存器（M 与普通 ALU 共用 OPCODE_OP，所以 func10 必须一起寄存）
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             opcode_post <= 7'd0;
             func10_post <= 10'd0;
             rd_post     <= 5'd0;

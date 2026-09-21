@@ -29,6 +29,12 @@ module bra_predict(
     output reg br1, br2, br3, jalr, jalr_fail
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
     reg [1:0] bht [0:63];
     reg [31:0] btb [0:63];
 //BTB 有效表：把命中判定从"目标 != 0"（32 位或归约）换成 1 位查表。
@@ -40,12 +46,12 @@ module bra_predict(
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
-        if (rst) predict_en = 1'b0;
+        if (rst_q) predict_en = 1'b0;
         else predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
     end
 
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
 //初始BHT回到弱不跳转
             for (i = 0; i < 64; i = i + 1) bht[i] <= 2'd1;
             for (i = 0; i < 64; i = i + 1) btb[i] <= 32'd0;
@@ -71,7 +77,7 @@ module bra_predict(
 
 //组合输出：当前取指PC的预测结果 + 载荷的预测判定
     always @(*) begin
-        if (rst) begin
+        if (rst_q) begin
             br_addr1 = 32'd0;
             br_addr2 = 32'd0;
             br1 = 1'b0;

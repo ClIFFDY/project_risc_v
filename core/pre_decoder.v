@@ -42,6 +42,12 @@ module pre_decoder(
     output reg [31:0] jalr_pred_addr_out
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
 //RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;
@@ -98,7 +104,7 @@ module pre_decoder(
 //根据不同指令类型对输入的指令进行opcode、function字段、地址和立即数拆分
 //func10是RV32I指令集funct7和funct3字段的组合
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             func10_dec <= 10'd0;
             func10_lsu <= 10'd0;
             r1 <= 5'd0;
@@ -309,7 +315,7 @@ module pre_decoder(
         offset_jal2 = 32'd0;
         jal = 1'b0;
         jalr = 1'b0;
-        if (!rst) begin
+        if (!rst_q) begin
             case (inst_effective[6:0])
                 OPCODE_JAL: begin
                     offset_jal1 = $signed(immJ(inst_effective)) - 4'd4;

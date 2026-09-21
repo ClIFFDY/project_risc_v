@@ -32,6 +32,12 @@ module pc(
     output reg [31:0] pc_addr, aux_addr
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
@@ -48,7 +54,7 @@ module pc(
 
 //程序计数器，传递取指地址
     always @(posedge clk) begin
-        if (rst) begin
+        if (rst_q) begin
             pc_addr <= 32'd0;
             aux_addr <= 32'd0;
         end

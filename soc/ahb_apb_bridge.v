@@ -96,17 +96,34 @@ module ahb_apb_bridge(
         endcase
     end
 
+    reg [31:0] hrdata_c;
+    reg rd_valid_c;
     always @(*) begin
         case (sel_pend)
-        SLOT_UART: hrdata = uart_data;
-        SLOT_PLIC: hrdata = plic_data;
-        SLOT_GPIO: hrdata = gpio_data;
-        SLOT_I2C:  hrdata = i2c_data;
-        default:   hrdata = 32'd0;
+        SLOT_UART: hrdata_c = uart_data;
+        SLOT_PLIC: hrdata_c = plic_data;
+        SLOT_GPIO: hrdata_c = gpio_data;
+        SLOT_I2C:  hrdata_c = i2c_data;
+        default:   hrdata_c = 32'd0;
         endcase
+        rd_valid_c = pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready;
         hready = 1'b1;
         hresp  = 2'b00;
-        rd_valid = pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready;
+    end
+
+//读回再打一拍才交出去。四家外设的 ld_ready 与 bus_data_out 本来就都是寄存器，中间只隔
+//sel_pend 的这一个 4:1 mux —— 这一级是纯组合的，原先一路穿过 u_io_block → u_bus_con →
+//u_cpu_top/u_lsu 的前递选择端，是全部失败路径的共同头部。打一拍把它断在寄存器 D 端，
+//下游从寄存器 Q 重新起算一条短链。代价：外设读应答晚一拍（lsu 侧由 ld_fifo 的深度接住）。
+    always @(posedge clk) begin
+        if (rst) begin
+            hrdata   <= 32'd0;
+            rd_valid <= 1'b0;
+        end
+        else begin
+            hrdata   <= hrdata_c;
+            rd_valid <= rd_valid_c;
+        end
     end
 
 endmodule
