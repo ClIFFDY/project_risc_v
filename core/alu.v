@@ -51,7 +51,7 @@ module alu(
         CSRRWI = 3'b101,
         CSRRSI = 3'b110,
         CSRSCI = 3'b111;
-        
+
 //SYSTEM类指令：cs_data源于csr寄存器，result_csr写回csr寄存器，result返回rd
     always @(*) begin
         if (we_in && cs_wr_en) begin
@@ -94,7 +94,7 @@ module alu(
         else begin
             rd_out = 5'd0;
             result = 32'd0;
-            we = 1'd0;
+            we = 1'b0;
             result_csr = r2_data;
         end
         result_back1 = result;

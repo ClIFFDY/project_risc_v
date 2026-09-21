@@ -28,11 +28,14 @@ module forw(
     input [31:0] r1_data_in_dec, r2_data_in_dec, r1_data_in_lsu, r2_data_in_lsu, ld_data,
     input [31:0] r1_data_in_mul, r2_data_in_mul,
     input [31:0] mul_data,
-    input loaded, mul_loaded, stall,
+    input loaded, mul_loaded, lsu_stall, mul_stall,
     output reg [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu,
     output reg [31:0] r1_data_final_mul, r2_data_final_mul
     );
-    reg stalled;
+    reg stalled, stall;
+
+//停顿合流（按"顶层不运算"从 cpu_top 下放至此）
+    always @(*) stall = lsu_stall | mul_stall;
 
 //对ld/st指令数据旁路进行延迟仲裁。
 //_mul 是【独立的第三份镜像】（照 pc.v 的 pc_addr/aux_addr 手法）：
@@ -93,7 +96,7 @@ module forw(
     end
 
     always @(posedge clk) begin
-        if (rst) stalled <= 1'd0;
+        if (rst) stalled <= 1'b0;
         else stalled <= stall;
     end
 endmodule

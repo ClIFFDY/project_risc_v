@@ -41,13 +41,14 @@
 
 module mulu(
     input clk, rst,
-    input flush,
-    input bus_hold_in,
-//整条流水线的合成 stall（controller 那个 OR，含 icache_busy_w / d_hold_int / lsu load-use）。
-//mulu 自己判的三类冒险看不到它，所以必须显式接进来：本级的两级乘法流水、除法提交链、
-//输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿严格同偏移（照 lsu 对 stage 的门控手法）。
-//不冻结的后果：icache 一 miss 就把 mul 冻在 c2，m_push 每拍重发 -> m_v 恒 1 -> we_mul 连续多拍。
-    input pipe_stall,
+    input [4:0] flag_bus,
+//冻结信号的三项源（按"顶层不运算"从 cpu_top 下放至此，由本模块内部合成 pipe_stall）：
+//本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
+//严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
+//m_push 每拍重发 -> m_v 恒 1 -> we_mul 连续多拍。
+//【合流里必须排掉本模块自己的 stall】：那正是 div 进行 / mul-use 冒险的输出，一并冻住会自锁。
+    input lsu_stall, icache_busy,
+    input bus_hold_in, dcache_hold,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -59,6 +60,19 @@ module mulu(
     );
 
     localparam OPCODE_OP = 7'b0110011;
+
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
+//不用流水线使能，故只取两条冲刷位。
+    reg flush_w;
+    always @(*) flush_w = flag_bus[3] | flag_bus[2];
+
+//冻结信号合流：总线保持（外部 + dcache 延拓拍）与取指缺失、以及 lsu 的 load-use
+    reg pipe_stall, bus_hold;
+    always @(*) begin
+        bus_hold   = bus_hold_in | dcache_hold;
+        pipe_stall = lsu_stall | icache_busy | bus_hold;
+    end
 
 //===============================================================
 // 乘法：两级流水寄存器
@@ -139,9 +153,9 @@ module mulu(
         is_mul_post  = is_m_post && (func10_post[2] == 1'b0);
     end
 
-//第一级：锁操作数。判据 !stall / !flush / !bus_hold_in 与 lsu 的 ld_enq 同形
+//第一级：锁操作数。判据 !stall / !flush_w / !bus_hold_in 与 lsu 的 ld_enq 同形
     always @(*) begin
-        m_push = is_mul && !stall && !pipe_stall && !flush && !bus_hold_in;
+        m_push = is_mul && !stall && !pipe_stall && !flush_w && !bus_hold;
     end
 
 //33 位扩展：
@@ -223,7 +237,7 @@ module mulu(
             d_neg_q <= 1'b0; d_neg_r <= 1'b0;
             d_zero <= 1'b0;  d_ovf <= 1'b0;
         end
-        else if (flush) begin
+        else if (flush_w) begin
 //除法无副作用，被冲刷就整体作废，重取指后会重新执行
             d_busy <= 1'b0;
         end
@@ -238,7 +252,7 @@ module mulu(
             if (d_last) d_busy <= 1'b0;
             else        d_cnt  <= d_cnt + 5'd1;
         end
-        else if (is_div && !d_issued && !bus_hold_in) begin
+        else if (is_div && !d_issued && !bus_hold) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //【不能判 !stall】—— stall 里含 is_div 本身，判了就永远发不出去（死锁）。
 //d_issued 保证一条 div 只发起一次；否则算完后 is_div 仍在（指令还冻在 mulu 级），
@@ -263,7 +277,7 @@ module mulu(
     end
 
     always @(posedge clk) begin
-        if (rst || flush) d_done <= 1'b0;
+        if (rst || flush_w) d_done <= 1'b0;
         else              d_done <= d_last;
     end
 
@@ -346,7 +360,7 @@ module mulu(
     always @(*) begin
 //除法：从"div 还在 mulu 级且尚未发起"那拍起一直停到收尾后。
 //d_issued 置起后本项让位给 d_busy/d_done，算完就放行，指令才能离开 mulu 级。
-        if (is_div && !d_issued && !bus_hold_in)
+        if (is_div && !d_issued && !bus_hold)
             stall = 1'b1;
         else if (d_busy || d_done)
             stall = 1'b1;

@@ -22,13 +22,13 @@
 
 module csr(
     input clk, rst,
-    input csr_wr_en, stall, iret, exti, timi, softi, trap, ebreak,
+    input csr_wr_en, stall_d, stall_i, flush, iret, exti, timi, softi, trap, ebreak,
     input [11:0] csr_addr,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
-    input retire,
+    input [1:0] ird_tmr,
     input [3:0] irq_bubble,
-    input irq_gate, jalr_fail, br2, br3,
+    input jalr_fail, br2, br3,
     output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause, iret_addr1, iret_addr2,
     output reg irq_act, irq_processing
     );
@@ -37,21 +37,29 @@ module csr(
     reg eirq_pend, tirq_pend, sirq_pend, irq_process, global_pend;
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_reg, mcycle_reg, minstret_reg;
 
+//输入合流（按"上层不运算"下放至此）：停顿、中断闸门、指令退役
+    reg stall, irq_gate, retire;
+    always @(*) begin
+        stall    = stall_d | stall_i;
+        irq_gate = (ird_tmr != 2'd0);
+//指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
+        retire   = !(flush | stall);
+    end
 
     always @(posedge clk) begin
         if (rst) begin
-            irq_en_reg <= 1'd0;
-            irq_en_post_reg <= 1'd0;
+            irq_en_reg <= 1'b0;
+            irq_en_post_reg <= 1'b0;
             isr_addr_reg1 <= 32'd0;
             isr_addr_reg2 <= 32'd0;
             iret_addr1 <= 32'd0;
             iret_addr2 <= 32'd0;
             mcause_reg <= 32'd0;
-            eirq_en <= 1'd0;
-            tirq_en <= 1'd0;
-            sirq_en <= 1'd0;
-            sirq_pend <= 1'd0;
-            irq_process <= 1'd0;
+            eirq_en <= 1'b0;
+            tirq_en <= 1'b0;
+            sirq_en <= 1'b0;
+            sirq_pend <= 1'b0;
+            irq_process <= 1'b0;
         end
 //默认情况中断地址/使能/状态寄存器保持
         else begin
@@ -94,7 +102,7 @@ module csr(
                 end
                 12'h344: begin
 //软件中断挂起
-                    if (csr_data_in[11]) sirq_pend <= 1'd0;
+                    if (csr_data_in[11]) sirq_pend <= 1'b0;
                 end
                 endcase
             end
@@ -116,21 +124,21 @@ module csr(
                 iret_addr2 <= pc_addr_in - 4'd12;
                 mcause_reg <= (ebreak) ? 32'h80000003 : 32'h8000000B;
                 irq_en_post_reg <= irq_en_reg;
-                irq_en_reg <= 1'd0;
-                irq_process <= 1'd1;
+                irq_en_reg <= 1'b0;
+                irq_process <= 1'b1;
             end
 //非isr状态下触发中断，保存上下文并使能受理信号
             else if (irq_act && !irq_process) begin
                 iret_addr1 <= pc_addr_in - irq_bubble;
                 iret_addr2 <= pc_addr_in - irq_bubble;
                 irq_en_post_reg <= irq_en_reg;
-                irq_en_reg <= 1'd0;
-                irq_process <= 1'd1;
+                irq_en_reg <= 1'b0;
+                irq_process <= 1'b1;
             end
 //isr返回（目前只支持机器模式）
             if (iret) begin
                 irq_en_reg <= irq_en_post_reg;
-                irq_process <= 1'd0;
+                irq_process <= 1'b0;
             end
         end
     end
@@ -150,14 +158,14 @@ module csr(
 //csr读操作逻辑
     always @(*) begin
         if (rst) begin
-            global_pend = 1'd0;
-            irq_act = 1'd0;
-            irq_processing = 1'd0;
+            global_pend = 1'b0;
+            irq_act = 1'b0;
+            irq_processing = 1'b0;
             mcause = 32'd0;
-            isr_addr1 = 16'd0;
-            isr_addr2 = 16'd0;
-            tirq_pend = 1'd0;
-            eirq_pend = 1'd0;
+            isr_addr1 = 32'd0;
+            isr_addr2 = 32'd0;
+            tirq_pend = 1'b0;
+            eirq_pend = 1'b0;
         end
         else begin
             tirq_pend = timi;

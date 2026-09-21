@@ -2,32 +2,18 @@
 
 module cpu_top(
     input clk, rst,
-    //
-    output reg [31:0] bus_addr_out,
-    output reg [31:0] bus_data_out,
-    output reg [3:0] bus_be_out,
-    output reg bus_we_out,
-    output reg bus_valid_out,
     input [31:0] bus_data_in_ext,
-    input bus_loaded_in,
-    input bus_hold_in,
-    input exti
+    input bus_loaded_in, bus_hold_in, exti,
+
+    output reg [31:0] bus_addr_out, bus_data_out,
+    output reg [3:0] bus_be_out,
+    output reg bus_we_out, bus_valid_out
     );
 
-    wire [1:0] stage;
-    wire [3:0] irq_bubble, alu_func4;
-    wire [11:0] csr_addr;
-    wire [4:0] rd_back1, rd_back2;
-
-    wire [31:0] pc_addr, aux_addr_0, br_addr1, br_addr2;
-    wire flush;
-    wire [31:0] icache_inst_w, icache_mem_addr_w, icache_mem_wdata_w, icache_mem_data_w;
-    wire [3:0] icache_mem_be_w;
-    wire icache_busy_w, icache_mem_req_w, icache_mem_we_w, icache_mem_valid_w;
-    wire [31:0] jalr_predict_offset;
-    wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
-    wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
-    wire [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2;
+//流水线层次块：按信号首生产者的流水线位置排序
+    wire [31:0] pc_addr, aux_addr_0;
+    wire [31:0] icache_inst_w;
+    wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3, jalr_fail;
 
     wire [4:0] rs1_1, rs2_1, rd_1;
@@ -39,8 +25,8 @@ module cpu_top(
     wire [31:0] offset_jalr0_1, offset_beq0_aux_1, offset_load0_1, offset_store0_1;
     wire [31:0] aux_addr_1;
     wire dec, lsu, jal, br_en, pre_jalr;
-    wire br_pred_taken_1, br_pred_taken_2, br_pred_taken_3;
-    wire [31:0] jalr_pred_addr_1, jalr_pred_addr_2, jalr_pred_addr_3;
+    wire br_pred_taken_1;
+    wire [31:0] jalr_pred_addr_1;
 
     wire [4:0] rs1_2, rs2_2, rd_2;
     wire [4:0] imm5_csr_2;
@@ -50,15 +36,14 @@ module cpu_top(
     wire [11:0] imm12_csr_2;
     wire [31:0] offset_jalr0_2, offset_beq0_aux_2, offset_load0_2, offset_store0_2;
     wire [31:0] aux_addr_2;
+    wire br_pred_taken_2;
+    wire [31:0] jalr_pred_addr_2;
 
     wire [4:0] rd_3;
     wire [31:0] r1_data_3, r2_data_3, aux_addr_3;
     wire we_3;
-    wire [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu;
-    wire [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu;
-    wire [31:0] ld_data_final;
-    wire jalr, br_fail, success, jal_flag, jalr_flag, irq_ret, trap, ebreak;
-    wire loaded, ld_we, stall;
+    wire br_pred_taken_3;
+    wire [31:0] jalr_pred_addr_3;
 
     wire [4:0] rd_4;
     wire [31:0] result_4, result_back1;
@@ -68,6 +53,26 @@ module cpu_top(
     wire [31:0] result_5, result_back2;
     wire we_5;
 
+//非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
+    wire [4:0] flag_bus;
+    wire [3:0] irq_bubble, alu_func4;
+    wire [11:0] csr_addr;
+    wire [4:0] rd_back1, rd_back2;
+    wire [31:0] br_addr1, br_addr2;
+    wire [31:0] jalr_predict_offset;
+    wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
+    wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
+    wire [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2;
+    wire [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu;
+    wire [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu;
+    wire [31:0] ld_data_final;
+    wire jalr, br_fail, success, jal_flag, jalr_flag, irq_ret, trap, ebreak;
+    wire loaded, ld_we, stall;
+    wire [4:0] rd_load;
+    wire btb_hit;
+    wire [31:0] icache_mem_addr_w, icache_mem_wdata_w, icache_mem_data_w;
+    wire [3:0] icache_mem_be_w;
+    wire icache_mem_req_w, icache_mem_we_w, icache_mem_valid_w;
     wire csr_wr_en, timi, irq_act, irq_processing, irq;
     wire [2:0] csr_func3;
     wire [31:0] csr_data_wr, csr_data_rd, mcause, csr_result;
@@ -76,43 +81,23 @@ module cpu_top(
     wire [31:0] dcache_data_w, dcache_mem_addr_w, dcache_mem_wdata_w, dcache_mem_data_w;
     wire [3:0] dcache_mem_be_w;
     wire dcache_busy_w, dcache_ld_ready_w, dcache_mem_req_w, dcache_mem_we_w, dcache_mem_valid_w;
-    reg  dcache_busy_d1;
-    wire d_hold_int = dcache_busy_w | dcache_busy_d1;
-    wire [4:0] rd_load;
-    wire btb_hit;
-
+//dcache 的 busy 延拓拍（原来在顶层合成 d_hold_int，现在由 dcache 自己输出）
+    wire dcache_hold_w;
 //RV32M 乘除法单元（与 lsu 流水线同步，独立第三写口）
     wire [31:0] mul_data_final;
-    wire        mul_loaded, mul_we, mul_stall;
-    wire [4:0]  rd_mul;
-//整条流水线的合成 stall：给 controller 定 stage，同时【也喂回 mulu】。
-//mulu 自己判的三类冒险看不到它，不喂回去的话，icache/dcache 一有多拍事务把 mul 冻在 c2，
-//m_push 就会逐拍重发 -> we_mul 连续多拍，与 alu 的写回沿错开（详见 mulu.v 端口注释）。
-//无组合环：mul_stall 来自 mulu 的 stall 输出，而它只依赖寄存器（rd_post / m_pv / mstalled）。
-    wire        pipe_stall_w = stall | mul_stall | icache_busy_w | bus_hold_in | d_hold_int;
-//喂给 mulu 的冻结信号【必须排掉 mul_stall】：那正是 mulu 自己的输出（div 进行 / mul-use 冒险），
-//若一并冻结，乘法两级流水就永远等不到 m_pv，自锁。mul-use 那一拍照旧只压 m_push（用 mulu 内部 stall），
-//流水本身继续走，m_pv 才能按时到达。外部多拍事务（icache/dcache/总线）才需要把级真正冻住。
-    wire        mul_freeze_w = stall | icache_busy_w | bus_hold_in | d_hold_int;
+    wire mul_loaded, mul_we, mul_stall;
+    wire [4:0] rd_mul;
 //mulu 专属的读数据通路镜像（照 pc_addr/aux_addr 手法，按消费者拆开降扇出）
-    wire        mul_sel_w;
+    wire mul_sel_w;
     wire [31:0] r1_data_mul_w, r2_data_mul_w;
     wire [31:0] r1_data_final_mul_w, r2_data_final_mul_w;
+    wire ibus_req_valid_i;
 
-    reg softi, retire_w, jalr_pred;
-    reg [31:0] bus_data_in_final;
+//总线层次块
     wire [31:0] bus_addr_out_i, bus_data_out_i;
     wire [3:0] bus_be_out_i;
     wire bus_we_out_i;
     wire bus_valid_out_i;
-    wire ibus_req_valid_i;
-
-    always @(*) begin
-        jalr_pred = pre_jalr & btb_hit;
-        bus_data_in_final = bus_data_in_ext | dcache_data_w | tim_data_out;
-        softi = 1'b0;
-        retire_w = (stage == 2'd1);
-    end
 
     always @(*) begin
         bus_addr_out = bus_addr_out_i;
@@ -129,13 +114,14 @@ module cpu_top(
         .br2(br2),
         .br3(br3),
         .jal(jal),
-        .jalr(jalr_pred),
+        .pre_jalr(pre_jalr),
+        .btb_hit(btb_hit),
         .jalr_fail(jalr_fail),
         .irq(irq),
         .irq_ret(irq_ret),
-        .stage(stage),
+        .flag_bus(flag_bus),
         .offset_jal2(offset_jal2),
-        .offset_jalr2(jalr_predict_offset + 4'd4),
+        .offset_jalr2(jalr_predict_offset),
         .offset_beq2(offset_beq2),
         .jalr_target_q(jalr_target_q2),
         .beq_off_q2(beq_off_q2),
@@ -151,7 +137,6 @@ module cpu_top(
         .rst(rst),
         .pc_addr(pc_addr),
         .offset_jal1(offset_jal1),
-        .offset_jalr1(jalr_predict_offset),
         .offset_beq1(offset_beq1),
         .isr_addr1(isr_addr1),
         .isr_ret_addr1(iret_addr1),
@@ -159,16 +144,18 @@ module cpu_top(
         .br2(br2),
         .br3(br3),
         .jal(jal),
-        .jalr(jalr_pred),
+        .pre_jalr(pre_jalr),
+        .btb_hit(btb_hit),
         .jalr_fail(jalr_fail),
         .irq(irq),
         .irq_ret(irq_ret),
-        .jalr_target_q(jalr_target_q1),
+        .flag_bus(flag_bus),
         .beq_off_q1(beq_off_q1),
         .br_addr1(br_addr1),
         .req_valid(ibus_req_valid_i),
         .inst_out(icache_inst_w),
         .busy(icache_busy_w),
+        .busy_q(icache_busy_q),
         .mem_req(icache_mem_req_w),
         .mem_we(icache_mem_we_w),
         .mem_addr(icache_mem_addr_w),
@@ -190,7 +177,7 @@ module cpu_top(
     pre_decoder u_pre_decoder (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
+        .flag_bus(flag_bus),
         .inst_in(icache_inst_w),
         .aux_addr_in(aux_addr_0),
         .br1_in(br1),
@@ -230,8 +217,7 @@ module cpu_top(
     mem_buf u_mem_buf (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
-        .flush(flush),
+        .flag_bus(flag_bus),
         .func10_in(func10_1),
         .func10_out(func10_2),
         .imm_alu_in(imm_alu_1),
@@ -273,7 +259,7 @@ module cpu_top(
     decoder u_decoder (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
+        .flag_bus(flag_bus),
         .func10(func10_2),
         .imm_alu_in(imm_alu_2),
         .imm12_csr_in(imm12_csr_2),
@@ -318,8 +304,7 @@ module cpu_top(
     lsu u_lsu (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
-        .flush(flush),
+        .flag_bus(flag_bus),
         .opcode(opcode_lsu_2),
         .func10(func10_lsu_2),
         .rd_in(rd_2),
@@ -329,9 +314,14 @@ module cpu_top(
         .r2_data_final(r2_data_final_lsu),
         .offset_load0(offset_load0_2),
         .offset_store0(offset_store0_2),
-        .bus_data_in(bus_data_in_final),
-        .ready_in(dcache_ld_ready_w | tim_ready | bus_loaded_in),
-        .bus_hold_in(bus_hold_in | d_hold_int),
+        .bus_data_ext(bus_data_in_ext),
+        .bus_data_dcache(dcache_data_w),
+        .bus_data_tim(tim_data_out),
+        .ready_dcache(dcache_ld_ready_w),
+        .ready_tim(tim_ready),
+        .ready_ext(bus_loaded_in),
+        .bus_hold_in(bus_hold_in),
+        .dcache_hold(dcache_hold_w),
         .bus_addr_out(bus_addr_out_i),
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
@@ -348,9 +338,11 @@ module cpu_top(
     mulu u_mulu (
         .clk(clk),
         .rst(rst),
-        .flush(flush),
-        .bus_hold_in(bus_hold_in | d_hold_int),
-        .pipe_stall(mul_freeze_w),
+        .flag_bus(flag_bus),
+        .lsu_stall(stall),
+        .icache_busy(icache_busy_q),
+        .bus_hold_in(bus_hold_in),
+        .dcache_hold(dcache_hold_w),
         .opcode(opcode_2),
         .func10(func10_2),
         .rd_in(rd_2),
@@ -382,7 +374,8 @@ module cpu_top(
         .rd_mul(rd_mul),
         .mul_data(mul_data_final),
         .mul_loaded(mul_loaded),
-        .stall(stall | mul_stall),
+        .lsu_stall(stall),
+        .mul_stall(mul_stall),
         .r1_data_in_dec(r1_data_dec),
         .r2_data_in_dec(r2_data_dec),
         .r1_data_in_lsu(r1_data_lsu),
@@ -441,7 +434,7 @@ module cpu_top(
     wb_reg u_wb_reg (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
+        .flag_bus(flag_bus),
         .we_in(we_4),
         .rd_in(rd_4),
         .result_in(result_4),
@@ -455,7 +448,7 @@ module cpu_top(
     regfile u_regfile (
         .clk(clk),
         .rst(rst),
-        .stage(stage),
+        .flag_bus(flag_bus),
         .r1(rs1_1),
         .r2(rs2_1),
         .rd_alu(rd_5),
@@ -488,6 +481,7 @@ module cpu_top(
         .bus_data_out(dcache_data_w),
         .ld_ready(dcache_ld_ready_w),
         .busy(dcache_busy_w),
+        .hold(dcache_hold_w),
         .mem_req(dcache_mem_req_w),
         .mem_we(dcache_mem_we_w),
         .mem_addr(dcache_mem_addr_w),
@@ -511,13 +505,6 @@ module cpu_top(
         .mem_ready()
     );
 
-//dcache busy 的 1 拍延拓（原 bus_arb.d_hold_ext 的作用）：
-//fill_end 拍 busy 就掉、ld_ready 要再等一拍，这 1 拍空窗必须兜住
-    always @(posedge clk) begin
-        if (rst) dcache_busy_d1 <= 1'b0;
-        else dcache_busy_d1 <= dcache_busy_w;
-    end
-
     tim_in u_tim_in (
         .clk(clk),
         .rst(rst),
@@ -537,17 +524,21 @@ module cpu_top(
         .br3(br3),
         .jalr_fail(jalr_fail),
         .jal(jal),
-        .jalr_pred(jalr_pred),
+        .pre_jalr(pre_jalr),
+        .btb_hit(btb_hit),
         .br1(br1),
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
-        .stall(pipe_stall_w),
+        .lsu_stall(stall),
+        .mul_stall(mul_stall),
+        .bus_hold_in(bus_hold_in),
+        .dcache_hold(dcache_hold_w),
+        .icache_busy(icache_busy_q),
         .csr_wr_en(csr_wr_en),
         .exti(exti),
         .timi(timi),
-        .softi(softi),
-        .retire(retire_w),
+        .softi(1'b0),
         .csr_addr(csr_addr),
         .csr_data_in(csr_result),
         .pc_addr_in(pc_addr),
@@ -561,8 +552,7 @@ module cpu_top(
         .iret_addr1(iret_addr1),
         .iret_addr2(iret_addr2),
         .irq_bubble(irq_bubble),
-        .stage(stage),
-        .flush(flush),
+        .flag_bus(flag_bus),
         .req_valid(ibus_req_valid_i)
     );
 

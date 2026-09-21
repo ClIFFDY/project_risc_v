@@ -22,7 +22,7 @@
 
 module decoder(
     input clk, rst,
-    input [1:0] stage,
+    input [4:0] flag_bus,
     input [9:0] func10,
     input [4:0] rd_in,
     input [6:0] opcode,
@@ -46,6 +46,7 @@ module decoder(
     output reg br_pred_taken_out,
     output reg [31:0] jalr_pred_addr_out
     );
+
 //RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;
@@ -58,11 +59,15 @@ module decoder(
     localparam OPCODE_AUIPC  = 7'b0010111;
     localparam OPCODE_SYSTEM = 7'b1110011;
 
-    localparam [1:0]
-    IDLE = 2'd0,
-    EXE = 2'd1,
-    FLUSH = 2'd2,
-    STALL = 2'd3;
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
+//故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
+    reg exec, flush_w, stall_w;
+    always @(*) begin
+        flush_w = flag_bus[3] | flag_bus[2];
+        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[4];
+    end
 
     always @(posedge clk) begin
         if (rst) begin
@@ -71,39 +76,39 @@ module decoder(
             rd_out <= 5'd0;
             rd_back1 <= 5'd0;
             alu_func4 <= 4'd0;
-            we <= 1'd0;
+            we <= 1'b0;
             csr_wr_en <= 1'b0;
             csr_addr <= 12'd0;
             csr_data <= 32'd0;
-            br_fail <=1'b0;
+            br_fail <= 1'b0;
             success <= 1'b0;
             irq_ret <= 1'b0;
             trap <= 1'b0;
             ebreak <= 1'b0;
             jal_flag <= 1'b0;
-            jalr_flag <= 1'd0;
+            jalr_flag <= 1'b0;
             jalr_target_q1 <= 32'd0;
             jalr_target_q2 <= 32'd0;
             beq_off_q1 <= 32'd0;
             beq_off_q2 <= 32'd0;
-            br_pred_taken_out <= 1'd0;
+            br_pred_taken_out <= 1'b0;
             jalr_pred_addr_out <= 32'd0;
         end
-        else begin
+        else if (exec) begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
-            if (stage == EXE) begin
-                    r1_data_out <= 32'd0;
+            if (!flush_w && !stall_w) begin
+                r1_data_out <= 32'd0;
                 r2_data_out <= 32'd0;
                 rd_out <= 5'd0;
                 rd_back1 <= 5'd0;
                 alu_func4 <= 4'd0;
                 csr_func3 <= 3'd0;
-                we <= 1'd0;
+                we <= 1'b0;
                 csr_wr_en <= 1'b0;
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
-                jalr <= 1'd0;
-                br_fail <=1'b0;
+                jalr <= 1'b0;
+                br_fail <= 1'b0;
                 success <= 1'b0;
                 irq_ret <= 1'b0;
                 trap <= 1'b0;
@@ -114,156 +119,181 @@ module decoder(
                 jalr_target_q2 <= 32'd0;
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
-                aux_addr_out <= 16'd0;
+                aux_addr_out <= 32'd0;
                 br_pred_taken_out <= br_pred_taken_in;
                 jalr_pred_addr_out <= jalr_pred_addr_in;
                 case (opcode)
-                OPCODE_OP: begin
-                    r1_data_out <= r1_data_final;
-                    r2_data_out <= r2_data_final;
-                    rd_out <= rd_in;
+                    OPCODE_OP: begin
+                        r1_data_out <= r1_data_final;
+                        r2_data_out <= r2_data_final;
+                        rd_out <= rd_in;
 //RV32M：写回由 mulu 独立完成，这条路必须让开 —— 否则同一条指令被写两次，
 //而且 alu 会按【撞车的 func3】算出垃圾结果、再经 rd_back1 前递给紧邻的下一条。
 //M 与普通 ALU 共用 OPCODE_OP，只能靠 funct7 区分（func10[9:3]==7'b0000001）。
-                    if (func10[9:3] == 7'b0000001) begin
-                        rd_back1 <= 5'd0;
-                        we <= 1'd0;
+                        if (func10[9:3] == 7'b0000001) begin
+                            rd_back1 <= 5'd0;
+                            we <= 1'b0;
+                        end
+                        else begin
+                            rd_back1 <= rd_in;
+                            alu_func4 <= {func10[8], func10[2:0]};
+                            we <= 1'b1;
+                        end
                     end
-                    else begin
+                    OPCODE_OP_IMM: begin
+                        r1_data_out <= r1_data_final;
+                        r2_data_out <= imm_alu_in;
+                        rd_out <= rd_in;
                         rd_back1 <= rd_in;
                         alu_func4 <= {func10[8], func10[2:0]};
-                        we <= 1'd1;
+                        we <= 1'b1;
                     end
-                end
-                OPCODE_OP_IMM: begin
-                    r1_data_out <= r1_data_final;
-                    r2_data_out <= imm_alu_in;
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    alu_func4 <= {func10[8], func10[2:0]};
-                    we <= 1'd1;
-                end
 //jal存储pc值传递
-                OPCODE_JAL: begin
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    we <= 1'd1;
-                    aux_addr_out <= aux_addr_in;
-                    jal_flag <= 1'd1;
-                end
+                    OPCODE_JAL: begin
+                        rd_out <= rd_in;
+                        rd_back1 <= rd_in;
+                        we <= 1'b1;
+                        aux_addr_out <= aux_addr_in;
+                        jal_flag <= 1'b1;
+                    end
 //jalr指令实际跳转目标计算
-                OPCODE_JALR: begin
-                    jalr <= 1'd1;
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    we <= 1'd1;
-                    jalr_flag <= 1'b1;
-                    aux_addr_out <= aux_addr_in;
-                    jalr_target_q1 <= r1_data_final + offset_jalr0;
-                    jalr_target_q2 <= r1_data_final + offset_jalr0;
-                end
+                    OPCODE_JALR: begin
+                        jalr <= 1'b1;
+                        rd_out <= rd_in;
+                        rd_back1 <= rd_in;
+                        we <= 1'b1;
+                        jalr_flag <= 1'b1;
+                        aux_addr_out <= aux_addr_in;
+                        jalr_target_q1 <= r1_data_final + offset_jalr0;
+                        jalr_target_q2 <= r1_data_final + offset_jalr0;
+                    end
 //分支跳转预测结果判定
-                OPCODE_BRANCH: begin
-                    aux_addr_out <= aux_addr_in;
-                    beq_off_q1 <= offset_beq0_aux - 4'd4;
-                    beq_off_q2 <= offset_beq0_aux - 4'd4;
-                    case (func10[2:0])
-                        3'b000: begin
-                            if (r1_data_final == r2_data_final) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        3'b001: begin
-                            if (r1_data_final != r2_data_final) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        3'b100: begin
-                            if ($signed(r1_data_final) < $signed(r2_data_final)) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        3'b101: begin
-                            if ($signed(r1_data_final) >= $signed(r2_data_final)) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        3'b110: begin
-                            if (r1_data_final < r2_data_final) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        3'b111: begin
-                            if (r1_data_final >= r2_data_final) success <= 1'd1;
-                            else br_fail <= 1'd1;
-                        end
-                        default: br_fail <= 1'b0;
-                    endcase
-                end
-                OPCODE_LUI: begin
-                    r1_data_out <= 32'd0;
-                    r2_data_out <= imm_alu_in;
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    alu_func4 <= 4'd0;
-                    we <= 1'd1;
-                end
-                OPCODE_AUIPC: begin
-                    r1_data_out <= pc_operand_in;
-                    r2_data_out <= imm_alu_in;
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    alu_func4 <= 4'd0;
-                    we <= 1'd1;
-                end
+                    OPCODE_BRANCH: begin
+                        aux_addr_out <= aux_addr_in;
+                        beq_off_q1 <= offset_beq0_aux - 4'd4;
+                        beq_off_q2 <= offset_beq0_aux - 4'd4;
+                        case (func10[2:0])
+                            3'b000: begin
+                                if (r1_data_final == r2_data_final) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            3'b001: begin
+                                if (r1_data_final != r2_data_final) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            3'b100: begin
+                                if ($signed(r1_data_final) < $signed(r2_data_final)) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            3'b101: begin
+                                if ($signed(r1_data_final) >= $signed(r2_data_final)) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            3'b110: begin
+                                if (r1_data_final < r2_data_final) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            3'b111: begin
+                                if (r1_data_final >= r2_data_final) success <= 1'b1;
+                                else br_fail <= 1'b1;
+                            end
+                            default: br_fail <= 1'b0;
+                        endcase
+                    end
+                    OPCODE_LUI: begin
+                        r1_data_out <= 32'd0;
+                        r2_data_out <= imm_alu_in;
+                        rd_out <= rd_in;
+                        rd_back1 <= rd_in;
+                        alu_func4 <= 4'd0;
+                        we <= 1'b1;
+                    end
+                    OPCODE_AUIPC: begin
+                        r1_data_out <= pc_operand_in;
+                        r2_data_out <= imm_alu_in;
+                        rd_out <= rd_in;
+                        rd_back1 <= rd_in;
+                        alu_func4 <= 4'd0;
+                        we <= 1'b1;
+                    end
 //SYSTEM类指令读写赋能，地址计算
-                OPCODE_SYSTEM: begin
-                    rd_out <= rd_in;
-                    rd_back1 <= rd_in;
-                    csr_func3 <= func10[2:0];
-                    irq_ret <= (func10[2:0] == 3'b000) && (imm12_csr_in == 12'h302);
-                    csr_addr <= imm12_csr_in[11:0];
-                    case (func10[2:0])
-                    3'b000: begin
-                        we <= 1'b0;
-                        csr_wr_en <= 1'b0;
-                        trap <= (imm12_csr_in == 12'h000) || (imm12_csr_in == 12'h001);
-                        ebreak <= (imm12_csr_in == 12'h001);
+                    OPCODE_SYSTEM: begin
+                        rd_out <= rd_in;
+                        rd_back1 <= rd_in;
+                        csr_func3 <= func10[2:0];
+                        irq_ret <= (func10[2:0] == 3'b000) && (imm12_csr_in == 12'h302);
+                        csr_addr <= imm12_csr_in[11:0];
+                        case (func10[2:0])
+                            3'b000: begin
+                                we <= 1'b0;
+                                csr_wr_en <= 1'b0;
+                                trap <= (imm12_csr_in == 12'h000) || (imm12_csr_in == 12'h001);
+                                ebreak <= (imm12_csr_in == 12'h001);
+                            end
+                            3'b001: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= r1_data_final;
+                            end
+                            3'b010: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= r1_data_final;
+                            end
+                            3'b011: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= r1_data_final;
+                            end
+                            3'b101: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= {27'd0, imm5_csr_in};
+                            end
+                            3'b110: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= {27'd0, imm5_csr_in};
+                            end
+                            3'b111: begin
+                                we <= 1'b1;
+                                csr_wr_en <= 1'b1;
+                                r1_data_out <= {27'd0, imm5_csr_in};
+                            end
+                            default: begin
+                                we <= 1'b0;
+                                csr_wr_en <= 1'b0;
+                            end
+                        endcase
                     end
-                    3'b001: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= r1_data_final;
-                    end
-                    3'b010: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= r1_data_final;
-                    end
-                    3'b011: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= r1_data_final;
-                    end
-                    3'b101: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= {27'd0, imm5_csr_in};
-                    end
-                    3'b110: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= {27'd0, imm5_csr_in};
-                    end
-                    3'b111: begin
-                        we <= 1'b1;
-                        csr_wr_en <= 1'b1;
-                        r1_data_out <= {27'd0, imm5_csr_in};
-                    end
-                    default: begin
-                        we <= 1'b0;
-                        csr_wr_en <= 1'b0;
-                    end
-                    endcase
-                end
                 endcase
             end
-            else if (stage == STALL) begin
+            else if (stall_w) begin
+                r1_data_out <= r1_data_out;
+                r2_data_out <= r2_data_out;
+                rd_out <= rd_out;
+                rd_back1 <= rd_back1;
+                alu_func4 <= alu_func4;
+                csr_func3 <= csr_func3;
+                we <= we;
+                csr_wr_en <= csr_wr_en;
+                csr_addr <= csr_addr;
+                csr_data <= csr_data;
+                jalr <= jalr;
+                br_fail <= br_fail;
+                success <= success;
+                irq_ret <= irq_ret;
+                trap <= trap;
+                ebreak <= ebreak;
+                jal_flag <= jal_flag;
+                jalr_flag <= jalr_flag;
+                jalr_target_q1 <= jalr_target_q1;
+                jalr_target_q2 <= jalr_target_q2;
+                beq_off_q1 <= beq_off_q1;
+                beq_off_q2 <= beq_off_q2;
+                aux_addr_out <= aux_addr_out;
+                br_pred_taken_out <= br_pred_taken_out;
+                jalr_pred_addr_out <= jalr_pred_addr_out;
             end
             else begin
                 r1_data_out <= 32'd0;
@@ -271,23 +301,23 @@ module decoder(
                 rd_out <= 5'd0;
                 rd_back1 <= 5'd0;
                 alu_func4 <= 4'd0;
-                we <= 1'd0;
+                we <= 1'b0;
                 csr_wr_en <= 1'b0;
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
-                jalr <= 1'd0;
-                br_fail <=1'b0;
+                jalr <= 1'b0;
+                br_fail <= 1'b0;
                 success <= 1'b0;
                 irq_ret <= 1'b0;
                 trap <= 1'b0;
                 ebreak <= 1'b0;
-                jal_flag <= 1'd0;
-                jalr_flag <= 1'd0;
+                jal_flag <= 1'b0;
+                jalr_flag <= 1'b0;
                 jalr_target_q1 <= 32'd0;
                 jalr_target_q2 <= 32'd0;
                 beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
-                br_pred_taken_out <= 1'd0;
+                br_pred_taken_out <= 1'b0;
                 jalr_pred_addr_out <= 32'd0;
             end
         end

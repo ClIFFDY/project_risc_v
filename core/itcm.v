@@ -50,7 +50,8 @@ module itcm(
     reg        v_d;
     reg        req_d;
 
-    wire start = mem_req & ~req_d;
+    reg start;
+    always @(*) start = mem_req & ~req_d;
 
     always @(posedge clk) begin
         if (rst) begin

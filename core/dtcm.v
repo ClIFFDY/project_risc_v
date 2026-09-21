@@ -55,8 +55,11 @@ module dtcm(
     reg        req_d;
 
 //写用【电平】判据：连续多拍的 store 每拍都要落（原 flash_spi 有写 FIFO 兜，这里必须自己保证）
-    wire start  = mem_req & ~req_d;
-    wire wr_now = mem_req & mem_we;
+    reg start, wr_now;
+    always @(*) begin
+        start  = mem_req & ~req_d;
+        wr_now = mem_req & mem_we;
+    end
 
     always @(posedge clk) begin
         if (rst) begin

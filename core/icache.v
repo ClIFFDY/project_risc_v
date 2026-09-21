@@ -29,20 +29,24 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input [31:0] offset_jal1, offset_jalr1, offset_beq1,
+    input [31:0] offset_jal1, offset_beq1,
     input [31:0] isr_addr1, isr_ret_addr1,
-    input [31:0] jalr_target_q, beq_off_q1, br_addr1,
-    input br1, br2, br3, jal, jalr, jalr_fail, irq, irq_ret,
-//读口控制与取指输出
+    input [31:0] beq_off_q1, br_addr1,
+    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret,
+    input [4:0] flag_bus,
+//读口控制
     input req_valid,
+//回填应答（接核内 itcm）
+    input mem_valid,
+    input [31:0] mem_data,
+
+//取指输出
     output reg [31:0] inst_out,
-    output reg busy,
-//回填接口（接核内 itcm）
+    output reg busy, busy_q,
+//回填请求（接核内 itcm）
     output reg mem_req, mem_we,
     output reg [31:0] mem_addr, mem_wdata,
-    output reg [3:0] mem_be,
-    input mem_valid,
-    input [31:0] mem_data
+    output reg [3:0] mem_be
     );
 
     localparam BOOT_LINES = 7'd127;
@@ -74,21 +78,37 @@ module icache(
 
     reg [13:0] rd_addr;
     reg rd_en, line_match;
+//回填交付判据，与缺失地址快照（缺失锁寄存一拍后用来补对位）
+    reg deliver_ok;
+    reg [31:0] miss_addr_q;
 
     integer i;
 
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//控制位译码（行为块，放本模块最前）：本模块的取指推进由 req_valid / 回填状态自己把关，
+//不用流水线使能，故只取两条冲刷位。
+    reg flush_w;
+    always @(*) flush_w = flag_bus[3] | flag_bus[2];
+
+//预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
+    reg jalr;
+    always @(*) jalr = pre_jalr & btb_hit;
+
 //跳转类地址透传处理，减少取值冲刷空窗
+//br1/jal 那两路要再与上 !flush_w：pre_decoder 的 jal/br_en 已不再受 stage 门控（为了把
+//stage 那条高扇出广播从取指地址锥里摘掉），所以"冲刷拍别拿错路指令的分支/jal 去改地址"
+//改由这里直接用 flush 挡。flush 恰好是那 7 个冲刷事件的或，trap 也一并覆盖，无需再加端口。
+//优先级与原行为一致：irq/irq_ret/br2/br3 都在 br1/jal 之前，冲刷拍照样优先走它们；
+//若都不是（例如只有 trap），br1/jal 被 flush_w 挡住，落到 pc_addr>>>2——正是原来门控后的落点。
+//jalr 的预测目标与 jalr 失败目标都【不再】走这里：它们只进 pc，icache 跟着 pc 走到目标。
+//原来这两条（尤其是 jalr_fail）要把 decoder 里的 32 位比较结果横穿到 tag 阵列地址，
+//是这条链上最贵的一段；现在 icache 侧只保留"当拍就能算出地址"的那几路。
+//代价：jalr 类改向各多一拍空泡（那拍把取指输出刷成 NOP，见下面 inst_out）。
     reg [31:0] fetch_addr;
     always @(*) begin
         if (rst) fetch_addr = 32'd0;
-        else if (irq)            fetch_addr = isr_addr1 >>> 2;
-        else if (irq_ret)        fetch_addr = isr_ret_addr1 >>> 2;
-        else if (br2)            fetch_addr = (br_addr1 + beq_off_q1) >>> 2;
-        else if (br3)            fetch_addr = br_addr1 >>> 2;
-        else if (jalr_fail)      fetch_addr = jalr_target_q >>> 2;
-        else if (br1)            fetch_addr = (pc_addr + offset_beq1) >>> 2;
-        else if (jal)            fetch_addr = (pc_addr + offset_jal1) >>> 2;
-        else if (jalr)           fetch_addr = offset_jalr1 >>> 2;
+        else if (br1 && !flush_w)  fetch_addr = (pc_addr + offset_beq1) >>> 2;
+        else if (jal && !flush_w)  fetch_addr = (pc_addr + offset_jal1) >>> 2;
         else                     fetch_addr = pc_addr >>> 2;
     end
 
@@ -101,12 +121,20 @@ module icache(
         hit_way[2] = valid2[idx] && (tag2[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1] || hit_way[2];
         hit_sel = hit_way[0] ? 2'd0 : (hit_way[1] ? 2'd1 : 2'd2);
-//自举期间及自举完成后的一拍都保持 busy
-        busy = boot ||
-               (stage == 1'd1 && (!fill_end || (!cache_hit &&
-                                             !(fill_idx == idx && fill_tag == tag)))) ||
-               (stage == 1'd0 && !cache_hit);
-        mem_req = (boot || stage == 1'd1) && !fill_end;
+//缺失锁：自举期间恒 busy；从缺失起点到回填结束之间保持 busy。
+//stage==1 的终止判据用 deliver_ok 而非 line_match，理由见下面 deliver_ok 处。
+        if (boot)                               busy = 1'b1;
+        else if (stage == 1'b1) begin
+            if (!fill_end)                      busy = 1'b1;
+            else if (!cache_hit && !deliver_ok) busy = 1'b1;
+            else                                busy = 1'b0;
+        end
+        else if (stage == 1'b0) begin
+            if (!cache_hit)                     busy = 1'b1;
+            else                                busy = 1'b0;
+        end
+        else                                    busy = 1'b0;
+        mem_req = (boot || stage == 1'b1) && !fill_end;
         mem_addr = fill_addr + (fill_cnt << 2);
         mem_we = 1'b0;
         mem_wdata = 32'd0;
@@ -115,23 +143,56 @@ module icache(
 //读口：把 hit 与 fill_end 两条路合成一个地址/一个使能/一个数据选择，
 //这样每个 iram 只有一个读口，才推得出 BRAM
         line_match = (fetch_addr & 32'hFFFFFFE0) == (fill_addr >> 2);
-        rd_en  = (fill_end && line_match) || req_valid;
-        rd_addr = (fill_end && line_match) ? {fill_way, fill_idx, miss_word}
-                                           : {hit_sel, idx, word};
+//回填完成那拍该不该把 miss_word 交出去。正常情形是 line_match（取指地址还落在刚填完
+//的那一行里）；但缺失锁寄存一拍后 pc 停在 X+4，若缺的是行末字（word 31），X+4 已经
+//进了下一行 ⇒ line_match 落空 ⇒ 丢指令、还要多起一次回填。
+//第二个条件"pc 恰好比缺失地址前进一个字"专门接住这种顺序前进的情形。
+        if (line_match)                                    deliver_ok = 1'b1;
+        else if ((pc_addr >>> 2) == (miss_addr_q + 32'd1)) deliver_ok = 1'b1;
+        else                                               deliver_ok = 1'b0;
+
+        if (fill_end && deliver_ok) begin
+            rd_en   = 1'b1;
+            rd_addr = {fill_way, fill_idx, miss_word};
+        end
+        else begin
+            rd_en   = req_valid;
+            rd_addr = {hit_sel, idx, word};
+        end
     end
 
 //回填：一拍收一个字直接写进 iram（BRAM 单写口，一拍只写一个地址）
     always @(posedge clk) begin
-        if ((boot || stage == 1'd1) && !fill_end && mem_valid) begin
+        if ((boot || stage == 1'b1) && !fill_end && mem_valid) begin
             iram[{fill_way, fill_idx, fill_cnt}] <= mem_data;
         end
     end
 
+//jalr 类改向当拍把取指输出刷成 NOP：icache 不再当拍跳目标，当拍读出来的那条是
+//跳转后的顺序指令（错路），必须挡掉；下一拍 pc 已在目标上，照常取到目标指令。
+//【必须写在这个触发器的 D 端，不能挪到"喂给 pre_decoder 的组合信号"上】：
+//jalr_pred = pre_jalr & btb_hit，而 pre_jalr 是 pre_decoder 从它的 inst_in 组合算出来的。
+//写在 D 端是 inst_out(Q)→pre_decoder→jalr_pred→inst_out(D)，触发器对触发器，合法；
+//若在 cpu_top 里对 icache_inst_w 过门再喂 pre_decoder，就闭成了
+//inst_g→pre_decoder→pre_jalr→jalr_pred→inst_g 的零延时组合环（xsim 实测 Iteration limit 10000）。
+//与 req_valid 相与：停顿期间 req_valid=0，本来就没有新指令要挡，
+//而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
-        if (rst)
-            inst_out <= 32'd0;
-        else if (rd_en)
-            inst_out <= iram[rd_addr];
+        if (rst)                                  inst_out <= 32'd0;
+        else if ((jalr | jalr_fail | br2 | br3 | irq | irq_ret) && req_valid) inst_out <= 32'd0;
+        else if (rd_en)                           inst_out <= iram[rd_addr];
+    end
+
+//缺失锁的延时拍。cache_hit 是组合的：若由它组合地驱动 busy→pipe_stall_w→stage，
+//"tag 阵读出→比较→busy"这条链会一路横跨到全片每一个寄存器的 CE/R（15ns 下量到约 8ns）。
+//寄存一拍就把链切断：链终止在 busy_q 的 D 端，下游从 busy_q 的 Q 端起算新的一拍。
+//pc 与 icache 用的是同一个 stage，所以"晚一拍"是两者一起晚，pc↔icache 对位不变：
+//缺失拍后 pc 停在 X+4，回填完那拍旁路送出 instr(X)，恰好满足 inst_out(N)=instr(pc_addr(N)-4)。
+//复位值必须是 1：复位期间 boot=1 ⇒ busy 恒 1，取 0 会让复位后第一拍 stage 落到 EXE、
+//req_valid 抬起，icache 拿无效 hit_sel 去读 iram 并被 pre_decoder 锁进流水线。
+    always @(posedge clk) begin
+        if (rst) busy_q <= 1'b1;
+        else     busy_q <= busy;
     end
 
 //自举序列：复位释放后逐行填充前 16KB（128 行 × 32 字），固定写 way0
@@ -139,7 +200,7 @@ module icache(
         if (rst) begin
             boot <= 1'b1;
             boot_line <= 7'd0;
-            stage <= 1'd0;
+            stage <= 1'b0;
             fill_end <= 1'b0;
             fill_cnt <= 5'd0;
             fill_way <= 2'd0;
@@ -147,6 +208,7 @@ module icache(
             fill_tag <= 19'd0;
             fill_idx <= 7'd0;
             miss_word <= 5'd0;
+            miss_addr_q <= 32'd0;
             valid0 <= 128'd0;
             valid1 <= 128'd0;
             valid2 <= 128'd0;
@@ -172,7 +234,7 @@ module icache(
                 miss_word <= 5'd0;
                 if (boot_line == BOOT_LINES) begin
                     boot <= 1'b0;
-                    stage <= 1'd0;
+                    stage <= 1'b0;
                 end
                 else begin
                     boot_line <= boot_line + 7'd1;
@@ -182,13 +244,14 @@ module icache(
             end
         end
         else begin
-            if (stage == 1'd0) begin
+            if (stage == 1'b0) begin
                 fill_end <= 1'b0;
                 if (hit_way[1])      lru[idx] <= 1'b1;
                 else if (hit_way[2]) lru[idx] <= 1'b0;
                 if (!cache_hit) begin
-                    stage <= 1'd1;
+                    stage <= 1'b1;
                     miss_word <= word;
+                    miss_addr_q <= fetch_addr;
                     fill_cnt <= 5'd0;
                     fill_addr <= {fetch_addr[31:5], 5'd0} << 2;
                     fill_tag <= tag;
@@ -215,9 +278,10 @@ module icache(
                         valid2[fill_idx] <= 1'b1;
                     end
                     lru[fill_idx] <= (fill_way == 2'd1);
-                    if (!cache_hit && !(fill_idx == idx && fill_tag == tag)) begin
-                        stage <= 1'd1;
+                    if (!cache_hit && !deliver_ok) begin
+                        stage <= 1'b1;
                         miss_word <= word;
+                        miss_addr_q <= fetch_addr;
                         fill_cnt <= 5'd0;
                         fill_addr <= {fetch_addr[31:5], 5'd0} << 2;
                         fill_tag <= tag;
@@ -226,7 +290,7 @@ module icache(
                         fill_end <= 1'b0;
                     end
                     else begin
-                        stage <= 1'd0;
+                        stage <= 1'b0;
                         fill_end <= 1'b0;
                     end
                 end

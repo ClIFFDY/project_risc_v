@@ -1705,8 +1705,13 @@ x 会顺着 OR 爬满整条读回路径（`ra` 变 x）。
   - `system/tb_isr_ret.v` —— **26 探针**，白盒比对每次 `irq_ret` 的落点是否 `iret_addr2+4`，
     黑盒查 ISR 标记。**这一项才咬得住 23.6 的缺陷**（`tb_isr` 只查 `dtcm[0]/[1]`，
     重定向早一条时那两个值照样成立）。
-- **基线 A/B**：`Tools/test/system/tb_base.v` 直接对 `RTL/_bak_20260915/` 跑同类检查，
+- **基线 A/B**：`Tools/test/system/tb_base.v` 直接对基线 RTL 跑同类检查。基线用
+  `git archive a7f5eb8^ | tar -x -C <目录>` 导出（单通道化之前那份，端口表含 `ibus_*`，
+  布局为 `soc/peripherals/core`；原先的平铺副本 `RTL/_bak_20260915/` 与之逐字节相同、
+  仅差 `itcm/dtcm.v` 的 `$readmemh` 路径，2026-09-20 已删）。
   基线 mret 全部落在 `iret_addr2+4`（偏离 0 次）—— 这是"+4 必须保留"的实证。
+  **注**：该基线里 `pc.v` 带 `ext_target` 端口 —— 就是"重定向 +4 该不该减 4"的原始开关，
+  2026-09-20 推导同一规则时参考过；要做同类改动先看 `git show a7f5eb8^:core/pc.v`。
 - 资源：itcm 64KB + icache 48KB + dtcm 32KB + dcache 16KB = **160KB**（§21 那版是 224KB）。
 
 ### 23.9b 综合 / 实现实测（Vivado 2019.1，xc7z010clg400-1）

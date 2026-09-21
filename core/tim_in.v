@@ -38,19 +38,19 @@ module tim_in(
         if (rst) begin
             cnt_set <= 32'd0;
             cnt <= 32'd0;
-            timi <= 1'd0;
+            timi <= 1'b0;
             bus_data_out <= 32'd0;
-            ready <= 1'd0;
+            ready <= 1'b0;
         end
         else begin
             bus_data_out <= 32'd0;
-            ready <= 1'd0;
-            if (cnt + 1'd1 == cnt_set) begin
-                timi <= 1'd1;
+            ready <= 1'b0;
+            if (cnt + 32'd1 == cnt_set) begin
+                timi <= 1'b1;
                 cnt <= 32'd0;
             end
             else begin
-                cnt <= cnt + 1'd1;
+                cnt <= cnt + 32'd1;
             end
 //字节使能写重装值设定
             if (bus_addr_in[31:24] == 8'd0 && bus_addr_in[23:20] == 4'd1) begin
@@ -63,18 +63,18 @@ module tim_in(
                     end
                     else begin
                         bus_data_out <= cnt_set;
-                        ready <= 1'd1;
+                        ready <= 1'b1;
                     end
                 end
                 else if (bus_addr_in[3:0] == 4'd2) begin
                     if (!bus_we_in) begin
                         bus_data_out <= cnt;
-                        ready <= 1'd1;
+                        ready <= 1'b1;
                     end
                 end
 //写指令清除中断挂起
                 else if (bus_addr_in[3:0] == 4'd3) begin
-                    if (bus_we_in) timi <= 1'd0;
+                    if (bus_we_in) timi <= 1'b0;
                 end
             end
         end

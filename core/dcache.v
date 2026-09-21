@@ -22,19 +22,21 @@
 
 module dcache(
     input clk, rst,
-    input [31:0] bus_addr_in,
-    input [31:0] bus_data_in,
+//总线接口
+    input [31:0] bus_addr_in, bus_data_in,
     input [3:0] bus_be_in,
     input bus_we_in,
+//后端存储接口
+    input [31:0] mem_data,
+    input mem_valid, mem_ready,
+
+//总线接口
     output reg [31:0] bus_data_out,
-    output reg ld_ready,
-    output reg busy,
+    output reg ld_ready, busy, hold,
+//后端存储接口
     output reg mem_req, mem_we,
     output reg [31:0] mem_addr, mem_wdata,
-    output reg [3:0] mem_be,
-    input [31:0] mem_data,
-    input mem_valid,
-    input mem_ready
+    output reg [3:0] mem_be
     );
 
     reg [20:0] tag;
@@ -66,6 +68,7 @@ module dcache(
     reg [31:0] ram_wdata;
     reg [31:0] wr_addr, wr_data;
     reg [3:0] wr_be;
+    reg busy_d1;
 
     integer i;
 
@@ -81,16 +84,16 @@ module dcache(
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
 
-        rd_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
-        wr_req = !rst && (stage == 1'd0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
+        rd_req = !rst && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
+        wr_req = !rst && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
 //整字 store 命中：能整字覆盖行内那个字，故【不失效】，直接行内更新。
 //写穿照做，缓存与后端仍一致。子字 store 覆盖不了整字，维持写失效。
         wr_full_hit = wr_req && cache_hit && (bus_be_in == 4'b1111);
 
         wr_drive = wr_pend || wr_req;
-        rd_drive = (stage == 1'd1) && !fill_end;
+        rd_drive = (stage == 1'b1) && !fill_end;
 
-        busy = !rst && ((stage == 1'd1 && !fill_end) || (rd_req && !cache_hit) ||
+        busy = !rst && ((stage == 1'b1 && !fill_end) || (rd_req && !cache_hit) ||
                         (wr_pend && !mem_ready));
         mem_req = !rst && (wr_drive || rd_drive);
         mem_we = wr_drive;
@@ -117,7 +120,7 @@ module dcache(
 //两者天然互斥：wr_req 要求 stage==0，填充时 stage==1。
 //字节粒度写会变成多个独立写操作（BRAM 只有 1 个写口），推不成，故子字 store 不做行更新。
     always @(*) begin
-        is_fill_wr = (stage == 1'd1) && !fill_end && mem_valid;
+        is_fill_wr = (stage == 1'b1) && !fill_end && mem_valid;
         ram_we     = is_fill_wr || wr_full_hit;
         if (is_fill_wr) begin
             ram_waddr = {fill_way, fill_idx, fill_cnt};
@@ -148,7 +151,7 @@ module dcache(
 
     always @(posedge clk) begin
         if (rst) begin
-            stage <= 1'd0;
+            stage <= 1'b0;
             fill_end <= 1'b0;
             fill_cnt <= 3'd0;
             fill_way <= 1'b0;
@@ -171,7 +174,7 @@ module dcache(
                     lru[idx] <= 1'b0;
                 end
                 else begin
-                    stage <= 1'd1;
+                    stage <= 1'b1;
                     miss_word <= word;
                     fill_cnt <= 3'd0;
                     fill_addr <= (bus_addr_in & 32'hFFFFFFF8) << 2;
@@ -201,7 +204,7 @@ module dcache(
 
             if (wr_pend && mem_ready) wr_pend <= 1'b0;
 
-            if (stage == 1'd1 && !fill_end && mem_valid) begin
+            if (stage == 1'b1 && !fill_end && mem_valid) begin
                 if (fill_cnt == 4'd7) fill_end <= 1'b1;
                 else fill_cnt <= fill_cnt + 3'd1;
             end
@@ -217,9 +220,20 @@ module dcache(
                 end
                 lru[fill_idx] <= ~fill_way;
                 ld_ready <= 1'b1;
-                stage <= 1'd0;
+                stage <= 1'b0;
                 fill_end <= 1'b0;
             end
         end
+    end
+
+//busy 的 1 拍延拓（原 cpu_top 的 d_hold_int，按"顶层不运算"下放到此）：
+//fill_end 拍 busy 就掉、ld_ready 要再等一拍，这 1 拍空窗必须兜住。
+    always @(posedge clk) begin
+        if (rst) busy_d1 <= 1'b0;
+        else     busy_d1 <= busy;
+    end
+
+    always @(*) begin
+        hold = busy | busy_d1;
     end
 endmodule
