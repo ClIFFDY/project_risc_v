@@ -12,7 +12,7 @@ module cpu_top(
 
 //流水线层次块：按信号首生产者的流水线位置排序
     wire [31:0] pc_addr, aux_addr_0;
-    wire [31:0] icache_inst_w;
+    (* max_fanout = 32 *) wire [31:0] icache_inst_w;
     wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3, jalr_fail;
 

@@ -52,17 +52,16 @@ module icache(
     localparam BOOT_LINES = 7'd127;
 
     reg cache_hit;
-    reg [18:0] tag;
-    reg [6:0] idx;
-    reg [4:0] word;
+    (* max_fanout = 32 *) reg [18:0] tag;
+    (* max_fanout = 32 *) reg [6:0] idx;
+    (* max_fanout = 32 *) reg [4:0] word;
     reg [2:0] hit_way;
     reg [1:0] hit_sel;
 
-    reg [18:0] tag0 [0:127];
     reg [18:0] tag1 [0:127];
     reg [18:0] tag2 [0:127];
     (* ram_style = "block" *) reg [31:0] iram [0:12287];
-    reg [127:0] valid0, valid1, valid2, lru;
+    reg [127:0] valid1, valid2, lru;
 
     reg boot;
     reg [6:0] boot_line;
@@ -76,7 +75,7 @@ module icache(
     reg [6:0] fill_idx;
     reg [1:0] fill_way;
 
-    reg [13:0] rd_addr;
+    (* max_fanout = 32 *) reg [13:0] rd_addr;
     reg rd_en, line_match;
 //回填交付判据，与缺失地址快照（缺失锁寄存一拍后用来补对位）
     reg deliver_ok;
@@ -94,29 +93,26 @@ module icache(
     reg jalr;
     always @(*) jalr = pre_jalr & btb_hit;
 
-//跳转类地址透传处理，减少取值冲刷空窗
-//br1/jal 那两路要再与上 !flush_w：pre_decoder 的 jal/br_en 已不再受 stage 门控（为了把
-//stage 那条高扇出广播从取指地址锥里摘掉），所以"冲刷拍别拿错路指令的分支/jal 去改地址"
-//改由这里直接用 flush 挡。flush 恰好是那 7 个冲刷事件的或，trap 也一并覆盖，无需再加端口。
-//优先级与原行为一致：irq/irq_ret/br2/br3 都在 br1/jal 之前，冲刷拍照样优先走它们；
-//若都不是（例如只有 trap），br1/jal 被 flush_w 挡住，落到 pc_addr>>>2——正是原来门控后的落点。
-//jalr 的预测目标与 jalr 失败目标都【不再】走这里：它们只进 pc，icache 跟着 pc 走到目标。
-//原来这两条（尤其是 jalr_fail）要把 decoder 里的 32 位比较结果横穿到 tag 阵列地址，
-//是这条链上最贵的一段；现在 icache 侧只保留"当拍就能算出地址"的那几路。
-//代价：jalr 类改向各多一拍空泡（那拍把取指输出刷成 NOP，见下面 inst_out）。
-    reg [31:0] fetch_addr;
+//取指地址 = pc_addr >>> 2，不再依赖本拍刚读出的指令。
+//br1/jal 的改向原先也在这里"当拍"生效，代价是锥里串进了 pre_decoder 的译码 +
+//pc_addr+offset 的 32 位进位链 + fetch_addr 两级 mux；那是 icache 那个 0 拍环的头。
+//现在改由 pc 寄存一拍（pc 落到目标，icache 下一拍自然跟着 pc_addr>>>2 走到目标），
+//环头整段消失。代价：每次预测跳转命中多一拍空泡 —— 那拍由下面的 NOP 门刷掉。
+    (* max_fanout = 32 *) reg [31:0] fetch_addr;
     always @(*) begin
         if (rst) fetch_addr = 32'd0;
-        else if (br1 && !flush_w)  fetch_addr = (pc_addr + offset_beq1) >>> 2;
-        else if (jal && !flush_w)  fetch_addr = (pc_addr + offset_jal1) >>> 2;
-        else                     fetch_addr = pc_addr >>> 2;
+        else     fetch_addr = pc_addr >>> 2;
     end
 
     always @(*) begin
         tag = fetch_addr[31:12];
         idx = fetch_addr[11:5];
         word = fetch_addr[4:0];
-        hit_way[0] = valid0[idx] && (tag0[idx] == tag);
+//way0 是锁定路：boot 把 128 组全填成 tag=0 且 valid=1，此后永不改写（替换只在 way1/way2 之间选），
+//所以"查 tag0 阵列再比较"等价于"地址是否落在低 16KB"——常量比较即可，整个阵列连同 valid0 都能删。
+//boot 期间 tag==0 会误报命中，但那时 busy 被 boot 分支强制为 1、req_valid=0（inst_out 不更新）、
+//时钟块也走 boot 分支，三处消费点都不用它。
+        hit_way[0] = (tag == 19'd0);
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         hit_way[2] = valid2[idx] && (tag2[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1] || hit_way[2];
@@ -179,7 +175,7 @@ module icache(
 //而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
         if (rst)                                  inst_out <= 32'd0;
-        else if ((jalr | jalr_fail | br2 | br3 | irq | irq_ret) && req_valid) inst_out <= 32'd0;
+        else if ((jalr | jalr_fail | br2 | br3 | irq | irq_ret | br1 | jal) && req_valid) inst_out <= 32'd0;
         else if (rd_en)                           inst_out <= iram[rd_addr];
     end
 
@@ -209,11 +205,10 @@ module icache(
             fill_idx <= 7'd0;
             miss_word <= 5'd0;
             miss_addr_q <= 32'd0;
-            valid0 <= 128'd0;
             valid1 <= 128'd0;
             valid2 <= 128'd0;
             lru <= 128'd0;
-//tag0/tag1/tag2 不复位：命中由 valid 挡住，陈旧 tag 无害。
+//tag1/tag2 不复位：命中由 valid 挡住，陈旧 tag 无害。
 //带复位会让这 3x128x19 位全被综合成带复位的 FF（撑爆 slice 打包），
 //去掉后能进分布式 RAM。valid 必须留复位 —— 它才是命中判据。
         end
@@ -225,8 +220,6 @@ module icache(
                     fill_cnt <= fill_cnt + 5'd1;
             end
             if (fill_end) begin
-                valid0[fill_idx] <= 1'b1;
-                tag0[fill_idx] <= 19'd0;
                 fill_end <= 1'b0;
                 fill_cnt <= 5'd0;
                 fill_way <= 2'd0;

@@ -55,12 +55,12 @@ module pc(
         else if (exec) begin
             if (!flush_w && !stall_w) begin
                 if (br1) begin
-                    pc_addr <= pc_addr + offset_beq2;
-                    aux_addr <= aux_addr + offset_beq2;
+                    pc_addr <= pc_addr + offset_beq2 - 4'd4;
+                    aux_addr <= aux_addr + offset_beq2 - 4'd4;
                 end
                 else if (jal) begin
-                    pc_addr <= pc_addr + offset_jal2;
-                    aux_addr <= pc_addr + offset_jal2;
+                    pc_addr <= pc_addr + offset_jal2 - 4'd4;
+                    aux_addr <= pc_addr + offset_jal2 - 4'd4;
                 end
                 else if (jalr) begin
                     pc_addr <= offset_jalr2;
