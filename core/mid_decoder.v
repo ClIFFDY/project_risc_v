@@ -20,7 +20,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module mem_buf(
+module mid_decoder(
     input clk, rst,
     input [4:0] flag_bus,
     input [31:0] inst_in,
@@ -68,6 +68,87 @@ module mem_buf(
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
+
+    localparam OPCODE_OP_IMM = 7'b0010011;
+    localparam OPCODE_OP     = 7'b0110011;
+    localparam OPCODE_JAL    = 7'b1101111;
+    localparam OPCODE_JALR   = 7'b1100111;
+    localparam OPCODE_BRANCH = 7'b1100011;
+    localparam OPCODE_LOAD   = 7'b0000011;
+    localparam OPCODE_STORE  = 7'b0100011;
+    localparam OPCODE_LUI    = 7'b0110111;
+    localparam OPCODE_AUIPC  = 7'b0010111;
+    localparam OPCODE_SYSTEM = 7'b1110011;
+
+    function [31:0] immI;
+        input [31:0] inst;
+        immI = {{20{inst[31]}}, inst[31:20]};
+    endfunction
+
+    function [31:0] immB;
+        input [31:0] inst;
+        immB = {{19{inst[31]}}, inst[31], inst[7], inst[30:25], inst[11:8], 1'b0};
+    endfunction
+
+    function [31:0] immS;
+        input [31:0] inst;
+        immS = {{20{inst[31]}}, inst[31:25], inst[11:7]};
+    endfunction
+
+    function [31:0] immU;
+        input [31:0] inst;
+        immU = {inst[31:12], 12'd0};
+    endfunction
+
+    reg [4:0] rd_c;
+    reg [9:0] func10_c;
+    reg [31:0] imm_c;
+    always @(*) begin
+        rd_c = 5'd0;
+        func10_c = 10'd0;
+        imm_c = 32'd0;
+        case (inst_in[6:0])
+            OPCODE_OP: begin
+                rd_c = inst_in[11:7];
+                func10_c = {inst_in[31:25], inst_in[14:12]};
+            end
+            OPCODE_OP_IMM: begin
+                imm_c = immI(inst_in);
+                rd_c = inst_in[11:7];
+                func10_c = {(inst_in[14:12] == 3'b001 || inst_in[14:12] == 3'b101) ? inst_in[31:25] : 7'd0, inst_in[14:12]};
+            end
+            OPCODE_JAL: begin
+                rd_c = inst_in[11:7];
+            end
+            OPCODE_JALR: begin
+                rd_c = inst_in[11:7];
+                imm_c = immI(inst_in);
+            end
+            OPCODE_BRANCH: begin
+                imm_c = immB(inst_in);
+                func10_c = {7'd0, inst_in[14:12]};
+            end
+            OPCODE_LOAD: begin
+                imm_c = immI(inst_in);
+                rd_c = inst_in[11:7];
+            end
+            OPCODE_STORE: begin
+                imm_c = immS(inst_in);
+            end
+            OPCODE_LUI: begin
+                imm_c = immU(inst_in);
+                rd_c = inst_in[11:7];
+            end
+            OPCODE_AUIPC: begin
+                imm_c = immU(inst_in) - 4'd4;
+                rd_c = inst_in[11:7];
+            end
+            OPCODE_SYSTEM: begin
+                rd_c = inst_in[11:7];
+                func10_c = {7'd0, inst_in[14:12]};
+            end
+        endcase
+    end
 
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
@@ -120,9 +201,9 @@ module mem_buf(
             end
             else begin
                 inst_out <= inst_in;
-                func10_out <= func10_in;
-                imm_alu_out <= imm_alu_in;
-                rd_out <= rd_in;
+                func10_out <= func10_c;
+                imm_alu_out <= imm_c;
+                rd_out <= rd_c;
                 aux_addr_out <= aux_addr_in;
                 br_pred_taken_out <= br_pred_taken_in;
                 jalr_pred_addr_out <= jalr_pred_addr_in;

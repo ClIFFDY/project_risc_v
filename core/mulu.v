@@ -114,6 +114,7 @@ module mulu(
     reg [4:0]  d_cnt;
     reg        d_busy;
     reg        d_issued;          // 本条 div 已发起过（防止离开 mulu 级之前重复发起）
+    reg        d_done_q;
     reg        d_done;            // 完成脉冲（比最后一次迭代晚一拍）
 
     reg [31:0] d_q_rem;           // 迭代中的余数累加器
@@ -255,7 +256,7 @@ module mulu(
 //除法无副作用，被冲刷就整体作废，重取指后会重新执行
             d_busy <= 1'b0;
         end
-        else if (!is_div) begin
+        else if (d_done_q || !is_div) begin
 //指令离开 mulu 级 → 清"已发起"
             d_issued <= 1'b0;
         end
@@ -291,8 +292,14 @@ module mulu(
     end
 
     always @(posedge clk) begin
-        if (rst_q || flush_w) d_done <= 1'b0;
-        else              d_done <= d_last;
+        if (rst_q || flush_w) begin
+            d_done   <= 1'b0;
+            d_done_q <= 1'b0;
+        end
+        else begin
+            d_done   <= d_last;
+            d_done_q <= d_done;
+        end
     end
 
 //除法结果提交延迟链 + 输出保持（对应 lsu 的 ld_hold）

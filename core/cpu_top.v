@@ -13,7 +13,7 @@ module cpu_top(
 //流水线层次块：按信号首生产者的流水线位置排序
     wire [31:0] pc_addr, aux_addr_0;
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
-    wire [31:0] inst_1;
+    (* max_fanout = 32 *) wire [31:0] inst_1;
     wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3;
 
@@ -203,7 +203,7 @@ module cpu_top(
         .jalr(pre_jalr)
     );
 
-    mem_buf u_mem_buf (
+    mid_decoder u_mid_decoder (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
@@ -247,7 +247,7 @@ module cpu_top(
         .r2_out(rs2_2)
     );
 
-    decoder u_decoder (
+    post_decoder u_post_decoder (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),

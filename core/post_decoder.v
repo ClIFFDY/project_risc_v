@@ -20,7 +20,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module decoder(
+module post_decoder(
     input clk, rst,
     input [4:0] flag_bus,
     input [9:0] func10,
@@ -33,7 +33,7 @@ module decoder(
     input [31:0] aux_addr_in,
     input br_pred_taken_in,
     input [31:0] jalr_pred_addr_in,
-    output reg [31:0] r1_data_out, r2_data_out,
+    (* max_fanout = 32 *) output reg [31:0] r1_data_out, r2_data_out,
     output reg [4:0] rd_out, rd_back1,
     output reg [3:0] alu_func4,
     output reg [2:0] csr_func3,
