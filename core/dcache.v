@@ -54,7 +54,13 @@ module dcache(
     reg [20:0] tag0 [0:255];
     reg [20:0] tag1 [0:255];
     (* ram_style = "block" *) reg [31:0] data [0:4095];
-    reg [255:0] valid0, valid1, lru;
+    reg [255:0] valid0, valid1;
+//lru 必须是阵列，不能是宽向量：`reg [255:0] lru` 用运行时下标读写，会被综合成 256 个散
+//触发器 + 一棵 256:1 mux 树（实测 256 FDRE + 353 LUT6 + 42 MUXF7/F8，还带一条 fo=260 的
+//译码网），而阵列才推得成 LUTRAM。它和 valid0/valid1 的区别在于【复位后初值任意都安全】：
+//只有两路都满时才参考它，选哪一路做牺牲品功能上都对。valid0/valid1 则必须留复位——
+//tag 阵列本就无复位，全靠 valid 清零兜住脏 tag，去掉复位后 rst 再拉起会假命中读到陈旧数据。
+    (* ram_style = "distributed" *) reg lru [0:255];
 
     reg stage;
     reg fill_end;
@@ -66,7 +72,9 @@ module dcache(
     reg fill_way;
 
     reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
-    reg wr_upd;
+    reg wr_upd, hit_upd;
+    reg lru_we, lru_wval;
+    reg [7:0] lru_widx;
     reg [11:0] rd_addr;
     reg rd_en;
     reg is_fill_wr, ram_we;
@@ -81,6 +89,7 @@ module dcache(
 
     initial begin
         for (i = 0; i < 4096; i = i + 1) data[i] = 32'd0;
+        for (i = 0; i < 256;  i = i + 1) lru[i]  = 1'b0;
     end
 
     always @(*) begin
@@ -97,6 +106,13 @@ module dcache(
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
         wr_upd = wr_req && cache_hit;
+//lru 收成【单写口】：命中改 idx（stage==0），回填改 fill_idx（fill_end 拍 stage 仍为 1）。
+//rd_req / wr_req / fill_end 三者两两互斥，所以一个写地址就能覆盖原来散在三处的写，
+//索引与值逐字保持原语义（命中时 way0 优先 ⇒ 值取 hit_way[0]）。
+        hit_upd  = (rd_req || wr_req) && cache_hit;
+        lru_we   = hit_upd || fill_end;
+        lru_widx = fill_end ? fill_idx : idx;
+        lru_wval = fill_end ? ~fill_way : hit_way[0];
 
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'b1) && !fill_end;
@@ -175,19 +191,18 @@ module dcache(
             ld_ready <= 1'b0;
             valid0 <= 256'd0;
             valid1 <= 256'd0;
-            lru <= 256'd0;
         end
         else begin
             ld_ready <= 1'b0;
 
+            if (lru_we) lru[lru_widx] <= lru_wval;
+
             if (rd_req) begin
                 if (hit_way[0]) begin
                     ld_ready <= 1'b1;
-                    lru[idx] <= 1'b1;
                 end
                 else if (hit_way[1]) begin
                     ld_ready <= 1'b1;
-                    lru[idx] <= 1'b0;
                 end
                 else begin
                     stage <= 1'b1;
@@ -202,10 +217,6 @@ module dcache(
             end
 
             if (wr_req) begin
-                if (cache_hit) begin
-                    if (hit_way[0]) lru[idx] <= 1'b1;
-                    else            lru[idx] <= 1'b0;
-                end
                 if (!mem_ready) begin
                     wr_pend <= 1'b1;
                     wr_addr <= bus_addr_in << 2;
@@ -230,7 +241,6 @@ module dcache(
                     tag0[fill_idx] <= fill_tag;
                     valid0[fill_idx] <= 1'b1;
                 end
-                lru[fill_idx] <= ~fill_way;
                 ld_ready <= 1'b1;
                 stage <= 1'b0;
                 fill_end <= 1'b0;
