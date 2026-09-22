@@ -23,6 +23,7 @@
 module mem_buf(
     input clk, rst,
     input [4:0] flag_bus,
+    input [31:0] inst_in,
     input [9:0] func10_in,
     input [31:0] imm_alu_in,
     input [11:0] imm12_csr_in,
@@ -41,6 +42,7 @@ module mem_buf(
     input [31:0] offset_store0_in,
     input [4:0] r1_in,
     input [4:0] r2_in,
+    output reg [31:0] inst_out,
     output reg [9:0] func10_out,
     output reg [31:0] imm_alu_out,
     output reg [11:0] imm12_csr_out,
@@ -77,89 +79,72 @@ module mem_buf(
         exec    = flag_bus[4];
     end
 
-//指令缓冲级，对齐寄存器组数据访问
+//指令缓冲级，对齐寄存器组数据访问。
+//寄存器只留跨拍真正要用的：指令字本身 + 一个 opcode 选择好的立即数 + PC 载荷/预测两件
+//+ regfile 要用的 rd 与前递要用的 rs。其余字段（opcode/func10/offset_*/pc_operand/立即数各位）
+//全部由 inst_out 就地切片/别名给出 —— 原来它们是各自寄存一遍的（18 个寄存器 323 位）。
     always @(posedge clk) begin
         if (rst_q) begin
+            inst_out <= 32'd0;
             func10_out <= 10'd0;
             imm_alu_out <= 32'd0;
-            imm12_csr_out <= 12'd0;
-            imm5_csr_out <= 5'd0;
             rd_out <= 5'd0;
-            opcode_out <= 7'd0;
-            offset_jalr0_out <= 32'd0;
-            offset_beq0_aux_out <= 32'd0;
-            pc_operand_out <= 32'd0;
             aux_addr_out <= 32'd0;
-            opcode_lsu_out <= 7'd0;
-            func10_lsu_out <= 10'd0;
-            offset_load0_out <= 32'd0;
-            offset_store0_out <= 32'd0;
-            r1_out <= 5'd0;
-            r2_out <= 5'd0;
             br_pred_taken_out <= 1'b0;
             jalr_pred_addr_out <= 32'd0;
+            r1_out <= 5'd0;
+            r2_out <= 5'd0;
         end
         else if (exec) begin
             if (stall_w) begin
+                inst_out <= inst_out;
                 func10_out <= func10_out;
                 imm_alu_out <= imm_alu_out;
-                imm12_csr_out <= imm12_csr_out;
-                imm5_csr_out <= imm5_csr_out;
                 rd_out <= rd_out;
-                opcode_out <= opcode_out;
-                offset_jalr0_out <= offset_jalr0_out;
-                offset_beq0_aux_out <= offset_beq0_aux_out;
-                pc_operand_out <= pc_operand_out;
                 aux_addr_out <= aux_addr_out;
-                opcode_lsu_out <= opcode_lsu_out;
-                func10_lsu_out <= func10_lsu_out;
-                offset_load0_out <= offset_load0_out;
-                offset_store0_out <= offset_store0_out;
-                r1_out <= r1_out;
-                r2_out <= r2_out;
                 br_pred_taken_out <= br_pred_taken_out;
                 jalr_pred_addr_out <= jalr_pred_addr_out;
+                r1_out <= r1_out;
+                r2_out <= r2_out;
             end
             else if (flush_w) begin
+                inst_out <= 32'd0;
                 func10_out <= 10'd0;
                 imm_alu_out <= 32'd0;
-                imm12_csr_out <= 12'd0;
-                imm5_csr_out <= 5'd0;
                 rd_out <= 5'd0;
-                opcode_out <= 7'd0;
-                offset_jalr0_out <= 32'd0;
-                offset_beq0_aux_out <= 32'd0;
-                pc_operand_out <= 32'd0;
                 aux_addr_out <= 32'd0;
-                opcode_lsu_out <= 7'd0;
-                func10_lsu_out <= 10'd0;
-                offset_load0_out <= 32'd0;
-                offset_store0_out <= 32'd0;
-                r1_out <= 5'd0;
-                r2_out <= 5'd0;
                 br_pred_taken_out <= 1'b0;
                 jalr_pred_addr_out <= 32'd0;
+                r1_out <= 5'd0;
+                r2_out <= 5'd0;
             end
             else begin
+                inst_out <= inst_in;
                 func10_out <= func10_in;
                 imm_alu_out <= imm_alu_in;
-                imm12_csr_out <= imm12_csr_in;
-                imm5_csr_out <= imm5_csr_in;
                 rd_out <= rd_in;
-                opcode_out <= opcode_in;
-                offset_jalr0_out <= offset_jalr0_in;
-                offset_beq0_aux_out <= offset_beq0_aux_in;
-                pc_operand_out <= pc_operand_in;
                 aux_addr_out <= aux_addr_in;
-                opcode_lsu_out <= opcode_lsu_in;
-                func10_lsu_out <= func10_lsu_in;
-                offset_load0_out <= offset_load0_in;
-                offset_store0_out <= offset_store0_in;
-                r1_out <= r1_in;
-                r2_out <= r2_in;
                 br_pred_taken_out <= br_pred_taken_in;
                 jalr_pred_addr_out <= jalr_pred_addr_in;
+                r1_out <= r1_in;
+                r2_out <= r2_in;
             end
         end
     end
+
+//派生输出：切片与别名，无逻辑。消费者都按 opcode 自门控，所以"每个 opcode 只看它那一份"
+//（偏移族四个输出共用同一个 imm_alu_out：一条指令只有一个立即数 flavour 是活的）。
+    always @(*) begin
+        opcode_out = inst_out[6:0];
+        opcode_lsu_out = inst_out[6:0];
+        func10_lsu_out = {7'd0, inst_out[14:12]};
+        imm12_csr_out = inst_out[31:20];
+        imm5_csr_out = inst_out[19:15];
+        pc_operand_out = aux_addr_out;
+        offset_jalr0_out = imm_alu_out;
+        offset_beq0_aux_out = imm_alu_out;
+        offset_load0_out = imm_alu_out;
+        offset_store0_out = imm_alu_out;
+    end
+
 endmodule

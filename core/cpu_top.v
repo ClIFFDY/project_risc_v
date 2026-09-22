@@ -13,6 +13,7 @@ module cpu_top(
 //流水线层次块：按信号首生产者的流水线位置排序
     wire [31:0] pc_addr, aux_addr_0;
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
+    wire [31:0] inst_1;
     wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3;
 
@@ -28,6 +29,7 @@ module cpu_top(
     wire br_pred_taken_1;
     wire [31:0] jalr_pred_addr_1;
 
+    wire [31:0] inst_2;
     (* max_fanout = 32 *) wire [4:0] rs1_2, rs2_2, rd_2;
     wire [4:0] imm5_csr_2;
     wire [6:0] opcode_2, opcode_lsu_2;
@@ -169,6 +171,7 @@ module cpu_top(
         .flag_bus(flag_bus),
         .inst_in(icache_inst_w),
         .aux_addr_in(aux_addr_0),
+        .inst_out(inst_1),
         .br1_in(br1),
         .jalr_pred_addr_in(jalr_predict_offset),
         .br_pred_taken_out(br_pred_taken_1),
@@ -204,6 +207,8 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
+        .inst_in(inst_1),
+        .inst_out(inst_2),
         .func10_in(func10_1),
         .func10_out(func10_2),
         .imm_alu_in(imm_alu_1),
