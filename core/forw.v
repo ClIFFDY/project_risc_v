@@ -38,16 +38,11 @@ module forw(
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
-    reg stalled, stall;
-
-//停顿合流（按"顶层不运算"从 cpu_top 下放至此）
-    always @(*) stall = lsu_stall | mul_stall;
-
 //对ld/st指令数据旁路进行延迟仲裁。
 //优先级：alu 在途 > load 在途 > mulu 在途 > wb_reg。
     always @(*) begin
         if (r1 != 5'd0) begin
-            if (!stalled && r1 == rd_back1) begin
+            if (r1 == rd_back1) begin
                 r1_data_final = result_back1;
             end
             else if (loaded && r1 == rd_load) begin
@@ -67,7 +62,7 @@ module forw(
         end
         else r1_data_final = r1_data_in;
         if (r2 != 5'd0) begin
-            if (!stalled && r2 == rd_back1) begin
+            if (r2 == rd_back1) begin
                 r2_data_final = result_back1;
             end
             else if (loaded && r2 == rd_load) begin
@@ -84,10 +79,5 @@ module forw(
             end
         end
         else r2_data_final = r2_data_in;
-    end
-
-    always @(posedge clk) begin
-        if (rst_q) stalled <= 1'b0;
-        else stalled <= stall;
     end
 endmodule
