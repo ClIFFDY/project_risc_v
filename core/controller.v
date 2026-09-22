@@ -28,6 +28,8 @@ module controller(
     input jal, pre_jalr, btb_hit, br1,
     input csr_wr_en, exti, timi, softi,
     input [11:0] csr_addr,
+//csr 读口地址（c2 级），比 csr_addr 早一拍；读值寄存一拍后由 csr_data_out 给出
+    input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
     output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause,
@@ -60,6 +62,8 @@ module controller(
     always @(*) jalr_pred = pre_jalr & btb_hit;
 
 //五条控制位各自成网：位与位之间不共享逻辑，综合时互不依赖
+//前置冲刷 stallf 不进 flag_bus：它是 bju 判定块里的组合派生信号，绕 controller 一圈
+//只是把同一根线进出一次，实测会让它挂上全片广播网、多花 0.45ns（见 path_cl10 vs path_jp10）。
     always @(*) begin
         flush_irq = irq || irq_ret || irq_act || trap;
         flush_jump = jalr_fail || br2 || br3;
@@ -93,6 +97,7 @@ module controller(
         .trap(trap),
         .ebreak(ebreak),
         .csr_addr(csr_addr),
+        .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_data_in),
         .pc_addr_in(pc_addr_in),
         .irq_bubble(irq_bubble),

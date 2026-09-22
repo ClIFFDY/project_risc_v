@@ -24,6 +24,8 @@ module csr(
     input clk, rst,
     input csr_wr_en, stall_d, stall_i, flush, iret, exti, timi, softi, trap, ebreak,
     input [11:0] csr_addr,
+//读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
+    input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
     input [1:0] ird_tmr,
@@ -179,19 +181,36 @@ module csr(
         end
     end
 
-//根据不同的csr读地址返回相应的csr寄存器数据
+//csr 读操作：地址取 c2 级的 csr_addr_pre（比 csr_addr 早一拍），结果寄存一拍后供 alu 当 cs_data。
+//原设计在 c3 级组合读出，读值要经 alu 直通再喂 forw 的 back1 旁路，于是
+//"csr mux → alu → forw → 判定比较"整条链落在同一拍里 —— 那正是全片最差路径的头（实测入口网 1.016ns）。
+//提前一拍读出并寄存后，cs_data 的源头变成触发器，链头整段消失；forw/decoder/流水线结构都不用动。
+//写后读旁路：本拍 c3 级正要写的 csr（csr_addr/csr_wr_en/csr_data_in）若与本级要读的地址相同，
+//直接前递写入值 —— 否则提前读会拿到写之前的老值。
+//两个地址都出自 decoder 且非 SYSTEM 已清 0，故不会因为"双方恰好都是 0"而误命中。
+    reg [31:0] csr_data_rd;
     always@ (*) begin
-        csr_data_out = 32'd0;
-        case (csr_addr)
-        12'h300: csr_data_out = {20'd0, irq_en_post_reg, 3'd0, irq_en_reg, 3'd0};
-        12'h304: csr_data_out = {20'd0, sirq_en, 3'd0, tirq_en, 3'd0, eirq_en, 3'd0};
-        12'h305: csr_data_out = isr_addr_reg1;
-        12'h341: csr_data_out = iret_addr1;
-        12'h342: csr_data_out = mcause_reg;
-        12'h344: csr_data_out = {20'd0, sirq_pend, 3'd0, tirq_pend, 3'd0, eirq_pend, 3'd0};
-        12'hB00: csr_data_out = mcycle_reg;
-        12'hB02: csr_data_out = minstret_reg;
-        default: csr_data_out = 32'd0;
-        endcase
+        if (csr_wr_en && (csr_addr != 12'd0) && (csr_addr == csr_addr_pre)) begin
+            csr_data_rd = csr_data_in;
+        end
+        else begin
+            case (csr_addr_pre)
+            12'h300: csr_data_rd = {20'd0, irq_en_post_reg, 3'd0, irq_en_reg, 3'd0};
+            12'h304: csr_data_rd = {20'd0, sirq_en, 3'd0, tirq_en, 3'd0, eirq_en, 3'd0};
+            12'h305: csr_data_rd = isr_addr_reg1;
+            12'h341: csr_data_rd = iret_addr1;
+            12'h342: csr_data_rd = mcause_reg;
+            12'h344: csr_data_rd = {20'd0, sirq_pend, 3'd0, tirq_pend, 3'd0, eirq_pend, 3'd0};
+            12'hB00: csr_data_rd = mcycle_reg;
+            12'hB02: csr_data_rd = minstret_reg;
+            default: csr_data_rd = 32'd0;
+            endcase
+        end
+    end
+
+//读值寄存器：与上面同拍采样，故 cs_data 相对 c2 级地址晚一拍可用，正好落在该指令进 alu 的那一拍
+    always@ (posedge clk) begin
+        if (rst) csr_data_out <= 32'd0;
+        else     csr_data_out <= csr_data_rd;
     end
 endmodule 

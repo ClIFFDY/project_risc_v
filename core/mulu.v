@@ -42,6 +42,11 @@
 module mulu(
     input clk, rst,
     input [4:0] flag_bus,
+//前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
+//而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
+//推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
+//不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
+    input stallf,
 //冻结信号的三项源（按"顶层不运算"从 cpu_top 下放至此，由本模块内部合成 pipe_stall）：
 //本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
 //严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
@@ -70,8 +75,11 @@ module mulu(
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取两条冲刷位。
+//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：m_push、除法 FSM 的作废、
+//d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
+//乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
-    always @(*) flush_w = flag_bus[3] | flag_bus[2];
+    always @(*) flush_w = flag_bus[3] | flag_bus[2] | stallf;
 
 //冻结信号合流：总线保持（外部 + dcache 延拓拍）与取指缺失、以及 lsu 的 load-use
     reg pipe_stall, bus_hold;

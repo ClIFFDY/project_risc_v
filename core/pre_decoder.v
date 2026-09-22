@@ -27,7 +27,7 @@ module pre_decoder(
     input [31:0] aux_addr_in,
     input br1_in,
     input [31:0] jalr_pred_addr_in,
-    output reg [4:0] r1, r2, r1_mem, r2_mem, rd,
+    output reg [4:0] r1, r2, rd,
     output reg [9:0] func10_dec, func10_lsu,
     output reg [31:0] imm_alu_out,
     output reg [11:0] imm12_csr_out,
@@ -37,7 +37,7 @@ module pre_decoder(
     output reg [31:0] aux_addr_out,
     output reg [4:0] imm5_csr_out,
     output reg [6:0] opcode_dec, opcode_lsu,
-    output reg jal, dec, lsu, mul, br_en, jalr,
+    output reg jal, dec, lsu, br_en, jalr,
     output reg br_pred_taken_out,
     output reg [31:0] jalr_pred_addr_out
     );
@@ -109,12 +109,9 @@ module pre_decoder(
             func10_lsu <= 10'd0;
             r1 <= 5'd0;
             r2 <= 5'd0;
-            r1_mem <= 5'd0;
-            r2_mem <= 5'd0;
             rd <= 5'd0;
             dec <= 1'b0;
             lsu <= 1'b0;
-            mul <= 1'b0;
             imm_alu_out <= 32'd0;
             offset_jalr0 <= 32'd0;
             offset_beq0_aux <= 32'd0;
@@ -135,12 +132,9 @@ module pre_decoder(
                 func10_lsu <= 10'd0;
                 r1 <= 5'd0;
                 r2 <= 5'd0;
-                r1_mem <= 5'd0;
-                r2_mem <= 5'd0;
                 rd <= 5'd0;
                 dec <= 1'b0;
                 lsu <= 1'b0;
-                mul <= 1'b0;
                 imm_alu_out <= 32'd0;
                 offset_jalr0 <= 32'd0;
                 offset_beq0_aux <= 32'd0;
@@ -158,20 +152,14 @@ module pre_decoder(
                     OPCODE_OP: begin
                         r2 <= inst_effective[24:20];
                         r1 <= inst_effective[19:15];
-                        r2_mem <= inst_effective[24:20];
-                        r1_mem <= inst_effective[19:15];
                         rd <= inst_effective[11:7];
                         func10_dec <= {inst_effective[31:25], inst_effective[14:12]};
                         opcode_dec <= OPCODE_OP;
                         dec <= 1'b1;
-//RV32M：funct7==0000001 是乘除法。给 regfile 一条独立的读数据通路（复制副本降扇出），
-//mulu 用它自己那一份，不与其他消费单元共享 _dec/_lsu 的网。
-                        if (inst_effective[31:25] == 7'b0000001) mul <= 1'b1;
                     end
                     OPCODE_OP_IMM: begin
                         imm_alu_out <= immI(inst_effective);
                         r1 <= inst_effective[19:15];
-                        r1_mem <= inst_effective[19:15];
                         rd <= inst_effective[11:7];
                         func10_dec <= {(inst_effective[14:12] == 3'b001 || inst_effective[14:12] == 3'b101) ? inst_effective[31:25] : 7'd0, inst_effective[14:12]};
                         opcode_dec <= OPCODE_OP_IMM;
@@ -185,7 +173,6 @@ module pre_decoder(
                     OPCODE_JALR: begin
                         rd <= inst_effective[11:7];
                         r1 <= inst_effective[19:15];
-                        r1_mem <= inst_effective[19:15];
                         offset_jalr0 <= immI(inst_effective);
                         opcode_dec <= OPCODE_JALR;
                         aux_addr_out <= aux_addr_in;
@@ -197,8 +184,6 @@ module pre_decoder(
                         offset_beq0_aux <= immB(inst_effective);
                         r2 <= inst_effective[24:20];
                         r1 <= inst_effective[19:15];
-                        r2_mem <= inst_effective[24:20];
-                        r1_mem <= inst_effective[19:15];
                         func10_dec <= {7'd0, inst_effective[14:12]};
                         dec <= 1'b1;
                     end
@@ -208,7 +193,6 @@ module pre_decoder(
                         offset_load0 <= immI(inst_effective);
                         rd <= inst_effective[11:7];
                         r1 <= inst_effective[19:15];
-                        r1_mem <= inst_effective[19:15];
                         func10_lsu <= {7'd0, inst_effective[14:12]};
                         lsu <= 1'b1;
                     end
@@ -218,8 +202,6 @@ module pre_decoder(
                         offset_store0 <= immS(inst_effective);
                         r2 <= inst_effective[24:20];
                         r1 <= inst_effective[19:15];
-                        r2_mem <= inst_effective[24:20];
-                        r1_mem <= inst_effective[19:15];
                         func10_lsu <= {7'd0, inst_effective[14:12]};
                         lsu <= 1'b1;
                     end
@@ -239,7 +221,6 @@ module pre_decoder(
                         opcode_dec <= OPCODE_SYSTEM;
                         imm12_csr_out <= inst_effective[31:20];
                         r1 <= inst_effective[19:15];
-                        r1_mem <= inst_effective[19:15];
                         imm5_csr_out <= inst_effective[19:15];
                         rd <= inst_effective[11:7];
                         func10_dec <= {7'd0, inst_effective[14:12]};
@@ -252,12 +233,9 @@ module pre_decoder(
                 func10_lsu <= func10_lsu;
                 r1 <= r1;
                 r2 <= r2;
-                r1_mem <= r1_mem;
-                r2_mem <= r2_mem;
                 rd <= rd;
                 dec <= dec;
                 lsu <= lsu;
-                mul <= mul;
                 imm_alu_out <= imm_alu_out;
                 offset_jalr0 <= offset_jalr0;
                 offset_beq0_aux <= offset_beq0_aux;
@@ -277,12 +255,9 @@ module pre_decoder(
                 func10_lsu <= 10'd0;
                 r1 <= 5'd0;
                 r2 <= 5'd0;
-                r1_mem <= 5'd0;
-                r2_mem <= 5'd0;
                 rd <= 5'd0;
                 dec <= 1'b0;
                 lsu <= 1'b0;
-                mul <= 1'b0;
                 imm_alu_out <= 32'd0;
                 offset_jalr0 <= 32'd0;
                 offset_beq0_aux <= 32'd0;

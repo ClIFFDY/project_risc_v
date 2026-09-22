@@ -14,9 +14,9 @@ module cpu_top(
     wire [31:0] pc_addr, aux_addr_0;
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
     wire icache_busy_w, icache_busy_q;
-    wire br1, br2, br3, jalr_fail;
+    wire br1, br2, br3;
 
-    wire [4:0] rs1_1, rs2_1, rd_1;
+    (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1, rd_1;
     wire [4:0] imm5_csr_1;
     wire [6:0] opcode_1, opcode_lsu_1;
     wire [9:0] func10_1, func10_lsu_1;
@@ -28,7 +28,7 @@ module cpu_top(
     wire br_pred_taken_1;
     wire [31:0] jalr_pred_addr_1;
 
-    wire [4:0] rs1_2, rs2_2, rd_2;
+    (* max_fanout = 32 *) wire [4:0] rs1_2, rs2_2, rd_2;
     wire [4:0] imm5_csr_2;
     wire [6:0] opcode_2, opcode_lsu_2;
     wire [9:0] func10_2, func10_lsu_2;
@@ -40,10 +40,8 @@ module cpu_top(
     wire [31:0] jalr_pred_addr_2;
 
     wire [4:0] rd_3;
-    wire [31:0] r1_data_3, r2_data_3, aux_addr_3;
-    wire we_3;
-    wire br_pred_taken_3;
-    wire [31:0] jalr_pred_addr_3;
+    wire [31:0] r1_data_3, r2_data_3, aux_addr_3, beq_off_q2, jalr_pred_addr_3;
+    wire we_3, br_flag, br_pred_taken_3;
 
     wire [4:0] rd_4;
     wire [31:0] result_4, result_back1;
@@ -56,17 +54,19 @@ module cpu_top(
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
     wire [4:0] flag_bus;
     wire [3:0] irq_bubble, alu_func4;
-    wire [11:0] csr_addr;
+    wire [11:0] csr_addr, csr_addr_pre;
     wire [4:0] rd_back1, rd_back2;
-    wire [31:0] br_addr1, br_addr2;
     wire [31:0] jalr_predict_offset;
     wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
     wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
-    wire [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2;
-    wire [31:0] r1_data_final_dec, r2_data_final_dec, r1_data_final_lsu, r2_data_final_lsu;
-    wire [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu;
+    wire [31:0] jalr_target_q2, jp_target;
+    wire [5:0] br_pc_idx;
+    wire [31:0] r1_data_final, r2_data_final;
+    wire [31:0] r1_data, r2_data;
     wire [31:0] ld_data_final;
-    wire jalr, br_fail, success, jal_flag, jalr_flag, irq_ret, trap, ebreak;
+    wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, irq_ret, trap, ebreak;
+//前置冲刷（早一拍）：由 bju 的组合判定给出，直连 lsu/mulu（不进 flag_bus，见 controller.v）
+    wire stallf;
     wire loaded, ld_we, stall;
     wire [4:0] rd_load;
     wire btb_hit;
@@ -87,10 +87,6 @@ module cpu_top(
     wire [31:0] mul_data_final;
     wire mul_loaded, mul_we, mul_stall;
     wire [4:0] rd_mul;
-//mulu 专属的读数据通路镜像（照 pc_addr/aux_addr 手法，按消费者拆开降扇出）
-    wire mul_sel_w;
-    wire [31:0] r1_data_mul_w, r2_data_mul_w;
-    wire [31:0] r1_data_final_mul_w, r2_data_final_mul_w;
     wire ibus_req_valid_i;
 
 //总线层次块
@@ -111,21 +107,16 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .br1(br1),
-        .br2(br2),
-        .br3(br3),
         .jal(jal),
         .pre_jalr(pre_jalr),
         .btb_hit(btb_hit),
-        .jalr_fail(jalr_fail),
         .irq(irq),
         .irq_ret(irq_ret),
         .flag_bus(flag_bus),
+        .jp_target(jp_target),
         .offset_jal2(offset_jal2),
         .offset_jalr2(jalr_predict_offset),
         .offset_beq2(offset_beq2),
-        .jalr_target_q(jalr_target_q2),
-        .beq_off_q2(beq_off_q2),
-        .br_addr2(br_addr2),
         .isr_addr2(isr_addr2),
         .isr_ret_addr2(iret_addr2),
         .pc_addr(pc_addr),
@@ -150,8 +141,6 @@ module cpu_top(
         .irq(irq),
         .irq_ret(irq_ret),
         .flag_bus(flag_bus),
-        .beq_off_q1(beq_off_q1),
-        .br_addr1(br_addr1),
         .req_valid(ibus_req_valid_i),
         .inst_out(icache_inst_w),
         .busy(icache_busy_w),
@@ -186,8 +175,6 @@ module cpu_top(
         .jalr_pred_addr_out(jalr_pred_addr_1),
         .r1(rs1_1),
         .r2(rs2_1),
-        .r1_mem(rs1_1),
-        .r2_mem(rs2_1),
         .rd(rd_1),
         .func10_dec(func10_1),
         .func10_lsu(func10_lsu_1),
@@ -208,7 +195,6 @@ module cpu_top(
         .aux_addr_out(aux_addr_1),
         .dec(dec),
         .lsu(lsu),
-        .mul(mul_sel_w),
         .jal(jal),
         .br_en(br_en),
         .jalr(pre_jalr)
@@ -266,10 +252,11 @@ module cpu_top(
         .imm5_csr_in(imm5_csr_2),
         .csr_wr_en(csr_wr_en),
         .csr_addr(csr_addr),
+        .csr_addr_pre(csr_addr_pre),
         .csr_data(csr_data_wr),
         .csr_func3(csr_func3),
-        .r1_data_final(r1_data_final_dec),
-        .r2_data_final(r2_data_final_dec),
+        .r1_data_final(r1_data_final),
+        .r2_data_final(r2_data_final),
         .rd_in(rd_2),
         .opcode(opcode_2),
         .offset_jalr0(offset_jalr0_2),
@@ -278,15 +265,10 @@ module cpu_top(
         .aux_addr_in(aux_addr_2),
         .br_pred_taken_in(br_pred_taken_2),
         .jalr_pred_addr_in(jalr_pred_addr_2),
+        .br_flag(br_flag),
+        .beq_off_q2(beq_off_q2),
         .br_pred_taken_out(br_pred_taken_3),
         .jalr_pred_addr_out(jalr_pred_addr_3),
-        .jalr_target_q1(jalr_target_q1),
-        .jalr_target_q2(jalr_target_q2),
-        .beq_off_q1(beq_off_q1),
-        .beq_off_q2(beq_off_q2),
-        .jalr(jalr),
-        .br_fail(br_fail),
-        .success(success),
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
@@ -301,17 +283,44 @@ module cpu_top(
         .aux_addr_out(aux_addr_3)
     );
 
+//分支/跳转判定单元：判定源与 alu 的输入同源（r1_data_3 / r2_data_3 / alu_func4），
+//比较与加法在本拍做，结果、落点在下一拍生效；stallf 是同一判定的组合版本、早一拍
+    bju u_bju (
+        .clk(clk),
+        .rst(rst),
+        .flag_bus(flag_bus),
+        .r1_data_in(r1_data_3),
+        .r2_data_in(r2_data_3),
+        .alu_func4_in(alu_func4),
+        .br_flag_in(br_flag),
+        .jalr_flag_in(jalr_flag),
+        .aux_addr_in(aux_addr_3),
+        .beq_off_in(beq_off_q2),
+        .jalr_pred_addr_in(jalr_pred_addr_3),
+        .br_pred_taken_in(br_pred_taken_3),
+        .success(success),
+        .br_fail(br_fail),
+        .jalr_fail(jalr_fail),
+        .jp_target(jp_target),
+        .jalr_target_q2(jalr_target_q2),
+        .br_pc_idx(br_pc_idx),
+        .jalr_flag_q(jalr_flag_q),
+        .br_pred_taken_q(br_pred_taken_q),
+        .stallf(stallf)
+    );
+
     lsu u_lsu (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
+        .stallf(stallf),
         .opcode(opcode_lsu_2),
         .func10(func10_lsu_2),
         .rd_in(rd_2),
         .r1_post(rs1_2),
         .r2_post(rs2_2),
-        .r1_data_final(r1_data_final_lsu),
-        .r2_data_final(r2_data_final_lsu),
+        .r1_data_final(r1_data_final),
+        .r2_data_final(r2_data_final),
         .offset_load0(offset_load0_2),
         .offset_store0(offset_store0_2),
         .bus_data_ext(bus_data_in_ext),
@@ -339,6 +348,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
+        .stallf(stallf),
         .lsu_stall(stall),
         .icache_busy(icache_busy_q),
         .bus_hold_in(bus_hold_in),
@@ -350,8 +360,8 @@ module cpu_top(
         .r2_post(rs2_2),
 //用 mulu 自己那一份镜像（_mul）：它由 pre_decoder 的 mul 标志单独填充，
 //既保证 M 指令一定拿到操作数（_dec/_lsu 是按各自的标志填的），又把扇出按消费者拆开。
-        .r1_data_final(r1_data_final_mul_w),
-        .r2_data_final(r2_data_final_mul_w),
+        .r1_data_final(r1_data_final),
+        .r2_data_final(r2_data_final),
         .mul_data_out(mul_data_final),
         .mul_loaded(mul_loaded),
         .mul_we(mul_we),
@@ -376,18 +386,10 @@ module cpu_top(
         .mul_loaded(mul_loaded),
         .lsu_stall(stall),
         .mul_stall(mul_stall),
-        .r1_data_in_dec(r1_data_dec),
-        .r2_data_in_dec(r2_data_dec),
-        .r1_data_in_lsu(r1_data_lsu),
-        .r2_data_in_lsu(r2_data_lsu),
-        .r1_data_in_mul(r1_data_mul_w),
-        .r2_data_in_mul(r2_data_mul_w),
-        .r1_data_final_dec(r1_data_final_dec),
-        .r2_data_final_dec(r2_data_final_dec),
-        .r1_data_final_lsu(r1_data_final_lsu),
-        .r2_data_final_lsu(r2_data_final_lsu),
-        .r1_data_final_mul(r1_data_final_mul_w),
-        .r2_data_final_mul(r2_data_final_mul_w)
+        .r1_data_in(r1_data),
+        .r2_data_in(r2_data),
+        .r1_data_final(r1_data_final),
+        .r2_data_final(r2_data_final)
     );
 
     bra_predict u_bra_predict (
@@ -395,21 +397,17 @@ module cpu_top(
         .rst(rst),
         .pc_addr_in(pc_addr),
         .jalr_target_q(jalr_target_q2),
-        .br_pc_in(aux_addr_3),
-        .jalr_pred_addr_in(jalr_pred_addr_3),
+        .br_pc_idx(br_pc_idx),
         .success(success),
         .br_fail(br_fail),
         .br_en(br_en),
-        .jalr_flag(jalr_flag),
-        .br_pred_taken_in(br_pred_taken_3),
-        .br_addr1(br_addr1),
-        .br_addr2(br_addr2),
+        .jalr_flag(jalr_flag_q),
+        .br_pred_taken_in(br_pred_taken_q),
         .br1(br1),
         .br2(br2),
         .br3(br3),
         .jalr_predict_offset(jalr_predict_offset),
-        .jalr(btb_hit),
-        .jalr_fail(jalr_fail)
+        .jalr(btb_hit)
     );
 
     alu u_alu (
@@ -460,15 +458,8 @@ module cpu_top(
         .rd_mul(rd_mul),
         .mul_data_mul(mul_data_final),
         .we_mul(mul_we),
-        .dec(dec),
-        .lsu(lsu),
-        .mul(mul_sel_w),
-        .r1_data_dec(r1_data_dec),
-        .r2_data_dec(r2_data_dec),
-        .r1_data_lsu(r1_data_lsu),
-        .r2_data_lsu(r2_data_lsu),
-        .r1_data_mul(r1_data_mul_w),
-        .r2_data_mul(r2_data_mul_w)
+        .r1_data(r1_data),
+        .r2_data(r2_data)
     );
 
     dcache u_dcache (
@@ -540,6 +531,7 @@ module cpu_top(
         .timi(timi),
         .softi(1'b0),
         .csr_addr(csr_addr),
+        .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_result),
         .pc_addr_in(pc_addr),
         .csr_data_out(csr_data_rd),

@@ -22,13 +22,11 @@
 
 module pc(
     input clk, rst,
-    input br1, br2, br3,
-    input jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret,
+    input br1, irq, irq_ret,
+    input jal, pre_jalr, btb_hit,
     input [4:0] flag_bus,
-    input [31:0] offset_jal2, offset_jalr2,
+    input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
-    input [31:0] jalr_target_q, beq_off_q2,
-    input [31:0] br_addr2,
     output reg [31:0] pc_addr, aux_addr
     );
 
@@ -41,11 +39,12 @@ module pc(
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
-    reg exec, flush_w, stall_w;
+    reg exec, flush_w, stall_w, flush_jump_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_jump_w = flag_bus[2];
+        flush_w      = flag_bus[3] | flag_bus[2];
+        stall_w      = (flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec         = flag_bus[4];
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -78,19 +77,13 @@ module pc(
                 end
             end
             else if (flush_w) begin
-                if (br2) begin
-                    pc_addr <= (br_addr2 + beq_off_q2 - 4'd4);
-                    aux_addr <= (br_addr2 + beq_off_q2 - 4'd4);
-                end
-                else if (br3) begin
-                    pc_addr <= br_addr2 - 4'd4;
-                    aux_addr <= br_addr2 - 4'd4;
-                end
+//跳转类冲刷的落点已在 decoder 的判定延迟拍里算清（jp_target）：br2 = 分支地址+immB、
+//br3 = 分支地址+4、jalr_fail = jalr 真目标。三种不再在这里区分，也不再各自做 32 位加法。
 //icache 不再当拍跳 jalr 目标，改成跟着 pc 走：pc 落在目标上，icache 下一拍取目标指令，
-//一拍后交付。所以这里不能再 +4（+4 是给"icache 当拍已读目标"那种时序补时差的）。
-                else if (jalr_fail) begin
-                    pc_addr <= jalr_target_q;
-                    aux_addr <= jalr_target_q;
+//一拍后交付，所以落点一律不再 +4。
+                if (flush_jump_w) begin
+                    pc_addr <= jp_target;
+                    aux_addr <= jp_target;
                 end
 //同上：icache 的 irq/irq_ret 支路也拿掉了，落点同样不能再 +4
                 else if (irq) begin

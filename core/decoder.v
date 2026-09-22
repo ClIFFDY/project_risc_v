@@ -34,17 +34,19 @@ module decoder(
     input br_pred_taken_in,
     input [31:0] jalr_pred_addr_in,
     output reg [31:0] r1_data_out, r2_data_out,
-    output reg [31:0] jalr_target_q1, jalr_target_q2, beq_off_q1, beq_off_q2,
     output reg [4:0] rd_out, rd_back1,
     output reg [3:0] alu_func4,
     output reg [2:0] csr_func3,
-    output reg we, jalr, br_fail, success, irq_ret, trap, ebreak, jal_flag, jalr_flag,
+    output reg we, irq_ret, trap, ebreak, jal_flag, jalr_flag,
     output reg csr_wr_en,
     output reg [11:0] csr_addr,
+    output reg [11:0] csr_addr_pre,
     output reg [31:0] csr_data,
+//交给 bju 的判定源：前三条与 alu 的输入同源（r1_data_out / r2_data_out / alu_func4），
+//其余是本级寄存下来的跳转载荷与限定位，都由判定单元在下一拍使用
     output reg [31:0] aux_addr_out,
-    output reg br_pred_taken_out,
-    output reg [31:0] jalr_pred_addr_out
+    output reg [31:0] beq_off_q2, jalr_pred_addr_out,
+    output reg br_flag, br_pred_taken_out
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -75,6 +77,14 @@ module decoder(
         exec    = flag_bus[4];
     end
 
+//csr 读口地址：就是本级【组合输入】里那条指令的 csr 号（即 csr_addr 的下一条流水位置），
+//非 SYSTEM 清 0 —— 与 csr_addr 的语义完全一致，读口不必再自己挡非法地址。
+//csr 的读值要提前一拍（见 csr.v 的读口注释），所以这条地址必须取组合版、不能取 csr_addr。
+    always @(*) begin
+        csr_addr_pre = 12'd0;
+        if (opcode == OPCODE_SYSTEM) csr_addr_pre = imm12_csr_in[11:0];
+    end
+
     always @(posedge clk) begin
         if (rst_q) begin
             r1_data_out <= 32'd0;
@@ -86,16 +96,12 @@ module decoder(
             csr_wr_en <= 1'b0;
             csr_addr <= 12'd0;
             csr_data <= 32'd0;
-            br_fail <= 1'b0;
-            success <= 1'b0;
+            br_flag <= 1'b0;
             irq_ret <= 1'b0;
             trap <= 1'b0;
             ebreak <= 1'b0;
             jal_flag <= 1'b0;
             jalr_flag <= 1'b0;
-            jalr_target_q1 <= 32'd0;
-            jalr_target_q2 <= 32'd0;
-            beq_off_q1 <= 32'd0;
             beq_off_q2 <= 32'd0;
             br_pred_taken_out <= 1'b0;
             jalr_pred_addr_out <= 32'd0;
@@ -113,17 +119,12 @@ module decoder(
                 csr_wr_en <= 1'b0;
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
-                jalr <= 1'b0;
-                br_fail <= 1'b0;
-                success <= 1'b0;
+                br_flag <= 1'b0;
                 irq_ret <= 1'b0;
                 trap <= 1'b0;
                 ebreak <= 1'b0;
                 jal_flag <= 1'b0;
                 jalr_flag <= 1'b0;
-                jalr_target_q1 <= 32'd0;
-                jalr_target_q2 <= 32'd0;
-                beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
                 aux_addr_out <= 32'd0;
                 br_pred_taken_out <= br_pred_taken_in;
@@ -162,49 +163,24 @@ module decoder(
                         aux_addr_out <= aux_addr_in;
                         jal_flag <= 1'b1;
                     end
-//jalr指令实际跳转目标计算
+//jalr：偏移与基址各寄存一拍，真目标由判定块在下一拍相加得出
                     OPCODE_JALR: begin
-                        jalr <= 1'b1;
                         rd_out <= rd_in;
                         rd_back1 <= rd_in;
                         we <= 1'b1;
                         jalr_flag <= 1'b1;
                         aux_addr_out <= aux_addr_in;
-                        jalr_target_q1 <= r1_data_final + offset_jalr0;
-                        jalr_target_q2 <= r1_data_final + offset_jalr0;
+                        r1_data_out <= r1_data_final;
+                        r2_data_out <= offset_jalr0;
                     end
-//分支跳转预测结果判定
+//分支：两个比较源寄存一拍，比较由判定块在下一拍做
                     OPCODE_BRANCH: begin
                         aux_addr_out <= aux_addr_in;
-                        beq_off_q1 <= offset_beq0_aux - 4'd4;
                         beq_off_q2 <= offset_beq0_aux - 4'd4;
-                        case (func10[2:0])
-                            3'b000: begin
-                                if (r1_data_final == r2_data_final) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            3'b001: begin
-                                if (r1_data_final != r2_data_final) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            3'b100: begin
-                                if ($signed(r1_data_final) < $signed(r2_data_final)) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            3'b101: begin
-                                if ($signed(r1_data_final) >= $signed(r2_data_final)) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            3'b110: begin
-                                if (r1_data_final < r2_data_final) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            3'b111: begin
-                                if (r1_data_final >= r2_data_final) success <= 1'b1;
-                                else br_fail <= 1'b1;
-                            end
-                            default: br_fail <= 1'b0;
-                        endcase
+                        r1_data_out <= r1_data_final;
+                        r2_data_out <= r2_data_final;
+                        alu_func4 <= {1'b0, func10[2:0]};
+                        br_flag <= 1'b1;
                     end
                     OPCODE_LUI: begin
                         r1_data_out <= 32'd0;
@@ -285,17 +261,12 @@ module decoder(
                 csr_wr_en <= csr_wr_en;
                 csr_addr <= csr_addr;
                 csr_data <= csr_data;
-                jalr <= jalr;
-                br_fail <= br_fail;
-                success <= success;
+                br_flag <= br_flag;
                 irq_ret <= irq_ret;
                 trap <= trap;
                 ebreak <= ebreak;
                 jal_flag <= jal_flag;
                 jalr_flag <= jalr_flag;
-                jalr_target_q1 <= jalr_target_q1;
-                jalr_target_q2 <= jalr_target_q2;
-                beq_off_q1 <= beq_off_q1;
                 beq_off_q2 <= beq_off_q2;
                 aux_addr_out <= aux_addr_out;
                 br_pred_taken_out <= br_pred_taken_out;
@@ -311,21 +282,17 @@ module decoder(
                 csr_wr_en <= 1'b0;
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
-                jalr <= 1'b0;
-                br_fail <= 1'b0;
-                success <= 1'b0;
+                br_flag <= 1'b0;
                 irq_ret <= 1'b0;
                 trap <= 1'b0;
                 ebreak <= 1'b0;
                 jal_flag <= 1'b0;
                 jalr_flag <= 1'b0;
-                jalr_target_q1 <= 32'd0;
-                jalr_target_q2 <= 32'd0;
-                beq_off_q1 <= 32'd0;
                 beq_off_q2 <= 32'd0;
                 br_pred_taken_out <= 1'b0;
                 jalr_pred_addr_out <= 32'd0;
             end
         end
     end
+
 endmodule

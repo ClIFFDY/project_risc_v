@@ -31,7 +31,6 @@ module icache(
     input [31:0] pc_addr,
     input [31:0] offset_jal1, offset_beq1,
     input [31:0] isr_addr1, isr_ret_addr1,
-    input [31:0] beq_off_q1, br_addr1,
     input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret,
     input [4:0] flag_bus,
 //读口控制

@@ -22,11 +22,11 @@
 
 module bra_predict(
     input clk, rst,
-    input [31:0] pc_addr_in, jalr_target_q, br_pc_in, jalr_pred_addr_in,
+    input [31:0] pc_addr_in, jalr_target_q,
+    input [5:0] br_pc_idx,
     input success, br_fail, br_en, jalr_flag, br_pred_taken_in,
-    output reg [31:0] br_addr1, br_addr2,
     output reg [31:0] jalr_predict_offset,
-    output reg br1, br2, br3, jalr, jalr_fail
+    output reg br1, br2, br3, jalr
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -60,17 +60,17 @@ module bra_predict(
         else begin
 //分支在EX期判定：按随指令流水的载荷PC回写BHT
             if (success) begin
-                if (bht[br_pc_in[8:3]] < 2'd3)
-                    bht[br_pc_in[8:3]] <= bht[br_pc_in[8:3]] + 2'd1;
+                if (bht[br_pc_idx] < 2'd3)
+                    bht[br_pc_idx] <= bht[br_pc_idx] + 2'd1;
             end
             else if (br_fail) begin
-                if (bht[br_pc_in[8:3]] > 2'd0)
-                    bht[br_pc_in[8:3]] <= bht[br_pc_in[8:3]] - 2'd1;
+                if (bht[br_pc_idx] > 2'd0)
+                    bht[br_pc_idx] <= bht[br_pc_idx] - 2'd1;
             end
 //jalr实际目标在EX期解析：按随指令流水的载荷PC回写BTB
             if (jalr_flag) begin
-                btb[br_pc_in[8:3]] <= jalr_target_q;
-                btb_v[br_pc_in[8:3]] <= (jalr_target_q != 32'd0);
+                btb[br_pc_idx] <= jalr_target_q;
+                btb_v[br_pc_idx] <= (jalr_target_q != 32'd0);
             end
         end
     end
@@ -78,24 +78,18 @@ module bra_predict(
 //组合输出：当前取指PC的预测结果 + 载荷的预测判定
     always @(*) begin
         if (rst_q) begin
-            br_addr1 = 32'd0;
-            br_addr2 = 32'd0;
             br1 = 1'b0;
             br2 = 1'b0;
             br3 = 1'b0;
             jalr = 1'b0;
-            jalr_fail = 1'b0;
             jalr_predict_offset = 32'd0;
         end
         else begin
-            br_addr1 = br_pc_in;
-            br_addr2 = br_pc_in + 4'd4;
             br1 = br_en & predict_en;
             br2 = success & !br_pred_taken_in;
             br3 = br_fail & br_pred_taken_in;
             jalr_predict_offset = btb[pc_addr_in[8:3]];
             jalr = btb_v[pc_addr_in[8:3]];
-            jalr_fail = (jalr_target_q != 32'd0) & (jalr_target_q != jalr_pred_addr_in);
         end
     end
 

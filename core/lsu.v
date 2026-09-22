@@ -23,6 +23,11 @@
 module lsu(
     input clk, rst,
     input [4:0] flag_bus,
+//前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
+//而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
+//动 FIFO 指针、拉总线（store 也在这条路上），等寄存器清已经收不回来，故入口要多挡一拍。
+//不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
+    input stallf,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -74,9 +79,11 @@ module lsu(
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
+//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：入队门控与总线选通都挂在
+//这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
+        flush_w = flag_bus[3] | flag_bus[2] | stallf;
         stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
         exec    = flag_bus[4];
     end

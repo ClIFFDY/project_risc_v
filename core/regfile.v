@@ -33,9 +33,9 @@ module regfile(
     input [4:0] rd_mul,
     input [31:0] mul_data_mul,
     input we_mul,
-    input dec, lsu, mul,
-    output reg [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu,
-    output reg [31:0] r1_data_mul, r2_data_mul
+//读数据：合并成一对（原来是 dec/lsu/mul 三份按限定分开填）。按消费者复制交给
+//max_fanout 在布局阶段做 —— 比手工拆三份更省逻辑，复制点也更贴实际负载。
+    (* max_fanout = 32 *) output reg [31:0] r1_data, r2_data
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -81,50 +81,26 @@ module regfile(
         exec    = flag_bus[4];
     end
 
-//读数据进行双写口(alu/ld)旁路仲裁并输出
+//读数据进行双写口(alu/ld)旁路仲裁并输出。
+//原来的 dec/lsu/mul 三个限定只用来决定"填哪一份"，合并成一对后不再需要：
+//没有限定置位时算出来的值无人消费（JAL 之类），驱出去无害。
     always @(posedge clk) begin
         if (rst_q) begin
-            r1_data_dec <= 32'd0;
-            r2_data_dec <= 32'd0;
-            r1_data_lsu <= 32'd0;
-            r2_data_lsu <= 32'd0;
-            r1_data_mul <= 32'd0;
-            r2_data_mul <= 32'd0;
+            r1_data <= 32'd0;
+            r2_data <= 32'd0;
             r1_q <= 5'd0;
             r2_q <= 5'd0;
         end
         else if (exec) begin
             if (stall_w) begin
-                r1_data_dec <= bypass(r1_q);
-                r2_data_dec <= bypass(r2_q);
-                r1_data_lsu <= bypass(r1_q);
-                r2_data_lsu <= bypass(r2_q);
-                r1_data_mul <= bypass(r1_q);
-                r2_data_mul <= bypass(r2_q);
+                r1_data <= bypass(r1_q);
+                r2_data <= bypass(r2_q);
             end
             else begin
-                r1_data_dec <= 32'd0;
-                r2_data_dec <= 32'd0;
-                r1_data_lsu <= 32'd0;
-                r2_data_lsu <= 32'd0;
-                r1_data_mul <= 32'd0;
-                r2_data_mul <= 32'd0;
+                r1_data <= bypass(r1);
+                r2_data <= bypass(r2);
                 r1_q <= r1;
                 r2_q <= r2;
-                if (dec) begin
-                    r1_data_dec <= bypass(r1);
-                    r2_data_dec <= bypass(r2);
-                end
-                else if (lsu) begin
-                    r1_data_lsu <= bypass(r1);
-                    r2_data_lsu <= bypass(r2);
-                end
-//mulu 那一份：与 dec/lsu 是【独立通路】，M 指令与普通 ALU 同属 OPCODE_OP（dec 也置 1），
-//所以这里用独立的 if 而不是 else if —— 两份各填各的，各自只喂一个消费单元。
-                if (mul) begin
-                    r1_data_mul <= bypass(r1);
-                    r2_data_mul <= bypass(r2);
-                end
             end
         end
     end

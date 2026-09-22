@@ -40,14 +40,19 @@ module wb_reg(
 //flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
-    reg exec, flush_w, stall_w;
+    reg exec, flush_w, stall_w, flush_jump_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_jump_w = flag_bus[2];
+        flush_w      = flag_bus[3] | flag_bus[2];
+        stall_w      = (flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec         = flag_bus[4];
     end
 
 //写回级缓冲寄存器
+//跳转冲刷【只挂 flush_jump，绝不能带上 flush_irq】：判定搬去 decoder 的下一拍后，
+//本级的输入在冲刷拍是错路的 B+1（原来那拍 decoder 已经清零了，现在还没），不capture 就漏写。
+//但中断/mret 类冲刷的相位没变，那时本级里的正是 trap/mret 自己 —— 一起门掉就会把它的
+//写回（含 jalr 的 link）抹掉。所以两条冲刷位必须分开处理：一条门本级，一条不门。
     always @(posedge clk) begin
         if (rst_q) begin
             we_out <= 1'b0;
@@ -61,7 +66,14 @@ module wb_reg(
 //若跟着保持，被冻住的这条 ALU 指令会每拍往 regfile 重复写一次，把期间更新的
 //load/mulu 结果又盖回去（CoreMark rv32im 里 divu 冻住 wb_reg 34 拍、后面 sb 读到陈旧值）。
 //写使能一拍已在进入本级那拍完成，故此处清零不会丢写。
-            if (stall_w) begin
+            if (flush_jump_w) begin
+                we_out <= 1'b0;
+                rd_out <= 5'd0;
+                rd_back2 <= 5'd0;
+                result_out <= 32'd0;
+                result_back2 <= 32'd0;
+            end
+            else if (stall_w) begin
                 we_out <= 1'b0;
                 rd_out <= rd_out;
                 rd_back2 <= rd_back2;
