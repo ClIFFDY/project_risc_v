@@ -46,38 +46,44 @@ module forw(
 //对ld/st指令数据旁路进行延迟仲裁。
 //优先级：alu 在途 > load 在途 > mulu 在途 > wb_reg。
     always @(*) begin
-        if (!stalled && rd_back1 != 5'd0 && r1 == rd_back1) begin
-            r1_data_final = result_back1;
-        end
-        else if (loaded && rd_load != 5'd0 && r1 == rd_load) begin
-            r1_data_final = ld_data;
-        end
+        if (r1 != 5'd0) begin
+            if (!stalled && r1 == rd_back1) begin
+                r1_data_final = result_back1;
+            end
+            else if (loaded && r1 == rd_load) begin
+                r1_data_final = ld_data;
+            end
 //mulu 在途结果：与 loaded 一样是【独立支路】，绝不能与 back2 合并成一个比较器
 //（历史翻车记录见 逻辑说明 §2.2）。mulu 与 lsu 同为在途单元，程序序早于 wb_reg。
-        else if (mul_loaded && rd_mul != 5'd0 && r1 == rd_mul) begin
-            r1_data_final = mul_data;
+            else if (mul_loaded && r1 == rd_mul) begin
+                r1_data_final = mul_data;
+            end
+            else if (r1 == rd_back2) begin
+                r1_data_final = result_back2;
+            end
+            else begin
+                r1_data_final = r1_data_in;
+            end
         end
-        else if (rd_back2 != 5'd0 && r1 == rd_back2) begin
-            r1_data_final = result_back2;
+        else r1_data_final = r1_data_in;
+        if (r2 != 5'd0) begin
+            if (!stalled && r2 == rd_back1) begin
+                r2_data_final = result_back1;
+            end
+            else if (loaded && r2 == rd_load) begin
+                r2_data_final = ld_data;
+            end
+            else if (mul_loaded && r2 == rd_mul) begin
+                r2_data_final = mul_data;
+            end
+            else if (r2 == rd_back2) begin
+                r2_data_final = result_back2;
+            end
+            else begin
+                r2_data_final = r2_data_in;
+            end
         end
-        else begin
-            r1_data_final = r1_data_in;
-        end
-        if (!stalled && rd_back1 != 5'd0 && r2 == rd_back1) begin
-            r2_data_final = result_back1;
-        end
-        else if (loaded && rd_load != 5'd0 && r2 == rd_load) begin
-            r2_data_final = ld_data;
-        end
-        else if (mul_loaded && rd_mul != 5'd0 && r2 == rd_mul) begin
-            r2_data_final = mul_data;
-        end
-        else if (rd_back2 != 5'd0 && r2 == rd_back2) begin
-            r2_data_final = result_back2;
-        end
-        else begin
-            r2_data_final = r2_data_in;
-        end
+        else r2_data_final = r2_data_in;
     end
 
     always @(posedge clk) begin
