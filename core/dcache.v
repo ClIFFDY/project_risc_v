@@ -66,10 +66,11 @@ module dcache(
     reg fill_way;
 
     reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
-    reg wr_full_hit;
+    reg wr_upd;
     reg [11:0] rd_addr;
     reg rd_en;
     reg is_fill_wr, ram_we;
+    reg [3:0] ram_be;
     reg [11:0] ram_waddr;
     reg [31:0] ram_wdata;
     reg [31:0] wr_addr, wr_data;
@@ -92,9 +93,10 @@ module dcache(
 
         rd_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
         wr_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
-//整字 store 命中：能整字覆盖行内那个字，故【不失效】，直接行内更新。
-//写穿照做，缓存与后端仍一致。子字 store 覆盖不了整字，维持写失效。
-        wr_full_hit = wr_req && cache_hit && (bus_be_in == 4'b1111);
+//store 命中即行内就地更新，一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
+//写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
+//下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
+        wr_upd = wr_req && cache_hit;
 
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'b1) && !fill_end;
@@ -120,14 +122,17 @@ module dcache(
         rd_addr = fill_end ? {fill_way, fill_idx, miss_word} : {hit_way[1], idx, word};
     end
 
-//写口：两路整字写共用【单写口】，仍能推成 BRAM ——
-//  ① 回填（stage==1）
-//  ② 整字 store 命中（stage==0）
-//两者天然互斥：wr_req 要求 stage==0，填充时 stage==1。
-//字节粒度写会变成多个独立写操作（BRAM 只有 1 个写口），推不成，故子字 store 不做行更新。
+//写口：单写口 + 字节使能，三个写源合成【一个】写表达式，仍能推成 BRAM ——
+//  ① 回填（stage==1，整字，be 恒 1111）
+//  ② store 命中（stage==0，整字或子字，be 来自 lsu）
+//互斥性：wr_req 要求 stage==0，is_fill_wr 要求 stage==1；rd_en 要求 fill_end 或
+//  (rd_req && hit)，而 rd_req 要求 !bus_we_in —— 三者两两不同拍，不会同拍读写同址。
+//整字写与字节写【必须在同一个 if 里按 be 展开成 WEBA[3:0]】：这才是单写口；
+//拆成两个写表达式才会变成"多个写操作"、才推不成 BRAM。
     always @(*) begin
         is_fill_wr = (stage == 1'b1) && !fill_end && mem_valid;
-        ram_we     = is_fill_wr || wr_full_hit;
+        ram_we     = is_fill_wr || wr_upd;
+        ram_be     = is_fill_wr ? 4'b1111 : bus_be_in;
         if (is_fill_wr) begin
             ram_waddr = {fill_way, fill_idx, fill_cnt};
             ram_wdata = mem_data;
@@ -139,7 +144,12 @@ module dcache(
     end
 
     always @(posedge clk) begin
-        if (ram_we) data[ram_waddr] <= ram_wdata;
+        if (ram_we) begin
+            if (ram_be[0]) data[ram_waddr][7:0]   <= ram_wdata[7:0];
+            if (ram_be[1]) data[ram_waddr][15:8]  <= ram_wdata[15:8];
+            if (ram_be[2]) data[ram_waddr][23:16] <= ram_wdata[23:16];
+            if (ram_be[3]) data[ram_waddr][31:24] <= ram_wdata[31:24];
+        end
     end
 
 //每拍先清零：cpu_top 把 dcache/tim_in/dtcm 的读数据按【位或】合流成一个 bus_data_in_final，
@@ -192,13 +202,9 @@ module dcache(
             end
 
             if (wr_req) begin
-                if (wr_full_hit) begin
+                if (cache_hit) begin
                     if (hit_way[0]) lru[idx] <= 1'b1;
                     else            lru[idx] <= 1'b0;
-                end
-                else begin
-                    if (hit_way[0])      valid0[idx] <= 1'b0;
-                    else if (hit_way[1]) valid1[idx] <= 1'b0;
                 end
                 if (!mem_ready) begin
                     wr_pend <= 1'b1;
