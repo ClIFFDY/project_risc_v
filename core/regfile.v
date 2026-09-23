@@ -35,7 +35,7 @@ module regfile(
     input we_mul,
 //读数据：合并成一对（原来是 dec/lsu/mul 三份按限定分开填）。按消费者复制交给
 //max_fanout 在布局阶段做 —— 比手工拆三份更省逻辑，复制点也更贴实际负载。
-    (* max_fanout = 32 *) output reg [31:0] r1_data, r2_data
+    output reg [31:0] r1_data, r2_data
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -44,8 +44,7 @@ module regfile(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
-//同步读写型通用寄存器组，节省lut资源
-    (* ram_style = "block" *) reg [31:0] regs [0:31];
+    reg [31:0] regs [0:31];
 
     reg [4:0] r1_q, r2_q;
     reg am_we;

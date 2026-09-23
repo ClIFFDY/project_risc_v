@@ -9,12 +9,16 @@
 // Project Name:
 // Target Devices:
 // Tool Versions:
-// Description:
+// Description: 两节车厢 + 直接入径
+//   车2（发送）：常态下 ld/st 直接进这节，进来的当拍把地址/数据/be 摆上总线；下一拍进车3。
+//   车3（写回）：占用 ⇒ 组合拉高 stall（把入口顶住）——所以能进来的新指令只可能撞上车2，
+//                hazard 只看车2 就够。store 进车3 即算提交（下一拍让位）；load 等应答。
+//   miss（dcache_hold_in 当拍）：新指令进车3 停靠（操作数当拍锁进车），miss 落下那拍
+//               车3 → 车2 前移一节，再照常发送。
 //
 // Dependencies:
 //
 // Revision:
-// Revision 0.01 - File Created
 // Additional Comments:
 //
 //////////////////////////////////////////////////////////////////////////////////
@@ -35,6 +39,7 @@ module lsu(
     input [31:0] offset_load0, offset_store0,
     input [31:0] bus_data_ext, bus_data_dcache, bus_data_tim,
     input ready_dcache, ready_tim, ready_ext,
+    input dcache_hold_in,
     output reg [31:0] bus_addr_out,
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
@@ -44,6 +49,7 @@ module lsu(
     output reg loaded,
     output reg ld_we,
     output reg stall,
+    output reg mem_inflight,
     output reg [4:0] rd_load
     );
 
@@ -64,7 +70,7 @@ module lsu(
     reg exec, flush_w, stall_w;
     always @(*) begin
         flush_w = flag_bus[7] | flag_bus[6] | stallf;
-        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        stall_w = (dcache_hold_in | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
         exec    = flag_bus[8];
     end
 
@@ -76,50 +82,87 @@ module lsu(
     always @(*) begin
         bus_data_in = bus_data_ext | bus_data_dcache | bus_data_tim;
         ready_in    = ready_dcache | ready_tim | ready_ext;
-        bus_hold    = flag_bus[5] | flag_bus[4];
+        bus_hold    = dcache_hold_in | flag_bus[4];
     end
 
-//寄存器（按级分组）
-//第一级：总线地址
-    reg [31:0] st_addr;
+//两节车厢
+//  车2（发送）：miss 当拍照进（操作数锁好），等回填完再发；常态进车那拍就发。
+//               载荷带全（addr/wdat/be），s2_sent 记"发过没有"。
+    reg        s2_v, s2_kind, s2_sent;
+    reg [4:0]  s2_rd;
+    reg [2:0]  s2_size;
+    reg [1:0]  s2_off;
+    reg [31:0] s2_addr, s2_wdat;
+    reg [3:0]  s2_be;
+//  车3（写回）：与 dcache 里锁住的那条是【同一条】—— 进车2 时已经发过请求，
+//               在这节只等数据回来（ready_in），所以不需要再发、也不用带载荷。
+    reg        s3_v, s3_kind;
+    reg [4:0]  s3_rd;
+    reg [2:0]  s3_size;
+    reg [1:0]  s3_off;
 
-//第二级：在途 load 队列
-    reg [4:0] ld_rd_fifo [0:3];
-    reg [2:0] ld_size_fifo [0:3];
-    reg [1:0] ld_off_fifo [0:3];
-    reg [2:0] ld_wr_ptr, ld_rd_ptr;
-    reg [3:0] ld_occ;
-
-//第三级：应答保持与数据返回
+//写回保持与数据返回
     reg [4:0] ld_hold_rd;
     reg [31:0] ld_hold_data;
     reg [31:0] ld_data_cur;
     reg ld_hold;
 
-//判据与输出（组合）
-    reg ld_fifo_empty, ld_fifo_full, ld_pop, ld_enq, ld_push_eff;
-    reg ld_use_hit;
-    reg [3:0] ld_occ_q;
-    reg [4:0] ld_rd_cur;
-    reg [2:0] ld_size_cur;
-    reg [1:0] ld_off_cur;
+//组合判据
+    reg mem_op, is_st, new_in, new_go, full_stall, bus_go;
+    reg s3_done, s3_ok, s2_move, s2_ok, s2_put_go;
+    reg ld_out, blank_bus, s2_put, new_put;
+    reg ls_use_hit, ls_waw_hit, miss;
+    reg [31:0] st_addr, st_wdata, cur_addr;
+    reg [3:0]  st_be;
 
 //===============================================================
-// 第一级：总线地址（T→T+1）
+// 组合：入车/推车 + 冒险（只看车2）+ 入口
 //===============================================================
-//在途 load 队列的空满、收发条件与队头载荷
+//store 的字节使能与数据（按地址低位对齐后随请求一起上车）
     always @(*) begin
-        ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
-        ld_fifo_full  = (ld_wr_ptr[2] != ld_rd_ptr[2]) && (ld_wr_ptr[1:0] == ld_rd_ptr[1:0]);
-        ld_pop        = ready_in && !ld_fifo_empty;
-        ld_enq        = (opcode == OPCODE_LOAD) && !stall && !flush_w && !bus_hold;
-        ld_push_eff   = ld_enq && !(ld_fifo_full && !ld_pop);
-        ld_rd_cur     = ld_rd_fifo[ld_rd_ptr[1:0]];
-        ld_size_cur   = ld_size_fifo[ld_rd_ptr[1:0]];
-        ld_off_cur    = ld_off_fifo[ld_rd_ptr[1:0]];
+        st_addr = r1_data_final + offset_store0;
+        case (func10[2:0])
+            3'b000: begin st_be = 4'b0001 << st_addr[1:0]; st_wdata = {24'd0, r2_data_final[7:0]} << (8 * st_addr[1:0]); end
+            3'b001: begin st_be = 4'b0011 << (2 * st_addr[1]); st_wdata = {16'd0, r2_data_final[15:0]} << (16 * st_addr[1]); end
+            3'b010: begin st_be = 4'b1111; st_wdata = r2_data_final; end
+            default: begin st_be = 4'd0; st_wdata = 32'd0; end
+        endcase
     end
 
-//ld/st读写类指令总线地址处理逻辑
+//本条上车要用的载荷
+    always @(*) begin
+        is_st    = (opcode == OPCODE_STORE);
+        cur_addr = is_st ? (st_addr >> 2) : ((r1_data_final + offset_load0) >> 2);
+    end
+
+//让位与入口：
+//  车3：store 进这节即算提交（下一拍让位）；load 等应答
+//  车2：车3 让位那拍就前移一节
+//  miss 当拍：新指令进车3 停靠；否则进车2（要求车3、车2 都腾出来）
+    always @(*) begin
+        mem_op   = (opcode == OPCODE_LOAD) | (opcode == OPCODE_STORE);
+        miss     = dcache_hold_in;
+        s3_done  = s3_v & (s3_kind | ready_in);
+        s3_ok    = ~s3_v | s3_done;
+        s2_move  = s2_v & s2_sent & s3_ok;   // 没发过的车不许前移（否则请求就丢了）
+        s2_ok    = ~s2_v | s2_move;
+        new_in   = mem_op & ~flush_w & ~(flag_bus[3] | flag_bus[2] | flag_bus[0]) & ~ls_use_hit & ~ls_waw_hit;
+//入口【不看 miss】：miss 当拍也要进车锁操作数；只有发送等 miss 落下。
+        new_go     = s3_ok & s2_ok;
+//空总线（blank）：miss 在跑，或"在途那笔读还没被应答" ⇒ 这一拍总线上不摆。
+//在途读 = 车3 里那笔读，或车2 里刚摆上、下一拍才进车3 的那笔读（后一项不能省：快慢设备
+//混跑时先回来的应答会串到前一条头上 —— 实测 ls_mix2 两条读结果互换）。
+//dcache 1 拍应答 ⇒ 该摆下一笔的那拍 ready_in 正好是 1 ⇒ blank 为 0 ⇒ 快路径一拍不减速。
+        ld_out     = (s2_v & ~s2_kind & s2_sent) | (s3_v & ~s3_kind);
+        blank_bus  = miss | (ld_out & ~ready_in);
+        s2_put     = s2_v & ~s2_sent & ~blank_bus;
+        s2_put_go  = s2_put & exec & ~flush_w;
+        new_put    = new_in & new_go & ~blank_bus & exec & ~flush_w;
+        bus_go     = s2_put_go | new_put;
+        full_stall = mem_op & ~new_go;
+    end
+
+//总线呈现：摆出来那拍（bus_go）才有值，blank 的拍次全 0 —— 新指令进车2 那拍就摆（与 HEAD 同拍）
     always @(posedge clk) begin
         if (rst_q) begin
             bus_addr_out <= 32'd0;
@@ -128,172 +171,101 @@ module lsu(
             bus_we_out <= 1'b0;
             bus_valid_out <= 1'b0;
         end
-        else if (exec) begin
-            if (stall_w) begin
-                if (ld_push_eff) begin
-                    bus_addr_out <= (r1_data_final + offset_load0) >> 2;
-                    bus_we_out <= 1'b0;
-                    bus_be_out <= 4'd0;
-                    bus_data_out <= 32'd0;
-                    bus_valid_out <= 1'b1;
-                end
-//读地址只摆一拍：外设应答是寄存的，下一拍照常到达，重复摆地址只会让它连答
-                else begin
-                    bus_addr_out <= 32'd0;
-                    bus_we_out <= 1'b0;
-                    bus_be_out <= 4'd0;
-                    bus_data_out <= 32'd0;
-                    bus_valid_out <= 1'b0;
-                end
-            end
-            else if (!flush_w && !stall_w) begin
-                bus_addr_out <= 32'd0;
-                bus_data_out <= 32'd0;
-                bus_be_out <= 4'd0;
-                bus_we_out <= 1'b0;
-                bus_valid_out <= 1'b0;
-                case (opcode)
-                    OPCODE_LOAD: begin
-                        bus_valid_out <= ld_push_eff;
-                        case (func10[2:0])
-                            3'b000: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 32'd0;
-                            3'b001: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 32'd0;
-                            3'b010: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 32'd0;
-                            3'b100: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 32'd0;
-                            3'b101: bus_addr_out <= ld_push_eff ? ((r1_data_final + offset_load0) >> 2) : 32'd0;
-                            default: begin
-                                bus_addr_out <= 32'd0;
-                                bus_valid_out <= 1'b0;
-                            end
-                        endcase
-                    end
-                    OPCODE_STORE: begin
-                        bus_we_out <= 1'b1;
-                        bus_valid_out <= 1'b1;
-                        case (func10[2:0])
-                            3'b000: begin
-                                bus_addr_out <= st_addr >> 2;
-                                bus_be_out <= 4'b0001 << st_addr[1:0];
-                                bus_data_out <= {24'd0, r2_data_final[7:0]} << (8 * st_addr[1:0]);
-                            end
-                            3'b001: begin
-                                bus_addr_out <= st_addr >> 2;
-                                bus_be_out <= 4'b0011 << (2 * st_addr[1]);
-                                bus_data_out <= {16'd0, r2_data_final[15:0]} << (16 * st_addr[1]);
-                            end
-                            3'b010: begin
-                                bus_addr_out <= (r1_data_final + offset_store0) >> 2;
-                                bus_be_out <= 4'b1111;
-                                bus_data_out <= r2_data_final;
-                            end
-                            default: begin
-                                bus_addr_out <= 32'd0;
-                                bus_valid_out <= 1'b0;
-                            end
-                        endcase
-                    end
-                endcase
-            end
-            else begin
-                bus_addr_out <= 32'd0;
-                bus_data_out <= 32'd0;
-                bus_be_out <= 4'd0;
-                bus_we_out <= 1'b0;
-                bus_valid_out <= 1'b0;
-            end
+        else if (bus_go && exec && !flush_w) begin
+            bus_addr_out  <= s2_put ? s2_addr : cur_addr;
+            bus_data_out  <= s2_put ? s2_wdat : st_wdata;
+            bus_be_out    <= s2_put ? s2_be   : st_be;
+            bus_we_out    <= s2_put ? s2_kind : is_st;
+            bus_valid_out <= 1'b1;
+        end
+//blank 的拍必须把总线清零：从设备是电平判据，残留地址会被当成新请求连答（读地址只摆一拍的原因）
+        else begin
+            bus_addr_out <= 32'd0;
+            bus_data_out <= 32'd0;
+            bus_be_out <= 4'd0;
+            bus_we_out <= 1'b0;
+            bus_valid_out <= 1'b0;
         end
     end
 
+//冒险只扫车2（车3 占着的时候入口已经被 stall 顶住，新指令根本进不来）。
+//x0 不算依赖：在途项的 rd=0（store 的车厢就是 0）与操作数 x0 都排除。
+    always @(*) begin
+        ls_use_hit = 1'b0;
+        ls_waw_hit = 1'b0;
+        if (s2_v && s2_rd != 5'd0) begin
+            if (r1_post != 5'd0 && (s2_rd == r1_post)) ls_use_hit = 1'b1;
+            if (r2_post != 5'd0 && (s2_rd == r2_post)) ls_use_hit = 1'b1;
+            if (rd_in   != 5'd0 && (s2_rd == rd_in))   ls_waw_hit = 1'b1;
+        end
+    end
+
+//车3 有人 ⇒ 组合拉高整个 stall（不分访存/非访存）：车3 里那条的结果还没回来时，
+//后面的任何指令都不许越过它去读寄存器——这就是"hazard 只用看车2"的依据。
+    always @(*) stall = ls_use_hit | ls_waw_hit | (s3_v & ~s3_done) | full_stall;
+
 //===============================================================
-// 第二级：在途 load 队列与应答（T+1→T+2）
+// 时序：两节车厢推进
 //===============================================================
-//在途 load 请求队列：load 发射入队，应答出队，rd/size/off 与应答同源出队。
-//ld_occ 是与数据阵列并行维护的占用掩码（绝对下标）：出队先清、入队后置，
-//两者撞同一格（队满且本拍既收又发）时后置生效——新入队的那项才是有效的那个。
     always @(posedge clk) begin
         if (rst_q) begin
-            ld_wr_ptr <= 3'd0;
-            ld_rd_ptr <= 3'd0;
-            ld_occ    <= 4'd0;
+            s2_v <= 1'b0; s3_v <= 1'b0;
         end
         else begin
-            if (ld_pop)      ld_occ[ld_rd_ptr[1:0]] <= 1'b0;
-            if (ld_push_eff) ld_occ[ld_wr_ptr[1:0]] <= 1'b1;
-            if (ld_push_eff) begin
-                ld_rd_fifo[ld_wr_ptr[1:0]]   <= rd_in;
-                ld_size_fifo[ld_wr_ptr[1:0]] <= func10[2:0];
-                ld_off_fifo[ld_wr_ptr[1:0]]  <= r1_data_final + offset_load0;
-                ld_wr_ptr <= ld_wr_ptr + 3'd1;
+            if (s3_done) s3_v <= 1'b0;                                  // 车3 走掉
+            if (s2_put_go) s2_sent <= 1'b1;                             // 补摆
+            if (s2_move) begin                                          // 车2 → 车3（请求已摆过）
+                s3_v <= 1'b1; s3_kind <= s2_kind; s3_rd <= s2_rd; s3_size <= s2_size; s3_off <= s2_off;
+                s2_v <= 1'b0;
             end
-            if (ld_pop)
-                ld_rd_ptr <= ld_rd_ptr + 3'd1;
+            if (new_in && new_go) begin                                 // 新指令进车2（miss 当拍也进；没摆就留着）
+                s2_v <= 1'b1; s2_kind <= is_st; s2_rd <= rd_in; s2_size <= func10[2:0];
+                s2_off <= is_st ? 2'd0 : (r1_data_final + offset_load0);
+                s2_addr <= cur_addr; s2_wdat <= st_wdata; s2_be <= st_be;
+                s2_sent <= new_put;                                     // 没摆出去就保持 0，等不 blank 了再补摆
+            end
         end
     end
 
-//应答只摆一拍的话，落在 back2 槽的消费者会取不到，故再保持一拍
+//写回口保持：离开车3 那拍给数据，落在 back2 槽的消费者取不到 ⇒ 再保持一拍
     always @(posedge clk) begin
         if (rst_q) ld_hold <= 1'b0;
         else begin
-            ld_hold <= ld_pop;
-            if (ld_pop) begin
-                ld_hold_rd <= ld_rd_cur;
+            ld_hold <= ld_we;
+            if (ld_we) begin
+                ld_hold_rd <= s3_rd;
                 ld_hold_data <= ld_data_cur;
             end
         end
     end
 
-//load-use 互锁：不按"上一条是 load 吗"做单槽判断，而是扫遍在途队列的每一个占用项。
-//队列现在可同时挂 4 条 load，单槽判断只认最近发射的那一条，更早就在途的那几条会漏判——
-//而漏判不会报错，只会把还没回来的数据当成已经回来的用。
-//本拍就要出队的那一项排除在外：它的数据这拍已经从总线上取回、可以同拍前递，不该再压流水线。
-    always @(*) begin
-        ld_occ_q   = ld_occ;
-        ld_use_hit = 1'b0;
-        if (ld_pop) ld_occ_q[ld_rd_ptr[1:0]] = 1'b0;
-        if (ld_occ_q[0] && ((ld_rd_fifo[0] == r1_post) | (ld_rd_fifo[0] == r2_post))) ld_use_hit = 1'b1;
-        if (ld_occ_q[1] && ((ld_rd_fifo[1] == r1_post) | (ld_rd_fifo[1] == r2_post))) ld_use_hit = 1'b1;
-        if (ld_occ_q[2] && ((ld_rd_fifo[2] == r1_post) | (ld_rd_fifo[2] == r2_post))) ld_use_hit = 1'b1;
-        if (ld_occ_q[3] && ((ld_rd_fifo[3] == r1_post) | (ld_rd_fifo[3] == r2_post))) ld_use_hit = 1'b1;
-    end
-
-//stall信号拉起逻辑
-    always @(*) begin
-        st_addr = r1_data_final + offset_store0;
-        stall   = ld_use_hit;
-    end
-
 //===============================================================
-// 第三级：数据返回与写口（T+2→T+3）
+// 写回 / 提交
 //===============================================================
-//字节使能数据返回输出：出队拍按 off/size 取字节
     always @(*) begin
-        case (ld_size_cur)
-            3'b000: ld_data_cur = {{24{bus_data_in[8*ld_off_cur + 7]}}, bus_data_in[8*ld_off_cur +: 8]};
-            3'b001: ld_data_cur = {{16{bus_data_in[16*ld_off_cur[1] + 15]}}, bus_data_in[16*ld_off_cur[1] +: 16]};
+        case (s3_size)
+            3'b000: ld_data_cur = {{24{bus_data_in[8*s3_off + 7]}}, bus_data_in[8*s3_off +: 8]};
+            3'b001: ld_data_cur = {{16{bus_data_in[16*s3_off[1] + 15]}}, bus_data_in[16*s3_off[1] +: 16]};
             3'b010: ld_data_cur = bus_data_in;
-            3'b100: ld_data_cur = {24'd0, bus_data_in[8*ld_off_cur +: 8]};
-            3'b101: ld_data_cur = {16'd0, bus_data_in[16*ld_off_cur[1] +: 16]};
+            3'b100: ld_data_cur = {24'd0, bus_data_in[8*s3_off +: 8]};
+            3'b101: ld_data_cur = {16'd0, bus_data_in[16*s3_off[1] +: 16]};
             default: ld_data_cur = bus_data_in;
         endcase
     end
 
-//rd 与 data 同拍同源输出；ld_we 只在应答拍置起（避免保持拍重复写寄存器堆）
     always @(*) begin
-        ld_we = ld_pop;
-        if (ld_pop) begin
-            loaded = 1'b1;
-            rd_load = ld_rd_cur;
-            ld_data_out = ld_data_cur;
+        ld_we = s3_v & ~s3_kind & ready_in;
+        if (ld_we) begin
+            loaded = 1'b1; rd_load = s3_rd; ld_data_out = ld_data_cur;
         end
         else if (ld_hold) begin
-            loaded = 1'b1;
-            rd_load = ld_hold_rd;
-            ld_data_out = ld_hold_data;
+            loaded = 1'b1; rd_load = ld_hold_rd; ld_data_out = ld_hold_data;
         end
         else begin
-            loaded = 1'b0;
-            rd_load = 5'd0;
-            ld_data_out = bus_data_in;
+            loaded = 1'b0; rd_load = 5'd0; ld_data_out = bus_data_in;
         end
     end
+
+    always @(*) mem_inflight = s2_v | s3_v;
+
 endmodule

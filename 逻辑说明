@@ -322,11 +322,11 @@ lsu 与 decoder 同拍（都读 mem_buf 输出）。总线侧信号全部经 lsu
 | bus_data_out | 写数据（sh/sb 已按 a[1:0] 移到目标字节槽） |
 | bus_we_out | 1=写 |
 | ready_in | 读响应有效，来自 cpu_top 组合：`dtcm_ready | tim_ready | bus_loaded_in` |
-| loaded | lsu 在途队列队头出队那一拍有效；`rd_load` 与 `ld_data` 由队列配对取出，不靠延迟凑（见 §5.3） |
-| ld_we | load 写回寄存器堆使能，只在出队那一拍置起（保持拍不重复写） |
+| loaded | 车3 里那条 load 的响应到达那拍有效；`rd_load`/`ld_data` 与它同源（见 §5.3） |
+| ld_we | load 写回寄存器堆使能，只在响应那拍置起（保持拍不重复写） |
 | ld_data | 回读数据（按 func3 符号/零扩展；字节槽从地址低位取） |
 | we/rd_out | lsu 要写回的 rd 使能/号（喂 alu 的 we_in/rd_in 合并线） |
-| stall | `opcode==LOAD && (rd_in==r1_fast | r2_fast) && rd_del2!=rd_in`（load-use 保护） |
+| stall | `use_hit | waw_hit | (车3 占用) | (访存指令进不了车)`，见 §5.3 |
 
 地址译码（2026-09-19 起，dtcm/dcache 已不在总线上，见 §23）：
 - **dcache**：字地址 `[31:24]==8'd0 && [23:13]==11'h100`（字节 0x0080_0000 区，32 KB），在 `cpu_top` 内，
@@ -393,29 +393,58 @@ store 不产生 we，不写 regs。无访存依赖时不 stall。
 字节扩展：lb/lbu/lh/lhu 的符号/零扩展与字节槽选择都由 `ld_size/ld_off`（func10 + 地址低 2 位）
 在 lsu 组合完成；数据回到 `ld_data_out` 已按 32 位对齐。
 
-### 5.3 在途 load 队列（rd/size/off 与应答同源出队）
+### 5.3 两节车厢（车2 发送 / 车3 写回）
 
-lsu 里有一支 2 槽在途 load 队列：`ld_rd_fifo`/`ld_size_fifo`/`ld_off_fifo`（各 2 项），
-配 `ld_wr_ptr`/`ld_rd_ptr` 两个 2 位指针（低位选槽、高位判空满）。
+load 与 store 走**同一条**在途队列，只有两节在用（"三节车厢"里的第一节常态空着）：
+
+| 车厢 | 存什么 | 干什么 |
+| --- | --- | --- |
+| 车2（发送） | kind / rd / size / off / 载荷（addr、wdat、be）+ `s2_sent` | 常态下 ld/st **直接进这节**，进来那拍就把总线摆上（与 alu 写回同拍）；下一拍进车3 |
+| 车3（写回） | kind / rd / size / off | 与 dcache 里锁住的那条**是同一条**（请求已发），只等 `ready_in`；store 进这节即算提交（下一拍让位） |
 
 | 事件 | 条件 | 动作 |
 | --- | --- | --- |
-| 入队（发射） | `ld_enq = (opcode==LOAD) && !stall && (stage!=FLUSH)` | 把 `rd_in`/`func10[2:0]`/`基址+offset_load0` 写进队尾；同时把读地址摆上总线（**只摆这一拍**） |
-| 出队（应答） | `ld_pop = ready_in && !ld_fifo_empty` | 队头的 `rd`/`size`/`off` 与 `bus_data_in` 同拍组合出 `rd_load`/`ld_data`，读指针 +1 |
-| 保持 | `ld_hold`（`ld_pop` 打一拍） | 同一对 `(rd,data)` 再多摆一拍，给落在 back2 槽的消费者 |
-| 写回 | `ld_we = ld_pop` | 只在出队那一拍写寄存器堆 |
+| 进车2 | `new_in & new_go`（见下） | 锁 kind/rd/size/off 与载荷；`s2_sent <= send_new`（**没真发出去就保持 0**） |
+| 发送 | 进车2 那拍（`send_new`），或 `s2_send`（miss 期间进来的、或等在途读应答的，条件够了补发） | 摆一拍总线（`bus_go`，只摆一拍） |
+| 车2→车3 | `s2_v & s2_sent & s3_ok` | **没发过的车不许前移**——否则请求丢失、后续数据全错配 |
+| 出车3 | `s3_done = s3_v & (s3_kind | ready_in)` | store 下一拍让位；load 等到响应 |
+| 写回 | `ld_we = s3_v & ~s3_kind & ready_in` | `rd_load`/`ld_data_out` 同拍给出；`ld_hold` 再保持一拍给 back2 槽的消费者 |
 
-- **入队用 `!stall` 而不是"指令刚到达"**：`stall` 正好表示"本拍该指令的操作数还没到"。
-  若在停顿期就入队，基址来自上一条 load 的指令（`lw t6,0(t6)` → `lw sp,0(t6)`）
-  会把**旧操作数**算出的地址锁进队列，整条恢复链全错位。
-- **`stage!=FLUSH` 必须挡**：被冲刷的死槽 load 若入队，会带垃圾操作数算出的地址占住队头，
-  应答永远不来 ⇒ 队头永久卡死、后续所有 load 全部错配。
-- **保持一拍的理由**：load 往后第 2 条指令在 lsu 拍靠 `forw` 的 `loaded` 支路（`rd_load` 比对）
-  取数，那一拍正好落在出队的**下一拍**；只摆一拍它会取不到（实测该拍 `loaded=0`）。
-- **保持拍会顶掉 back2（2026-09-18 修）**：`loaded` 拉长到 2 拍后，若 forw 仍把 `loaded`
-  与 back2 合并成一个比较器，保持拍上 back2 通路整个失效。已拆成三条独立支路，见 §2.2。
-- **写回另用 `ld_we`**：若直接用 `loaded` 当 `we_ld`，保持拍会拿同一个 rd 再写一次，
-  把同拍 ALU 写回的结果盖掉。
+**入口门（`new_in`）**：`访存 && !flush_w && !(stall_m|stall_v|icache_busy) && !use_hit && !waw_hit`
+—— **不看 dcache 忙**：miss 当拍照样进车2 把操作数锁好，等 hold 落下再发（这就是"miss 当拍锁操作数、回填完发送拍释放"）。
+**`new_go`**：`s3_ok & s2_ok`（车3、车2 都要腾得出来），**只看车厢位置**。
+
+**stall（两节车厢的四条来源）**：
+```
+stall = use_hit | waw_hit | (s3_v & ~s3_done) | (访存指令 && !new_go)
+```
+- **车3 有人 ⇒ 组合拉高整个 stall（不分访存/非访存）**：车3 里那条结果没回来时，后面**任何**指令都不许越过它去读寄存器。
+  正因为这条，能进来的新指令只可能撞上**车2** ⇒ **hazard 只扫车2 就够**（不必扫车3）。
+- **`full_stall` 只按"车厢有没有位置"算，不能把"被上游 stall 挡住"也算进去**：本模块的 stall 经 `flag_bus[1]`
+  回灌 mulu 的 `pipe_stall`，混进来会与 `stall_m` 构成组合环（死锁）。
+- **入口门里也不能带 `~miss`**：那样 miss 期间整条流水被停，而 dcache 的 miss 要靠流水推进才收得了尾 ⇒ 环。
+- **hazard 扫描必须排除 x0**：store 车厢的 `rd=0` 与 `sw zero,…` 的 `rs2=x0` 会误命中 ⇒ 无谓停顿（甚至卡住）。
+
+**在途读只许一笔（空总线 `blank_bus`）**：应答**只能按顺序归属** —— 车3 里那条在等哪笔应答，就只能收哪笔。
+慢设备（外设读）与 dcache 的应答拍数不同，若允许两笔读同时在途，**先回来的那笔会落到前一条头上**。
+```
+ld_out    = (车2 里刚摆上、下一拍才进车3 的读) | (车3 里还没等到应答的读)
+blank_bus = miss | (ld_out & ~ready_in)        // 这一拍总线上不摆
+```
+`blank_bus` 为 1 时，新指令**照样进车2**（锁操作数），只是 `s2_sent=0`，等不 blank 了由 `s2_put` 补摆。
+- **为什么不能只把总线空一下、`s2_sent` 照旧置 1**：车厢会把"没真摆出去的请求"当发过了前移到车3 ⇒
+  **请求凭空消失**，后续应答全部错配（实测：总线流里少一条读）。所以 `s2_sent <= new_put` 必须说实话。
+- **为什么 blank 那拍必须把总线清零**（`else` 分支不能省）：从设备是**电平**判据，残留地址会被当成新请求**连答**
+  （HEAD 注释里的"读地址只摆一拍"就是这个道理）。实测：漏掉清零 ⇒ 同一笔读被应答多次 ⇒ 数据全错。
+- **为什么不能只"锁存应答"**：锁存只能知道"有一笔应答到了"，不知道是哪一笔 —— 归属问题没解决。
+- **实测（`prog/ls_mix2.s`）**：`lw t2,0(外设)` 紧跟 `lw t3,4(dtcm)`，dcache 的应答先回、被前一条收走 ⇒
+  **t2/t3 两条读的结果互换**（signature 第 1/2 字对调）。加门后与 ISS 参考模型逐字一致。
+- **不减速**：dcache 1 拍应答 ⇒ 需要摆下一笔的那拍 `ready_in` 恰好为 1 ⇒ `blank_bus=0`；
+  只有"应答确实还没到"时（外设慢读）才等 —— 那时本来就该等。
+
+**为什么保持一拍**：load 往后第 2 条指令在 lsu 拍靠 `forw` 的 `loaded` 支路（`rd_load` 比对）取数，
+那一拍正好落在响应**下一拍**；只摆一拍它会取不到（实测该拍 `loaded=0`）。
+**写回另用 `ld_we`**：直接用 `loaded` 当 `we_ld` 会在保持拍把同 rd 再写一次，盖掉同拍 ALU 的写回。
 
 
 ---
@@ -1023,16 +1052,17 @@ mem 侧是**字节地址**（`bus_addr_in << 2`）。
 
 ### 16.4 反压通路（本次唯一动到已验核的地方）
 
-多周期设备必须有停顿线：`lsu` 的在途 load 队列只有 2 槽，队列满时只是不发地址、没有结构性反压，
-背靠背 3 条 load 就会丢掉第 3 条。所以：
+多周期设备必须有停顿线：访存队列若满却不反压，背靠背的 load 就会丢掉。
+**2026-09-24 起 lsu 改成两节车厢（§5.3）后有了结构性反压**：车3 占用就组合拉高 `stall`，
+入口进不来时也拉 `stall`（`full_stall`）⇒ 不再有"丢第 N 条"的问题。
 
 - `controller.stall = stall | i_busy | bus_hold_in`
-- `lsu.ld_enq = (opcode == OPCODE_LOAD) && !stall && (stage != FLUSH) && !bus_hold_in`
+- `lsu` 的入队门 `new_in = 访存 && !flush_w && !(stall_m|stall_v|icache_busy) && !use_hit && !waw_hit`
 
-第二条是必需的：停顿期间 `stage == STALL`，若 lsu 级停着一条 LOAD，`ld_enq` 仍为 1 ⇒
-地址脉冲**每拍重复摆**、FIFO 每拍重复入队（`lsu.v:94-100` 的既有性质，对 dtcm 无害是因为它每拍都答），
+第二条是必需的：停顿期间若 lsu 级停着一条访存指令，入队信号仍为 1 ⇒
+地址脉冲**每拍重复摆**、队列每拍重复入队（对 dtcm 无害是因为它每拍都答），
 对多周期的 dcache 就变成「入队 N 次、只应答 1 次」⇒ 队列失步挂死。门控后停顿期不发，停机解除再按 EXE 发一次。
-（store 不用管：`lsu.v:102-107` 的 STALL 分支本来就把 `we/be/data` 清零。）
+（store 不用管：store 的 `we/be/data` 本来就在停顿分支里清零。）
 
 **验证没伤到核**：把 HEAD 的 4 个文件（`cpu_top`/`lsu`/`bus_arb`/`mcu_top`）取出来建基线树，同一套 tb 跑一遍，
 **回归输出与改动后逐字一致**（只多出新增的 dcache 项）。`bus_hold_in` 恒 0 时核的行为严格不变。
@@ -2239,6 +2269,15 @@ icache 缺失                                   = 67 次
 > wire pipe_stall_w = stall | mul_stall | icache_busy_w | bus_hold_in | d_hold_int;  // 给 controller 定 stage
 > wire mul_freeze_w = stall | icache_busy_w | bus_hold_in | d_hold_int;              // 给 mulu，排掉自己
 > ```
+
+> **另一个同形状的坑（2026-09-24 修，CoreMark 挂死根因）**：`stall_m` 的**释放**条件写成
+> `(mstalled && m_pv)` —— 等的是**结果脉冲**；而 `mstalled` 在任何 `stall` 拍都会置起。
+> 一旦那个脉冲在 `mstalled` 置起**之前**拍到（相位错开一次），之后就再无脉冲 ⇒ 永久等 ⇒
+> `stall_m` 常 1 ⇒ `m_push` 里的 `!stall` 又把这条 mul 自己挡死 ⇒ 沿程序序向后传染 = 死锁。
+> **改成看"乘法流水还有没有在途"**：`stall_m = (m_v | m_pv | hold) ? 1'b1 : 1'b0`（流水空 ⇒ 结果早已落地 ⇒ 放行）。
+> 实测：CoreMark 从"351 字符挂死"变成 777 字符且 CRC 全对，周期与基线一致。
+> **为什么不能简单删 `!stall`**：`stall_m` 同时承担"本条 mul 的操作数还没到"这一正当等待，
+> 删掉会让乘法拿陈旧操作数推进（实测 CoreMark CRC 算错）。
 
 **契约表述**：*已发射的事务（mulu 的乘除、lsu 的在途 load）一旦发起就必须跑完 —— 冻它只会自锁；
 外部停顿必须先冻住它们，否则写口沿会与 alu 错开。所以每个「有在途事务」的单元，

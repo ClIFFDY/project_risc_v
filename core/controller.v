@@ -24,7 +24,7 @@ module controller(
     input clk, rst, jalr_fail, br2, br3, irq_ret, trap, ebreak,
 //d 类停顿的四个源（按"顶层不运算"从 cpu_top 下放至此，本模块内合成 stall_d）
     input lsu_stall, stall_m, stall_v, bus_hold_in, dcache_hold,
-    input icache_busy,
+    input icache_busy, lsu_inflight,
     input jal, pre_jalr, btb_hit, br1,
     input csr_wr_en, exti, timi, softi,
     input [11:0] csr_addr,
@@ -76,8 +76,11 @@ module controller(
         end
     end
 
+
+
 //csr异常/中断寄存器
     csr u_csr (
+        .mem_inflight(lsu_inflight),
         .clk(clk),
         .rst(rst_q),
         .csr_wr_en(csr_wr_en),

@@ -372,7 +372,7 @@ module mulu(
 //乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
     always @(*) begin
         if (is_mul_post && ((rd_post == r1_post) | (rd_post == r2_post)))
-            stall_m = (mstalled && m_pv) ? 1'b0 : 1'b1;
+            stall_m = (m_v | m_pv | hold) ? 1'b1 : 1'b0;
         else
             stall_m = 1'b0;
     end

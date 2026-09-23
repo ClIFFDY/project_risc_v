@@ -24,6 +24,7 @@ module csr(
     input clk, rst,
     input csr_wr_en, iret, exti, timi, softi, trap, ebreak,
     input [8:0] flag_bus,
+    input mem_inflight,
     input [11:0] csr_addr,
 //读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
     input [11:0] csr_addr_pre,
@@ -48,7 +49,7 @@ module csr(
         flush_w  = flag_bus[7] | flag_bus[6];
         irq_gate = (ird_tmr != 2'd0);
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
-        retire   = !(flush_w | stall);
+        retire   = !(flush_w | stall | mem_inflight);
     end
 
     always @(posedge clk) begin

@@ -73,7 +73,7 @@ module post_decoder(
     reg exec, flush_w, stall_w;
     always @(*) begin
         flush_w = flag_bus[7] | flag_bus[6];
-        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
         exec    = flag_bus[8];
     end
 

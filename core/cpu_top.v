@@ -1,28 +1,23 @@
 `timescale 1ns / 1ps
-
 module cpu_top(
     input clk, rst,
     input [31:0] bus_data_in_ext,
     input bus_loaded_in, bus_hold_in, exti,
-
     output reg [31:0] bus_addr_out, bus_data_out,
     output reg [3:0] bus_be_out,
     output reg bus_we_out, bus_valid_out
     );
-
 //流水线层次块：按信号首生产者的流水线位置排序
     wire [31:0] pc_addr, aux_addr_0;
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
     (* max_fanout = 32 *) wire [31:0] inst_1;
     wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3;
-
     (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
     wire jal, br_en, pre_jalr;
     wire br_pred_taken_1;
     wire [31:0] jalr_pred_addr_1;
-
     wire [31:0] inst_2;
     (* max_fanout = 32 *) wire [4:0] rs1_2, rs2_2, rd_2;
     wire [4:0] imm5_csr_2;
@@ -34,19 +29,15 @@ module cpu_top(
     wire [31:0] aux_addr_2;
     wire br_pred_taken_2;
     wire [31:0] jalr_pred_addr_2;
-
     wire [4:0] rd_3;
     wire [31:0] r1_data_3, r2_data_3, aux_addr_3, beq_off_q2, jalr_pred_addr_3;
     wire we_3, br_flag, br_pred_taken_3;
-
     wire [4:0] rd_4;
     wire [31:0] result_4, result_back1;
     wire we_4;
-
     wire [4:0] rd_5;
     wire [31:0] result_5, result_back2;
     wire we_5;
-
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
     wire [8:0] flag_bus;
     wire [3:0] irq_bubble, alu_func4;
@@ -63,7 +54,7 @@ module cpu_top(
     wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, irq_ret, trap, ebreak;
 //前置冲刷（早一拍）：由 bju 的组合判定给出，直连 lsu/mulu（不进 flag_bus，见 controller.v）
     wire stallf;
-    wire loaded, ld_we, stall;
+    wire loaded, ld_we, stall, lsu_inflight_w;
     wire [4:0] rd_load;
     wire btb_hit;
     wire [31:0] icache_mem_addr_w, icache_mem_wdata_w, icache_mem_data_w;
@@ -83,13 +74,11 @@ module cpu_top(
     wire [31:0] mul_data_final;
     wire mul_loaded, mul_we, mul_stall, stall_m, stall_v;
     wire [4:0] rd_mul;
-
 //总线层次块
     wire [31:0] bus_addr_out_i, bus_data_out_i;
     wire [3:0] bus_be_out_i;
     wire bus_we_out_i;
     wire bus_valid_out_i;
-
     always @(*) begin
         bus_addr_out = bus_addr_out_i;
         bus_data_out = bus_data_out_i;
@@ -97,7 +86,6 @@ module cpu_top(
         bus_we_out = bus_we_out_i;
         bus_valid_out = bus_valid_out_i;
     end
-
     pc u_pc (
         .clk(clk),
         .rst(rst),
@@ -117,7 +105,6 @@ module cpu_top(
         .pc_addr(pc_addr),
         .aux_addr(aux_addr_0)
     );
-
     icache u_icache (
         .clk(clk),
         .rst(rst),
@@ -143,7 +130,6 @@ module cpu_top(
         .mem_valid(icache_mem_valid_w),
         .mem_data(icache_mem_data_w)
     );
-
     itcm u_itcm (
         .clk(clk),
         .rst(rst),
@@ -152,7 +138,6 @@ module cpu_top(
         .mem_data(icache_mem_data_w),
         .mem_valid(icache_mem_valid_w)
     );
-
     pre_decoder u_pre_decoder (
         .clk(clk),
         .rst(rst),
@@ -173,7 +158,6 @@ module cpu_top(
         .br_en(br_en),
         .jalr(pre_jalr)
     );
-
     mid_decoder u_mid_decoder (
         .clk(clk),
         .rst(rst),
@@ -204,7 +188,6 @@ module cpu_top(
         .r2_in(rs2_1),
         .r2_out(rs2_2)
     );
-
     post_decoder u_post_decoder (
         .clk(clk),
         .rst(rst),
@@ -245,7 +228,6 @@ module cpu_top(
         .we(we_3),
         .aux_addr_out(aux_addr_3)
     );
-
 //分支/跳转判定单元：判定源与 alu 的输入同源（r1_data_3 / r2_data_3 / alu_func4），
 //比较与加法在本拍做，结果、落点在下一拍生效；stallf 是同一判定的组合版本、早一拍
     bju u_bju (
@@ -271,7 +253,6 @@ module cpu_top(
         .br_pred_taken_q(br_pred_taken_q),
         .stallf(stallf)
     );
-
     lsu u_lsu (
         .clk(clk),
         .rst(rst),
@@ -290,6 +271,8 @@ module cpu_top(
         .bus_data_dcache(dcache_data_w),
         .bus_data_tim(tim_data_out),
         .ready_dcache(dcache_ld_ready_w),
+        .dcache_hold_in(dcache_hold_w),
+        .mem_inflight(lsu_inflight_w),
         .ready_tim(tim_ready),
         .ready_ext(bus_loaded_in),
         .bus_addr_out(bus_addr_out_i),
@@ -303,7 +286,6 @@ module cpu_top(
         .stall(stall),
         .rd_load(rd_load)
     );
-
 //RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
     mulu u_mulu (
         .clk(clk),
@@ -327,7 +309,6 @@ module cpu_top(
         .stall_v(stall_v),
         .stall(mul_stall)
     );
-
     forw u_forw (
         .clk(clk),
         .rst(rst),
@@ -350,7 +331,6 @@ module cpu_top(
         .r1_data_final(r1_data_final),
         .r2_data_final(r2_data_final)
     );
-
     bra_predict u_bra_predict (
         .clk(clk),
         .rst(rst),
@@ -368,7 +348,6 @@ module cpu_top(
         .jalr_predict_offset(jalr_predict_offset),
         .jalr(btb_hit)
     );
-
     alu u_alu (
         .we_in(we_3),
         .jal_flag(jal_flag),
@@ -387,7 +366,6 @@ module cpu_top(
         .result_back1(result_back1),
         .we(we_4)
     );
-
     wb_reg u_wb_reg (
         .clk(clk),
         .rst(rst),
@@ -401,7 +379,6 @@ module cpu_top(
         .result_out(result_5),
         .result_back2(result_back2)
     );
-
     regfile u_regfile (
         .clk(clk),
         .rst(rst),
@@ -420,7 +397,6 @@ module cpu_top(
         .r1_data(r1_data),
         .r2_data(r2_data)
     );
-
     dcache u_dcache (
         .clk(clk),
         .rst(rst),
@@ -441,7 +417,6 @@ module cpu_top(
         .mem_valid(dcache_mem_valid_w),
         .mem_ready(1'b1)
     );
-
     dtcm u_dtcm (
         .clk(clk),
         .rst(rst),
@@ -454,7 +429,6 @@ module cpu_top(
         .mem_valid(dcache_mem_valid_w),
         .mem_ready()
     );
-
     tim_in u_tim_in (
         .clk(clk),
         .rst(rst),
@@ -466,7 +440,6 @@ module cpu_top(
         .timi(timi),
         .ready(tim_ready)
     );
-
     controller u_controller (
         .clk(clk),
         .rst(rst),
@@ -484,7 +457,8 @@ module cpu_top(
         .stall_m(stall_m),
         .stall_v(stall_v),
         .bus_hold_in(bus_hold_in),
-        .dcache_hold(dcache_hold_w),
+        .dcache_hold(1'b0),
+        .lsu_inflight(lsu_inflight_w),
         .icache_busy(icache_busy_q),
         .csr_wr_en(csr_wr_en),
         .exti(exti),
@@ -504,6 +478,4 @@ module cpu_top(
         .irq_bubble(irq_bubble),
         .flag_bus(flag_bus)
     );
-
-
 endmodule

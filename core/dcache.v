@@ -45,12 +45,29 @@ module dcache(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
+//寄存器（按级分组）
+//第 0 级：本拍组合
     reg [20:0] tag;
     reg [7:0] idx;
     reg [2:0] word;
     reg [1:0] hit_way;
     reg cache_hit;
 
+    reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
+    reg wr_upd, hit_upd;
+    reg lru_we, lru_wval;
+    reg [7:0] lru_widx;
+    reg [11:0] rd_addr;
+    reg rd_en;
+
+    reg is_fill_wr, ram_we;
+    reg [3:0] ram_be;
+    reg [11:0] ram_waddr;
+    reg [31:0] ram_wdata;
+    reg [31:0] wr_addr, wr_data;
+    reg [3:0] wr_be;
+
+//第 1 级与自举/回填：阵列与状态机
     reg [20:0] tag0 [0:255];
     reg [20:0] tag1 [0:255];
     (* ram_style = "block" *) reg [31:0] data [0:4095];
@@ -71,18 +88,6 @@ module dcache(
     reg [7:0] fill_idx;
     reg fill_way;
 
-    reg rd_req, wr_req, wr_pend, wr_drive, rd_drive;
-    reg wr_upd, hit_upd;
-    reg lru_we, lru_wval;
-    reg [7:0] lru_widx;
-    reg [11:0] rd_addr;
-    reg rd_en;
-    reg is_fill_wr, ram_we;
-    reg [3:0] ram_be;
-    reg [11:0] ram_waddr;
-    reg [31:0] ram_wdata;
-    reg [31:0] wr_addr, wr_data;
-    reg [3:0] wr_be;
     reg busy_d1;
 
     integer i;
@@ -92,6 +97,9 @@ module dcache(
         for (i = 0; i < 256;  i = i + 1) lru[i]  = 1'b0;
     end
 
+//===============================================================
+// 第 0 级：本拍组合（请求与命中判定 + 写口合成）
+//===============================================================
     always @(*) begin
         tag = bus_addr_in[31:11];
         idx = bus_addr_in[10:3];
@@ -159,6 +167,9 @@ module dcache(
         end
     end
 
+//===============================================================
+// 第 1 级：数据阵列写入与读数据输出
+//===============================================================
     always @(posedge clk) begin
         if (ram_we) begin
             if (ram_be[0]) data[ram_waddr][7:0]   <= ram_wdata[7:0];
@@ -181,6 +192,9 @@ module dcache(
         end
     end
 
+//===============================================================
+// 缺失回填状态机与 busy/hold 延拓
+//===============================================================
     always @(posedge clk) begin
         if (rst_q) begin
             stage <= 1'b0;

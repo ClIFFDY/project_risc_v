@@ -54,8 +54,8 @@ module pc(
 //程序计数器，传递取指地址
     always @(posedge clk) begin
         if (rst_q) begin
-            pc_addr <= 32'd0;
-            aux_addr <= 32'd0;
+            pc_addr <= 32'd4;
+            aux_addr <= 32'd4;
         end
         else if (exec) begin
             if (!flush_w && !stall_w) begin
