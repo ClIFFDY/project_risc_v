@@ -31,6 +31,10 @@
 //
 //   操作数由 regfile 的【独立第三份读数据通路】供给（_mul），不与其他消费单元共享。
 //
+//   本文件内 always 块按【流水级数】排列：
+//     第一级（锁操作数）→ 第二级（锁乘积）→ 除法迭代 → 提交链/输出保持
+//     → 冒险判定与 stall 输出 → 组合输出（写回仲裁）。
+//
 // Dependencies:
 //
 // Revision:
@@ -41,19 +45,18 @@
 
 module mulu(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [8:0] flag_bus,
 //前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
 //而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
 //推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
 //不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
     input stallf,
-//冻结信号的三项源（按"顶层不运算"从 cpu_top 下放至此，由本模块内部合成 pipe_stall）：
+//冻结信号从 flag_bus 取位（本模块不设专用 stall 端口）：
 //本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
 //严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
 //m_push 每拍重发 -> m_v 恒 1 -> we_mul 连续多拍。
-//【合流里必须排掉本模块自己的 stall】：那正是 div 进行 / mul-use 冒险的输出，一并冻住会自锁。
-    input lsu_stall, icache_busy,
-    input bus_hold_in, dcache_hold,
+//【合流里必须排掉本模块自己的 stall（stall_m/stall_v）】：那正是 div 进行 / mul-use 冒险的输出，
+//一并冻住会自锁。
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -61,7 +64,7 @@ module mulu(
     output reg [31:0] mul_data_out,
     output reg mul_loaded, mul_we,
     output reg [4:0] rd_mul,
-    output reg stall
+    output reg stall_m, stall_v, stall
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -72,25 +75,25 @@ module mulu(
 
     localparam OPCODE_OP = 7'b0110011;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//控制位译码（与流水级无关，放本模块最前）
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取两条冲刷位。
 //本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：m_push、除法 FSM 的作废、
 //d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
-    always @(*) flush_w = flag_bus[3] | flag_bus[2] | stallf;
+    always @(*) flush_w = flag_bus[7] | flag_bus[6] | stallf;
 
-//冻结信号合流：总线保持（外部 + dcache 延拓拍）与取指缺失、以及 lsu 的 load-use
+//冻结信号合流：总线保持（外部 + dcache 延拓拍）、取指缺失、lsu 的 load-use（排掉自己那两位）
     reg pipe_stall, bus_hold;
     always @(*) begin
-        bus_hold   = bus_hold_in | dcache_hold;
-        pipe_stall = lsu_stall | icache_busy | bus_hold;
+        bus_hold   = flag_bus[5] | flag_bus[4];
+        pipe_stall = flag_bus[5] | flag_bus[4] | flag_bus[1] | flag_bus[0];
     end
 
-//===============================================================
-// 乘法：两级流水寄存器
-//===============================================================
+//寄存器声明（按级分组）
+//乘法：第一级锁操作数 / 第二级锁乘积
     reg [31:0] m_a, m_b;
     reg [4:0]  m_rd;
     reg [2:0]  m_op;
@@ -101,15 +104,14 @@ module mulu(
     reg [2:0]  m_op_q;
     reg        m_pv;
 
-//===============================================================
-// 除法：32 拍移位-相减迭代
-//===============================================================
+//除法：32 拍移位-相减迭代
     reg [31:0] d_dvd;             // 原被除数（除零时余数要回它）
     reg [31:0] d_a, d_b;          // 取绝对值后的被除数 / 除数
     reg        d_rem;             // 1 = 求余数
     reg        d_neg_q, d_neg_r;  // 商 / 余 需要取负
     reg        d_zero;            // 除数为 0
     reg        d_ovf;             // INT_MIN / -1
+    reg        d_sign_b;
     reg [4:0]  d_rd;
     reg [4:0]  d_cnt;
     reg        d_busy;
@@ -120,13 +122,7 @@ module mulu(
     reg [31:0] d_q_rem;           // 迭代中的余数累加器
     reg [31:0] d_q_quo;           // 迭代中的商
 
-//===============================================================
-// 输出保持
-//===============================================================
-    reg [4:0]  hold_rd;
-    reg [31:0] hold_data;
-    reg        hold;
-
+//提交链
 //除法写口延迟：d_done 那拍 div 还停在 c2（stall 尚未放行），而程序序在它【前面】、
 //被同一个 stall 冻在 c3/c4 的 ALU 指令，要等放行后再走两级才到写口。若除法在 d_done
 //当拍就写，同 rd 时晚写的 ALU 指令会盖掉除法结果（CoreMark rv32im 的首个错误即此）。
@@ -135,17 +131,18 @@ module mulu(
     reg [4:0]  d_cmt_rd;
     reg [31:0] d_cmt_data;
 
-//===============================================================
-// 冒险判定
-//===============================================================
+//输出保持
+    reg [4:0]  hold_rd;
+    reg [31:0] hold_data;
+    reg        hold;
+
+//冒险判定
     reg [6:0] opcode_post;
     reg [9:0] func10_post;
     reg [4:0] rd_post;
     reg       mstalled;
 
-//===============================================================
-// 组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）
-//===============================================================
+//组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）
     reg        is_m, is_mul, is_div;
     reg        is_m_post, is_mul_post;
     reg        m_push;
@@ -157,6 +154,9 @@ module mulu(
     reg [31:0] d_quo_fin, d_rem_fin, d_res;
     reg        d_cmt, d_pend;
 
+//===============================================================
+// 第一级：锁操作数
+//===============================================================
 //RV32M 判据：与普通 ALU 指令共用 OPCODE_OP，只能靠 funct7 区分
 //func10 = {inst[31:25], inst[14:12]}，M 的 inst[31:25] = 0000001
 //funct3[1:0]：乘法 00=MUL 01=MULH 10=MULHSU 11=MULHU；除法 00=DIV 01=DIVU 10=REM 11=REMU
@@ -173,40 +173,6 @@ module mulu(
         m_push = is_mul && !stall && !pipe_stall && !flush_w && !bus_hold;
     end
 
-//33 位扩展：
-//  a 无符号 ⟺ funct3==011 (MULHU)
-//  b 无符号 ⟺ funct3∈{010,011} (MULHSU/MULHU) ⟺ funct3[1]==1
-    always @(*) begin
-        a_ext   = (m_op == 3'b011) ? {1'b0, m_a} : {m_a[31], m_a};
-        b_ext   = (m_op[1])        ? {1'b0, m_b} : {m_b[31], m_b};
-        m_p_int = a_ext * b_ext;
-    end
-
-//除法迭代一拍：余数左移一位并入被除数最高位，够减则商 1
-    always @(*) begin
-        d_sub = {d_q_rem[30:0], d_a[31]} - {1'b0, d_b};
-        d_ge  = ~d_sub[32];
-        d_last = d_busy && (d_cnt == 5'd31);
-    end
-
-//收尾还原符号 + 规范边界值
-//  除零 → 商全 1 / 余为原被除数；溢出 INT_MIN/-1 → 商 INT_MIN / 余 0
-    always @(*) begin
-        d_quo_fin = d_neg_q ? (~d_q_quo + 32'd1) : d_q_quo;
-        d_rem_fin = d_neg_r ? (~d_q_rem + 32'd1) : d_q_rem;
-        d_res = d_zero ? (d_rem ? d_dvd : 32'hFFFFFFFF) :
-                d_ovf  ? (d_rem ? 32'd0 : 32'h80000000) :
-                         (d_rem ? d_rem_fin : d_quo_fin);
-    end
-
-//funct3[1:0]==00 → MUL，取低 32；其余（MULH/MULHSU/MULHU）取高 32
-    always @(*) begin
-        mul_sel = (m_op_q[1:0] == 2'b00);
-    end
-
-//===============================================================
-// 时序逻辑
-//===============================================================
 //乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与 alu 的写回级同呼吸。
     always @(posedge clk) begin
         if (rst_q) begin
@@ -224,6 +190,18 @@ module mulu(
         end
     end
 
+//===============================================================
+// 第二级：锁乘积
+//===============================================================
+//33 位扩展：
+//  a 无符号 ⟺ funct3==011 (MULHU)
+//  b 无符号 ⟺ funct3∈{010,011} (MULHSU/MULHU) ⟺ funct3[1]==1
+    always @(*) begin
+        a_ext   = (m_op == 3'b011) ? {1'b0, m_a} : {m_a[31], m_a};
+        b_ext   = (m_op[1])        ? {1'b0, m_b} : {m_b[31], m_b};
+        m_p_int = a_ext * b_ext;
+    end
+
 //乘法第二级：锁乘积。同样按 pipe_stall 冻结。这一级【不判 flush】—— 能走到这里的乘法，
 //发起它的那条指令一定比正在冲刷的那条更老，必须照样提交（与 lsu 在途队列语义一致）。
     always @(posedge clk) begin
@@ -239,6 +217,21 @@ module mulu(
         end
     end
 
+//funct3[1:0]==00 → MUL，取低 32；其余（MULH/MULHSU/MULHU）取高 32
+    always @(*) begin
+        mul_sel = (m_op_q[1:0] == 2'b00);
+    end
+
+//===============================================================
+// 除法：32 拍移位-相减迭代
+//===============================================================
+//除法迭代一拍：余数左移一位并入被除数最高位，够减则商 1
+    always @(*) begin
+        d_sub = {d_q_rem[30:0], d_a[31]} - {1'b0, d_b};
+        d_ge  = ~d_sub[32];
+        d_last = d_busy && (d_cnt == 5'd31);
+    end
+
 //除法迭代
     always @(posedge clk) begin
         if (rst_q) begin
@@ -251,6 +244,7 @@ module mulu(
             d_rd <= 5'd0;  d_rem <= 1'b0;
             d_neg_q <= 1'b0; d_neg_r <= 1'b0;
             d_zero <= 1'b0;  d_ovf <= 1'b0;
+            d_sign_b <= 1'b0;
         end
         else if (flush_w) begin
 //除法无副作用，被冲刷就整体作废，重取指后会重新执行
@@ -266,21 +260,24 @@ module mulu(
             d_q_quo <= {d_q_quo[30:0], d_ge};
             if (d_last) d_busy <= 1'b0;
             else        d_cnt  <= d_cnt + 5'd1;
+            if (d_cnt == 5'd0) begin
+                d_zero  <= (d_b == 32'd0);
+                d_ovf   <= (func10[0] == 1'b0) && (d_dvd == 32'h80000000) &&
+                           (d_b == 32'd1) && d_sign_b;
+                d_neg_q <= (func10[0] == 1'b0) && (d_dvd[31] ^ d_sign_b) &&
+                           (d_b != 32'd0);
+                d_neg_r <= (func10[0] == 1'b0) && d_dvd[31] && (d_b != 32'd0);
+            end
         end
         else if (is_div && !d_issued && !bus_hold) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //【不能判 !stall】—— stall 里含 is_div 本身，判了就永远发不出去（死锁）。
 //d_issued 保证一条 div 只发起一次；否则算完后 is_div 仍在（指令还冻在 mulu 级），
 //会无限重复发起、stall 永远落不下去。
-            d_rd    <= rd_in;
-            d_rem   <= func10[1];
-            d_zero  <= (r2_data_final == 32'd0);
-            d_ovf   <= (func10[0] == 1'b0) && (r1_data_final == 32'h80000000) &&
-                       (r2_data_final == 32'hFFFFFFFF);
-            d_neg_q <= (func10[0] == 1'b0) && (r1_data_final[31] ^ r2_data_final[31]) &&
-                       (r2_data_final != 32'd0);
-            d_neg_r <= (func10[0] == 1'b0) && r1_data_final[31] && (r2_data_final != 32'd0);
-            d_dvd   <= r1_data_final;
+            d_rd     <= rd_in;
+            d_rem    <= func10[1];
+            d_dvd    <= r1_data_final;
+            d_sign_b <= r2_data_final[31];
             d_a     <= ((func10[0] == 1'b0) && r1_data_final[31]) ? (~r1_data_final + 32'd1) : r1_data_final;
             d_b     <= ((func10[0] == 1'b0) && r2_data_final[31]) ? (~r2_data_final + 32'd1) : r2_data_final;
             d_q_rem <= 32'd0;
@@ -291,6 +288,17 @@ module mulu(
         end
     end
 
+//收尾还原符号 + 规范边界值
+//  除零 → 商全 1 / 余为原被除数；溢出 INT_MIN/-1 → 商 INT_MIN / 余 0
+    always @(*) begin
+        d_quo_fin = d_neg_q ? (~d_q_quo + 32'd1) : d_q_quo;
+        d_rem_fin = d_neg_r ? (~d_q_rem + 32'd1) : d_q_rem;
+        d_res = d_zero ? (d_rem ? d_dvd : 32'hFFFFFFFF) :
+                d_ovf  ? (d_rem ? 32'd0 : 32'h80000000) :
+                         (d_rem ? d_rem_fin : d_quo_fin);
+    end
+
+//完成脉冲（比最后一次迭代晚一拍）
     always @(posedge clk) begin
         if (rst_q || flush_w) begin
             d_done   <= 1'b0;
@@ -302,6 +310,9 @@ module mulu(
         end
     end
 
+//===============================================================
+// 提交链（d_done+3 写口）与输出保持
+//===============================================================
 //除法结果提交延迟链 + 输出保持（对应 lsu 的 ld_hold）
     always @(posedge clk) begin
 //【只由 rst 清】不能判 flush：d_done 一旦发出，说明这条 div 已在 c2 完成并即将离级，
@@ -329,6 +340,7 @@ module mulu(
         end
     end
 
+//冒险判定（第二级载荷 + stall 输出）
 //冒险用的载荷寄存器（M 与普通 ALU 共用 OPCODE_OP，所以 func10 必须一起寄存）
     always @(posedge clk) begin
         if (rst_q) begin
@@ -348,9 +360,26 @@ module mulu(
         end
     end
 
-//===============================================================
-// 组合输出：写回仲裁（乘法第二级与除法收尾共用，同一时刻只有一个在途结果）
-//===============================================================
+//冒险：照 lsu 的 load-use 形状
+    always @(*) begin
+//除法：从"div 还在 mulu 级且尚未发起"那拍起一直停到收尾后。
+//d_issued 置起后本项让位给 d_busy/d_done，算完就放行，指令才能离开 mulu 级。
+        if (is_div && !d_issued && !bus_hold)  stall_v = 1'b1;
+        else if (d_busy || d_done)             stall_v = 1'b1;
+        else                                   stall_v = 1'b0;
+    end
+
+//乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
+    always @(*) begin
+        if (is_mul_post && ((rd_post == r1_post) | (rd_post == r2_post)))
+            stall_m = (mstalled && m_pv) ? 1'b0 : 1'b1;
+        else
+            stall_m = 1'b0;
+    end
+
+    always @(*) stall = stall_m | stall_v;
+
+//组合输出：写回仲裁（乘法第二级与除法收尾共用，同一时刻只有一个在途结果）
     always @(*) begin
         d_cmt  = d_cmt_q[2];                          // 除法写口脉冲 = d_done+3
         d_pend = d_cmt_q[0] | d_cmt_q[1] | d_cmt_q[2]; // 除法结果前递窗口
@@ -375,21 +404,6 @@ module mulu(
             rd_mul       = 5'd0;
             mul_data_out = 32'd0;
         end
-    end
-
-//冒险：照 lsu 的 load-use 形状
-    always @(*) begin
-//除法：从"div 还在 mulu 级且尚未发起"那拍起一直停到收尾后。
-//d_issued 置起后本项让位给 d_busy/d_done，算完就放行，指令才能离开 mulu 级。
-        if (is_div && !d_issued && !bus_hold)
-            stall = 1'b1;
-        else if (d_busy || d_done)
-            stall = 1'b1;
-//乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
-        else if (is_mul_post && ((rd_post == r1_post) | (rd_post == r2_post)))
-            stall = (mstalled && m_pv) ? 1'b0 : 1'b1;
-        else
-            stall = 1'b0;
     end
 
 endmodule

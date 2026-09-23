@@ -22,7 +22,7 @@
 
 module post_decoder(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [8:0] flag_bus,
     input [9:0] func10,
     input [4:0] rd_in,
     input [6:0] opcode,
@@ -67,14 +67,14 @@ module post_decoder(
     localparam OPCODE_AUIPC  = 7'b0010111;
     localparam OPCODE_SYSTEM = 7'b1110011;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_w = flag_bus[7] | flag_bus[6];
+        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[8];
     end
 
 //csr 读口地址：就是本级【组合输入】里那条指令的 csr 号（即 csr_addr 的下一条流水位置），

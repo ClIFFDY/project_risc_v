@@ -29,12 +29,8 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input [31:0] offset_jal1, offset_beq1,
-    input [31:0] isr_addr1, isr_ret_addr1,
     input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret,
-    input [4:0] flag_bus,
-//读口控制
-    input req_valid,
+    input [8:0] flag_bus,
 //回填应答（接核内 itcm）
     input mem_valid,
     input [31:0] mem_data,
@@ -88,11 +84,14 @@ module icache(
 
     integer i;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
-//控制位译码（行为块，放本模块最前）：本模块的取指推进由 req_valid / 回填状态自己把关，
-//不用流水线使能，故只取两条冲刷位。
-    reg flush_w;
-    always @(*) flush_w = flag_bus[3] | flag_bus[2];
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
+//控制位译码（行为块，放本模块最前）：本模块的取指推进由六条 stall 位合出来的 req_valid
+//与回填状态自己把关，不用流水线使能，故只取冲刷位与 stall 位。
+    reg flush_w, req_valid;
+    always @(*) begin
+        flush_w   = flag_bus[7] | flag_bus[6];
+        req_valid = ~(flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
+    end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
     reg jalr;

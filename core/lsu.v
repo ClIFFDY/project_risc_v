@@ -22,7 +22,7 @@
 
 module lsu(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [8:0] flag_bus,
 //前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
 //而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
 //动 FIFO 指针、拉总线（store 也在这条路上），等寄存器清已经收不回来，故入口要多挡一拍。
@@ -35,7 +35,6 @@ module lsu(
     input [31:0] offset_load0, offset_store0,
     input [31:0] bus_data_ext, bus_data_dcache, bus_data_tim,
     input ready_dcache, ready_tim, ready_ext,
-    input bus_hold_in, dcache_hold,
     output reg [31:0] bus_addr_out,
     output reg [31:0] bus_data_out,
     output reg [3:0] bus_be_out,
@@ -57,35 +56,16 @@ module lsu(
     localparam OPCODE_LOAD  = 7'b0000011;
     localparam OPCODE_STORE = 7'b0100011;
 
-    reg [31:0] st_addr;
-
-    reg [4:0] ld_rd_fifo [0:3];
-    reg [2:0] ld_size_fifo [0:3];
-    reg [1:0] ld_off_fifo [0:3];
-    reg [2:0] ld_wr_ptr, ld_rd_ptr;
-    reg [3:0] ld_occ;
-    reg [4:0] ld_hold_rd;
-    reg [31:0] ld_hold_data;
-    reg [31:0] ld_data_cur;
-    reg ld_hold;
-
-    reg ld_fifo_empty, ld_fifo_full, ld_pop, ld_enq, ld_push_eff;
-    reg ld_use_hit;
-    reg [3:0] ld_occ_q;
-    reg [4:0] ld_rd_cur;
-    reg [2:0] ld_size_cur;
-    reg [1:0] ld_off_cur;
-
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
 //本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：入队门控与总线选通都挂在
 //这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2] | stallf;
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_w = flag_bus[7] | flag_bus[6] | stallf;
+        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[8];
     end
 
 //总线读数据与停顿的合流（按"顶层不运算"从 cpu_top 下放至此）：
@@ -96,9 +76,37 @@ module lsu(
     always @(*) begin
         bus_data_in = bus_data_ext | bus_data_dcache | bus_data_tim;
         ready_in    = ready_dcache | ready_tim | ready_ext;
-        bus_hold    = bus_hold_in | dcache_hold;
+        bus_hold    = flag_bus[5] | flag_bus[4];
     end
 
+//寄存器（按级分组）
+//第一级：总线地址
+    reg [31:0] st_addr;
+
+//第二级：在途 load 队列
+    reg [4:0] ld_rd_fifo [0:3];
+    reg [2:0] ld_size_fifo [0:3];
+    reg [1:0] ld_off_fifo [0:3];
+    reg [2:0] ld_wr_ptr, ld_rd_ptr;
+    reg [3:0] ld_occ;
+
+//第三级：应答保持与数据返回
+    reg [4:0] ld_hold_rd;
+    reg [31:0] ld_hold_data;
+    reg [31:0] ld_data_cur;
+    reg ld_hold;
+
+//判据与输出（组合）
+    reg ld_fifo_empty, ld_fifo_full, ld_pop, ld_enq, ld_push_eff;
+    reg ld_use_hit;
+    reg [3:0] ld_occ_q;
+    reg [4:0] ld_rd_cur;
+    reg [2:0] ld_size_cur;
+    reg [1:0] ld_off_cur;
+
+//===============================================================
+// 第一级：总线地址（T→T+1）
+//===============================================================
 //在途 load 队列的空满、收发条件与队头载荷
     always @(*) begin
         ld_fifo_empty = (ld_wr_ptr == ld_rd_ptr);
@@ -196,6 +204,9 @@ module lsu(
         end
     end
 
+//===============================================================
+// 第二级：在途 load 队列与应答（T+1→T+2）
+//===============================================================
 //在途 load 请求队列：load 发射入队，应答出队，rd/size/off 与应答同源出队。
 //ld_occ 是与数据阵列并行维护的占用掩码（绝对下标）：出队先清、入队后置，
 //两者撞同一格（队满且本拍既收又发）时后置生效——新入队的那项才是有效的那个。
@@ -251,6 +262,9 @@ module lsu(
         stall   = ld_use_hit;
     end
 
+//===============================================================
+// 第三级：数据返回与写口（T+2→T+3）
+//===============================================================
 //字节使能数据返回输出：出队拍按 off/size 取字节
     always @(*) begin
         case (ld_size_cur)

@@ -24,7 +24,7 @@
 
 module bju(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [8:0] flag_bus,
 //判定源：与 alu 的输入同源（decoder 本级的寄存器输出）
     input [31:0] r1_data_in, r2_data_in,
     input [3:0] alu_func4_in,
@@ -46,15 +46,19 @@ module bju(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
 //控制位译码（行为块，放本模块最前）：判定延迟拍只关心"本拍是不是冲刷拍"。
     reg flush_w;
-    always @(*) flush_w = flag_bus[3] | flag_bus[2];
+    always @(*) flush_w = flag_bus[7] | flag_bus[6];
 
 //判定组合逻辑用的寄存器
-    reg success_now, br_fail_now, br2_now, br3_now, jalr_fail_now;
+    reg success_now, br_fail_now, br2_now, br3_now;
+    reg jalr_fail_now;
     reg [31:0] jalr_target_now, jp_target_now;
 
+//===============================================================
+// 判定组合（本级生效）
+//===============================================================
 //跳转判定（组合）：br 的两个操作数与 jalr 的基址/偏移都由 decoder 的寄存器给出
 //（r1_data_in/r2_data_in 就是 alu 的输入），故比较与加法落在这一拍，结果在下一拍生效。
 //原设计把这两件事串在【decoder 进本级那一拍】的 D 端上，而那条 D 端的入口是 forw 的输出
@@ -117,6 +121,9 @@ module bju(
         else jp_target_now = 32'd0;
     end
 
+//===============================================================
+// 判定延迟拍（下一拍生效）
+//===============================================================
 //判定延迟拍：判定结果、跳转落点、以及预测表回写要用的索引与限定信号统一寄存一拍。
 //冲刷拍必须清（否则同一笔判定会连拉两拍）；停顿拍不清：操作数被冻住时判定值不变，
 //与旧设计把 success/br_fail 放在 decoder 主块里自保持的行为一致。

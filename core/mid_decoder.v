@@ -22,24 +22,11 @@
 
 module mid_decoder(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [8:0] flag_bus,
     input [31:0] inst_in,
-    input [9:0] func10_in,
-    input [31:0] imm_alu_in,
-    input [11:0] imm12_csr_in,
-    input [4:0] imm5_csr_in,
-    input [4:0] rd_in,
-    input [6:0] opcode_in,
-    input [31:0] offset_jalr0_in,
-    input [31:0] offset_beq0_aux_in,
-    input [31:0] pc_operand_in,
     input [31:0] aux_addr_in,
     input br_pred_taken_in,
     input [31:0] jalr_pred_addr_in,
-    input [6:0] opcode_lsu_in,
-    input [9:0] func10_lsu_in,
-    input [31:0] offset_load0_in,
-    input [31:0] offset_store0_in,
     input [4:0] r1_in,
     input [4:0] r2_in,
     output reg [31:0] inst_out,
@@ -150,14 +137,14 @@ module mid_decoder(
         endcase
     end
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_w = flag_bus[7] | flag_bus[6];
+        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[8];
     end
 
 //指令缓冲级，对齐寄存器组数据访问。

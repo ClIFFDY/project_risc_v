@@ -22,7 +22,8 @@
 
 module csr(
     input clk, rst,
-    input csr_wr_en, stall_d, stall_i, flush, iret, exti, timi, softi, trap, ebreak,
+    input csr_wr_en, iret, exti, timi, softi, trap, ebreak,
+    input [8:0] flag_bus,
     input [11:0] csr_addr,
 //读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
     input [11:0] csr_addr_pre,
@@ -31,21 +32,23 @@ module csr(
     input [1:0] ird_tmr,
     input [3:0] irq_bubble,
     input jalr_fail, br2, br3,
-    output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause, iret_addr1, iret_addr2,
+    output reg [31:0] csr_data_out, isr_addr2, mcause, iret_addr2,
     output reg irq_act, irq_processing
     );
 
     reg irq_en_reg, irq_en_post_reg, eirq_en, tirq_en, sirq_en;
     reg eirq_pend, tirq_pend, sirq_pend, irq_process, global_pend;
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_reg, mcycle_reg, minstret_reg;
+    reg [31:0] iret_addr1;
 
 //输入合流（按"上层不运算"下放至此）：停顿、中断闸门、指令退役
-    reg stall, irq_gate, retire;
+    reg stall, irq_gate, retire, flush_w;
     always @(*) begin
-        stall    = stall_d | stall_i;
+        stall    = flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0];
+        flush_w  = flag_bus[7] | flag_bus[6];
         irq_gate = (ird_tmr != 2'd0);
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
-        retire   = !(flush | stall);
+        retire   = !(flush_w | stall);
     end
 
     always @(posedge clk) begin
@@ -164,7 +167,6 @@ module csr(
             irq_act = 1'b0;
             irq_processing = 1'b0;
             mcause = 32'd0;
-            isr_addr1 = 32'd0;
             isr_addr2 = 32'd0;
             tirq_pend = 1'b0;
             eirq_pend = 1'b0;
@@ -176,7 +178,6 @@ module csr(
             irq_act = irq_en_reg && global_pend && !irq_process && !irq_gate && !(iret | trap | jalr_fail | br2 | br3);
             irq_processing = irq_process;
             mcause = mcause_reg;
-            isr_addr1 = isr_addr_reg1;
             isr_addr2 = isr_addr_reg2;
         end
     end

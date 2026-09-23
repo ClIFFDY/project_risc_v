@@ -17,15 +17,9 @@ module cpu_top(
     wire icache_busy_w, icache_busy_q;
     wire br1, br2, br3;
 
-    (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1, rd_1;
-    wire [4:0] imm5_csr_1;
-    wire [6:0] opcode_1, opcode_lsu_1;
-    wire [9:0] func10_1, func10_lsu_1;
-    wire [31:0] imm_alu_1, pc_operand_1;
-    wire [11:0] imm12_csr_1;
-    wire [31:0] offset_jalr0_1, offset_beq0_aux_1, offset_load0_1, offset_store0_1;
+    (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
-    wire dec, lsu, jal, br_en, pre_jalr;
+    wire jal, br_en, pre_jalr;
     wire br_pred_taken_1;
     wire [31:0] jalr_pred_addr_1;
 
@@ -54,13 +48,13 @@ module cpu_top(
     wire we_5;
 
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
-    wire [4:0] flag_bus;
+    wire [8:0] flag_bus;
     wire [3:0] irq_bubble, alu_func4;
     wire [11:0] csr_addr, csr_addr_pre;
     wire [4:0] rd_back1, rd_back2;
     wire [31:0] jalr_predict_offset;
-    wire [31:0] isr_addr1, isr_addr2, iret_addr1, iret_addr2;
-    wire [31:0] offset_jal1, offset_jal2, offset_beq1, offset_beq2;
+    wire [31:0] isr_addr2, iret_addr2;
+    wire [31:0] offset_jal2, offset_beq2;
     wire [31:0] jalr_target_q2, jp_target;
     wire [5:0] br_pc_idx;
     wire [31:0] r1_data_final, r2_data_final;
@@ -87,9 +81,8 @@ module cpu_top(
     wire dcache_hold_w;
 //RV32M 乘除法单元（与 lsu 流水线同步，独立第三写口）
     wire [31:0] mul_data_final;
-    wire mul_loaded, mul_we, mul_stall;
+    wire mul_loaded, mul_we, mul_stall, stall_m, stall_v;
     wire [4:0] rd_mul;
-    wire ibus_req_valid_i;
 
 //总线层次块
     wire [31:0] bus_addr_out_i, bus_data_out_i;
@@ -129,10 +122,6 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .pc_addr(pc_addr),
-        .offset_jal1(offset_jal1),
-        .offset_beq1(offset_beq1),
-        .isr_addr1(isr_addr1),
-        .isr_ret_addr1(iret_addr1),
         .br1(br1),
         .br2(br2),
         .br3(br3),
@@ -143,7 +132,6 @@ module cpu_top(
         .irq(irq),
         .irq_ret(irq_ret),
         .flag_bus(flag_bus),
-        .req_valid(ibus_req_valid_i),
         .inst_out(icache_inst_w),
         .busy(icache_busy_w),
         .busy_q(icache_busy_q),
@@ -178,26 +166,9 @@ module cpu_top(
         .jalr_pred_addr_out(jalr_pred_addr_1),
         .r1(rs1_1),
         .r2(rs2_1),
-        .rd(rd_1),
-        .func10_dec(func10_1),
-        .func10_lsu(func10_lsu_1),
-        .imm_alu_out(imm_alu_1),
-        .imm12_csr_out(imm12_csr_1),
-        .imm5_csr_out(imm5_csr_1),
-        .offset_jal1(offset_jal1),
         .offset_jal2(offset_jal2),
-        .offset_jalr0(offset_jalr0_1),
-        .offset_beq0_aux(offset_beq0_aux_1),
-        .offset_beq1(offset_beq1),
         .offset_beq2(offset_beq2),
-        .offset_load0(offset_load0_1),
-        .offset_store0(offset_store0_1),
-        .pc_operand(pc_operand_1),
-        .opcode_dec(opcode_1),
-        .opcode_lsu(opcode_lsu_1),
         .aux_addr_out(aux_addr_1),
-        .dec(dec),
-        .lsu(lsu),
         .jal(jal),
         .br_en(br_en),
         .jalr(pre_jalr)
@@ -209,23 +180,14 @@ module cpu_top(
         .flag_bus(flag_bus),
         .inst_in(inst_1),
         .inst_out(inst_2),
-        .func10_in(func10_1),
         .func10_out(func10_2),
-        .imm_alu_in(imm_alu_1),
         .imm_alu_out(imm_alu_2),
-        .imm12_csr_in(imm12_csr_1),
         .imm12_csr_out(imm12_csr_2),
-        .imm5_csr_in(imm5_csr_1),
         .imm5_csr_out(imm5_csr_2),
-        .rd_in(rd_1),
         .rd_out(rd_2),
-        .opcode_in(opcode_1),
         .opcode_out(opcode_2),
-        .offset_jalr0_in(offset_jalr0_1),
         .offset_jalr0_out(offset_jalr0_2),
-        .offset_beq0_aux_in(offset_beq0_aux_1),
         .offset_beq0_aux_out(offset_beq0_aux_2),
-        .pc_operand_in(pc_operand_1),
         .pc_operand_out(pc_operand_2),
         .aux_addr_in(aux_addr_1),
         .aux_addr_out(aux_addr_2),
@@ -233,13 +195,9 @@ module cpu_top(
         .br_pred_taken_out(br_pred_taken_2),
         .jalr_pred_addr_in(jalr_pred_addr_1),
         .jalr_pred_addr_out(jalr_pred_addr_2),
-        .opcode_lsu_in(opcode_lsu_1),
         .opcode_lsu_out(opcode_lsu_2),
-        .func10_lsu_in(func10_lsu_1),
         .func10_lsu_out(func10_lsu_2),
-        .offset_load0_in(offset_load0_1),
         .offset_load0_out(offset_load0_2),
-        .offset_store0_in(offset_store0_1),
         .offset_store0_out(offset_store0_2),
         .r1_in(rs1_1),
         .r1_out(rs1_2),
@@ -334,8 +292,6 @@ module cpu_top(
         .ready_dcache(dcache_ld_ready_w),
         .ready_tim(tim_ready),
         .ready_ext(bus_loaded_in),
-        .bus_hold_in(bus_hold_in),
-        .dcache_hold(dcache_hold_w),
         .bus_addr_out(bus_addr_out_i),
         .bus_data_out(bus_data_out_i),
         .bus_be_out(bus_be_out_i),
@@ -354,10 +310,6 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus),
         .stallf(stallf),
-        .lsu_stall(stall),
-        .icache_busy(icache_busy_q),
-        .bus_hold_in(bus_hold_in),
-        .dcache_hold(dcache_hold_w),
         .opcode(opcode_2),
         .func10(func10_2),
         .rd_in(rd_2),
@@ -371,6 +323,8 @@ module cpu_top(
         .mul_loaded(mul_loaded),
         .mul_we(mul_we),
         .rd_mul(rd_mul),
+        .stall_m(stall_m),
+        .stall_v(stall_v),
         .stall(mul_stall)
     );
 
@@ -527,7 +481,8 @@ module cpu_top(
         .trap(trap),
         .ebreak(ebreak),
         .lsu_stall(stall),
-        .mul_stall(mul_stall),
+        .stall_m(stall_m),
+        .stall_v(stall_v),
         .bus_hold_in(bus_hold_in),
         .dcache_hold(dcache_hold_w),
         .icache_busy(icache_busy_q),
@@ -540,17 +495,14 @@ module cpu_top(
         .csr_data_in(csr_result),
         .pc_addr_in(pc_addr),
         .csr_data_out(csr_data_rd),
-        .isr_addr1(isr_addr1),
         .isr_addr2(isr_addr2),
         .mcause(mcause),
         .irq_act(irq_act),
         .irq_processing(irq_processing),
         .irq(irq),
-        .iret_addr1(iret_addr1),
         .iret_addr2(iret_addr2),
         .irq_bubble(irq_bubble),
-        .flag_bus(flag_bus),
-        .req_valid(ibus_req_valid_i)
+        .flag_bus(flag_bus)
     );
 
 

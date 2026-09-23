@@ -23,7 +23,7 @@
 module controller(
     input clk, rst, jalr_fail, br2, br3, irq_ret, trap, ebreak,
 //d 类停顿的四个源（按"顶层不运算"从 cpu_top 下放至此，本模块内合成 stall_d）
-    input lsu_stall, mul_stall, bus_hold_in, dcache_hold,
+    input lsu_stall, stall_m, stall_v, bus_hold_in, dcache_hold,
     input icache_busy,
     input jal, pre_jalr, btb_hit, br1,
     input csr_wr_en, exti, timi, softi,
@@ -32,11 +32,10 @@ module controller(
     input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
-    output reg [31:0] csr_data_out, isr_addr1, isr_addr2, mcause,
+    output reg [31:0] csr_data_out, isr_addr2, mcause,
     output reg irq_act, irq_processing, irq,
-    output reg [31:0] iret_addr1, iret_addr2,
-    output reg [4:0] flag_bus,
-    output reg req_valid,
+    output reg [31:0] iret_addr2,
+    output reg [8:0] flag_bus,
     output reg [3:0] irq_bubble
     );
 
@@ -48,12 +47,13 @@ module controller(
 
     reg [1:0] ird_tmr;
     reg jalr_pred;
-    wire [31:0] csr_data_out_i, isr_addr1_i, isr_addr2_i, mcause_i;
+    wire [31:0] csr_data_out_i, isr_addr2_i, mcause_i;
     wire irq_act_i, irq_processing_i;
-    wire [31:0] iret_addr1_i, iret_addr2_i;
+    wire [31:0] iret_addr2_i;
 
-//流水线控制位：五条 1bit，收束进 flag_bus，对外不再有统一的 stage / stall
-    reg exec, flush_irq, flush_jump, stall_d, stall_i;
+//流水线控制位：三条冲刷/使能位自成本模块逻辑；停顿位按【逐源】原样进 flag_bus，
+//由各消费端自己取位做或（本模块不再合成统一的 stall）
+    reg exec, flush_irq, flush_jump;
     reg flush_w;
     always @(*) flush_w = flush_irq | flush_jump;
 
@@ -61,24 +61,18 @@ module controller(
 //btb_hit 是 bra_predict 的命中输出，两者都是寄存器输出，此处相与不成环。
     always @(*) jalr_pred = pre_jalr & btb_hit;
 
-//五条控制位各自成网：位与位之间不共享逻辑，综合时互不依赖
+//各控制/停顿位各自成网：位与位之间不共享逻辑，综合时互不依赖
 //前置冲刷 stallf 不进 flag_bus：它是 bju 判定块里的组合派生信号，绕 controller 一圈
 //只是把同一根线进出一次，实测会让它挂上全片广播网、多花 0.45ns（见 path_cl10 vs path_jp10）。
     always @(*) begin
         flush_irq = irq || irq_ret || irq_act || trap;
         flush_jump = jalr_fail || br2 || br3;
-        stall_d = lsu_stall | mul_stall | bus_hold_in | dcache_hold;
-        stall_i = icache_busy;
-        req_valid = !(stall_d || stall_i);
-        flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i};
-//复位期按原 stage = EXE / req_valid = 0 的口径给：只有 exec 抬、其余落下
+        flag_bus = {exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy};
+//复位期按原 stage = EXE / 无停顿 的口径给：只有 exec 抬、其余落下
         if (rst_q) begin
             flush_irq = 1'b0;
             flush_jump = 1'b0;
-            stall_d = 1'b0;
-            stall_i = 1'b0;
-            req_valid = 1'b0;
-            flag_bus = 5'b10000;
+            flag_bus = 9'b100000000;
         end
     end
 
@@ -87,9 +81,7 @@ module controller(
         .clk(clk),
         .rst(rst_q),
         .csr_wr_en(csr_wr_en),
-        .stall_d(stall_d),
-        .stall_i(stall_i),
-        .flush(flush_w),
+        .flag_bus(flag_bus),
         .iret(irq_ret),
         .exti(exti),
         .timi(timi),
@@ -106,24 +98,20 @@ module controller(
         .br2(br2),
         .br3(br3),
         .csr_data_out(csr_data_out_i),
-        .isr_addr1(isr_addr1_i),
         .isr_addr2(isr_addr2_i),
         .mcause(mcause_i),
         .irq_act(irq_act_i),
         .irq_processing(irq_processing_i),
-        .iret_addr1(iret_addr1_i),
         .iret_addr2(iret_addr2_i)
     );
 
     always @(*) begin
         csr_data_out = csr_data_out_i;
-        isr_addr1 = isr_addr1_i;
         isr_addr2 = isr_addr2_i;
         mcause = mcause_i;
         irq_act = irq_act_i;
         irq_processing = irq_processing_i;
         irq = irq_act_i;
-        iret_addr1 = iret_addr1_i;
         iret_addr2 = iret_addr2_i;
     end
 
