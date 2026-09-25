@@ -39,7 +39,7 @@ module cpu_top(
     wire [31:0] result_5, result_back2;
     wire we_5;
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
-    wire [8:0] flag_bus;
+    wire [9:0] flag_bus;
     wire [3:0] irq_bubble, alu_func4;
     wire [11:0] csr_addr, csr_addr_pre;
     wire [4:0] rd_back1, rd_back2;
@@ -52,6 +52,11 @@ module cpu_top(
     wire [31:0] r1_data, r2_data;
     wire [31:0] ld_data_final;
     wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, irq_ret, trap, ebreak;
+    wire exc, exc_bju, jal_misalign_e4, illegal_e4, exc_ldst_misalign, exc_ldst_st;
+    wire [31:0] exc_ldst_addr;
+    wire [31:0] jal_target_e4;
+    wire [3:0] exc_cause;
+    wire [31:0] exc_pc, exc_tval, exc_pc_e5;
 //前置冲刷（早一拍）：由 bju 的组合判定给出，直连 lsu/mulu（不进 flag_bus，见 controller.v）
     wire stallf;
     wire loaded, ld_we, stall, lsu_inflight_w;
@@ -95,6 +100,7 @@ module cpu_top(
         .btb_hit(btb_hit),
         .irq(irq),
         .irq_ret(irq_ret),
+        .trap(trap),
         .flag_bus(flag_bus),
         .jp_target(jp_target),
         .offset_jal2(offset_jal2),
@@ -118,6 +124,7 @@ module cpu_top(
         .jalr_fail(jalr_fail),
         .irq(irq),
         .irq_ret(irq_ret),
+        .trap(trap),
         .flag_bus(flag_bus),
         .inst_out(icache_inst_w),
         .busy(icache_busy_w),
@@ -208,6 +215,7 @@ module cpu_top(
         .offset_jalr0(offset_jalr0_2),
         .offset_beq0_aux(offset_beq0_aux_2),
         .pc_operand_in(pc_operand_2),
+        .inst_in(inst_2),
         .aux_addr_in(aux_addr_2),
         .br_pred_taken_in(br_pred_taken_2),
         .jalr_pred_addr_in(jalr_pred_addr_2),
@@ -215,6 +223,9 @@ module cpu_top(
         .beq_off_q2(beq_off_q2),
         .br_pred_taken_out(br_pred_taken_3),
         .jalr_pred_addr_out(jalr_pred_addr_3),
+        .jal_misalign_out(jal_misalign_e4),
+        .jal_target_out(jal_target_e4),
+        .illegal_out(illegal_e4),
         .irq_ret(irq_ret),
         .trap(trap),
         .ebreak(ebreak),
@@ -248,10 +259,33 @@ module cpu_top(
         .jalr_fail(jalr_fail),
         .jp_target(jp_target),
         .jalr_target_q2(jalr_target_q2),
+        .exc_bju(exc_bju),
+        .exc_pc(exc_pc_e5),
         .br_pc_idx(br_pc_idx),
         .jalr_flag_q(jalr_flag_q),
         .br_pred_taken_q(br_pred_taken_q),
+        .jal_misalign_in(jal_misalign_e4),
+        .jal_target_in(jal_target_e4),
         .stallf(stallf)
+    );
+    trap_unit u_trap_unit (
+        .flag_bus(flag_bus),
+        .exc_bju_in(exc_bju),
+        .exc_pc_e5_in(exc_pc_e5),
+//bju 的 jp_target 在异常拍就是"出错的目标地址"（br 的目标 / jalr 的目标），复用它当 mtval：
+//非对齐拍 exc 压掉 jump 重定向 ⇒ 那一拍这个寄存器只被 mtval 消费，不重复寄存一份。
+        .exc_tval_e5_in(jp_target),
+        .exc_e4_in(trap),
+        .exc_ebreak_e4_in(ebreak),
+        .exc_illegal_e4_in(illegal_e4),
+        .exc_ldst_misalign_e4_in(exc_ldst_misalign),
+        .exc_ldst_st_e4_in(exc_ldst_st),
+        .exc_ldst_addr_e4_in(exc_ldst_addr),
+        .exc_pc_e4_in(aux_addr_3),
+        .exc(exc),
+        .exc_cause(exc_cause),
+        .exc_pc(exc_pc),
+        .exc_tval(exc_tval)
     );
     lsu u_lsu (
         .clk(clk),
@@ -280,6 +314,9 @@ module cpu_top(
         .bus_be_out(bus_be_out_i),
         .bus_we_out(bus_we_out_i),
         .bus_valid_out(bus_valid_out_i),
+        .exc_ldst_misalign(exc_ldst_misalign),
+        .exc_ldst_st(exc_ldst_st),
+        .exc_ldst_addr(exc_ldst_addr),
         .ld_data_out(ld_data_final),
         .loaded(loaded),
         .ld_we(ld_we),
@@ -388,6 +425,7 @@ module cpu_top(
         .rd_alu(rd_5),
         .rd_data_alu(result_5),
         .we_alu(we_5),
+        .exc_kill(exc_bju),
         .rd_ld(rd_load),
         .ld_data_ld(ld_data_final),
         .we_ld(ld_we),
@@ -452,7 +490,11 @@ module cpu_top(
         .br1(br1),
         .irq_ret(irq_ret),
         .trap(trap),
-        .ebreak(ebreak),
+        .exc(exc),
+        .exc_bju(exc_bju),
+        .exc_cause(exc_cause),
+        .exc_pc(exc_pc),
+        .exc_tval(exc_tval),
         .lsu_stall(stall),
         .stall_m(stall_m),
         .stall_v(stall_v),

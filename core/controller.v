@@ -21,7 +21,7 @@
 
 
 module controller(
-    input clk, rst, jalr_fail, br2, br3, irq_ret, trap, ebreak,
+    input clk, rst, jalr_fail, br2, br3, irq_ret, trap, exc, exc_bju,
 //d 类停顿的四个源（按"顶层不运算"从 cpu_top 下放至此，本模块内合成 stall_d）
     input lsu_stall, stall_m, stall_v, bus_hold_in, dcache_hold,
     input icache_busy, lsu_inflight,
@@ -32,10 +32,12 @@ module controller(
     input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
+    input [3:0] exc_cause,
+    input [31:0] exc_pc, exc_tval,
     output reg [31:0] csr_data_out, isr_addr2, mcause,
     output reg irq_act, irq_processing, irq,
     output reg [31:0] iret_addr2,
-    output reg [8:0] flag_bus,
+    output reg [9:0] flag_bus,
     output reg [3:0] irq_bubble
     );
 
@@ -55,7 +57,7 @@ module controller(
 //由各消费端自己取位做或（本模块不再合成统一的 stall）
     reg exec, flush_irq, flush_jump;
     reg flush_w;
-    always @(*) flush_w = flush_irq | flush_jump;
+    always @(*) flush_w = flush_irq | flush_jump | exc;
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）：pre_jalr 是 pre_decoder 的译码输出，
 //btb_hit 是 bra_predict 的命中输出，两者都是寄存器输出，此处相与不成环。
@@ -65,14 +67,14 @@ module controller(
 //前置冲刷 stallf 不进 flag_bus：它是 bju 判定块里的组合派生信号，绕 controller 一圈
 //只是把同一根线进出一次，实测会让它挂上全片广播网、多花 0.45ns（见 path_cl10 vs path_jp10）。
     always @(*) begin
-        flush_irq = irq || irq_ret || irq_act || trap;
+        flush_irq = irq || irq_ret || irq_act;
         flush_jump = jalr_fail || br2 || br3;
-        flag_bus = {exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy};
+        flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy};
 //复位期按原 stage = EXE / 无停顿 的口径给：只有 exec 抬、其余落下
         if (rst_q) begin
             flush_irq = 1'b0;
             flush_jump = 1'b0;
-            flag_bus = 9'b100000000;
+            flag_bus = 10'b0100000000;
         end
     end
 
@@ -90,7 +92,11 @@ module controller(
         .timi(timi),
         .softi(softi),
         .trap(trap),
-        .ebreak(ebreak),
+        .exc(exc),
+        .exc_bju(exc_bju),
+        .exc_cause(exc_cause),
+        .exc_pc(exc_pc),
+        .exc_tval(exc_tval),
         .csr_addr(csr_addr),
         .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_data_in),

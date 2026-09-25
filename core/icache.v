@@ -33,8 +33,8 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret,
-    input [8:0] flag_bus,
+    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret, trap,
+    input [9:0] flag_bus,
 //回填应答（接核内 itcm）
     input mem_valid,
     input [31:0] mem_data,
@@ -56,12 +56,12 @@ module icache(
 
     localparam BOOT_LINES = 7'd127;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
+//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
 //控制位译码（行为块，放本模块最前）：本模块的取指推进由六条 stall 位合出来的 req_valid
 //与回填状态自己把关，不用流水线使能，故只取冲刷位与 stall 位。
     reg flush_w, req_valid;
     always @(*) begin
-        flush_w   = flag_bus[7] | flag_bus[6];
+        flush_w   = flag_bus[9] | flag_bus[7] | flag_bus[6];
         req_valid = ~(flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
     end
 
@@ -195,7 +195,7 @@ module icache(
 //而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
         if (rst_q)                                  inst_out <= 32'd0;
-        else if ((jalr_fail | br2 | br3 | irq | irq_ret) | ((jalr | br1 | jal) && req_valid)) inst_out <= 32'd0;
+        else if ((jalr_fail | br2 | br3 | irq | irq_ret | trap | flag_bus[9]) | ((jalr | br1 | jal) && req_valid)) inst_out <= 32'd0;
         else if (rd_en)                           inst_out <= iram[rd_addr];
     end
 

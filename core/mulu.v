@@ -45,7 +45,7 @@
 
 module mulu(
     input clk, rst,
-    input [8:0] flag_bus,
+    input [9:0] flag_bus,
 //前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
 //而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
 //推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
@@ -76,14 +76,14 @@ module mulu(
     localparam OPCODE_OP = 7'b0110011;
 
 //控制位译码（与流水级无关，放本模块最前）
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
+//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取两条冲刷位。
 //本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：m_push、除法 FSM 的作废、
 //d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
-    always @(*) flush_w = flag_bus[7] | flag_bus[6] | stallf;
+    always @(*) flush_w = flag_bus[9] | flag_bus[7] | flag_bus[6] | stallf;
 
 //冻结信号合流：总线保持（外部 + dcache 延拓拍）、取指缺失、lsu 的 load-use（排掉自己那两位）
     reg pipe_stall, bus_hold;

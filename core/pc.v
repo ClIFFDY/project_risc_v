@@ -22,9 +22,9 @@
 
 module pc(
     input clk, rst,
-    input br1, irq, irq_ret,
+    input br1, irq, irq_ret, trap,
     input jal, pre_jalr, btb_hit,
-    input [8:0] flag_bus,
+    input [9:0] flag_bus,
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
     output reg [31:0] pc_addr, aux_addr
@@ -36,13 +36,15 @@ module pc(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_b, stall_m, stall_v, stall_l, stall_i}
+//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
     reg exec, flush_w, stall_w, flush_jump_w;
+    reg exc_w;
     always @(*) begin
-        flush_jump_w = flag_bus[6];
-        flush_w      = flag_bus[7] | flag_bus[6];
+        flush_jump_w = flag_bus[6] & ~flag_bus[9];
+        exc_w        = flag_bus[9];
+        flush_w      = flag_bus[9] | flag_bus[7] | flag_bus[6];
         stall_w      = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
         exec         = flag_bus[8];
     end
@@ -86,7 +88,7 @@ module pc(
                     aux_addr <= jp_target;
                 end
 //同上：icache 的 irq/irq_ret 支路也拿掉了，落点同样不能再 +4
-                else if (irq) begin
+                else if (irq | trap | exc_w) begin
                     pc_addr <= isr_addr2;
                     aux_addr <= isr_addr2;
                 end
