@@ -22,24 +22,30 @@
 
 module regfile(
     input clk, rst,
-    input [4:0] flag_bus,
+    input [9:0] flag_bus,
     input [4:0] r1, r2,
     input [4:0] rd_alu,
     input [31:0] rd_data_alu,
     input we_alu,
+    input exc_kill,
     input [4:0] rd_ld,
     input [31:0] ld_data_ld,
     input we_ld,
     input [4:0] rd_mul,
     input [31:0] mul_data_mul,
     input we_mul,
-    input dec, lsu, mul,
-    output reg [31:0] r1_data_dec, r2_data_dec, r1_data_lsu, r2_data_lsu,
-    output reg [31:0] r1_data_mul, r2_data_mul
+//读数据：合并成一对（原来是 dec/lsu/mul 三份按限定分开填）。按消费者复制交给
+//max_fanout 在布局阶段做 —— 比手工拆三份更省逻辑，复制点也更贴实际负载。
+    output reg [31:0] r1_data, r2_data
     );
 
-//同步读写型通用寄存器组，节省lut资源
-    (* ram_style = "block" *) reg [31:0] regs [0:31];
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
+    reg [31:0] regs [0:31];
 
     reg [4:0] r1_q, r2_q;
     reg am_we;
@@ -65,60 +71,36 @@ module regfile(
         end
     endfunction
 
-//flag_bus = {exec, flush_irq, flush_jump, stall_d, stall_i}
+//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
 //控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
 //故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[3] | flag_bus[2];
-        stall_w = (flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[4];
+        flush_w = flag_bus[9] | flag_bus[7] | flag_bus[6];
+        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[8];
     end
 
-//读数据进行双写口(alu/ld)旁路仲裁并输出
+//读数据进行双写口(alu/ld)旁路仲裁并输出。
+//原来的 dec/lsu/mul 三个限定只用来决定"填哪一份"，合并成一对后不再需要：
+//没有限定置位时算出来的值无人消费（JAL 之类），驱出去无害。
     always @(posedge clk) begin
-        if (rst) begin
-            r1_data_dec <= 32'd0;
-            r2_data_dec <= 32'd0;
-            r1_data_lsu <= 32'd0;
-            r2_data_lsu <= 32'd0;
-            r1_data_mul <= 32'd0;
-            r2_data_mul <= 32'd0;
+        if (rst_q) begin
+            r1_data <= 32'd0;
+            r2_data <= 32'd0;
             r1_q <= 5'd0;
             r2_q <= 5'd0;
         end
         else if (exec) begin
             if (stall_w) begin
-                r1_data_dec <= bypass(r1_q);
-                r2_data_dec <= bypass(r2_q);
-                r1_data_lsu <= bypass(r1_q);
-                r2_data_lsu <= bypass(r2_q);
-                r1_data_mul <= bypass(r1_q);
-                r2_data_mul <= bypass(r2_q);
+                r1_data <= bypass(r1_q);
+                r2_data <= bypass(r2_q);
             end
             else begin
-                r1_data_dec <= 32'd0;
-                r2_data_dec <= 32'd0;
-                r1_data_lsu <= 32'd0;
-                r2_data_lsu <= 32'd0;
-                r1_data_mul <= 32'd0;
-                r2_data_mul <= 32'd0;
+                r1_data <= bypass(r1);
+                r2_data <= bypass(r2);
                 r1_q <= r1;
                 r2_q <= r2;
-                if (dec) begin
-                    r1_data_dec <= bypass(r1);
-                    r2_data_dec <= bypass(r2);
-                end
-                else if (lsu) begin
-                    r1_data_lsu <= bypass(r1);
-                    r2_data_lsu <= bypass(r2);
-                end
-//mulu 那一份：与 dec/lsu 是【独立通路】，M 指令与普通 ALU 同属 OPCODE_OP（dec 也置 1），
-//所以这里用独立的 if 而不是 else if —— 两份各填各的，各自只喂一个消费单元。
-                if (mul) begin
-                    r1_data_mul <= bypass(r1);
-                    r2_data_mul <= bypass(r2);
-                end
             end
         end
     end
@@ -136,7 +118,7 @@ module regfile(
 
 //写口仲裁：alu > mul > ld
     always @(*) begin
-        if (we_alu && rd_alu != 5'd0) begin
+        if (we_alu && rd_alu != 5'd0 && ~exc_kill) begin
             am_we = 1'b1;
             am_rd = rd_alu;
             am_data = rd_data_alu;
