@@ -114,7 +114,7 @@ module lsu(
     reg s3_done, s3_ok, s2_move, s2_ok, s2_put_go;
     reg ld_out, blank_bus, s2_put, new_put;
     reg ls_use_hit, ls_waw_hit, miss;
-    reg [31:0] st_addr, st_wdata, cur_addr;
+    reg [31:0] addr_sum, st_wdata, cur_addr;
     reg [3:0]  st_be;
     reg [31:0] byte_addr;
     reg exc_ldst_misalign_now, size_bad_now;
@@ -122,12 +122,16 @@ module lsu(
 //===============================================================
 // 组合：入级/推进 + 冒险（只看级2）+ 入口
 //===============================================================
-//store 的字节使能与数据（按地址低位对齐后随请求一起摆上总线）
+//访存地址 = 本条指令的 (rs1 + 偏移)，以及 store 的字节使能与数据。
+//★ 上游 mid_decoder 的 offset_load0_out 与 offset_store0_out 接的是【同一个信号】
+//（都是 imm_alu_out），所以这一个加法器同时服务 load 与 store —— 原来把 load 那一支
+//另外算了一遍、还在结果上摆 is_st 的 mux，纯属重复（最差路末端那个 LUT3 就是它）。
+//offset_load0 端口因此不再使用（保留端口不动接口；综合会把那条无负载的线剪掉）。
     always @(*) begin
-        st_addr = r1_data_final + offset_store0;
+        addr_sum = r1_data_final + offset_store0;
         case (func10[2:0])
-            3'b000: begin st_be = 4'b0001 << st_addr[1:0]; st_wdata = {24'd0, r2_data_final[7:0]} << (8 * st_addr[1:0]); end
-            3'b001: begin st_be = 4'b0011 << (2 * st_addr[1]); st_wdata = {16'd0, r2_data_final[15:0]} << (16 * st_addr[1]); end
+            3'b000: begin st_be = 4'b0001 << addr_sum[1:0]; st_wdata = {24'd0, r2_data_final[7:0]} << (8 * addr_sum[1:0]); end
+            3'b001: begin st_be = 4'b0011 << (2 * addr_sum[1]); st_wdata = {16'd0, r2_data_final[15:0]} << (16 * addr_sum[1]); end
             3'b010: begin st_be = 4'b1111; st_wdata = r2_data_final; end
             default: begin st_be = 4'd0; st_wdata = 32'd0; end
         endcase
@@ -136,7 +140,7 @@ module lsu(
 //本条摆上总线要用的载荷
     always @(*) begin
         is_st    = (opcode == OPCODE_STORE);
-        cur_addr = is_st ? (st_addr >> 2) : ((r1_data_final + offset_load0) >> 2);
+        cur_addr = addr_sum >> 2;
     end
 
 //入口两道合法性：①非对齐（按访问宽度）②【宽度本身非法】（ld/sd 之类在 RV32 非法）。
@@ -144,7 +148,7 @@ module lsu(
 //否则它会先上总线（非法宽度的 store 以 be=0000 上线、非法宽度的 load 读回垃圾还写回 rd），
 //而 lsu 两级车厢在冲刷拍是【不清】的。★ 这张白名单必须与 post_decoder 的白名单一致。
     always @(*) begin
-        byte_addr = is_st ? st_addr : (r1_data_final + offset_load0);
+        byte_addr = addr_sum;
         exc_ldst_misalign_now = 1'b0;
         size_bad_now = 1'b0;
         if (mem_op) begin
@@ -255,7 +259,7 @@ module lsu(
             end
             if (new_in && new_go) begin                                 // 新指令进级2（miss 当拍也进；没摆就留着）
                 s2_v <= 1'b1; s2_kind <= is_st; s2_rd <= rd_in; s2_size <= func10[2:0];
-                s2_off <= is_st ? 2'd0 : (r1_data_final + offset_load0);
+                s2_off <= is_st ? 2'd0 : addr_sum[1:0];
                 s2_addr <= cur_addr; s2_wdat <= st_wdata; s2_be <= st_be;
                 s2_sent <= new_put;                                     // 没摆出去就保持 0，等不 blank 了再补摆
             end
