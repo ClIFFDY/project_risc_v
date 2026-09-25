@@ -40,7 +40,7 @@ module icache(
     input [31:0] mem_data,
 
 //取指输出
-    output reg [31:0] inst_out,
+    output reg [31:0] inst_out, inst_next,
     output reg busy, busy_q,
 //回填请求（接核内 itcm）
     output reg mem_req, mem_we,
@@ -78,7 +78,7 @@ module icache(
     (* max_fanout = 32 *) reg [4:0] word;
     reg [2:0] hit_way;
     reg [1:0] hit_sel;
-    (* max_fanout = 32 *) reg [13:0] rd_addr;
+    (* max_fanout = 32 *) reg [13:0] rd_addr, rd_addr1;
     reg rd_en, line_match;
     reg deliver_ok;
     reg [31:0] miss_addr_q;
@@ -96,6 +96,8 @@ module icache(
     reg fill_end;
     reg [4:0] miss_word;
     reg [4:0] fill_cnt;
+    reg [13:0] fill_waddr, portb_addr;
+    reg fill_we;
     reg [31:0] fill_addr;
     reg [18:0] fill_tag;
     reg [6:0] fill_idx;
@@ -169,6 +171,13 @@ module icache(
         end
     end
 
+//lane1 的取指地址：与 lane0 同 way、同组，只 +1 个字。成对只在同一 icache 行内成立，
+//所以 lane1 不需要自己那套 tag/命中判定，也不用第二个 hit_sel。
+//word==31 时 +1 回绕到本行首字，那时本就不成对，这个口读出来的值没有消费者。
+    always @(*) begin
+        rd_addr1 = {hit_sel, idx, word + 5'd1};
+    end
+
 //===============================================================
 // 第 1 级：缺失锁延拓与取指输出（含 jalr 类 NOP 门）
 //===============================================================
@@ -200,12 +209,28 @@ module icache(
     end
 
 //===============================================================
-// 自举与回填状态机（iram 写口）
+// 自举与回填状态机（iram 口 B：回填写 / lane1 取指读 二选一）
 //===============================================================
-//回填：一拍收一个字直接写进 iram（BRAM 单写口，一拍只写一个地址）
+//回填一拍收一个字直接写进 iram；不写的那拍拿同一个口去读 lane1 的那个字。
+//写与读在时序上【不共拍】（写 ⟹ stage==1 && !fill_end ⟹ busy ⟹ 取指停），所以两个来源共用一个口
+//是行为等价的。
+//★ BRAM 的一个口只有【一根地址总线】，读写是这根线的时分复用，所以两个来源的地址必须先显式合成
+//一根（portb_addr）。若直接写成 if (we) iram[写地址] <= d; else q <= iram[读地址];，综合器会数出
+//三个地址、判 "Infeasible attribute ram_style"、把整个 48KB 阵列掉进 LUTRAM（实测 RAMB 16→0、
+//LUTRAM 破万）；那条告警不中断流程，只能靠报告的 BRAM 数或单独综合才看得出来。
+    always @(*) begin
+        fill_waddr = {fill_way, fill_idx, fill_cnt};
+        fill_we    = (boot || stage == 1'b1) && !fill_end && mem_valid;
+        if (fill_we) portb_addr = fill_waddr;
+        else         portb_addr = rd_addr1;
+    end
+
     always @(posedge clk) begin
-        if ((boot || stage == 1'b1) && !fill_end && mem_valid) begin
-            iram[{fill_way, fill_idx, fill_cnt}] <= mem_data;
+        if (fill_we) begin
+            iram[portb_addr] <= mem_data;
+        end
+        else begin
+            inst_next <= iram[portb_addr];
         end
     end
 
