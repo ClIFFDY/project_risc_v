@@ -428,11 +428,11 @@ s0  pc ──► s1 icache(2 读口) ──► s2 pre_decoder ──► s3 mid_d
 
 ### 3.4 模块级改动清单
 
-**新增（3 个文件）**
+**新增（2 个文件）** —— ★ 原表里的 `pair_form.v` 已按"模块按级划分"的规则**并入 `pre_decoder.v`**（E2），
+不再单独成文件，见 §11。剩下的两个是真正"本级没有归属"的新单元：
 
 | 模块 | 职责 | 位置 |
 | --- | --- | --- |
-| `core/pair_form.v` | 成对判据（R1~R5）→ 输出 `lane1_v`；同时生成 lane1 的 `aux_addr1 = aux_addr0 + 4`；维护写通道回压引起的抑制 | s1/s2 之间（纯组合 + 一个 32 位自增寄存） |
 | `core/alu2.v` | lane1 的 ALU。**可以直接例化第二份 `alu.v`**（`jal_flag/jalr_flag/cs_wr_en` 接常量 0，例化处不得有表达式 ⇒ 允许常量） | s4 |
 | `core/wb_portb.v` | 口 B 写通道：`lane1 优先 > 上拍被让位的 load 写 > 本拍 load 写`；2 深队列；满 ⇒ 回压位 | s5 → regfile 口 B |
 
@@ -880,3 +880,41 @@ LUTRAM**（实测 `RAMB36 16 → 0`、RAMD 位点 `104 → 17,000`、`LUT 976 �
    全片报告都验不出东西。阶段 2（`pair_form`）之所以值得先做，是因为它的产物
    （动态成对率）**在仿真里就能量到**；而 `wb_portb` / 携带组 / `forw` / `alu2` / `regfile`
    读口这些**必须与"打开成对"合并成一个阶段**，否则同样是假绿。
+
+---
+
+## 11. 模块归位（2026-09-26）：`trap_unit` / `pair_form` 并回现有模块
+
+**起因**：这两个模块是**没有自己流水级**的纯组合单元（`trap_unit` 的输入全是 E4/E5 的寄存器源、
+生效在 E5 拍；`pair_form` 在 E1→E2 边界），违反了"多级模块按级划分"（参照 `lsu`/`mulu`）。
+按规则，它们应当归到**所服务的那一级的模块**里，而不是各自成文件。
+
+| 原模块 | 并入 | 理由 | 结果 |
+| --- | --- | --- | --- |
+| `core/pair_form.v` | **`pre_decoder.v`**（E2）| 判据就是"把 icache 交来的两个字变成 s2 字段"的输入侧判断；§3.4 本来就让 pre_decoder 携带 lane1 的字段 | 三档输出改成 pre_decoder 的**内部 reg**；顶层三根本来悬空的 wire 消失 |
+| `core/trap_unit.v` | **`controller.v`**（全片控制，内含 `csr`）| 它就是"第三类冲刷源"的产生处，与 `flush_irq`/`flush_jump` 并列；并进来后 `exc`/`exc_cause`/`exc_pc`/`exc_tval` **不必再穿顶层**（csr 就在本模块里）| `csr` 例化处**一行未改**（同名，只是从端口变内部）；controller 端口 −4、顶层 wire −4 |
+
+**净结果**：我新增的文件 **2 → 0**；`cpu_top` 少 2 个例化、少 **7 根 wire**。级位表恢复干净：
+
+| 级 | 模块 |
+| --- | --- |
+| E1 | `icache`（含 `inst_next` / `pair_fetch_ok`）|
+| E2 | `pre_decoder`（**含成对判据**）|
+| E3 | `mid_decoder`；`forw`（组合）|
+| E4 | `post_decoder`、`alu`、`bju`（E5 生效）、`lsu`（E4 发 / E5 写回）、`mulu` |
+| E5 | `wb_reg`；`regfile` 写口 |
+| 全片 | `controller`（`flag_bus` + **异常仲裁** + `csr`）|
+
+**验证（纯搬家，要求逐位不变 —— 全部通过）**：
+
+| 仪器 | 结果 |
+| --- | --- |
+| `run_reg.sh` | **8/8**，`@cyc` 与搬家前逐位相同（`gpio_irq @97`、`i2c_irq @7070`）|
+| CoreMark ITER=1 | 搬家前/后 `Total ticks` **都是 380,505**、CRC `e714`/`1fd7`/`8e3a`、479 字节 |
+| 成对判据统计 | 与搬家前**逐个计数完全相同**（`n_cyc=402506` / `n_inst=359806` / `n_pair=65364`，含四桶归因）|
+| a100t 10ns | WNS **+0.550** / WHS +0.048（搬家前 +0.518；差 0.032ns 在布局噪声带内）|
+
+**⚠️ 记录一个操作坑（第二次踩了）**：`run_reg.sh` 会把 `tools/hex/ins.hex` 覆盖成微测程序
+⇒ **跑 CoreMark 之前必须 `build_coremark_v1.sh 1 -O2` 重建**（判据：**3,403 行**、首条 `00808117`）。
+本次就是因为搬家后先跑了回归、又直接跑 CoreMark 仿真，得到"收到 0 字节 / 最后字符 @cyc=0"的
+**假失败**（程序其实没跑）—— 这类"看着像 RTL 坏了、其实是仪器装错了"的情况，要先核 hex。

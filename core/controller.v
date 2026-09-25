@@ -21,7 +21,12 @@
 
 
 module controller(
-    input clk, rst, jalr_fail, br2, br3, irq_ret, trap, exc, exc_bju,
+    input clk, rst, jalr_fail, br2, br3, irq_ret, trap, exc_bju,
+//异常判据源：E4（post_decoder 的 ecall/ebreak/非法指令、lsu 的访存非对齐 + 出错地址 + 地址载荷）
+//与 E5（bju 的指令地址非对齐 + 它的落点寄存器兼任 mtval）。
+    input ebreak, illegal_e4, exc_ldst_misalign, exc_ldst_st,
+    input [31:0] exc_ldst_addr, aux_addr_3,
+    input [31:0] exc_pc_e5, jp_target,
 //d 类停顿的四个源（按"顶层不运算"从 cpu_top 下放至此，本模块内合成 stall_d）
     input lsu_stall, stall_m, stall_v, bus_hold_in, dcache_hold,
     input icache_busy, lsu_inflight,
@@ -32,14 +37,19 @@ module controller(
     input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
-    input [3:0] exc_cause,
-    input [31:0] exc_pc, exc_tval,
     output reg [31:0] csr_data_out, isr_addr2, mcause,
     output reg irq_act, irq_processing, irq,
     output reg [31:0] iret_addr2,
     output reg [9:0] flag_bus,
     output reg [3:0] irq_bubble
     );
+
+    localparam CAUSE_MISALIGN_INST  = 4'd0;
+    localparam CAUSE_ILLEGAL_INST   = 4'd2;
+    localparam CAUSE_LOAD_MISALIGN  = 4'd4;
+    localparam CAUSE_STORE_MISALIGN = 4'd6;
+    localparam CAUSE_BREAKPOINT     = 4'd3;
+    localparam CAUSE_ECALL_M        = 4'd11;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -49,13 +59,16 @@ module controller(
 
     reg [1:0] ird_tmr;
     reg jalr_pred;
+    reg flush_older, exc_e4_gated;
+    reg [3:0] exc_cause;
+    reg [31:0] exc_pc, exc_tval, exc_pc_c;
     wire [31:0] csr_data_out_i, isr_addr2_i, mcause_i;
     wire irq_act_i, irq_processing_i;
     wire [31:0] iret_addr2_i;
 
 //流水线控制位：三条冲刷/使能位自成本模块逻辑；停顿位按【逐源】原样进 flag_bus，
 //由各消费端自己取位做或（本模块不再合成统一的 stall）
-    reg exec, flush_irq, flush_jump;
+    reg exec, flush_irq, flush_jump, exc;
     reg flush_w;
     always @(*) flush_w = flush_irq | flush_jump | exc;
 
@@ -79,6 +92,49 @@ module controller(
     end
 
 
+
+//异常仲裁（原 core/trap_unit.v 并入本模块 —— 它本来就是"第三类冲刷源"的产生处，与
+//flush_irq / flush_jump 并列；并进来之后 exc / exc_cause / exc_pc / exc_tval 不必再穿顶层，
+//csr 就在本模块里）。优先级 E5 > E4：同拍多源时程序序最老者胜；E4 那一组要被更老的冲刷挡掉。
+    always @(*) flush_older = flag_bus[7] | flag_bus[6];
+
+    always @(*) exc_e4_gated = (trap | illegal_e4 | exc_ldst_misalign) & ~flush_older;
+
+    always @(*) begin
+        exc       = exc_bju | exc_e4_gated;
+        exc_cause = 4'd0;
+        exc_pc_c  = 32'd0;
+        exc_tval  = 32'd0;
+        if (exc_bju) begin
+            exc_cause = CAUSE_MISALIGN_INST;
+            exc_pc_c  = exc_pc_e5;
+//规范口径：指令地址非对齐的 mtval = 出错的【目标地址】。三路都从 bju 的落点寄存器取：
+//br 的目标 / jalr 的目标本来就在那个寄存器里；jal 的目标不在流水里，由 post_decoder
+//就地解 immJ 算好后单铺一路载荷送进来，同样落在这个寄存器。
+            exc_tval  = jp_target;
+        end
+        else if (exc_e4_gated) begin
+            if (illegal_e4) begin
+                exc_cause = CAUSE_ILLEGAL_INST;
+            end
+            else if (exc_ldst_misalign) begin
+                if (exc_ldst_st) begin
+                    exc_cause = CAUSE_STORE_MISALIGN;
+                end
+                else begin
+                    exc_cause = CAUSE_LOAD_MISALIGN;
+                end
+//规范口径：访存地址非对齐的 mtval = 出错的【地址】（不是指令字）
+                exc_tval  = exc_ldst_addr;
+            end
+            else begin
+                exc_cause = ebreak ? CAUSE_BREAKPOINT : CAUSE_ECALL_M;
+            end
+            exc_pc_c  = aux_addr_3;
+        end
+    end
+
+    always @(*) exc_pc = exc_pc_c - 32'd4;
 
 //csr异常/中断寄存器
     csr u_csr (

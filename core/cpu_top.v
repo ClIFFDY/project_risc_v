@@ -14,7 +14,6 @@ module cpu_top(
     wire icache_busy_w, icache_busy_q;
     wire [31:0] icache_inst_next_w;
     wire icache_pair_fetch_ok_w;
-    wire pair_class_ok_w, pair_raw_ok_w, pair_lane1_v_w;
     wire br1, br2, br3;
     (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
@@ -55,11 +54,9 @@ module cpu_top(
     wire [31:0] r1_data, r2_data;
     wire [31:0] ld_data_final;
     wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, irq_ret, trap, ebreak;
-    wire exc, exc_bju, jal_misalign_e4, illegal_e4, exc_ldst_misalign, exc_ldst_st;
-    wire [31:0] exc_ldst_addr;
+    wire exc_bju, jal_misalign_e4, illegal_e4, exc_ldst_misalign, exc_ldst_st;
+    wire [31:0] exc_ldst_addr, exc_pc_e5;
     wire [31:0] jal_target_e4;
-    wire [3:0] exc_cause;
-    wire [31:0] exc_pc, exc_tval, exc_pc_e5;
 //前置冲刷（早一拍）：由 bju 的组合判定给出，直连 lsu/mulu（不进 flag_bus，见 controller.v）
     wire stallf;
     wire loaded, ld_we, stall, lsu_inflight_w;
@@ -142,14 +139,6 @@ module cpu_top(
         .mem_valid(icache_mem_valid_w),
         .mem_data(icache_mem_data_w)
     );
-    pair_form u_pair_form (
-        .inst0_in(icache_inst_w),
-        .inst1_in(icache_inst_next_w),
-        .pair_fetch_ok_in(icache_pair_fetch_ok_w),
-        .pair_class_ok(pair_class_ok_w),
-        .pair_raw_ok(pair_raw_ok_w),
-        .pair_lane1_v(pair_lane1_v_w)
-    );
     itcm u_itcm (
         .clk(clk),
         .rst(rst),
@@ -163,6 +152,8 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus),
         .inst_in(icache_inst_w),
+        .inst1_in(icache_inst_next_w),
+        .pair_fetch_ok_in(icache_pair_fetch_ok_w),
         .aux_addr_in(aux_addr_0),
         .inst_out(inst_1),
         .br1_in(br1),
@@ -280,25 +271,6 @@ module cpu_top(
         .jal_misalign_in(jal_misalign_e4),
         .jal_target_in(jal_target_e4),
         .stallf(stallf)
-    );
-    trap_unit u_trap_unit (
-        .flag_bus(flag_bus),
-        .exc_bju_in(exc_bju),
-        .exc_pc_e5_in(exc_pc_e5),
-//bju 的 jp_target 在异常拍就是"出错的目标地址"（br 的目标 / jalr 的目标），复用它当 mtval：
-//非对齐拍 exc 压掉 jump 重定向 ⇒ 那一拍这个寄存器只被 mtval 消费，不重复寄存一份。
-        .exc_tval_e5_in(jp_target),
-        .exc_e4_in(trap),
-        .exc_ebreak_e4_in(ebreak),
-        .exc_illegal_e4_in(illegal_e4),
-        .exc_ldst_misalign_e4_in(exc_ldst_misalign),
-        .exc_ldst_st_e4_in(exc_ldst_st),
-        .exc_ldst_addr_e4_in(exc_ldst_addr),
-        .exc_pc_e4_in(aux_addr_3),
-        .exc(exc),
-        .exc_cause(exc_cause),
-        .exc_pc(exc_pc),
-        .exc_tval(exc_tval)
     );
     lsu u_lsu (
         .clk(clk),
@@ -503,11 +475,15 @@ module cpu_top(
         .br1(br1),
         .irq_ret(irq_ret),
         .trap(trap),
-        .exc(exc),
+        .ebreak(ebreak),
+        .illegal_e4(illegal_e4),
+        .exc_ldst_misalign(exc_ldst_misalign),
+        .exc_ldst_st(exc_ldst_st),
+        .exc_ldst_addr(exc_ldst_addr),
+        .aux_addr_3(aux_addr_3),
+        .exc_pc_e5(exc_pc_e5),
+        .jp_target(jp_target),
         .exc_bju(exc_bju),
-        .exc_cause(exc_cause),
-        .exc_pc(exc_pc),
-        .exc_tval(exc_tval),
         .lsu_stall(stall),
         .stall_m(stall_m),
         .stall_v(stall_v),

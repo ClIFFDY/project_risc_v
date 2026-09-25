@@ -23,7 +23,8 @@
 module pre_decoder(
     input clk, rst,
     input [9:0] flag_bus,
-    input [31:0] inst_in,
+    input [31:0] inst_in, inst1_in,
+    input pair_fetch_ok_in,
     input [31:0] aux_addr_in,
     input br1_in,
     input [31:0] jalr_pred_addr_in,
@@ -46,6 +47,7 @@ module pre_decoder(
 //RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;
+    localparam OPCODE_LUI    = 7'b0110111;
     localparam OPCODE_JAL    = 7'b1101111;
     localparam OPCODE_JALR   = 7'b1100111;
     localparam OPCODE_BRANCH = 7'b1100011;
@@ -55,6 +57,8 @@ module pre_decoder(
     localparam OPCODE_SYSTEM = 7'b1110011;
 
     reg [31:0] inst_effective;
+    reg lane0_ok, lane1_ok, raw_in_pair;
+    reg pair_class_ok, pair_raw_ok, pair_lane1_v;
 
 //提取不同类型指令立即数的函数块
     function [31:0] immB;
@@ -79,6 +83,55 @@ module pre_decoder(
 
 //指令来源：icache 为唯一取指源
     always @(*) inst_effective = inst_in;
+
+//成对判据（2-wide 阶段 2，原 core/pair_form.v 并入本级 —— 它本来就是 E2 输入侧的判断）：
+//由 icache 同拍交付的两个字判 lane1 能不能与 lane0 同拍进流水。本阶段只做判据、不接消费者；
+//打开成对时 lane1_v 随本级的寄存器一起跨拍携带。三档输出便于把收益缺口归因到具体规则：
+//pair_fetch_ok（在 icache）→ pair_class_ok（类别）→ pair_raw_ok（对内 RAW）→ pair_lane1_v
+//类别口径：lane0 允许 ALU 类（不含 M）与访存，lane1 只允许单周期 ALU 类（含移位、不含
+//M/访存/分支/CSR）。★ 排除 M 是 2-wide 的地基之一：M 永远只在单发包里 ⇒ mulu 与 alu 的
+//"写口永不同拍"、"除法冻全流水"两条既有语义一行不用重推。M 的判据（bit31:25 == 0000001）
+//与 mulu 同口径。★ 全零指令字（本核的气泡）opcode == 0000000，不在任何白名单里 ⇒ 天然不成对。
+//★ lane1 不含访存：lsu 一拍只吃一条（在途读只许一笔）。
+    always @(*) begin
+        lane0_ok = 1'b0;
+        if (inst_effective[6:0] == OPCODE_OP) begin
+            if (inst_effective[31:25] != 7'b0000001) lane0_ok = 1'b1;
+        end
+        else if (inst_effective[6:0] == OPCODE_OP_IMM) begin
+            if (inst_effective[31:25] != 7'b0000001) lane0_ok = 1'b1;
+        end
+        else if (inst_effective[6:0] == OPCODE_LUI)   lane0_ok = 1'b1;
+        else if (inst_effective[6:0] == OPCODE_AUIPC) lane0_ok = 1'b1;
+        else if (inst_effective[6:0] == OPCODE_LOAD)  lane0_ok = 1'b1;
+        else if (inst_effective[6:0] == OPCODE_STORE) lane0_ok = 1'b1;
+
+        lane1_ok = 1'b0;
+        if (inst1_in[6:0] == OPCODE_OP) begin
+            if (inst1_in[31:25] != 7'b0000001) lane1_ok = 1'b1;
+        end
+        else if (inst1_in[6:0] == OPCODE_OP_IMM) begin
+            if (inst1_in[31:25] != 7'b0000001) lane1_ok = 1'b1;
+        end
+        else if (inst1_in[6:0] == OPCODE_LUI)   lane1_ok = 1'b1;
+        else if (inst1_in[6:0] == OPCODE_AUIPC) lane1_ok = 1'b1;
+
+        pair_class_ok = lane0_ok & lane1_ok;
+    end
+
+//对内 RAW：lane0 的结果当拍不转发给 lane1 ⇒ lane0 的 rd 命中 lane1 的任一源即不成对。
+//★ 用"按指令字原始字段判 rs1/rs2"的朴素口径（LUI/AUIPC 的那几位其实是立即数），会漏掉
+//  一些本来能成对的组合 —— 方向是【保守】，且与静态统计（24.0%）同一口径，可直接对照。
+    always @(*) begin
+        raw_in_pair = 1'b0;
+        if (inst_effective[11:7] != 5'd0) begin
+            if (inst_effective[11:7] == inst1_in[19:15]) raw_in_pair = 1'b1;
+            if (inst_effective[11:7] == inst1_in[24:20]) raw_in_pair = 1'b1;
+        end
+        pair_raw_ok = ~raw_in_pair;
+    end
+
+    always @(*) pair_lane1_v = pair_fetch_ok_in & pair_class_ok & pair_raw_ok;
 
 //本模块寄存器只留"必须跨拍携带"的四项：指令字本身、两个源寄存器号（regfile 读口要用）、
 //PC 载荷与取指期的预测信息。原来那 15 个译码字段各寄存一份、再被原样重寄一遍。
