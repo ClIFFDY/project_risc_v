@@ -41,7 +41,7 @@ module icache(
 
 //取指输出
     output reg [31:0] inst_out, inst_next,
-    output reg busy, busy_q,
+    output reg busy, busy_q, pair_fetch_ok,
 //回填请求（接核内 itcm）
     output reg mem_req, mem_we,
     output reg [31:0] mem_addr, mem_wdata,
@@ -81,6 +81,7 @@ module icache(
     (* max_fanout = 32 *) reg [13:0] rd_addr, rd_addr1;
     reg rd_en, line_match;
     reg deliver_ok;
+    reg pair_fetch_ok_c;
     reg [31:0] miss_addr_q;
 
 //自举/回填：阵列与状态机
@@ -206,6 +207,24 @@ module icache(
         if (rst_q)                                  inst_out <= 32'd0;
         else if ((jalr_fail | br2 | br3 | irq | irq_ret | trap | flag_bus[9]) | ((jalr | br1 | jal) && req_valid)) inst_out <= 32'd0;
         else if (rd_en)                           inst_out <= iram[rd_addr];
+    end
+
+//成对判据里"取指侧"的那一位：这一拍 inst_out 上的字是不是一个能当 lane0 的合法取指
+//（同一 icache 行内、命中、不是缺失交付那一拍）。只依赖本模块的寄存器，不在取指环上。
+//★ 与 inst_out 同一个三分支形状（浇零 / 更新 / 保持）—— 这样它会【跟着指令走】：
+//  停顿拍保持（那条指令还压在 s1 上没前进），冲刷拍浇零（它不该被消费）。
+//★ 浇零条件写成上面那条的副本：本模块各处按 flag_bus 各自现推是既有惯例，保持一致；
+//  不为了消重复去动 inst_out 那个块（它的 BRAM 输出寄存器吸收值 2.45ns）。
+    always @(*) begin
+        pair_fetch_ok_c = (word != 5'd31) & cache_hit & ~busy & ~fill_end;
+    end
+
+    always @(posedge clk) begin
+        if (rst_q)                                              pair_fetch_ok <= 1'b0;
+        else if (jalr_fail | br2 | br3 | irq | irq_ret | trap | flag_bus[9]) pair_fetch_ok <= 1'b0;
+        else if ((jalr | br1 | jal) && req_valid)                pair_fetch_ok <= 1'b0;
+        else if (rd_en)                                         pair_fetch_ok <= pair_fetch_ok_c;
+        else                                                    pair_fetch_ok <= pair_fetch_ok;
     end
 
 //===============================================================

@@ -12,6 +12,9 @@ module cpu_top(
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
     (* max_fanout = 32 *) wire [31:0] inst_1;
     wire icache_busy_w, icache_busy_q;
+    wire [31:0] icache_inst_next_w;
+    wire icache_pair_fetch_ok_w;
+    wire pair_class_ok_w, pair_raw_ok_w, pair_lane1_v_w;
     wire br1, br2, br3;
     (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
@@ -127,8 +130,10 @@ module cpu_top(
         .trap(trap),
         .flag_bus(flag_bus),
         .inst_out(icache_inst_w),
+        .inst_next(icache_inst_next_w),
         .busy(icache_busy_w),
         .busy_q(icache_busy_q),
+        .pair_fetch_ok(icache_pair_fetch_ok_w),
         .mem_req(icache_mem_req_w),
         .mem_we(icache_mem_we_w),
         .mem_addr(icache_mem_addr_w),
@@ -136,6 +141,14 @@ module cpu_top(
         .mem_be(icache_mem_be_w),
         .mem_valid(icache_mem_valid_w),
         .mem_data(icache_mem_data_w)
+    );
+    pair_form u_pair_form (
+        .inst0_in(icache_inst_w),
+        .inst1_in(icache_inst_next_w),
+        .pair_fetch_ok_in(icache_pair_fetch_ok_w),
+        .pair_class_ok(pair_class_ok_w),
+        .pair_raw_ok(pair_raw_ok_w),
+        .pair_lane1_v(pair_lane1_v_w)
     );
     itcm u_itcm (
         .clk(clk),
