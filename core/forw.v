@@ -39,7 +39,7 @@ module forw(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 //对ld/st指令数据旁路进行延迟仲裁。
-//优先级：alu 在途 > load 在途 > mulu 在途 > wb_reg。
+//优先级：alu 在途 > load 在途 > mulu 在途 > wbu。
     always @(*) begin
         if (r1 != 5'd0) begin
             if (r1 == rd_back1) begin
@@ -49,7 +49,7 @@ module forw(
                 r1_data_final = ld_data;
             end
 //mulu 在途结果：与 loaded 一样是【独立支路】，绝不能与 back2 合并成一个比较器
-//（历史翻车记录见 逻辑说明 §2.2）。mulu 与 lsu 同为在途单元，程序序早于 wb_reg。
+//（历史翻车记录见 逻辑说明 §2.2）。mulu 与 lsu 同为在途单元，程序序早于 wbu。
             else if (mul_loaded && r1 == rd_mul) begin
                 r1_data_final = mul_data;
             end

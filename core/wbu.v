@@ -5,7 +5,7 @@
 //
 // Create Date: 2026/08/27 15:26:36
 // Design Name:
-// Module Name: wb_reg
+// Module Name: wbu
 // Project Name:
 // Target Devices:
 // Tool Versions:
@@ -20,7 +20,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module wb_reg(
+module wbu(
     input clk, rst,
     input [9:0] flag_bus,
     input we_in,
@@ -64,7 +64,7 @@ module wb_reg(
         else if (exec) begin
 //STALL 期间只保持数据，【写使能拉低】：
 //若跟着保持，被冻住的这条 ALU 指令会每拍往 regfile 重复写一次，把期间更新的
-//load/mulu 结果又盖回去（CoreMark rv32im 里 divu 冻住 wb_reg 34 拍、后面 sb 读到陈旧值）。
+//load/mulu 结果又盖回去（CoreMark rv32im 里 divu 冻住 wbu 34 拍、后面 sb 读到陈旧值）。
 //写使能一拍已在进入本级那拍完成，故此处清零不会丢写。
             if (flush_jump_w) begin
                 we_out <= 1'b0;

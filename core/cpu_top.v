@@ -403,7 +403,7 @@ module cpu_top(
         .result_back1(result_back1),
         .we(we_4)
     );
-    wb_reg u_wb_reg (
+    wbu u_wbu (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
