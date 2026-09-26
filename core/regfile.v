@@ -24,16 +24,13 @@ module regfile(
     input clk, rst,
     input [9:0] flag_bus,
     input [4:0] r1, r2,
-    input [4:0] rd_alu,
-    input [31:0] rd_data_alu,
-    input we_alu,
-    input exc_kill,
-    input [4:0] rd_ld,
-    input [31:0] ld_data_ld,
-    input we_ld,
-    input [4:0] rd_mul,
-    input [31:0] mul_data_mul,
-    input we_mul,
+//两个物理写口的请求（仲裁已在 wbu 内完成）：口 A = alu | mul，口 B = ld
+    input we_a,
+    input [4:0] rd_a,
+    input [31:0] data_a,
+    input we_b,
+    input [4:0] rd_b,
+    input [31:0] data_b,
 //读数据：合并成一对（原来是 dec/lsu/mul 三份按限定分开填）。按消费者复制交给
 //max_fanout 在布局阶段做 —— 比手工拆三份更省逻辑，复制点也更贴实际负载。
     output reg [31:0] r1_data, r2_data
@@ -48,10 +45,6 @@ module regfile(
     reg [31:0] regs [0:31];
 
     reg [4:0] r1_q, r2_q;
-    reg am_we;
-    reg [4:0] am_rd;
-    reg [31:0] am_data;
-    reg ld_we_eff;
 
     integer i;
     initial begin
@@ -60,13 +53,13 @@ module regfile(
         end
     end
 
-//bypass 与写口用同一优先级（alu > mul > ld）：真撞上时"写进去的"与"前递出去的"是同一个值。
-//（改前 bypass 是 alu>ld>mul、写口是 mul>ld>alu，方向正好相反 —— 那是 §2.2 记的老隐患。）
+//bypass 与写口用同一优先级（口 A > 口 B，即"后面那条 if 写的赢"）：真撞上时
+//"写进去的"与"前递出去的"是同一个值。
     function [31:0] bypass;
         input [4:0] rx;
         begin
-            if (am_we && rx == am_rd) bypass = am_data;
-            else if (ld_we_eff && rx == rd_ld) bypass = ld_data_ld;
+            if (we_a && rx == rd_a) bypass = data_a;
+            else if (we_b && rx == rd_b) bypass = data_b;
             else bypass = regs[rx];
         end
     endfunction
@@ -105,35 +98,11 @@ module regfile(
         end
     end
 
-//两个物理写口（原来是三个，见 逻辑说明 §27）：
-//  口 A = alu | mul —— 这两者的写沿都由【流水线偏移】决定（c2+3），且 mulu 的两级乘法流水、
-//        除法提交链、输出保持都已按 pipe_stall 冻结（照 alu 的写回级，与 lsu 对 stage 的门控同理），
-//        所以二者严格同偏移、永不同拍，可以共用一口。
-//  口 B = ld —— load 的写沿由【总线事务长度】决定（多拍），与流水线偏移不绑定，
-//        与谁合并都可能撞，故单独一口，保持"撞上也是两条独立写"的旧行为。
+//两个物理写口（原来是三个，见 逻辑说明 §27）。仲裁【已搬到 wbu】：本模块只按"准备好的两口"
+//写入，语句顺序即优先级（口 A 在后 ⇒ 同 rd 撞上时口 A 赢 = 原来 alu>mul>ld 的口径）。
     always @(posedge clk) begin
-        if (ld_we_eff) regs[rd_ld] <= ld_data_ld;
-        if (am_we)     regs[am_rd] <= am_data;
-    end
-
-//写口仲裁：alu > mul > ld
-    always @(*) begin
-        if (we_alu && rd_alu != 5'd0 && ~exc_kill) begin
-            am_we = 1'b1;
-            am_rd = rd_alu;
-            am_data = rd_data_alu;
-        end
-        else if (we_mul && rd_mul != 5'd0) begin
-            am_we = 1'b1;
-            am_rd = rd_mul;
-            am_data = mul_data_mul;
-        end
-        else begin
-            am_we = 1'b0;
-            am_rd = 5'd0;
-            am_data = 32'd0;
-        end
-        ld_we_eff = we_ld && (rd_ld != 5'd0);
+        if (we_b) regs[rd_b] <= data_b;
+        if (we_a) regs[rd_a] <= data_a;
     end
 
 endmodule

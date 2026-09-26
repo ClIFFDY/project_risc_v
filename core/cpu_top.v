@@ -35,9 +35,11 @@ module cpu_top(
     wire [4:0] rd_4;
     wire [31:0] result_4, result_back1;
     wire we_4;
-    wire [4:0] rd_5;
-    wire [31:0] result_5, result_back2;
-    wire we_5;
+    wire [31:0] result_back2;
+//wbu 的两个写口请求（口 A = alu|mul、口 B = ld，仲裁已在 wbu 内完成）
+    wire we_a_w, we_b_w;
+    wire [4:0] rd_a_w, rd_b_w;
+    wire [31:0] data_a_w, data_b_w;
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
     wire [9:0] flag_bus;
     wire [3:0] irq_bubble, alu_func4;
@@ -407,13 +409,23 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
-        .we_in(we_4),
-        .rd_in(rd_4),
-        .result_in(result_4),
-        .we_out(we_5),
-        .rd_out(rd_5),
+        .we_alu(we_4),
+        .rd_alu(rd_4),
+        .result_alu(result_4),
+        .exc_kill(exc_bju),
+        .we_mul(mul_we),
+        .rd_mul(rd_mul),
+        .result_mul(mul_data_final),
+        .we_ld(ld_we),
+        .rd_ld(rd_load),
+        .result_ld(ld_data_final),
+        .we_a(we_a_w),
+        .rd_a(rd_a_w),
+        .data_a(data_a_w),
+        .we_b(we_b_w),
+        .rd_b(rd_b_w),
+        .data_b(data_b_w),
         .rd_back2(rd_back2),
-        .result_out(result_5),
         .result_back2(result_back2)
     );
     regfile u_regfile (
@@ -422,16 +434,12 @@ module cpu_top(
         .flag_bus(flag_bus),
         .r1(rs1_1),
         .r2(rs2_1),
-        .rd_alu(rd_5),
-        .rd_data_alu(result_5),
-        .we_alu(we_5),
-        .exc_kill(exc_bju),
-        .rd_ld(rd_load),
-        .ld_data_ld(ld_data_final),
-        .we_ld(ld_we),
-        .rd_mul(rd_mul),
-        .mul_data_mul(mul_data_final),
-        .we_mul(mul_we),
+        .we_a(we_a_w),
+        .rd_a(rd_a_w),
+        .data_a(data_a_w),
+        .we_b(we_b_w),
+        .rd_b(rd_b_w),
+        .data_b(data_b_w),
         .r1_data(r1_data),
         .r2_data(r2_data)
     );
