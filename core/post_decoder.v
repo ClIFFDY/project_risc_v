@@ -33,8 +33,9 @@ module post_decoder(
 //★ stall 期间的回灌（消费端 = 本级的载荷）：停在本级与执行单元之间时，前送源那一档可能只在
 //  前面某一拍出现过、之后就没了（alu 的结果寄存器只有一拍宽）⇒ 放行那一刻源上什么都没有，
 //  载荷只能用"进本级时采的旧值"（实测 CoreMark：计数少加一次，crcstate 错）。
-//  所以：哪一拍命中就把哪一拍的值钉进载荷。（合法 = 命中"比我更老"的那一档）
-    input        fb_hit1, fb_hit2,
+//  ★ 门控只用【本级自己的 r*_reg_en】（局部寄存器），不用前送的命中标志：前送在没有命中时
+//  本来就返回"载荷自己的值"，所以"是寄存器操作数就每拍刷一遍"与"命中才钉"等价，
+//  但前者不把那棵比较器树（rd 比较+年龄比较+取最年轻）串进本级的 D/CE 路上。
     input [31:0] r1_data_fb, r2_data_fb,
     input [11:0] imm12_csr_in,
     input [4:0] imm5_csr_in,
@@ -528,13 +529,13 @@ module post_decoder(
                 exc_jal_misalign_out <= exc_jal_misalign_out;
                 jal_target_out <= jal_target_out;
                 exc_illegal_out <= exc_illegal_out;
-                if (fb_hit1) begin
+                if (r1_reg_en) begin
                     r1_data_out <= r1_data_fb;
                 end
                 else begin
                     r1_data_out <= r1_data_out;
                 end
-                if (fb_hit2) begin
+                if (r2_reg_en) begin
                     r2_data_out <= r2_data_fb;
                 end
                 else begin

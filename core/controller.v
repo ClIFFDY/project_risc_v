@@ -22,11 +22,17 @@
 
 module controller(
     input clk, rst, jalr_fail, br2, br3, exc_irq_ret, exc_ecall, flush_bju_exc,
+//bju 判定块的【组合版前置冲刷】：判定拍就有效，比寄存版早一拍
+    input flush_bju_pre,
 //异常仲裁源（原 trap_unit 并进本模块：它没有自己的流水级，按"模块按级划分"不该单独成文件）：
 //  bju 的【寄存版】异常只用来拉冲刷；【组合版】异常 + 组合落点用来做 ROB 的当拍标记；
 //  E4 级四路源（ecall/ebreak/非法/访存非对齐）都已在 E4 载荷拍有效。
-    input exc_bju_in,
-    input [31:0] jp_target_c_in,
+//bju 名下那几种（分支/jalr/jal 非对齐）改用【寄存版】：判定搬后一级之后，只有寄存版
+//与冲刷拍（flush_bju_exc）同拍有效；组合版在冲刷拍已经翻到下一条 ⇒ 载荷/mtval 全错位。
+    input [31:0] bju_pc_in,
+    input [31:0] bju_tgt_in,
+//判定输入拍采到的"更老指令正在冲刷"（bju 的 older_q）：门标记要用它，不能用当拍的 flush_older
+    input bju_older_in,
     input exc_ecall_in, exc_ebreak_in, exc_illegal_in,
     input exc_ldst_misalign_in, exc_ldst_st_in,
     input [31:0] exc_ldst_addr_in,
@@ -67,7 +73,9 @@ module controller(
     output reg flush_con_exc,
     output reg exc_mark,
     output reg [3:0]  exc_cause,
-    output reg [31:0] exc_pc, exc_tval
+    output reg [31:0] exc_pc, exc_tval,
+//mret 的资格版：同一根线既喂 pc 的排队武装、又喂 csr 的使能恢复（两者是同一次 mret 生效的两半）
+    output reg exc_irq_ret_ok
     );
 
 //异常 cause 号（规范）
@@ -110,7 +118,9 @@ module controller(
 //            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
 //★ 每位只连一个源，本模块不在这里做或运算；消费端自己取自己要的位做或（冲刷优先于停顿）。
     always @(*) begin
-        flush_con_irq  = exc_irq || exc_irq_ret || exc_irq_act;
+//★ mret 那一项用【资格版】：错路 mret 的冲刷会把正确路径刚取进来的指令冲掉
+//  （实测 wp_mret：分支落点后紧跟的 csrr/ sw 两条笔都不见了）。合法 mret 靠它的自冲刷清影子，必须留。
+        flush_con_irq  = exc_irq || exc_irq_ret_ok || exc_irq_act;
         flush_con_jump = jalr_fail || br2 || br3;
         flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
                     stall_rob_full, stall_pc_redir,
@@ -129,8 +139,12 @@ module controller(
 //  的项"卡在队头 ⇒ 而 pc 重定向正好在等 rob_empty ⇒ 自锁（实测 half_misalign 卡在 pc 0x58）。
 //  比边界更老的项照旧留着（它们的写是架构要求的，必须落地后才交付）。
         flush_con_rob = flush_con_jump | flush_con_irq | flush_con_exc;
+//★ bju 名下那几种（分支/jalr/jal 非对齐）判定已搬后一级 ⇒ 边界必须用 bju 自己那一条的号
+//  （idx_q），不能再用 issue_idx_in（E4 载荷那条 = 判定那条的下一条）。
+//  判据用【寄存版】flush_bju_exc，与寄存后的 bju_idx_in 同拍。
         if (flush_con_exc)
-            flush_idx = exc_ldst_misalign_in ? exc_ldst_idx_in : issue_idx_in;
+            flush_idx = flush_bju_exc ? bju_idx_in
+                      : (exc_ldst_misalign_in ? exc_ldst_idx_in : issue_idx_in);
         else if (flush_con_irq)
             flush_idx = issue_idx_in;
         else
@@ -152,6 +166,16 @@ module controller(
 //            stall_lsu_haz, stall_lsu_unload, stall_lsu_full, stall_mulu_haz, stall_mulu_div,
 //            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
     reg flush_older, exc_gated;
+//★ 对 payload 里的 mret 而言：flush_w 的 [13]（flush_bju_exc 是 bju 寄存版）与 [11]（br2/br3/jalr_fail）
+//  必来自更老的指令；[12] 里唯一属于本级自己的就是 mret 的自冲刷（合法 mret 要靠它清掉之后取进来的错路项）。
+//  ⇒ 资格 = 有冲刷、且那个冲刷不是我自己这一条。**不能用 flush_older**（它含 flush_con_irq，后者又含
+//  exc_irq_ret 自身）⇒ 会把合法 mret 也挡掉。
+//  ★ 资格里必须把【组合版前置冲刷】也算进来，理由与 exc_gated 那条完全相同：mret 的武装发生在
+//  它的 decoder 载荷拍，而寄存器版冲刷要到下一拍才抬 —— 只看 flush_w 会看不住影子槽里的 mret
+//  （实测 wp_mret：错路 mret 跳到 mepc、并恢复了中断使能）。flush_bju_pre 正是"更老的指令正在冲"。
+//  ★ 那个"排除自冲刷"的豁免（~exc_irq_ret）只能作用在 flush_w 上 —— mret 的自冲刷在 flag_bus[12] 里；
+//  flush_bju_pre 永远不是 mret 自己的（mret 不由 bju 判），给它加豁免等于把错路放进来（实测 wp_mret 复现）。
+    always @(*) exc_irq_ret_ok = exc_irq_ret & ~((flush_w & ~exc_irq_ret) | flush_bju_pre);
     reg [31:0] exc_pc_c;
 //★ 非对齐那条比 ecall/ebreak/非法晚一拍到（它在 lsu 里寄存过），pc 载荷得跟着寄存一拍；
 //  否则取到的是【下一条】指令的地址（实测 mepc 记成故障指令 +4：0x3c 而不是 0x38）。
@@ -162,7 +186,15 @@ module controller(
     end
     always @(*) flush_older = flag_bus[12] | flag_bus[11];
 //更老的指令在本拍冲刷 ⇒ 这条是错路，它的操作数是垃圾，不能拿它报异常
-    always @(*) exc_gated = (exc_ecall_in | exc_illegal_in | exc_ldst_misalign_in) & ~flush_older;
+//★ 解码阶段那两条（ecall/illegal）的资格必须把【组合版前置冲刷】也算进来：
+//  它们的检测发生在 decoder 载荷拍 = bju 判定的同一拍，而寄存版冲刷要到下一拍才抬 ——
+//  只 & ~flush_older 会看不住"影子槽里那条 ecall"（实测 wp_ecall：错路 ecall 被标记并交付、
+//  还带着 mepc 跳进了 handler）。flush_bju_pre 正是"更老的指令正在冲"的早一拍信号，
+//  与 lsu/mulu 那个"宽一拍窗口"是同一个信号、同一个道理。
+//★ 访存非对齐那条【不并入】：它是 lsu 寄存过的 1 拍脉冲（lsu.v:378），多挡一拍就再也报不上来 ⇒
+//  那条指令已被 lsu 门口拒收、永远等不到完成回报 ⇒ ROB 队头永不动（这个坑单独记着，不在本次范围）。
+    always @(*) exc_gated = ((exc_ecall_in | exc_illegal_in) & ~(flush_older | flush_bju_pre))
+                          | (exc_ldst_misalign_in & ~flush_older);
 
 //冲刷（寄存版判据）：bju 那条晚一拍报，与旧行为一致
     always @(*) flush_con_exc = flush_bju_exc | exc_gated;
@@ -173,13 +205,14 @@ module controller(
 //★ 必需与 ~flush_older 相与（理由同上）；mtval 口径：指令地址非对齐用 bju 的【组合落点】
 //  （br 目标 / jalr 目标 / jal 由 post_decoder 就地解出的目标），访存非对齐用出错地址，其余 0。
     always @(*) begin
-        exc_mark  = (exc_bju_in & ~flush_older) | exc_gated;
+        exc_mark  = (flush_bju_exc & ~bju_older_in) | exc_gated;
         exc_cause = 4'd0;
-        exc_pc_c  = exc_ldst_misalign_in ? exc_pc_in_d1 : exc_pc_in;
+        exc_pc_c  = flush_bju_exc ? bju_pc_in
+                  : (exc_ldst_misalign_in ? exc_pc_in_d1 : exc_pc_in);
         exc_tval  = 32'd0;
-        if (exc_bju_in) begin
+        if (flush_bju_exc) begin
             exc_cause = CAUSE_MISALIGN_INST;
-            exc_tval  = jp_target_c_in;
+            exc_tval  = bju_tgt_in;
         end
         else if (exc_gated) begin
             if (exc_illegal_in) begin
@@ -211,6 +244,7 @@ module controller(
         .csr_wr_en(csr_wr_en),
         .flag_bus(flag_bus),
         .exc_irq_ret(exc_irq_ret),
+        .exc_irq_ret_ok(exc_irq_ret_ok),
         .exti(exti),
         .timi(timi),
         .softi(softi),

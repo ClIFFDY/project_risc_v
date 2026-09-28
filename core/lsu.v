@@ -61,8 +61,8 @@ module lsu(
     output reg [3:0] bus_be_out,
     output reg bus_we_out,
     output reg bus_valid_out,
-    output reg [31:0] ld_data_out,
-    output reg loaded,
+    (* max_fanout = 8 *) output reg [31:0] ld_data_out,
+    (* max_fanout = 8 *) output reg loaded,
     output reg ld_we,
 //被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
     output reg kill_ld,
@@ -71,9 +71,9 @@ module lsu(
     output reg stall_lsu_unload,
     output reg stall_lsu_full,
     output reg mem_inflight,
-    output reg [4:0] rd_load,
+    (* max_fanout = 8 *) output reg [4:0] rd_load,
 //本条写回记录带的 ROB 索引（跟着数据走）
-    output reg [2:0]  ld_idx,
+    (* max_fanout = 8 *) output reg [2:0]  ld_idx,
     output reg exc_ldst_misalign_out, exc_ldst_st_out,
     output reg [31:0] exc_ldst_addr_out,
 //故障指令【自己的】ROB 索引（与故障同拍寄存）：故障晚一拍到 controller，那时 issue_idx 已是下一条
@@ -248,20 +248,20 @@ module lsu(
             bus_we_out <= 1'b0;
             bus_valid_out <= 1'b0;
         end
-        else if (bus_go && exec && !flush_w) begin
-            bus_addr_out  <= s2_put ? s2_addr : cur_addr;
-            bus_data_out  <= s2_put ? s2_wdat : st_wdata;
-            bus_be_out    <= s2_put ? s2_be   : st_be;
-            bus_we_out    <= s2_put ? s2_kind : is_st;
-            bus_valid_out <= 1'b1;
-        end
-//blank 的拍必须把总线清零：从设备是电平判据，残留地址会被当成新请求连答（读地址只摆一拍的原因）
         else begin
+//blank 的拍必须把总线清零：从设备是电平判据，残留地址会被当成新请求连答（读地址只摆一拍的原因）
             bus_addr_out <= 32'd0;
             bus_data_out <= 32'd0;
             bus_be_out <= 4'd0;
             bus_we_out <= 1'b0;
             bus_valid_out <= 1'b0;
+            if (bus_go && exec && !flush_w) begin
+                bus_addr_out  <= s2_put ? s2_addr : cur_addr;
+                bus_data_out  <= s2_put ? s2_wdat : st_wdata;
+                bus_be_out    <= s2_put ? s2_be   : st_be;
+                bus_we_out    <= s2_put ? s2_kind : is_st;
+                bus_valid_out <= 1'b1;
+            end
         end
     end
 

@@ -26,19 +26,21 @@ module alu(
     input clk, rst,
     input [13:0] flag_bus,
     input we_in, jal_flag, jalr_flag, cs_wr_en,
+//判定那条自己那一笔的 ROB 索引（bju 的 idx_q）：跳转冲刷拍用它区分"本级挂着的是不是发起者自己"
     input [4:0] rd_in,
 //ROB 索引：与结果同沿寄存（结果晚一拍，索引必须一起晚一拍，否则完成口会回填到错项）
     input [2:0] idx_in,
+    input [2:0] bju_idx,
     input [3:0] alu_func4,
     input [2:0] csr_func3,
     input [31:0] aux_addr_in,
     input [31:0] r1_data, r2_data, cs_data,
-    output reg [4:0] rd_out,
-    output reg [2:0] idx_out,
+    (* max_fanout = 8 *) output reg [4:0] rd_out,
+    (* max_fanout = 8 *) output reg [2:0] idx_out,
 //这一笔永不落地（异常冲刷把"错路那条"标掉）：写口不发写、但照常回报，项才能退
-    output reg kill_out,
-    output reg [31:0] result, result_csr,
-    output reg we
+    (* max_fanout = 8 *) output reg kill_out,
+    (* max_fanout = 8 *) output reg [31:0] result, result_csr,
+    (* max_fanout = 8 *) output reg we
     );
 
     localparam [3:0]
@@ -165,12 +167,15 @@ module alu(
             we       <= 1'b0;
             kill_out <= 1'b0;
         end
-        else if (flush_con_jump) begin               // 跳转冲刷：错路那条刚要进本级 ⇒ 保持不寄存
+        else if (flush_con_jump) begin
+//跳转冲刷：本级挂着的如果【不是发起者自己】那一笔，那就是判定拍溜进来的错路条
+//（它已在判定拍寄存、会被下面的"保持"一直挂在写口上 ⇒ 落进寄存器堆）⇒ 标"永不落地"。
+//是发起者自己（分支不写 rd、jalr 的 link 在判定拍已进写口）⇒ 照旧保持，不误杀。
             rd_out   <= rd_out;
             idx_out  <= idx_out;
             result   <= result;
             we       <= we;
-            kill_out <= kill_out;
+            kill_out <= kill_out | (idx_out != bju_idx);
         end
         else if (we_in) begin
             if ((flush_con_exc | flush_con_irq) |

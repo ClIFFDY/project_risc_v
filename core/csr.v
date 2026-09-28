@@ -23,6 +23,9 @@
 module csr(
     input clk, rst,
     input csr_wr_en, exc_irq_ret, exti, timi, softi, exc_ecall, flush_bju_exc, flush_con_exc,
+//★ 资格版（controller 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
+//  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
+    input exc_irq_ret_ok,
     input [13:0] flag_bus,
     input mem_inflight,
     input [11:0] csr_addr,
@@ -177,7 +180,7 @@ module csr(
                 mtval_reg <= exc_retire_tval;
             end
 //isr返回（目前只支持机器模式）
-            if (exc_irq_ret) begin
+            if (exc_irq_ret_ok) begin
                 exc_irq_en_reg <= exc_irq_en_post_reg;
                 exc_irq_en_post_reg <= 1'b1;
                 exc_irq_process <= 1'b0;

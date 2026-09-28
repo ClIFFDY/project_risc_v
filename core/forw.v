@@ -66,8 +66,6 @@ module forw(
     input [4:0]  r1_mid, r2_mid,
     input [31:0] r1_data_mid_in, r2_data_mid_in,
     output reg [31:0] r1_data_mid, r2_data_mid,
-//点② 的命中标志（给 post_decoder 在 stall 期间回灌用）：只在命中"比我更老"的那一档时置起
-    output reg fb_hit1, fb_hit2,
 //点②：消费者 = decoder 载荷那条（r1_en/r2_en = 该操作数是不是寄存器操作数）
     input [4:0]  r1_post, r2_post,
     input        r1_en, r2_en,
@@ -86,6 +84,7 @@ module forw(
 //两个前送点各自的"已命中/当前最优年龄"（不能共用：两个块都会写，等于竞争）
     reg        h1m, h2m;
     reg [3:0]  g1m, g2m;
+    reg        h1f, h2f;
     reg [3:0]  g1f, g2f;
 
 //★ 必须算"消费者自己"的年龄：结果口是前送源之后，【消费者自己那一笔也在源上】——
@@ -153,41 +152,41 @@ module forw(
         r1_data_final = r1_data_post_in;
         r2_data_final = r2_data_post_in;
         if (r1_en && (r1_post != 5'd0)) begin
-            fb_hit1 = 1'b0;
+            h1f = 1'b0;
             g1f = 4'd0;
             if (we_alu && (r1_post == rd_alu) && (age_alu < age_post)) begin
                 r1_data_final = data_alu;
                 g1f = age_alu;
-                fb_hit1 = 1'b1;
+                h1f = 1'b1;
             end
-            if (we_mul && (r1_post == rd_mul) && (age_mul < age_post) && (!fb_hit1 || (age_mul > g1f))) begin
+            if (we_mul && (r1_post == rd_mul) && (age_mul < age_post) && (!h1f || (age_mul > g1f))) begin
                 r1_data_final = data_mul;
                 g1f = age_mul;
-                fb_hit1 = 1'b1;
+                h1f = 1'b1;
             end
-            if (we_ld && (r1_post == rd_ld) && (age_ld < age_post) && (!fb_hit1 || (age_ld > g1f))) begin
+            if (we_ld && (r1_post == rd_ld) && (age_ld < age_post) && (!h1f || (age_ld > g1f))) begin
                 r1_data_final = data_ld;
                 g1f = age_ld;
-                fb_hit1 = 1'b1;
+                h1f = 1'b1;
             end
         end
         if (r2_en && (r2_post != 5'd0)) begin
-            fb_hit2 = 1'b0;
+            h2f = 1'b0;
             g2f = 4'd0;
             if (we_alu && (r2_post == rd_alu) && (age_alu < age_post)) begin
                 r2_data_final = data_alu;
                 g2f = age_alu;
-                fb_hit2 = 1'b1;
+                h2f = 1'b1;
             end
-            if (we_mul && (r2_post == rd_mul) && (age_mul < age_post) && (!fb_hit2 || (age_mul > g2f))) begin
+            if (we_mul && (r2_post == rd_mul) && (age_mul < age_post) && (!h2f || (age_mul > g2f))) begin
                 r2_data_final = data_mul;
                 g2f = age_mul;
-                fb_hit2 = 1'b1;
+                h2f = 1'b1;
             end
-            if (we_ld && (r2_post == rd_ld) && (age_ld < age_post) && (!fb_hit2 || (age_ld > g2f))) begin
+            if (we_ld && (r2_post == rd_ld) && (age_ld < age_post) && (!h2f || (age_ld > g2f))) begin
                 r2_data_final = data_ld;
                 g2f = age_ld;
-                fb_hit2 = 1'b1;
+                h2f = 1'b1;
             end
         end
     end

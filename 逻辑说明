@@ -2698,3 +2698,53 @@ Correct operation validated.
 
 **验证**：`alu_tb` 28/28（反向两发：拆掉判据 ⇒ 5 项红；把 `[9]`/`[8]` 也塞进去 ⇒ 6 项红）、
 `forw_tb` 28/28（反向一发）、16 支 archtest 15 支逐笔 SAME、CoreMark 三项 CRC 全对、`Total ticks 380564`。
+
+### 31. `bju` 判定搬后一级（2026-09-29）
+
+**为什么搬**：ROB 之后全片最差路一直是同一族 —— `计算单元结果口/索引 → forw（年龄比较 + 操作数 mux）
+→ decoder 载荷操作数 → bju 的分支/jalr 判定 → mtrace/冲刷/重定向`，a100t -1 @10ns 实测 15.6ns（route 占 80%）。
+搬法：`bju` 变两级 —— 新增"判定输入寄存级"，把**操作数（`forw` 的组合输出）与控制位一起**寄存，
+比较/加法落到下一拍，结果仍进原输出寄存器。**控制位必须同寄存**（否则拿"下一条的 br_flag"判"这一条"）；
+**每拍都装**（操作数在途时逐拍收敛，判定跑的那拍拿到的就是终值）；**冲刷拍要清这一级**（否则错路那条被补判）。
+实测：同族最差路 15.6→12.2ns，总 WNS −5.843→−2.452。
+
+**配套（两条不变式）**：
+
+1. **载荷/边界的"组合版"必须换成寄存版**：`exc_pc_q`（与 `jp_target` 同块同清；**不能用输入级的 `aux_q`** ——
+   它每拍都装、冲刷拍已是下一条的地址 ⇒ mepc 错 4）、`older_q`（判定输入拍采的 `flush_older`，
+   **不能用当拍值** —— 判定拍上 `flag_bus[11]` 就是这条指令自己的冲刷 ⇒ 标记自掐）、`bju_idx`（判定那条自己的号）。
+2. **撤销必须是组合的**：`alu` 的 `kill_out`、以及 `wport` 的三个口，都是**寄存器** ⇒ 到写口永远晚一拍，
+   撤不掉"判定拍已经寄存进结果寄存器"的那一笔 ⇒ 在 `wport` 里按 `(idx, 边界号)` 当拍组合撤销：
+   - `bju_exc & (idx_alu == bju_idx_i)`：判定当拍撤"故障那条自己的写"（jalr 的 link）；
+   - `flush_con_jump & (idx_alu != bju_idx_q)`：冲刷拍撤"错路那条的写"。
+   （两个号必须分开：前者是判定输入级、后者是判定那条自己。）
+
+### 31.2 `pc.v` 重定向排队的「武装 / 交付」失配（CoreMark 7650 跳 0 的真因）
+
+**现象**：CoreMark 在 cycle 7650 跳到地址 0、重放启动序列。探针现场：
+`redir_go=1 kind=1(ISR/trap) isr_addr2=0`，而 `ROB cnt=0 / trap_fire=0 / csr exc_retire=0` ——
+排队里挂着一条 trap 重定向，ROB 已空、根本没有 trap 在交付，它带着 `mtvec` 复位值跳了出去。
+
+**缺陷**（老代码，与搬拍无关，只是被新时序照出来）：
+`pc.v` 排队的**武装**用检测/译码侧信号（`exc_irq | exc_ecall | exc_w`、裸 `exc_irq_ret`），
+**发射**无条件等 `rob_empty`，**落点**是 `mtvec`/`mepc`（不是交付写的），**取消**只有复位与自身发射 ✗。
+⇒ 任何一次「检测到、但不交付」都会留下一条带陈旧落点的排队项，等下一次 `rob_empty` 发射。
+
+**不变式（修法的依据）**：**排队项的武装资格必须与交付资格同源**。配对性有证明：
+`ent_ex` 置位后该项只能由 `trap_fire` 或冲刷离场，且 `flush_idx` 与 `exc_idx` 是同一根线、
+部分冲刷保留边界项 ⇒ `exc_mark=1` ⇒ 交付必然发生。**武装时机仍留在"标记"那一拍**（
+`redir_kind` 就是 `stall_pc_redir` 的源，挪到交付拍会让"标记→交付"整段 ROB 排空窗口不再冻结前端）。
+
+**改法**：
+- `pc.v`：`redir_req_trap = exc_irq | exc_mark`（`exc_ecall` 裸载荷与 `exc_w` 两项删掉）；
+  `redir_req_ret = exc_irq_ret_ok`；
+- `controller.v`：`exc_irq_ret_ok = exc_irq_ret & ~((flush_w & ~exc_irq_ret) | flush_bju_pre)`
+  —— 那个"排除自冲刷"的豁免**只作用在 `flush_w` 上**（mret 的自冲刷在 `flag_bus[12]` 里），
+  `flush_bju_pre` 永远不是 mret 自己的；三处裸用（pc 武装 / csr 使能恢复 / `flush_con_irq` 的冲刷项）统一换它；
+- `exc_gated`：解码阶段那两条（ecall/illegal）的资格要并进 `flush_bju_pre` ——
+  它们的检测发生在判定那一拍，而寄存器版冲刷晚一拍；**访存非对齐那条不并入**（它是 lsu 的 1 拍脉冲，
+  多挡一拍就再也报不上来，见下面 R1）。
+
+**验证**：CoreMark 三项 CRC 全对 + **零 `[TRAP-ACCESS]`**（`Total ticks 385682`，比搬拍前多 1.3% = 误预测多一拍的合理代价）；
+25 支 archtest 只剩 3 支时间量差异；新增三条微测 `wp_ecall` / `wp_mret` / `wp_bju_older` 全过
+（`wp_bju_older` 就是 7650 的签名：真跳分支紧跟一条目标非对齐的 `jalr`）。

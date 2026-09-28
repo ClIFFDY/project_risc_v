@@ -1,0 +1,6 @@
+# Vivado 启动时在「当前目录」拉的东西，不是设计文件：
+#   vivado.jou / vivado.log  —— 启动那刻的 cwd 下写一份；同目录再起一个会话会把旧的改名成 vivado_<pid>.backup.*
+#   .Xil/                    —— 启动那刻的 cwd 下的临时目录
+vivado*.jou
+vivado*.log
+.Xil/

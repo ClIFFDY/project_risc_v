@@ -22,7 +22,7 @@
 
 module pc(
     input clk, rst,
-    input br1, exc_irq, exc_irq_ret, exc_ecall,
+    input br1, exc_irq, exc_irq_ret, exc_mark,
     input jal, pre_jalr, btb_hit,
     input [13:0] flag_bus,
     input [31:0] jp_target, offset_jal2, offset_jalr2,
@@ -77,7 +77,12 @@ module pc(
 //（实测 exc_ecall：凭空多执行一条 A+16 的 sw）。
     reg       redir_hold;
     always @(*) begin
-        redir_req_trap = exc_irq | exc_ecall | exc_w;
+//★ 武装资格必须与【交付资格】同源（这里曾经用 exc_ecall 裸载荷 + exc_w）：
+//  exc_ecall 是 post_decoder 的裸寄存器，交付侧却要 & ~flush_older（经 exc_gated）；
+//  exc_w（flush_con_exc）与标记资格 exc_mark 差一项 flush_bju_exc & bju_older_in —— 那一支永不交付。
+//  拿它们武装 ⇒ 队列里会留下带陈旧落点（mtvec/mepc 或复位 0）的排队项，等下一次 rob_empty 无条件发射。
+//  exc_irq 本身就是「同拍受理并锁 mepc」那根线，天然配对，保留。
+        redir_req_trap = exc_irq | exc_mark;
         redir_req_ret  = exc_irq_ret;
         redir_go        = (redir_kind != 2'd0) && rob_empty;
         flush_pc_redir  = redir_go;

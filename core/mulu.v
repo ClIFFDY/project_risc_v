@@ -77,13 +77,13 @@ module mulu(
     input [2:0]  idx_in,
 //落地广播（来自写回级两个写口）：据此把更老的同 rd 在途写（乘法/除法）作废
     input [31:0] r1_data_final, r2_data_final,
-    output reg [31:0] mul_data_out,
-    output reg mul_loaded, mul_we,
+    (* max_fanout = 8 *) output reg [31:0] mul_data_out,
+    (* max_fanout = 8 *) output reg mul_loaded, mul_we,
 //被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
     output reg kill_mul,
-    output reg [4:0] rd_mul,
+    (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
-    output reg [2:0]  mul_idx,
+    (* max_fanout = 8 *) output reg [2:0]  mul_idx,
 //两条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_mulu_haz,
     output reg stall_mulu_div
@@ -139,6 +139,7 @@ module mulu(
     reg [4:0]  m_rd_q;
     reg [2:0]  m_idx_q;
     reg [2:0]  m_op_q;
+    (* max_fanout = 8 *)
     reg        m_pv;
 
 //除法：32 拍移位-相减迭代

@@ -68,7 +68,7 @@ module cpu_top(
     wire [3:0]  rob_trap_cause_w;
     wire [31:0] rob_trap_pc_w, rob_trap_tval_w;
     wire        exc_mark_w, exc_bju_w;
-    wire [2:0]  bju_idx_q_w;
+    wire [2:0]  bju_idx_q_w, bju_idx_i_w;
     wire [31:0] r1_data_3, r2_data_3;
     wire [31:0] r1_data_mid_w, r2_data_mid_w;
     wire        r1_reg_en_3, r2_reg_en_3;
@@ -76,7 +76,8 @@ module cpu_top(
     wire [9:0]  fn10_3, fn10_ls_3;
     wire [31:0] off_mem_3;
     wire [4:0]  rs1_3, rs2_3;
-    wire [31:0] bju_jp_target_c_w;
+    wire [31:0] bju_exc_pc_w;
+    wire        bju_older_w;
     wire [3:0]  rob_occ_w;
     wire        rob_rwe0_w, rob_rwe1_w;
     wire [4:0]  rob_rrd0_w, rob_rrd1_w;
@@ -103,6 +104,7 @@ module cpu_top(
     wire [31:0] r1_data, r2_data;
     wire [31:0] ld_data_final;
     wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, exc_irq_ret, exc_ecall, exc_ebreak;
+    wire exc_irq_ret_ok_w;
     wire flush_bju_exc, exc_jal_misalign_out, exc_illegal_out, exc_ldst_misalign_out, exc_ldst_st_out;
 //非对齐故障【自己】的 ROB 索引（跟故障脉冲同拍寄出来）
     wire [2:0] exc_ldst_idx_out;
@@ -119,8 +121,6 @@ module cpu_top(
     wire stall_rob_full_w, stall_pc_redir_w;
     wire flush_con_rob_w, flush_pc_redir_w;
     wire [2:0] flush_idx_w;
-//stall 期间回灌用的命中标志（forw 点② → post_decoder）
-    wire        fb_hit1_w, fb_hit2_w;
     wire flush_rob_trap_w;
     wire [4:0] rd_load;
     wire btb_hit;
@@ -164,8 +164,9 @@ module cpu_top(
 //  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[13]（flush_con_exc）承担
 //  冲刷，不再单独进 pc；ROB 满改吃 flag_bus[9]（stall_rob_full），端口已删。
         .exc_irq(exc_irq),
-        .exc_irq_ret(exc_irq_ret),
-        .exc_ecall(exc_ecall),
+//★ 这两根都换成【交付资格】同源的版本（理由见 pc.v 排队那一块）：武装不能再用裸译码/裸载荷。
+        .exc_irq_ret(exc_irq_ret_ok_w),
+        .exc_mark(exc_mark_w),
         .rob_empty(rob_empty_w),
         .stall_pc_redir(stall_pc_redir_w),
         .flush_pc_redir(flush_pc_redir_w),
@@ -288,8 +289,7 @@ module cpu_top(
 //  这两根线漏了 ⇒ 默认值写进 X ⇒ 所有 rs1 操作数（sw/lh/beq…）全是 X（实测整核挂死）
         .r1_data_in(r1_data_mid_w),
         .r2_data_in(r2_data_mid_w),
-//stall 期间的回灌：点② 的命中值 + 命中标志
-        .fb_hit1(fb_hit1_w), .fb_hit2(fb_hit2_w),
+//stall 期间的回灌：前送当前输出（门控在 post_decoder 里用本级自己的 r*_reg_en）
         .r1_data_fb(r1_data_final), .r2_data_fb(r2_data_final),
         .inst_in(inst_2),
         .aux_addr_in(aux_addr_2),
@@ -351,7 +351,9 @@ module cpu_top(
         .jalr_target_q2(jalr_target_q2),
         .flush_bju_exc(flush_bju_exc),
         .exc_bju(exc_bju_w),
-        .jp_target_c(bju_jp_target_c_w),
+        .idx_i(bju_idx_i_w),
+        .exc_pc_q(bju_exc_pc_w),
+        .older_q(bju_older_w),
         .idx_q(bju_idx_q_w),
         .br_pc_idx(br_pc_idx),
         .jalr_flag_q(jalr_flag_q),
@@ -464,6 +466,8 @@ module cpu_top(
         .we_mul(mul_we), .rd_mul(rd_mul), .data_mul(mul_data_final), .idx_mul(mul_idx_w),
         .we_ld(ld_we), .rd_ld(rd_load), .data_ld(ld_data_final), .idx_ld(ld_idx_w),
         .kill_mul(kill_mul_w), .kill_ld(kill_ld_w), .kill_alu(kill_alu_w),
+        .bju_exc(exc_bju_w), .bju_idx_i(bju_idx_i_w), .bju_idx_q(bju_idx_q_w),
+        .flag_bus(flag_bus),
         .we_a(wp_we_a), .rd_a(wp_rd_a), .data_a(wp_data_a),
         .we_b(wp_we_b), .rd_b(wp_rd_b), .data_b(wp_data_b),
         .taken_mul(wp_taken_mul),
@@ -499,9 +503,7 @@ module cpu_top(
         .r1_data_post_in(r1_data_3),
         .r2_data_post_in(r2_data_3),
         .r1_data_final(r1_data_final),
-        .r2_data_final(r2_data_final),
-//点② 的命中标志给 post_decoder 回灌用
-        .fb_hit1(fb_hit1_w), .fb_hit2(fb_hit2_w)
+        .r2_data_final(r2_data_final)
     );
     alu u_alu (
         .clk(clk),
@@ -513,6 +515,7 @@ module cpu_top(
         .cs_wr_en(csr_wr_en),
         .rd_in(rd_3),
         .idx_in(issue_idx_w),
+        .bju_idx(bju_idx_q_w),
         .alu_func4(alu_func4),
         .aux_addr_in(aux_addr_3),
         .csr_func3(csr_func3),
@@ -547,7 +550,9 @@ module cpu_top(
         .flush_con_rob(flush_con_rob_w), .flush_idx(flush_idx_w), .flush_all(1'b0),
         .flush_con_exc(flush_con_exc),
 //标记落哪一项：非对齐那条用故障自带的索引（它比载荷晚一拍）；其余三条与 issue_idx 同拍
-        .exc_en(exc_mark_w), .exc_idx(exc_ldst_misalign_out ? exc_ldst_idx_out : issue_idx_w),
+        .exc_en(exc_mark_w),
+        .exc_idx(flush_bju_exc ? bju_idx_q_w
+                 : (exc_ldst_misalign_out ? exc_ldst_idx_out : issue_idx_w)),
         .exc_cause(exc_cause), .exc_pc(exc_pc), .exc_tval(exc_tval),
         .trap_fire(flush_rob_trap_w),
         .trap_cause(rob_trap_cause_w), .trap_pc(rob_trap_pc_w), .trap_tval(rob_trap_tval_w),
@@ -627,8 +632,11 @@ module cpu_top(
         .exc_ecall(exc_ecall),
         .flush_bju_exc(flush_bju_exc),
 //异常仲裁源（原 trap_unit 的例化并入 controller）
-        .exc_bju_in(exc_bju_w),
-        .jp_target_c_in(bju_jp_target_c_w),
+        .bju_pc_in(bju_exc_pc_w),
+        .flush_bju_pre(flush_bju_pre),
+        .exc_irq_ret_ok(exc_irq_ret_ok_w),
+        .bju_tgt_in(jp_target),
+        .bju_older_in(bju_older_w),
         .exc_ecall_in(exc_ecall),
         .exc_ebreak_in(exc_ebreak),
         .exc_illegal_in(exc_illegal_out),
