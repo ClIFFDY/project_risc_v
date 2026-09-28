@@ -22,34 +22,37 @@
 
 module csr(
     input clk, rst,
-    input csr_wr_en, iret, exti, timi, softi, trap, exc_bju, exc,
-    input [9:0] flag_bus,
+    input csr_wr_en, exc_irq_ret, exti, timi, softi, exc_ecall, flush_bju_exc, flush_con_exc,
+    input [13:0] flag_bus,
     input mem_inflight,
     input [11:0] csr_addr,
 //读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
     input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
-    input [3:0] exc_cause,
-    input [31:0] exc_pc, exc_tval,
+//异常【交付】口（来自 ROB 的 trap_fire）：故障项退到队头那一拍才拉，载荷是它自己那份。
+//检测那一拍（flush_con_exc）只负责挡中断，不锁 mepc/mcause/mtval —— 详见下方时序块里的注释。
+    input exc_retire,
+    input [3:0]  exc_retire_cause,
+    input [31:0] exc_retire_pc, exc_retire_tval,
     input [1:0] ird_tmr,
-    input [3:0] irq_bubble,
     input jalr_fail, br2, br3,
     output reg [31:0] csr_data_out, isr_addr2, mcause, iret_addr2,
-    output reg irq_act, irq_processing
+    output reg exc_irq_act, exc_irq_processing
     );
 
-    reg irq_en_reg, irq_en_post_reg, eirq_en, tirq_en, sirq_en;
-    reg eirq_pend, tirq_pend, sirq_pend, irq_process, global_pend;
+    reg exc_irq_en_reg, exc_irq_en_post_reg, exc_eirq_en, exc_tirq_en, exc_sirq_en;
+    reg exc_eirq_pend, exc_tirq_pend, exc_sirq_pend, exc_irq_process, exc_global_pend;
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_reg, mcycle_reg, minstret_reg, mscratch_reg, mtval_reg;
     reg [31:0] iret_addr1;
 
 //输入合流（按"上层不运算"下放至此）：停顿、中断闸门、指令退役
-    reg stall, irq_gate, retire, flush_w;
+    reg stall, exc_irq_gate, retire, flush_w;
     always @(*) begin
-        stall    = flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0];
-        flush_w  = flag_bus[9] | flag_bus[7] | flag_bus[6];
-        irq_gate = (ird_tmr != 2'd0);
+        stall    = flag_bus[9] | flag_bus[8] | flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4]
+                 | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0];
+        flush_w  = flag_bus[13] | flag_bus[12] | flag_bus[11];
+        exc_irq_gate = (ird_tmr != 2'd0);
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
         retire   = !(flush_w | stall | mem_inflight);
     end
@@ -66,8 +69,8 @@ module csr(
 
     always @(posedge clk) begin
         if (rst) begin
-            irq_en_reg <= 1'b0;
-            irq_en_post_reg <= 1'b0;
+            exc_irq_en_reg <= 1'b0;
+            exc_irq_en_post_reg <= 1'b0;
             isr_addr_reg1 <= 32'd0;
             isr_addr_reg2 <= 32'd0;
             iret_addr1 <= 32'd0;
@@ -75,40 +78,40 @@ module csr(
             mcause_reg <= 32'd0;
             mscratch_reg <= 32'd0;
             mtval_reg <= 32'd0;
-            eirq_en <= 1'b0;
-            tirq_en <= 1'b0;
-            sirq_en <= 1'b0;
-            sirq_pend <= 1'b0;
-            irq_process <= 1'b0;
+            exc_eirq_en <= 1'b0;
+            exc_tirq_en <= 1'b0;
+            exc_sirq_en <= 1'b0;
+            exc_sirq_pend <= 1'b0;
+            exc_irq_process <= 1'b0;
         end
 //默认情况中断地址/使能/状态寄存器保持
         else begin
-            irq_en_reg <= irq_en_reg;
-            irq_en_post_reg <= irq_en_post_reg;
+            exc_irq_en_reg <= exc_irq_en_reg;
+            exc_irq_en_post_reg <= exc_irq_en_post_reg;
             isr_addr_reg1 <= isr_addr_reg1;
             isr_addr_reg2 <= isr_addr_reg2;
             mcause_reg <= mcause_reg;
             mscratch_reg <= mscratch_reg;
             mtval_reg <= mtval_reg;
-            eirq_en <= eirq_en;
-            tirq_en <= tirq_en;
-            sirq_en <= sirq_en;
-            irq_process <= irq_process;
+            exc_eirq_en <= exc_eirq_en;
+            exc_tirq_en <= exc_tirq_en;
+            exc_sirq_en <= exc_sirq_en;
+            exc_irq_process <= exc_irq_process;
 //根据不同的csr写地址写入不同的csr寄存器
             if (csr_wr_en && !stall) begin
                 case (csr_addr)
 //全局使能设定
                 12'h300: begin
-                    irq_en_reg <= csr_data_in[3];
-                    irq_en_post_reg <= csr_data_in[7];
+                    exc_irq_en_reg <= csr_data_in[3];
+                    exc_irq_en_post_reg <= csr_data_in[7];
                 end
 //三类型中断分别使能：规范位序 bit3=MSIE(软件)、bit7=MTIE(定时器)、bit11=MEIE(外部)
 //★ 本核原来把外部/软件写反了（eirq@3、sirq@11），与自家 mcause 的中断码（外部=11/定时器=7/
 //  软件=3，规范）自相矛盾 ⇒ 按规范对调。定时器那条本来就对。
                 12'h304: begin
-                    eirq_en <= csr_data_in[11];
-                    tirq_en <= csr_data_in[7];
-                    sirq_en <= csr_data_in[3];
+                    exc_eirq_en <= csr_data_in[11];
+                    exc_tirq_en <= csr_data_in[7];
+                    exc_sirq_en <= csr_data_in[3];
                 end
 //isr跳转目标设定
                 12'h305: begin
@@ -132,42 +135,52 @@ module csr(
                 end
                 12'h344: begin
 //软件中断挂起：按规范在 bit3（MSIP）；写 1 清挂起
-                    if (csr_data_in[3]) sirq_pend <= 1'b0;
+                    if (csr_data_in[3]) exc_sirq_pend <= 1'b0;
                 end
                 endcase
             end
-//trap信号控制的系统异常处理
-            if (exc) begin
-                iret_addr1 <= exc_pc;
-                iret_addr2 <= exc_pc;
-                mcause_reg <= {28'd0, exc_cause};
-                mtval_reg <= exc_tval;
-                irq_en_post_reg <= irq_en_reg;
-                irq_en_reg <= 1'b0;
-                irq_process <= 1'b1;
+//异常【检测】那一拍：只做"关中断 + 置受理态"。真正的锁存等 ROB 把故障项退到队头（下面那条）。
+//★ 为什么不能在这里锁 mepc/mcause/mtval：先报出来的异常未必是最老的异常 —— 更老的指令可能
+//  还在 lsu 队列里没报（lsu 入口才判非对齐，队列里的那条要到下一拍才报）。检测拍就锁，会锁成
+//  "年轻的那条"，而 ROB 是按老的那条交付的 ⇒ 两个侧面对不上。改为按 ROB 的交付口锁，才精确。
+            if (flush_con_exc) begin
+                exc_irq_en_post_reg <= exc_irq_en_reg;
+                exc_irq_en_reg <= 1'b0;
+                exc_irq_process <= 1'b1;
             end
 //非isr状态下触发中断，保存上下文并使能受理信号
-            else if (irq_act && !irq_process) begin
-                iret_addr1 <= pc_addr_in - irq_bubble;
-                iret_addr2 <= pc_addr_in - irq_bubble;
-                if (eirq_en && eirq_pend) begin
+//  mepc 取 pc_addr_in - 4：cpu_top 把 pc_addr_in 接的是 mid_decoder 的 aux_addr_2
+//  （那条指令"地址 + 4"），也就是【正要进发射级、还没被发出去】的那一条 = 中断返回点。
+//  旧写法是"取指 PC 减一个气泡计数"，ROB 之后前端在等 ROB 排空期间还在取指，那个计数已对不上。
+            else if (exc_irq_act && !exc_irq_process) begin
+                iret_addr1 <= pc_addr_in - 32'd4;
+                iret_addr2 <= pc_addr_in - 32'd4;
+                if (exc_eirq_en && exc_eirq_pend) begin
                     mcause_reg <= 32'h8000000B;
                 end
-                else if (tirq_en && tirq_pend) begin
+                else if (exc_tirq_en && exc_tirq_pend) begin
                     mcause_reg <= 32'h80000007;
                 end
-                else if (sirq_en && sirq_pend) begin
+                else if (exc_sirq_en && exc_sirq_pend) begin
                     mcause_reg <= 32'h80000003;
                 end
-                irq_en_post_reg <= irq_en_reg;
-                irq_en_reg <= 1'b0;
-                irq_process <= 1'b1;
+                exc_irq_en_post_reg <= exc_irq_en_reg;
+                exc_irq_en_reg <= 1'b0;
+                exc_irq_process <= 1'b1;
+            end
+//异常【交付】：ROB 的队头是那条故障指令（比它老的都退完了、比它年轻的已作废）⇒ 这一拍锁上下文。
+//  与上面两条不冲突：受理态（irq_process）一置起，中断那条就不可能再进来。
+            if (exc_retire) begin
+                iret_addr1 <= exc_retire_pc;
+                iret_addr2 <= exc_retire_pc;
+                mcause_reg <= {28'd0, exc_retire_cause};
+                mtval_reg <= exc_retire_tval;
             end
 //isr返回（目前只支持机器模式）
-            if (iret) begin
-                irq_en_reg <= irq_en_post_reg;
-                irq_en_post_reg <= 1'b1;
-                irq_process <= 1'b0;
+            if (exc_irq_ret) begin
+                exc_irq_en_reg <= exc_irq_en_post_reg;
+                exc_irq_en_post_reg <= 1'b1;
+                exc_irq_process <= 1'b0;
             end
         end
     end
@@ -187,20 +200,20 @@ module csr(
 //csr读操作逻辑
     always @(*) begin
         if (rst) begin
-            global_pend = 1'b0;
-            irq_act = 1'b0;
-            irq_processing = 1'b0;
+            exc_global_pend = 1'b0;
+            exc_irq_act = 1'b0;
+            exc_irq_processing = 1'b0;
             mcause = 32'd0;
             isr_addr2 = 32'd0;
-            tirq_pend = 1'b0;
-            eirq_pend = 1'b0;
+            exc_tirq_pend = 1'b0;
+            exc_eirq_pend = 1'b0;
         end
         else begin
-            tirq_pend = timi;
-            eirq_pend = exti;
-            global_pend = (eirq_pend && eirq_en) | (tirq_pend && tirq_en) | (sirq_pend && sirq_en);
-            irq_act = irq_en_reg && global_pend && !irq_process && !irq_gate && !(iret | trap | exc_bju | jalr_fail | br2 | br3);
-            irq_processing = irq_process;
+            exc_tirq_pend = timi;
+            exc_eirq_pend = exti;
+            exc_global_pend = (exc_eirq_pend && exc_eirq_en) | (exc_tirq_pend && exc_tirq_en) | (exc_sirq_pend && exc_sirq_en);
+            exc_irq_act = exc_irq_en_reg && exc_global_pend && !exc_irq_process && !exc_irq_gate && !(exc_irq_ret | exc_ecall | flush_bju_exc | jalr_fail | br2 | br3);
+            exc_irq_processing = exc_irq_process;
             mcause = mcause_reg;
             isr_addr2 = isr_addr_reg2;
         end
@@ -230,17 +243,17 @@ module csr(
         end
         else begin
             case (csr_addr_pre)
-            12'h300: csr_data_rd = {20'd0, irq_en_post_reg, 3'd0, irq_en_reg, 3'd0};
+            12'h300: csr_data_rd = {20'd0, exc_irq_en_post_reg, 3'd0, exc_irq_en_reg, 3'd0};
 //misa：MXL[31:30]=01（32 位）+ I[8] + M[12]，只读常量。
 //★ 读回 0 是不合规的（MXL=00 是保留编码），arch-test 的启动宏会读它。写被忽略（WARL）。
             12'h301: csr_data_rd = 32'h40001100;
-            12'h304: csr_data_rd = {20'd0, eirq_en, 3'd0, tirq_en, 3'd0, sirq_en, 3'd0};
+            12'h304: csr_data_rd = {20'd0, exc_eirq_en, 3'd0, exc_tirq_en, 3'd0, exc_sirq_en, 3'd0};
             12'h305: csr_data_rd = isr_addr_reg1;
             12'h340: csr_data_rd = mscratch_reg;
             12'h341: csr_data_rd = iret_addr1;
             12'h342: csr_data_rd = mcause_reg;
             12'h343: csr_data_rd = mtval_reg;
-            12'h344: csr_data_rd = {20'd0, eirq_pend, 3'd0, tirq_pend, 3'd0, sirq_pend, 3'd0};
+            12'h344: csr_data_rd = {20'd0, exc_eirq_pend, 3'd0, exc_tirq_pend, 3'd0, exc_sirq_pend, 3'd0};
             12'hB00: csr_data_rd = mcycle_reg;
             12'hB02: csr_data_rd = minstret_reg;
 //mhartid：单 hart 恒 0，只读（地址 bit[11:10]==11 ⇒ post_decoder 会挡掉对它的写）

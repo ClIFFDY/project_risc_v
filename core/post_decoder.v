@@ -22,11 +22,20 @@
 
 module post_decoder(
     input clk, rst,
-    input [9:0] flag_bus,
+    input [13:0] flag_bus,
     input [9:0] func10,
     input [4:0] rd_in,
+    input [4:0] rs1_in, rs2_in,
     input [6:0] opcode,
-    input [31:0] imm_alu_in, r1_data_final, r2_data_final,
+    input [31:0] imm_alu_in,
+//操作数（寄存器操作数走点①前送后的值；非寄存器操作数在下面被立即数覆盖）
+    input [31:0] r1_data_in, r2_data_in,
+//★ stall 期间的回灌（消费端 = 本级的载荷）：停在本级与执行单元之间时，前送源那一档可能只在
+//  前面某一拍出现过、之后就没了（alu 的结果寄存器只有一拍宽）⇒ 放行那一刻源上什么都没有，
+//  载荷只能用"进本级时采的旧值"（实测 CoreMark：计数少加一次，crcstate 错）。
+//  所以：哪一拍命中就把哪一拍的值钉进载荷。（合法 = 命中"比我更老"的那一档）
+    input        fb_hit1, fb_hit2,
+    input [31:0] r1_data_fb, r2_data_fb,
     input [11:0] imm12_csr_in,
     input [4:0] imm5_csr_in,
     input [31:0] inst_in,
@@ -35,22 +44,50 @@ module post_decoder(
     input br_pred_taken_in,
     input [31:0] jalr_pred_addr_in,
     (* max_fanout = 32 *) output reg [31:0] r1_data_out, r2_data_out,
-    output reg [4:0] rd_out, rd_back1,
+    output reg [4:0] rd_out,
+//★ 这一对限定位决定单元的该操作数走哪条路：
+//  1 = 寄存器操作数：由前送级（decoder→执行单元之间那一点）用两个写回口再比一次
+//  0 = 非寄存器操作数（立即数 / pc / uimm）⇒ 直接用 r1_data_out/r2_data_out 里的值。
+//  没有这对位就分不清"rs2 字段其实是立即数"的 I 型，前送会拿立即数当寄存器号去读。
+    output reg r1_reg_en, r2_reg_en,
+//发射级（E4）写口广播：这一拍要不要写 rd、写的是哪个 rd（给 controller 发写序号用）
+    output reg issue_we,
+    output reg [4:0] issue_rd,
+//ROB 索引载荷（与其它载荷【同使能】锁存）：ROB 每分配一条指令就发一个索引，
+//  它随指令走到自己的完成点，回来时用它把结果写进 ROB 自己那一项。
+    input [2:0] idx_in,
+    output reg [2:0] issue_idx,
+//★ 三个执行单元（alu/lsu/mulu）的输入【级数对齐】：都吃这一级（decoder 载荷）。
+//  lsu/mulu 原来吃的是 mem_buf 的组合输出（比 alu 早一级），索引也得跟着差一拍；
+//  搬到这里之后三者同相：索引一律 issue_idx，操作数一律由 forw（decoder→单元之间）给出。
+    output reg [6:0]  opc_out,
+    output reg [9:0]  fn10_out,
+//给 lsu 的那一份：{7'd0, funct3}，任何 opcode 下都有效（func10 只在 OP/OP_IMM 类有意义）
+    output reg [9:0]  fn10_ls_out,
+    output reg [31:0] off_mem_out,
+    output reg [4:0]  rs1_out, rs2_out,
+//本拍载荷推进（不分写不写）—— ROB 的分配使能：每条指令都要占位，
+//  否则陷阱不知道自己在程序序里的位置
+    output payload_go,
+//寄存一拍的"载荷推进"脉冲：消费端（lsu/mulu）用它做【每条指令只收一次】的入口门 ——
+//  载荷因 stall/hold_issue/flush 停住时它是 0，车厢一空也不会把同一条指令再收一遍。
+//  寄存版是关键：直接用 payload_go 会经 stall_w 与消费端自己的 stall 成环（实测死锁）。
+    output reg payload_go_q,
     output reg [3:0] alu_func4,
     output reg [2:0] csr_func3,
-    output reg we, irq_ret, trap, ebreak, jal_flag, jalr_flag,
+    output reg we, exc_irq_ret, exc_ecall, exc_ebreak, jal_flag, jalr_flag,
     output reg csr_wr_en,
     output reg [11:0] csr_addr,
     output reg [11:0] csr_addr_pre,
     output reg [31:0] csr_data,
-//交给 bju 的判定源：前三条与 alu 的输入同源（r1_data_out / r2_data_out / alu_func4），
+//交给 bju 的判定源：判定源与 alu 同源（前送后的操作数 / alu_func4），
 //其余是本级寄存下来的跳转载荷与限定位，都由判定单元在下一拍使用
     output reg [31:0] aux_addr_out,
     output reg [31:0] beq_off_q2, jalr_pred_addr_out,
     output reg br_flag, br_pred_taken_out,
-    output reg jal_misalign_out,
+    output reg exc_jal_misalign_out,
     output reg [31:0] jal_target_out,
-    output reg illegal_out
+    output reg exc_illegal_out
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -72,15 +109,48 @@ module post_decoder(
     localparam OPCODE_AUIPC  = 7'b0010111;
     localparam OPCODE_SYSTEM = 7'b1110011;
 
-//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
-//控制位译码（行为块，放本模块最前）：三条互斥 —— 旧 stage 是单值而两条位可同时为 1，
-//故这里保持【冲刷优先于停顿】；exec 即本模块的停开机使能。
-    reg exec, flush_w, stall_w;
-    reg illegal_now;
+//flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
+//            stall_rob_full, stall_pc_redir,
+//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_mulu_haz, stall_mulu_div,
+//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//flag_bus 逐位翻译成原名：本模块内不起新的组合名，判定处直接写或运算。
+//冲刷位与停顿位可同时为 1，故判定处一律保持【冲刷优先于停顿】。
+    reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
+    reg stall_rob_full, stall_pc_redir;
+    reg stall_lsu_haz, stall_lsu_unload, stall_lsu_full;
+    reg stall_mulu_haz, stall_mulu_div;
+    reg stall_dcache_miss, stall_icache_miss, stall_bus_hold;
+    reg exc_illegal_now;
     always @(*) begin
-        flush_w = flag_bus[9] | flag_bus[7] | flag_bus[6];
-        stall_w = (flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[8];
+        flush_con_exc     = flag_bus[13];
+        flush_con_irq     = flag_bus[12];
+        flush_con_jump    = flag_bus[11];
+        exec              = flag_bus[10];
+        stall_rob_full    = flag_bus[9];
+        stall_pc_redir    = flag_bus[8];
+        stall_lsu_haz     = flag_bus[7];
+        stall_lsu_unload  = flag_bus[6];
+        stall_lsu_full    = flag_bus[5];
+        stall_mulu_haz    = flag_bus[4];
+        stall_mulu_div    = flag_bus[3];
+        stall_dcache_miss = flag_bus[2];
+        stall_icache_miss = flag_bus[1];
+        stall_bus_hold    = flag_bus[0];
+    end
+
+//发射级（E4）写口广播：这条指令会不会写 rd、写哪个（给 controller 发写序号用）。
+//判据取保守侧（多报最多多停几拍）：只排除【肯定不写寄存器堆】的 STORE/BRANCH/MISC_MEM。
+//SYSTEM 里的 ecall/ebreak/mret 其实不写，这里按会写处理（保守）。
+    always @(*) begin
+        issue_we = 1'b0;
+        issue_rd = rd_in;
+        if (exec && ~(flush_con_exc | flush_con_irq | flush_con_jump) && (rd_in != 5'd0)) begin
+            case (opcode)
+                OPCODE_OP, OPCODE_OP_IMM, OPCODE_LOAD, OPCODE_JAL,
+                OPCODE_JALR, OPCODE_LUI, OPCODE_AUIPC, OPCODE_SYSTEM: issue_we = 1'b1;
+            endcase
+        end
     end
 
 //csr 读口地址：就是本级【组合输入】里那条指令的 csr 号（即 csr_addr 的下一条流水位置），
@@ -124,115 +194,143 @@ module post_decoder(
     end
 
     always @(*) begin
-        illegal_now = 1'b0;
+        exc_illegal_now = 1'b0;
         if (inst_in != 32'd0) begin
             case (opcode)
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: begin
-                    illegal_now = 1'b0;
+                    exc_illegal_now = 1'b0;
                 end
 //LOAD 合法宽度：LB/LH/LW/LBU/LHU = 000/001/010/100/101 ⇒ 011/110/111 非法
                 OPCODE_LOAD: begin
-                    if (inst_in[14:12] == 3'b011) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b110) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b111) illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b110) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b111) exc_illegal_now = 1'b1;
                 end
 //STORE 合法宽度：SB/SH/SW = 000/001/010 ⇒ 011/100/101/110/111 非法
                 OPCODE_STORE: begin
-                    if (inst_in[14:12] == 3'b011) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b100) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b101) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b110) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b111) illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b100) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b101) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b110) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b111) exc_illegal_now = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (inst_in[14:12] != 3'b000) illegal_now = 1'b1;
+                    if (inst_in[14:12] != 3'b000) exc_illegal_now = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (inst_in[14:12] == 3'b010) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b011) illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b010) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (inst_in[14:12] == 3'b001) begin
-                        if (inst_in[31:25] != 7'd0) illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
                     end
                     if (inst_in[14:12] == 3'b101) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
                     end
                 end
                 OPCODE_OP: begin
                     if (inst_in[31:25] == 7'b0000001) begin
-                        illegal_now = 1'b0;
+                        exc_illegal_now = 1'b0;
                     end
                     else if (inst_in[14:12] == 3'b000) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
                     end
                     else if (inst_in[14:12] == 3'b001) begin
-                        if (inst_in[31:25] != 7'd0) illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
                     end
                     else if (inst_in[14:12] == 3'b101) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
                     end
                     else begin
-                        if (inst_in[31:25] != 7'd0) illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (inst_in[14:12] == 3'b010) illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b011) illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b010) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (inst_in[14:12] == 3'b100) illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b100) exc_illegal_now = 1'b1;
 //sret（0x102）：只对 S 模式有意义，本核是 M-only ⇒ 按非法指令（规范允许"实现为非法"）。
 //★ wfi（0x105）保持【合法】并当 NOP：规范要求 WFI 是一条合法指令（可以什么都不做），
 //  只有 mstatus.TW=1 且在低权限模式执行时才非法。
                     if (inst_in[14:12] == 3'b000) begin
-                        if (inst_in[31:20] == 12'h102) illegal_now = 1'b1;
+                        if (inst_in[31:20] == 12'h102) exc_illegal_now = 1'b1;
                     end
                     if (csr_is_access_now) begin
-                        if (!csr_exists_now) illegal_now = 1'b1;
+                        if (!csr_exists_now) exc_illegal_now = 1'b1;
                         if (csr_ro_now) begin
-                            if (csr_wr_now) illegal_now = 1'b1;
+                            if (csr_wr_now) exc_illegal_now = 1'b1;
                         end
                     end
                 end
                 default: begin
-                    illegal_now = 1'b1;
+                    exc_illegal_now = 1'b1;
                 end
             endcase
         end
     end
 
+//发号使能：与下面载荷寄存器的推进条件同形（exec 且不冲刷不暂停），再与"本拍有写"相与
+    assign payload_go = exec & ~(flush_con_exc | flush_con_irq | flush_con_jump)
+                      & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+                        | stall_lsu_full | stall_mulu_haz | stall_mulu_div
+                        | stall_dcache_miss | stall_icache_miss | stall_bus_hold);
+
+    always @(posedge clk) begin
+        if (rst_q) payload_go_q <= 1'b0;
+        else       payload_go_q <= payload_go;
+    end
+
     always @(posedge clk) begin
         if (rst_q) begin
-            r1_data_out <= 32'd0;
-            r2_data_out <= 32'd0;
             rd_out <= 5'd0;
-            rd_back1 <= 5'd0;
             alu_func4 <= 4'd0;
             we <= 1'b0;
             csr_wr_en <= 1'b0;
             csr_addr <= 12'd0;
             csr_data <= 32'd0;
             br_flag <= 1'b0;
-            irq_ret <= 1'b0;
-            trap <= 1'b0;
-            ebreak <= 1'b0;
+            exc_irq_ret <= 1'b0;
+            exc_ecall <= 1'b0;
+            exc_ebreak <= 1'b0;
             jal_flag <= 1'b0;
             jalr_flag <= 1'b0;
             beq_off_q2 <= 32'd0;
             br_pred_taken_out <= 1'b0;
             jalr_pred_addr_out <= 32'd0;
-            jal_misalign_out <= 1'b0;
+            exc_jal_misalign_out <= 1'b0;
             jal_target_out <= 32'd0;
-            illegal_out <= 1'b0;
+            exc_illegal_out <= 1'b0;
+            issue_idx <= 3'd0;
+            opc_out <= 7'd0;
+            fn10_out <= 10'd0;
+            fn10_ls_out <= 10'd0;
+            off_mem_out <= 32'd0;
+            rs1_out <= 5'd0;
+            rs2_out <= 5'd0;
+            r1_reg_en <= 1'b0;
+            r2_reg_en <= 1'b0;
+            r1_data_out <= 32'd0;
+            r2_data_out <= 32'd0;
         end
         else if (exec) begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
-            if (!flush_w && !stall_w) begin
-                r1_data_out <= 32'd0;
-                r2_data_out <= 32'd0;
+            if (~(flush_con_exc | flush_con_irq | flush_con_jump)
+              & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+                 | stall_lsu_full | stall_mulu_haz | stall_mulu_div
+                 | stall_dcache_miss | stall_icache_miss | stall_bus_hold)) begin
+                issue_idx <= idx_in;
+                opc_out <= opcode;
+                fn10_out <= func10;
+                fn10_ls_out <= {7'd0, inst_in[14:12]};
+                r1_reg_en <= 1'b0;
+                r2_reg_en <= 1'b0;
+                off_mem_out <= imm_alu_in;
+                rs1_out <= rs1_in;
+                rs2_out <= rs2_in;
                 rd_out <= 5'd0;
-                rd_back1 <= 5'd0;
                 alu_func4 <= 4'd0;
                 csr_func3 <= 3'd0;
                 we <= 1'b0;
@@ -240,48 +338,48 @@ module post_decoder(
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
                 br_flag <= 1'b0;
-                irq_ret <= 1'b0;
-                trap <= 1'b0;
-                ebreak <= 1'b0;
+                exc_irq_ret <= 1'b0;
+                exc_ecall <= 1'b0;
+                exc_ebreak <= 1'b0;
                 jal_flag <= 1'b0;
                 jalr_flag <= 1'b0;
                 beq_off_q2 <= 32'd0;
                 aux_addr_out <= aux_addr_in;
-                jal_misalign_out <= (opcode == OPCODE_JAL) & inst_in[21];
+                exc_jal_misalign_out <= (opcode == OPCODE_JAL) & inst_in[21];
                 jal_target_out <= jal_target_now;
-                illegal_out <= illegal_now;
+                exc_illegal_out <= exc_illegal_now;
                 br_pred_taken_out <= br_pred_taken_in;
                 jalr_pred_addr_out <= jalr_pred_addr_in;
+//操作数载体默认 = **点①前送之后的值**（寄存器操作数就是它，随载荷带到点②再前送一次）。
+//  非寄存器操作数（立即数 / pc / uimm）由下面各 opcode 分支覆盖。
+                r1_data_out <= r1_data_in;
+                r2_data_out <= r2_data_in;
                 case (opcode)
                     OPCODE_OP: begin
-                        r1_data_out <= r1_data_final;
-                        r2_data_out <= r2_data_final;
                         rd_out <= rd_in;
+                        r1_reg_en <= 1'b1;
+                        r2_reg_en <= 1'b1;
 //RV32M：写回由 mulu 独立完成，这条路必须让开 —— 否则同一条指令被写两次，
-//而且 alu 会按【撞车的 func3】算出垃圾结果、再经 rd_back1 前递给紧邻的下一条。
+//而且 alu 会按【撞车的 func3】算出垃圾结果。
 //M 与普通 ALU 共用 OPCODE_OP，只能靠 funct7 区分（func10[9:3]==7'b0000001）。
                         if (func10[9:3] == 7'b0000001) begin
-                            rd_back1 <= 5'd0;
                             we <= 1'b0;
                         end
                         else begin
-                            rd_back1 <= rd_in;
                             alu_func4 <= {func10[8], func10[2:0]};
                             we <= 1'b1;
                         end
                     end
                     OPCODE_OP_IMM: begin
-                        r1_data_out <= r1_data_final;
-                        r2_data_out <= imm_alu_in;
                         rd_out <= rd_in;
-                        rd_back1 <= rd_in;
+                        r1_reg_en <= 1'b1;
+                        r2_data_out <= imm_alu_in;
                         alu_func4 <= {func10[8], func10[2:0]};
                         we <= 1'b1;
                     end
 //jal存储pc值传递
                     OPCODE_JAL: begin
                         rd_out <= rd_in;
-                        rd_back1 <= rd_in;
                         we <= 1'b1;
                         aux_addr_out <= aux_addr_in;
                         jal_flag <= 1'b1;
@@ -289,44 +387,53 @@ module post_decoder(
 //jalr：偏移与基址各寄存一拍，真目标由判定块在下一拍相加得出
                     OPCODE_JALR: begin
                         rd_out <= rd_in;
-                        rd_back1 <= rd_in;
+                        r1_reg_en <= 1'b1;
+                        r2_data_out <= offset_jalr0;
                         we <= 1'b1;
                         jalr_flag <= 1'b1;
                         aux_addr_out <= aux_addr_in;
-                        r1_data_out <= r1_data_final;
-                        r2_data_out <= offset_jalr0;
                     end
 //分支：两个比较源寄存一拍，比较由判定块在下一拍做
                     OPCODE_BRANCH: begin
+                        r1_reg_en <= 1'b1;
+                        r2_reg_en <= 1'b1;
                         aux_addr_out <= aux_addr_in;
                         beq_off_q2 <= offset_beq0_aux - 4'd4;
-                        r1_data_out <= r1_data_final;
-                        r2_data_out <= r2_data_final;
                         alu_func4 <= {1'b0, func10[2:0]};
                         br_flag <= 1'b1;
                     end
                     OPCODE_LUI: begin
-                        r1_data_out <= 32'd0;
-                        r2_data_out <= imm_alu_in;
                         rd_out <= rd_in;
-                        rd_back1 <= rd_in;
+                        r2_data_out <= imm_alu_in;
                         alu_func4 <= 4'd0;
                         we <= 1'b1;
                     end
+//AUIPC：r1 = 本条 PC（非寄存器操作数）、r2 = 立即数
                     OPCODE_AUIPC: begin
+                        rd_out <= rd_in;
                         r1_data_out <= pc_operand_in;
                         r2_data_out <= imm_alu_in;
-                        rd_out <= rd_in;
-                        rd_back1 <= rd_in;
                         alu_func4 <= 4'd0;
                         we <= 1'b1;
+                    end
+//LOAD：r1 = 基址（寄存器操作数）；偏移走 off_mem_out（lsu 自己那一份）
+                    OPCODE_LOAD: begin
+                        rd_out <= rd_in;
+                        r1_reg_en <= 1'b1;
+                    end
+//STORE：r1 = 基址、r2 = 存的数据，两个都是寄存器操作数
+                    OPCODE_STORE: begin
+                        r1_reg_en <= 1'b1;
+                        r2_reg_en <= 1'b1;
+                    end
+//MISC_MEM（fence/fence.i）：不吃寄存器操作数
+                    OPCODE_MISC_MEM: begin
                     end
 //SYSTEM类指令读写赋能，地址计算
                     OPCODE_SYSTEM: begin
                         rd_out <= rd_in;
-                        rd_back1 <= rd_in;
                         csr_func3 <= func10[2:0];
-                        irq_ret <= (func10[2:0] == 3'b000) && (imm12_csr_in == 12'h302);
+                        exc_irq_ret <= (func10[2:0] == 3'b000) && (imm12_csr_in == 12'h302);
 //不写时不给出地址（地址 0 不是任何 CSR）：csr.v 的写 case 不命中 ⇒ 天然不写，
 //写后读旁路也自然关掉（读要走真寄存器）。★ 不能用"清 csr_wr_en"来表达不写 ——
 //csr_wr_en 是【双重身份】：alu 用它判定"这是条 CSR 指令"，据此把读值 cs_data 选进
@@ -341,23 +448,24 @@ module post_decoder(
                             3'b000: begin
                                 we <= 1'b0;
                                 csr_wr_en <= 1'b0;
-                                trap <= (imm12_csr_in == 12'h000) || (imm12_csr_in == 12'h001);
-                                ebreak <= (imm12_csr_in == 12'h001);
+                                exc_ecall <= (imm12_csr_in == 12'h000) || (imm12_csr_in == 12'h001);
+                                exc_ebreak <= (imm12_csr_in == 12'h001);
                             end
+//r1 的来路：csrrw/csrrs/csrrc 用 rs1（寄存器操作数 ⇒ 走前送）；csrrwi/si/ci 用 uimm。
                             3'b001: begin
                                 we <= 1'b1;
                                 csr_wr_en <= 1'b1;
-                                r1_data_out <= r1_data_final;
+                                r1_reg_en <= 1'b1;
                             end
                             3'b010: begin
                                 we <= 1'b1;
                                 csr_wr_en <= 1'b1;
-                                r1_data_out <= r1_data_final;
+                                r1_reg_en <= 1'b1;
                             end
                             3'b011: begin
                                 we <= 1'b1;
                                 csr_wr_en <= 1'b1;
-                                r1_data_out <= r1_data_final;
+                                r1_reg_en <= 1'b1;
                             end
                             3'b101: begin
                                 we <= 1'b1;
@@ -381,12 +489,26 @@ module post_decoder(
                         endcase
                     end
                 endcase
+//★ 故障指令一律不写 rd：乱序写回之后写不再由退口把关（完成即写）⇒ 必须在这里挡掉，
+//  否则非法指令 / 非对齐跳转的垃圾结果会先落进寄存器堆（trap 交付时已经来不及收回）。
+//  （ecall/ebreak 那条分支本来就置 we=0；访存非对齐由 lsu 拒绝，不发写回。）
+                if (exc_illegal_now | ((opcode == OPCODE_JAL) & inst_in[21]))
+                    we <= 1'b0;
             end
-            else if (stall_w) begin
-                r1_data_out <= r1_data_out;
-                r2_data_out <= r2_data_out;
+            else if ((stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+                    | stall_lsu_full | stall_mulu_haz | stall_mulu_div
+                    | stall_dcache_miss | stall_icache_miss | stall_bus_hold)
+                   & ~(flush_con_exc | flush_con_irq | flush_con_jump)) begin
+                issue_idx <= issue_idx;
+                opc_out <= opc_out;
+                fn10_out <= fn10_out;
+                fn10_ls_out <= fn10_ls_out;
+                r1_reg_en <= r1_reg_en;
+                r2_reg_en <= r2_reg_en;
+                off_mem_out <= off_mem_out;
+                rs1_out <= rs1_out;
+                rs2_out <= rs2_out;
                 rd_out <= rd_out;
-                rd_back1 <= rd_back1;
                 alu_func4 <= alu_func4;
                 csr_func3 <= csr_func3;
                 we <= we;
@@ -394,41 +516,56 @@ module post_decoder(
                 csr_addr <= csr_addr;
                 csr_data <= csr_data;
                 br_flag <= br_flag;
-                irq_ret <= irq_ret;
-                trap <= trap;
-                ebreak <= ebreak;
+                exc_irq_ret <= exc_irq_ret;
+                exc_ecall <= exc_ecall;
+                exc_ebreak <= exc_ebreak;
                 jal_flag <= jal_flag;
                 jalr_flag <= jalr_flag;
                 beq_off_q2 <= beq_off_q2;
                 aux_addr_out <= aux_addr_out;
                 br_pred_taken_out <= br_pred_taken_out;
                 jalr_pred_addr_out <= jalr_pred_addr_out;
-                jal_misalign_out <= jal_misalign_out;
+                exc_jal_misalign_out <= exc_jal_misalign_out;
                 jal_target_out <= jal_target_out;
-                illegal_out <= illegal_out;
+                exc_illegal_out <= exc_illegal_out;
+                if (fb_hit1) begin
+                    r1_data_out <= r1_data_fb;
+                end
+                else begin
+                    r1_data_out <= r1_data_out;
+                end
+                if (fb_hit2) begin
+                    r2_data_out <= r2_data_fb;
+                end
+                else begin
+                    r2_data_out <= r2_data_out;
+                end
             end
             else begin
-                r1_data_out <= 32'd0;
-                r2_data_out <= 32'd0;
+                    issue_idx <= 3'd0;
+                opc_out <= 7'd0;
+                fn10_out <= 10'd0;
+                off_mem_out <= 32'd0;
+                rs1_out <= 5'd0;
+                rs2_out <= 5'd0;
                 rd_out <= 5'd0;
-                rd_back1 <= 5'd0;
                 alu_func4 <= 4'd0;
                 we <= 1'b0;
                 csr_wr_en <= 1'b0;
                 csr_addr <= 12'd0;
                 csr_data <= 32'd0;
                 br_flag <= 1'b0;
-                irq_ret <= 1'b0;
-                trap <= 1'b0;
-                ebreak <= 1'b0;
+                exc_irq_ret <= 1'b0;
+                exc_ecall <= 1'b0;
+                exc_ebreak <= 1'b0;
                 jal_flag <= 1'b0;
                 jalr_flag <= 1'b0;
                 beq_off_q2 <= 32'd0;
                 br_pred_taken_out <= 1'b0;
                 jalr_pred_addr_out <= 32'd0;
-                jal_misalign_out <= 1'b0;
+                exc_jal_misalign_out <= 1'b0;
                 jal_target_out <= 32'd0;
-                illegal_out <= 1'b0;
+                exc_illegal_out <= 1'b0;
             end
         end
     end

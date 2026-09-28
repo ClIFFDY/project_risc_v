@@ -45,26 +45,48 @@
 
 module mulu(
     input clk, rst,
-    input [9:0] flag_bus,
-//前置冲刷（早一拍），由 bju 的组合判定直接给出：判定结果寄存后只能覆盖 c1..c4 与 wb，
-//而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
-//推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
+    input [13:0] flag_bus,
+//前置冲刷（早一拍），由 bju 的组合判定直接给出（源名 flush_bju_pre）：判定结果寄存后只能
+//覆盖 c1..c4 与 wb，而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），
+//那两拍里它已经会去推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
 //不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
-    input stallf,
+    input flush_bju_pre,
+//ROB 队头（年龄基准）+ 写口级落地广播（b0/b1）：本模块据此杀自己更老的同 rd 在途记录
+    input [2:0]  rob_head,
+    input        b0_we,
+    input [4:0]  b0_rd,
+    input [2:0]  b0_idx,
+    input        b1_we,
+    input [4:0]  b1_rd,
+    input [2:0]  b1_idx,
+//写口级"这一笔已处置（落地/被杀/不写）"：本模块据此撤值放行；没被取走就一直举着
+    input        taken_mul,
+//入口门（每条指令只收一次）：decoder 载荷【这一拍就要推进】才允许收（理由同 lsu：
+//  用上一拍的脉冲会让"被挤住那条"在新的一拍里成了上一拍的旧货 ⇒ 静默丢掉）
+    input payload_go,
 //冻结信号从 flag_bus 取位（本模块不设专用 stall 端口）：
 //本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
 //严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
 //m_push 每拍重发 -> m_v 恒 1 -> we_mul 连续多拍。
-//【合流里必须排掉本模块自己的 stall（stall_m/stall_v）】：那正是 div 进行 / mul-use 冒险的输出，
-//一并冻住会自锁。
+//【合流里必须排掉本模块自己的两条 stall（stall_mulu_haz/div）】：那正是 div 进行 /
+//mul-use 冒险的输出，一并冻住会自锁。
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
+//写序号（与 rd_in 同沿锁进本级）与当前最新号（滞留兜底用）
+    input [2:0]  idx_in,
+//落地广播（来自写回级两个写口）：据此把更老的同 rd 在途写（乘法/除法）作废
     input [31:0] r1_data_final, r2_data_final,
     output reg [31:0] mul_data_out,
     output reg mul_loaded, mul_we,
+//被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
+    output reg kill_mul,
     output reg [4:0] rd_mul,
-    output reg stall_m, stall_v, stall
+//本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
+    output reg [2:0]  mul_idx,
+//两条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
+    output reg stall_mulu_haz,
+    output reg stall_mulu_div
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -75,32 +97,47 @@ module mulu(
 
     localparam OPCODE_OP = 7'b0110011;
 
+
+
 //控制位译码（与流水级无关，放本模块最前）
-//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
+//flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
+//            stall_rob_full, stall_pc_redir,
+//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_mulu_haz, stall_mulu_div,
+//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
-//不用流水线使能，故只取两条冲刷位。
-//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 stallf）：m_push、除法 FSM 的作废、
+//不用流水线使能，故只取三条冲刷位。
+//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 flush_bju_pre）：m_push、除法 FSM 的作废、
 //d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
-    always @(*) flush_w = flag_bus[9] | flag_bus[7] | flag_bus[6] | stallf;
+    always @(*) flush_w = flag_bus[13] | flag_bus[12] | flag_bus[11] | flush_bju_pre;
 
-//冻结信号合流：总线保持（外部 + dcache 延拓拍）、取指缺失、lsu 的 load-use（排掉自己那两位）
+//冻结信号合流（本模块是消费者，或运算在这里做）：
+//  bus_hold   = 总线不可用（dcache 缺失 + 外部 hold）
+//  pipe_stall = 总线保持 / 取指缺失 / lsu 那三条（排掉自己的 haz/div 两位）
+//★ 不要并进 stall_rob_full(9) / stall_pc_redir(8)：ROB 排空要靠队头那条乘法完成，
+//  而乘法正被它挡在 mulu 门外 ⇒ ROB 永不排空 ⇒ 死锁（与 lsu 入口门同一个坑）。
     reg pipe_stall, bus_hold;
+//写口那一笔还没被取走 ⇒ 本模块整条冻住（结果连着乘积一起保持，不许被下一笔覆盖）。
+    reg wr_pend;
     always @(*) begin
-        bus_hold   = flag_bus[5] | flag_bus[4];
-        pipe_stall = flag_bus[5] | flag_bus[4] | flag_bus[1] | flag_bus[0];
+        bus_hold   = flag_bus[2] | flag_bus[0];
+        pipe_stall = flag_bus[7] | flag_bus[6] | flag_bus[5]
+                   | flag_bus[2] | flag_bus[1] | flag_bus[0];
     end
 
 //寄存器声明（按级分组）
 //乘法：第一级锁操作数 / 第二级锁乘积
     reg [31:0] m_a, m_b;
     reg [4:0]  m_rd;
+    reg [2:0]  m_idx;
     reg [2:0]  m_op;
     reg        m_v;
 
     reg [63:0] m_p;
     reg [4:0]  m_rd_q;
+    reg [2:0]  m_idx_q;
     reg [2:0]  m_op_q;
     reg        m_pv;
 
@@ -113,6 +150,7 @@ module mulu(
     reg        d_ovf;             // INT_MIN / -1
     reg        d_sign_b;
     reg [4:0]  d_rd;
+    reg [2:0]  d_idx;
     reg [4:0]  d_cnt;
     reg        d_busy;
     reg        d_issued;          // 本条 div 已发起过（防止离开 mulu 级之前重复发起）
@@ -129,10 +167,12 @@ module mulu(
 //按 c2 → c3 → c4 → 写口 的级数对齐，除法写口落在 d_done+3。
     reg [2:0]  d_cmt_q;
     reg [4:0]  d_cmt_rd;
+    reg [2:0]  d_cmt_idx;
     reg [31:0] d_cmt_data;
 
 //输出保持
     reg [4:0]  hold_rd;
+    reg [2:0]  idx_hold;
     reg [31:0] hold_data;
     reg        hold;
 
@@ -141,10 +181,13 @@ module mulu(
     reg [9:0] func10_post;
     reg [4:0] rd_post;
     reg       mstalled;
+    reg        div_pend_v;
+    reg [4:0]  div_pend_rd;
 
 //组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）
     reg        is_m, is_mul, is_div;
     reg        is_m_post, is_mul_post;
+    reg        stall;
     reg        m_push;
     reg        mul_sel;
     reg signed [32:0] a_ext, b_ext;
@@ -170,7 +213,7 @@ module mulu(
 
 //第一级：锁操作数。判据 !stall / !flush_w / !bus_hold_in 与 lsu 的 ld_enq 同形
     always @(*) begin
-        m_push = is_mul && !stall && !pipe_stall && !flush_w && !bus_hold;
+        m_push = is_mul && !stall && !pipe_stall && !flush_w && !bus_hold && !wr_pend && payload_go;
     end
 
 //乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与 alu 的写回级同呼吸。
@@ -179,12 +222,13 @@ module mulu(
             m_v <= 1'b0;
             m_a <= 32'd0;  m_b <= 32'd0;  m_rd <= 5'd0;  m_op <= 3'd0;
         end
-        else if (!pipe_stall) begin
+        else if (!pipe_stall && !wr_pend) begin
             m_v <= m_push;
             if (m_push) begin
                 m_a  <= r1_data_final;
                 m_b  <= r2_data_final;
                 m_rd <= rd_in;
+                m_idx <= idx_in;
                 m_op <= func10[2:0];
             end
         end
@@ -209,10 +253,11 @@ module mulu(
             m_pv <= 1'b0;
             m_p <= 64'd0;  m_rd_q <= 5'd0;  m_op_q <= 3'd0;
         end
-        else if (!pipe_stall) begin
+        else if (!pipe_stall && !wr_pend) begin
             m_pv   <= m_v;
             m_p    <= m_p_int[63:0];
             m_rd_q <= m_rd;
+            m_idx_q <= m_idx;
             m_op_q <= m_op;
         end
     end
@@ -252,7 +297,10 @@ module mulu(
         end
         else if (d_done_q || !is_div) begin
 //指令离开 mulu 级 → 清"已发起"
+//★ 必须同时清 d_busy：若 is_div 在迭代中掉了（本级换了指令），只清 d_issued 会让
+//  下面的迭代分支再也进不去 ⇒ d_busy 粘死 ⇒ stall_mulu_div 永久为 1 ⇒ 前端永久冻死（实测抓到）。
             d_issued <= 1'b0;
+            d_busy   <= 1'b0;
         end
         else if (d_busy) begin
             d_a     <= {d_a[30:0], 1'b0};
@@ -269,12 +317,17 @@ module mulu(
                 d_neg_r <= (func10[0] == 1'b0) && d_dvd[31] && (d_b != 32'd0);
             end
         end
-        else if (is_div && !d_issued && !bus_hold) begin
+//★ 发起条件必须等操作数真的就绪：`!stall_mulu_haz`（前一条乘法的结果还没回来）与 `!pipe_stall`
+//  （别的单元在停：载入用法相关、总线/缓存 hold）都要排掉。不能判 `!stall` —— stall 里含
+//  `stall_v` 而 stall_v 又含 is_div 本身，判了永远发不出去（死锁）。
+        else if (is_div && !d_issued && !bus_hold && !stall_mulu_haz && !pipe_stall && (d_cmt_q == 3'd0)) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //【不能判 !stall】—— stall 里含 is_div 本身，判了就永远发不出去（死锁）。
 //d_issued 保证一条 div 只发起一次；否则算完后 is_div 仍在（指令还冻在 mulu 级），
 //会无限重复发起、stall 永远落不下去。
+//★ 临时调试（验完删）：把发起那一拍的输入原样锁进寄存器，供 tb 事后打印（避免组合竞争）
             d_rd     <= rd_in;
+            d_idx    <= idx_in;
             d_rem    <= func10[1];
             d_dvd    <= r1_data_final;
             d_sign_b <= r2_data_final[31];
@@ -320,10 +373,11 @@ module mulu(
         if (rst_q) begin
             d_cmt_q <= 3'd0;
         end
-        else if (!pipe_stall) begin
+        else if (!pipe_stall && !wr_pend) begin
             d_cmt_q <= {d_cmt_q[1:0], d_done};
             if (d_done) begin
                 d_cmt_rd   <= d_rd;
+                d_cmt_idx  <= d_idx;
                 d_cmt_data <= d_res;
             end
         end
@@ -331,10 +385,11 @@ module mulu(
 
     always @(posedge clk) begin
         if (rst_q) hold <= 1'b0;
-        else if (!pipe_stall) begin
+        else if (!pipe_stall && !wr_pend) begin
             hold <= m_pv;
             if (m_pv) begin
                 hold_rd   <= m_rd_q;
+                idx_hold  <= m_idx_q;
                 hold_data <= mul_sel ? m_p[31:0] : m_p[63:32];
             end
         end
@@ -364,39 +419,105 @@ module mulu(
     always @(*) begin
 //除法：从"div 还在 mulu 级且尚未发起"那拍起一直停到收尾后。
 //d_issued 置起后本项让位给 d_busy/d_done，算完就放行，指令才能离开 mulu 级。
-        if (is_div && !d_issued && !bus_hold)  stall_v = 1'b1;
-        else if (d_busy || d_done)             stall_v = 1'b1;
-        else                                   stall_v = 1'b0;
+        if (is_div && !d_issued && !bus_hold)  stall_mulu_div = 1'b1;
+        else if (d_busy || d_done)             stall_mulu_div = 1'b1;
+        else                                   stall_mulu_div = 1'b0;
     end
 
 //乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
+//（结果还没上退口的那一格由 forw 点② 的【在途支路】覆盖，压在前端的那一拍不再需要）
     always @(*) begin
         if (is_mul_post && ((rd_post == r1_post) | (rd_post == r2_post)))
-            stall_m = (m_v | m_pv | hold) ? 1'b1 : 1'b0;
+            stall_mulu_haz = (m_v | m_pv | hold) ? 1'b1 : 1'b0;
         else
-            stall_m = 1'b0;
+            stall_mulu_haz = 1'b0;
     end
 
-    always @(*) stall = stall_m | stall_v;
+//杀老写（乱序写回）：写口级广播"某笔更年轻的同 rd 写已落地" ⇒ 本模块更老的同 rd 在途记录置 killed。
+//  被杀的笔照常走完流程（照常占级、照常被写口级"放行 + 回报"），只是写口不发它的写使能。
+//  ★ 年龄一律用 head 相对值 {1'b0,(idx - rob_head)}，先截 4 位再比（3 位减法回绕会判错）。
+//  ★ killed 的累积【不受 wr_pend 冻结】—— 写口被挤住期间恰恰是最容易被更年轻写杀掉的时候。
+    reg m_kl, m_kl_q, d_kl;
+    reg m_kl_hit, m_klq_hit, d_kl_hit;
+    reg [3:0] m_age, mq_age, d_age, b0_age, b1_age;
+    reg [4:0] d_cur_rd;
+    reg [2:0] d_cur_idx;
+    always @(*) begin
+        m_age     = {1'b0, (m_idx - rob_head)};
+        mq_age    = {1'b0, (m_idx_q - rob_head)};
+        b0_age    = {1'b0, (b0_idx - rob_head)};
+        b1_age    = {1'b0, (b1_idx - rob_head)};
+        d_cur_rd  = d_pend ? d_cmt_rd : d_rd;
+        d_cur_idx = d_pend ? d_cmt_idx : d_idx;
+        d_age     = {1'b0, (d_cur_idx - rob_head)};
+        m_kl_hit  = 1'b0;
+        m_klq_hit = 1'b0;
+        d_kl_hit  = 1'b0;
+        if (m_v && (m_rd != 5'd0)) begin
+            if (b0_we && (b0_rd == m_rd) && (b0_age > m_age)) m_kl_hit = 1'b1;
+            if (b1_we && (b1_rd == m_rd) && (b1_age > m_age)) m_kl_hit = 1'b1;
+        end
+        if (m_pv && (m_rd_q != 5'd0)) begin
+            if (b0_we && (b0_rd == m_rd_q) && (b0_age > mq_age)) m_klq_hit = 1'b1;
+            if (b1_we && (b1_rd == m_rd_q) && (b1_age > mq_age)) m_klq_hit = 1'b1;
+        end
+        if ((d_busy || d_pend) && (d_cur_rd != 5'd0)) begin
+            if (b0_we && (b0_rd == d_cur_rd) && (b0_age > d_age)) d_kl_hit = 1'b1;
+            if (b1_we && (b1_rd == d_cur_rd) && (b1_age > d_age)) d_kl_hit = 1'b1;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            m_kl   <= 1'b0;
+            m_kl_q <= 1'b0;
+            d_kl   <= 1'b0;
+        end
+        else begin
+            if (m_push)        m_kl <= 1'b0;
+            else if (m_kl_hit) m_kl <= 1'b1;
+            else               m_kl <= m_kl;
+            if (m_v && !pipe_stall && !wr_pend) m_kl_q <= m_kl | m_kl_hit;
+            else if (m_klq_hit)                 m_kl_q <= 1'b1;
+            else if (!m_pv)                     m_kl_q <= 1'b0;
+            else                                m_kl_q <= m_kl_q;
+            if (d_kl_hit)                d_kl <= 1'b1;
+            else if (~d_busy && ~d_pend) d_kl <= 1'b0;
+            else                         d_kl <= d_kl;
+        end
+    end
+
+//  口被 alu 占住时乘法让路是常态里的极少数（三笔同拍才轮到它让），量级可忽略。
+    always @(*) wr_pend = (m_pv && ~taken_mul) | (d_cmt_q[2] && ~taken_mul);
+
+//本模块内部用的合流（不回压任何人，只用于 m_push 与 mstalled）：两条停顿源相或。
+//旧 wbu 的 hold_mul 端口与它对应的回压已随 ROB 取代 wbu 而作废，整条删除。
+    always @(*) stall = stall_mulu_haz | stall_mulu_div;
 
 //组合输出：写回仲裁（乘法第二级与除法收尾共用，同一时刻只有一个在途结果）
     always @(*) begin
         d_cmt  = d_cmt_q[2];                          // 除法写口脉冲 = d_done+3
+        kill_mul = 1'b0;
         d_pend = d_cmt_q[0] | d_cmt_q[1] | d_cmt_q[2]; // 除法结果前递窗口
         mul_we = m_pv | d_cmt;              // 只在提交拍（对应 lsu 的 ld_pop）
         if (m_pv) begin
             mul_loaded   = 1'b1;
             rd_mul       = m_rd_q;
+            mul_idx      = m_idx_q;
             mul_data_out = mul_sel ? m_p[31:0] : m_p[63:32];
+            kill_mul     = m_kl_q;
         end
         else if (d_pend) begin
             mul_loaded   = 1'b1;
             rd_mul       = d_cmt_rd;
+            mul_idx      = d_cmt_idx;
             mul_data_out = d_cmt_data;
+            kill_mul     = d_cmt ? d_kl : 1'b0;
         end
         else if (hold) begin
             mul_loaded   = 1'b1;
             rd_mul       = hold_rd;
+            mul_idx      = idx_hold;
             mul_data_out = hold_data;
         end
         else begin

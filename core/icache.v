@@ -33,14 +33,18 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, irq, irq_ret, trap,
-    input [9:0] flag_bus,
+    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, exc_irq, exc_irq_ret, exc_ecall,
+    input [13:0] flag_bus,
 //回填应答（接核内 itcm）
     input mem_valid,
     input [31:0] mem_data,
+//本拍 pc 落到重定向目标（pc.v 的 redir_go，源名 flush_pc_redir）：挡掉"跳转前那次取指"的陈旧交付
+    input flush_pc_redir,
 
 //取指输出
     output reg [31:0] inst_out,
+//busy = 本模块自己的停顿源（stall_icache_miss）；busy_q 是它打一拍后的广播镜像
+//（组合版会让 tag 阵读出→比较→busy 这条约 8ns 的链横跨全核每一个寄存器的 CE/R，故广播用镜像）
     output reg busy, busy_q,
 //回填请求（接核内 itcm）
     output reg mem_req, mem_we,
@@ -56,13 +60,18 @@ module icache(
 
     localparam BOOT_LINES = 7'd127;
 
-//flag_bus = {exc, exec, flush_irq, flush_jump, dcache_hold, bus_hold_in, stall_m, stall_v, lsu_stall, icache_busy}
-//控制位译码（行为块，放本模块最前）：本模块的取指推进由六条 stall 位合出来的 req_valid
-//与回填状态自己把关，不用流水线使能，故只取冲刷位与 stall 位。
+//flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
+//            stall_rob_full, stall_pc_redir,
+//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_mulu_haz, stall_mulu_div,
+//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//控制位译码（行为块，放本模块最前）：本模块的取指推进由十条 stall 位合出来的 req_valid
+//与回填状态自己把关，不用流水线使能，故只取冲刷位与 stall 位（这里是消费者，或运算在本模块内做）。
     reg flush_w, req_valid;
     always @(*) begin
-        flush_w   = flag_bus[9] | flag_bus[7] | flag_bus[6];
-        req_valid = ~(flag_bus[5] | flag_bus[4] | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
+        flush_w   = flag_bus[13] | flag_bus[12] | flag_bus[11];
+        req_valid = ~(flag_bus[9] | flag_bus[8] | flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4]
+                    | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -195,7 +204,7 @@ module icache(
 //而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
         if (rst_q)                                  inst_out <= 32'd0;
-        else if ((jalr_fail | br2 | br3 | irq | irq_ret | trap | flag_bus[9]) | ((jalr | br1 | jal) && req_valid)) inst_out <= 32'd0;
+        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flag_bus[13] | flush_pc_redir) | ((jalr | br1 | jal) && req_valid)) inst_out <= 32'd0;
         else if (rd_en)                           inst_out <= iram[rd_addr];
     end
 
