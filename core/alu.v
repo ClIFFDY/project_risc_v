@@ -24,7 +24,7 @@
 
 module alu(
     input clk, rst,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
     input we_in, jal_flag, jalr_flag, cs_wr_en,
 //判定那条自己那一笔的 ROB 索引（bju 的 idx_q）：跳转冲刷拍用它区分"本级挂着的是不是发起者自己"
     input [4:0] rd_in,
@@ -71,22 +71,20 @@ module alu(
 //flag_bus 逐位翻译成原名：本模块内不起新的组合名，判定处直接写或运算
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
     reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_unload, stall_lsu_full;
+    reg stall_lsu_haz, stall_lsu_full;
     reg stall_mulu_haz, stall_mulu_div;
-    reg stall_dcache_miss, stall_icache_miss, stall_bus_hold;
+    reg stall_icache_miss, stall_bus_hold;
     always @(*) begin
-        flush_con_exc     = flag_bus[13];
-        flush_con_irq     = flag_bus[12];
-        flush_con_jump    = flag_bus[11];
-        exec              = flag_bus[10];
-        stall_rob_full    = flag_bus[9];
-        stall_pc_redir    = flag_bus[8];
-        stall_lsu_haz     = flag_bus[7];
-        stall_lsu_unload  = flag_bus[6];
-        stall_lsu_full    = flag_bus[5];
-        stall_mulu_haz    = flag_bus[4];
-        stall_mulu_div    = flag_bus[3];
-        stall_dcache_miss = flag_bus[2];
+        flush_con_exc     = flag_bus[11];
+        flush_con_irq     = flag_bus[10];
+        flush_con_jump    = flag_bus[9];
+        exec              = flag_bus[8];
+        stall_rob_full    = flag_bus[7];
+        stall_pc_redir    = flag_bus[6];
+        stall_lsu_haz     = flag_bus[5];
+        stall_lsu_full    = flag_bus[4];
+        stall_mulu_haz    = flag_bus[3];
+        stall_mulu_div    = flag_bus[2];
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
     end
@@ -179,7 +177,7 @@ module alu(
         end
         else if (we_in) begin
             if ((flush_con_exc | flush_con_irq) |
-                ~(stall_lsu_haz | stall_lsu_unload | stall_lsu_full | stall_mulu_haz | stall_mulu_div)) begin
+                ~(stall_lsu_haz | stall_lsu_full | stall_mulu_haz | stall_mulu_div)) begin
                 rd_out   <= rd_nx;
                 idx_out  <= idx_in;
                 result   <= result_nx;

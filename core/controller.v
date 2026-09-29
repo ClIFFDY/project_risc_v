@@ -43,9 +43,9 @@ module controller(
     input [2:0]  bju_idx_in,
 //停顿源（按"顶层不运算"从 cpu_top 下放至此）：逐源各占 flag_bus 一位，
 //本模块【不做任何或运算】—— 或/非一律下放到消费者模块内（见各家 stall_w/flush_w 的译码）。
-    input stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+    input stall_lsu_haz, stall_lsu_full,
     input stall_mulu_haz, stall_mulu_div,
-    input stall_dcache_miss, stall_icache_miss, stall_bus_hold,
+    input stall_icache_miss, stall_bus_hold,
     input stall_rob_full, stall_pc_redir,
     input lsu_inflight,
 //异常交付口（ROB 的 trap_fire + 载荷）：透传给 csr，由它在【队头那一拍】锁 mepc/mcause/mtval
@@ -68,7 +68,7 @@ module controller(
     output reg [31:0] csr_data_out, isr_addr2, mcause,
     output reg exc_irq_act, exc_irq_processing, exc_irq,
     output reg [31:0] iret_addr2,
-    output reg [13:0] flag_bus,
+    output reg [11:0] flag_bus,
 //异常仲裁结果：flush_con_exc = 冲刷请求（寄存版判据）；exc_mark + cause/pc/tval = 给 ROB 的当拍标记
     output reg flush_con_exc,
     output reg exc_mark,
@@ -98,7 +98,7 @@ module controller(
     wire exc_irq_act_i, exc_irq_processing_i;
     wire [31:0] iret_addr2_i;
 
-//流水线控制位：本模块只产自己那三条冲刷源与 exec；十条停顿源逐源过路进 flag_bus，
+//流水线控制位：本模块只产自己那三条冲刷源与 exec；八条停顿源逐源过路进 flag_bus，
 //本模块内不做任何或运算（或/非是消费者模块的事）。
     reg exec, flush_con_irq, flush_con_jump;
     reg flush_w;
@@ -113,9 +113,9 @@ module controller(
 //只是把同一根线进出一次，实测会让它挂上全片广播网、多花 0.45ns（见 path_cl10 vs path_jp10）。
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_icache_miss, stall_bus_hold}
 //★ 每位只连一个源，本模块不在这里做或运算；消费端自己取自己要的位做或（冲刷优先于停顿）。
     always @(*) begin
 //★ mret 那一项用【资格版】：错路 mret 的冲刷会把正确路径刚取进来的指令冲掉
@@ -124,9 +124,9 @@ module controller(
         flush_con_jump = jalr_fail || br2 || br3;
         flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
                     stall_rob_full, stall_pc_redir,
-                    stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+                    stall_lsu_haz, stall_lsu_full,
                     stall_mulu_haz, stall_mulu_div,
-                    stall_dcache_miss, stall_icache_miss, stall_bus_hold};
+                    stall_icache_miss, stall_bus_hold};
 //ROB 冲刷口 + 边界：**三种冲刷都要作废比边界更年轻的项**。
 //★ 异常/中断也必须在【检测那一拍】就冲 ROB（不能只等队头交付）：冲刷拍会把流水线里那些
 //  年轻指令的载荷清掉（pd 清 we、lsu 门口挡住），它们已经不可能再写、也永远等不到完成回报
@@ -153,7 +153,7 @@ module controller(
         if (rst_q) begin
             flush_con_irq  = 1'b0;
             flush_con_jump = 1'b0;
-            flag_bus = {1'b0, 1'b0, 1'b0, 1'b1, 10'd0};
+            flag_bus = {1'b0, 1'b0, 1'b0, 1'b1, 8'd0};
         end
     end
 
@@ -163,17 +163,17 @@ module controller(
 // 异常仲裁（原 trap_unit）
 //===============================================================
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec, stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full, stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_lsu_haz, stall_lsu_full, stall_mulu_haz, stall_mulu_div,
+//            stall_icache_miss, stall_bus_hold}
     reg flush_older, exc_gated;
-//★ 对 payload 里的 mret 而言：flush_w 的 [13]（flush_bju_exc 是 bju 寄存版）与 [11]（br2/br3/jalr_fail）
-//  必来自更老的指令；[12] 里唯一属于本级自己的就是 mret 的自冲刷（合法 mret 要靠它清掉之后取进来的错路项）。
+//★ 对 payload 里的 mret 而言：flush_w 的 [11]（flush_bju_exc 是 bju 寄存版）与 [9]（br2/br3/jalr_fail）
+//  必来自更老的指令；[10] 里唯一属于本级自己的就是 mret 的自冲刷（合法 mret 要靠它清掉之后取进来的错路项）。
 //  ⇒ 资格 = 有冲刷、且那个冲刷不是我自己这一条。**不能用 flush_older**（它含 flush_con_irq，后者又含
 //  exc_irq_ret 自身）⇒ 会把合法 mret 也挡掉。
 //  ★ 资格里必须把【组合版前置冲刷】也算进来，理由与 exc_gated 那条完全相同：mret 的武装发生在
 //  它的 decoder 载荷拍，而寄存器版冲刷要到下一拍才抬 —— 只看 flush_w 会看不住影子槽里的 mret
 //  （实测 wp_mret：错路 mret 跳到 mepc、并恢复了中断使能）。flush_bju_pre 正是"更老的指令正在冲"。
-//  ★ 那个"排除自冲刷"的豁免（~exc_irq_ret）只能作用在 flush_w 上 —— mret 的自冲刷在 flag_bus[12] 里；
+//  ★ 那个"排除自冲刷"的豁免（~exc_irq_ret）只能作用在 flush_w 上 —— mret 的自冲刷在 flag_bus[10] 里；
 //  flush_bju_pre 永远不是 mret 自己的（mret 不由 bju 判），给它加豁免等于把错路放进来（实测 wp_mret 复现）。
     always @(*) exc_irq_ret_ok = exc_irq_ret & ~((flush_w & ~exc_irq_ret) | flush_bju_pre);
     reg [31:0] exc_pc_c;
@@ -184,7 +184,7 @@ module controller(
         if (rst_q) exc_pc_in_d1 <= 32'd0;
         else       exc_pc_in_d1 <= exc_pc_in;
     end
-    always @(*) flush_older = flag_bus[12] | flag_bus[11];
+    always @(*) flush_older = flag_bus[10] | flag_bus[9];
 //更老的指令在本拍冲刷 ⇒ 这条是错路，它的操作数是垃圾，不能拿它报异常
 //★ 解码阶段那两条（ecall/illegal）的资格必须把【组合版前置冲刷】也算进来：
 //  它们的检测发生在 decoder 载荷拍 = bju 判定的同一拍，而寄存版冲刷要到下一拍才抬 ——

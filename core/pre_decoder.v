@@ -22,7 +22,7 @@
 
 module pre_decoder(
     input clk, rst,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
     input [31:0] inst_in,
     input [31:0] aux_addr_in,
     input br1_in,
@@ -69,17 +69,17 @@ module pre_decoder(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】；
 //或运算在本模块内做（源在 controller 里已逐条分开，见其 flag_bus 拼装）。
     reg exec, flush_w, stall_w;
     always @(*) begin
-        flush_w = flag_bus[13] | flag_bus[12] | flag_bus[11];
-        stall_w = (flag_bus[9] | flag_bus[8] | flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4]
-                 | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[10];
+        flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
+        stall_w = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
+                 | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[8];
     end
 
 //指令来源：icache 为唯一取指源

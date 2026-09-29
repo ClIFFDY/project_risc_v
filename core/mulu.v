@@ -45,7 +45,7 @@
 
 module mulu(
     input clk, rst,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
 //前置冲刷（早一拍），由 bju 的组合判定直接给出（源名 flush_bju_pre）：判定结果寄存后只能
 //覆盖 c1..c4 与 wb，而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），
 //那两拍里它已经会去推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
@@ -102,29 +102,30 @@ module mulu(
 //控制位译码（与流水级无关，放本模块最前）
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取三条冲刷位。
 //本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 flush_bju_pre）：m_push、除法 FSM 的作废、
 //d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
-    always @(*) flush_w = flag_bus[13] | flag_bus[12] | flag_bus[11] | flush_bju_pre;
+    always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9] | flush_bju_pre;
 
 //冻结信号合流（本模块是消费者，或运算在这里做）：
-//  bus_hold   = 总线不可用（dcache 缺失 + 外部 hold）
+//  bus_hold   = 总线不可用（外部 hold）
 //  pipe_stall = 总线保持 / 取指缺失 / lsu 那三条（排掉自己的 haz/div 两位）
+//★ dcache 忙(2) 已撤出全核广播：乘法与 dcache 无关，本模块不再吃它（它只在 lsu 内部生效）。
 //★ 不要并进 stall_rob_full(9) / stall_pc_redir(8)：ROB 排空要靠队头那条乘法完成，
 //  而乘法正被它挡在 mulu 门外 ⇒ ROB 永不排空 ⇒ 死锁（与 lsu 入口门同一个坑）。
     reg pipe_stall, bus_hold;
 //写口那一笔还没被取走 ⇒ 本模块整条冻住（结果连着乘积一起保持，不许被下一笔覆盖）。
     reg wr_pend;
     always @(*) begin
-        bus_hold   = flag_bus[2] | flag_bus[0];
-        pipe_stall = flag_bus[7] | flag_bus[6] | flag_bus[5]
-                   | flag_bus[2] | flag_bus[1] | flag_bus[0];
+        bus_hold   = flag_bus[0];
+        pipe_stall = flag_bus[5] | flag_bus[4]
+                   | flag_bus[1] | flag_bus[0];
     end
 
 //寄存器声明（按级分组）

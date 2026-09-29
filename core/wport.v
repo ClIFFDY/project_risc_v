@@ -66,7 +66,7 @@ module wport(
     input [2:0]  bju_idx_i,
     input [2:0]  bju_idx_q,
 //flag_bus：进模块先逐位翻译成原名，判定处直接用（不在模块内合成新名字）
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
 //写口（到寄存器堆）
     output reg        we_a,
     output reg [4:0]  rd_a,
@@ -95,22 +95,20 @@ module wport(
 //flag_bus 逐位翻译成原名
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
     reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_unload, stall_lsu_full;
+    reg stall_lsu_haz, stall_lsu_full;
     reg stall_mulu_haz, stall_mulu_div;
-    reg stall_dcache_miss, stall_icache_miss, stall_bus_hold;
+    reg stall_icache_miss, stall_bus_hold;
     always @(*) begin
-        flush_con_exc     = flag_bus[13];
-        flush_con_irq     = flag_bus[12];
-        flush_con_jump    = flag_bus[11];
-        exec              = flag_bus[10];
-        stall_rob_full    = flag_bus[9];
-        stall_pc_redir    = flag_bus[8];
-        stall_lsu_haz     = flag_bus[7];
-        stall_lsu_unload  = flag_bus[6];
-        stall_lsu_full    = flag_bus[5];
-        stall_mulu_haz    = flag_bus[4];
-        stall_mulu_div    = flag_bus[3];
-        stall_dcache_miss = flag_bus[2];
+        flush_con_exc     = flag_bus[11];
+        flush_con_irq     = flag_bus[10];
+        flush_con_jump    = flag_bus[9];
+        exec              = flag_bus[8];
+        stall_rob_full    = flag_bus[7];
+        stall_pc_redir    = flag_bus[6];
+        stall_lsu_haz     = flag_bus[5];
+        stall_lsu_full    = flag_bus[4];
+        stall_mulu_haz    = flag_bus[3];
+        stall_mulu_div    = flag_bus[2];
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
     end
@@ -126,13 +124,21 @@ module wport(
     reg        sup_a, sup_b;
 
 //候选有效性：不写 rd=0 的那笔不占口；已判死的笔也不占口（但下面照常放行/回报）
+//★ 三条口的撤销判据必须【同构】：跳转冲刷那一拍，挂在本口上的若不是发起者自己那一笔，
+//  那就是判定拍溜进来的错路条 ⇒ 不许落地。原先只有口 A（alu）挂了这一项，B（load）与 mul
+//  没挂 ⇒ 冲刷拍在途 load 照样把值写进寄存器堆，用错路的值污染寄存器（实测 CoreMark：
+//  跳转冲刷同拍一笔在途 load 把 callee 的返回值写进 a0，把前一个调用该留下的值覆盖掉）。
     always @(*) begin
         c0_v   = we_alu && (rd_alu != 5'd0)
               && ~(kill_alu
                  | (bju_exc && (idx_alu == bju_idx_i))          // 判定当拍：故障那条自己的写
                  | (flush_con_jump && (idx_alu != bju_idx_q)));  // 冲刷拍：挂的是错路那条
-        c1_v   = we_mul && (rd_mul != 5'd0) && ~kill_mul;
-        c2_v   = we_ld && (rd_ld != 5'd0) && ~kill_ld;
+        c1_v   = we_mul && (rd_mul != 5'd0)
+              && ~(kill_mul
+                 | (flush_con_jump && (idx_mul != bju_idx_q)));
+        c2_v   = we_ld && (rd_ld != 5'd0)
+              && ~(kill_ld
+                 | (flush_con_jump && (idx_ld != bju_idx_q)));
         c0_age = {1'b0, (idx_alu - rob_head)};
         c1_age = {1'b0, (idx_mul - rob_head)};
         c2_age = {1'b0, (idx_ld - rob_head)};

@@ -22,7 +22,7 @@
 
 module post_decoder(
     input clk, rst,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
     input [9:0] func10,
     input [4:0] rd_in,
     input [4:0] rs1_in, rs2_in,
@@ -112,30 +112,28 @@ module post_decoder(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_icache_miss, stall_bus_hold}
 //flag_bus 逐位翻译成原名：本模块内不起新的组合名，判定处直接写或运算。
 //冲刷位与停顿位可同时为 1，故判定处一律保持【冲刷优先于停顿】。
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
     reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_unload, stall_lsu_full;
+    reg stall_lsu_haz, stall_lsu_full;
     reg stall_mulu_haz, stall_mulu_div;
-    reg stall_dcache_miss, stall_icache_miss, stall_bus_hold;
+    reg stall_icache_miss, stall_bus_hold;
     reg exc_illegal_now;
     always @(*) begin
-        flush_con_exc     = flag_bus[13];
-        flush_con_irq     = flag_bus[12];
-        flush_con_jump    = flag_bus[11];
-        exec              = flag_bus[10];
-        stall_rob_full    = flag_bus[9];
-        stall_pc_redir    = flag_bus[8];
-        stall_lsu_haz     = flag_bus[7];
-        stall_lsu_unload  = flag_bus[6];
-        stall_lsu_full    = flag_bus[5];
-        stall_mulu_haz    = flag_bus[4];
-        stall_mulu_div    = flag_bus[3];
-        stall_dcache_miss = flag_bus[2];
+        flush_con_exc     = flag_bus[11];
+        flush_con_irq     = flag_bus[10];
+        flush_con_jump    = flag_bus[9];
+        exec              = flag_bus[8];
+        stall_rob_full    = flag_bus[7];
+        stall_pc_redir    = flag_bus[6];
+        stall_lsu_haz     = flag_bus[5];
+        stall_lsu_full    = flag_bus[4];
+        stall_mulu_haz    = flag_bus[3];
+        stall_mulu_div    = flag_bus[2];
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
     end
@@ -275,9 +273,9 @@ module post_decoder(
 
 //发号使能：与下面载荷寄存器的推进条件同形（exec 且不冲刷不暂停），再与"本拍有写"相与
     assign payload_go = exec & ~(flush_con_exc | flush_con_irq | flush_con_jump)
-                      & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+                      & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz
                         | stall_lsu_full | stall_mulu_haz | stall_mulu_div
-                        | stall_dcache_miss | stall_icache_miss | stall_bus_hold);
+ | stall_icache_miss | stall_bus_hold);
 
     always @(posedge clk) begin
         if (rst_q) payload_go_q <= 1'b0;
@@ -319,9 +317,9 @@ module post_decoder(
         else if (exec) begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
             if (~(flush_con_exc | flush_con_irq | flush_con_jump)
-              & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+              & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz
                  | stall_lsu_full | stall_mulu_haz | stall_mulu_div
-                 | stall_dcache_miss | stall_icache_miss | stall_bus_hold)) begin
+ | stall_icache_miss | stall_bus_hold)) begin
                 issue_idx <= idx_in;
                 opc_out <= opcode;
                 fn10_out <= func10;
@@ -496,9 +494,9 @@ module post_decoder(
                 if (exc_illegal_now | ((opcode == OPCODE_JAL) & inst_in[21]))
                     we <= 1'b0;
             end
-            else if ((stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_unload
+            else if ((stall_rob_full | stall_pc_redir | stall_lsu_haz
                     | stall_lsu_full | stall_mulu_haz | stall_mulu_div
-                    | stall_dcache_miss | stall_icache_miss | stall_bus_hold)
+ | stall_icache_miss | stall_bus_hold)
                    & ~(flush_con_exc | flush_con_irq | flush_con_jump)) begin
                 issue_idx <= issue_idx;
                 opc_out <= opc_out;

@@ -25,7 +25,7 @@
 
 module bju(
     input clk, rst,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
 //判定源：与 alu 的输入同源（decoder 本级的寄存器输出）
     input [31:0] r1_data_in, r2_data_in,
     input [3:0] alu_func4_in,
@@ -53,8 +53,8 @@ module bju(
 //判定输入级那一条自己的 ROB 号（与 exc_bju 同拍）：wport 用它认"本级挂的是不是它"
     output reg [2:0] idx_i,
     output reg [31:0] exc_pc_q,
-//F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[12]|flag_bus[11]）。
-//  寄存判定那一拍上 flag_bus[11] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
+//F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[10]|flag_bus[9]）。
+//  寄存判定那一拍上 flag_bus[9] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
 //  去门标记会自己掐掉自己（br 预测不跳+真跳+非对齐那一支的异常会静默丢失）。
     output reg older_q,
 //前置冲刷：同一判定的组合版本，早一拍，只喂 lsu/mulu
@@ -69,12 +69,12 @@ module bju(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_unload, stall_lsu_full,
+//            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
-//            stall_dcache_miss, stall_icache_miss, stall_bus_hold}
+//            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：判定延迟拍只关心"本拍是不是冲刷拍"。
     reg flush_w;
-    always @(*) flush_w = flag_bus[13] | flag_bus[12] | flag_bus[11];
+    always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
 
 //===============================================================
 // 判定输入寄存级（新增）：把"这一拍要判的那条指令"整个寄存一级
@@ -120,7 +120,7 @@ module bju(
     end
 
 //操作数在途（lsu 的 load-use / 载荷未应答、mulu 的 mul-use / 除法）那几拍，采样到的还是旧值
-    wire op_haz = flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3];
+    wire op_haz = flag_bus[5] | flag_bus[3] | flag_bus[2];
 
 //F2 用：与"操作数被采样的那一拍"对齐的采样（判定级读当拍的 flush_older 会把自己掐掉）
     always @(posedge clk) begin
@@ -129,7 +129,7 @@ module bju(
             op_haz_q <= 1'b0;
         end
         else begin
-            older_q  <= flag_bus[12] | flag_bus[11];
+            older_q  <= flag_bus[10] | flag_bus[9];
             op_haz_q <= op_haz;
         end
     end

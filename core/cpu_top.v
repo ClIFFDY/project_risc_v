@@ -92,7 +92,7 @@ module cpu_top(
     wire [4:0] wbu_pend_rd0_w, wbu_pend_rd1_w, wbu_pend_rd2_w;
     wire       wbu_pend_v0_w,  wbu_pend_v1_w,  wbu_pend_v2_w;
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
-    wire [13:0] flag_bus;
+    wire [11:0] flag_bus;
     wire [3:0] alu_func4;
     wire [11:0] csr_addr, csr_addr_pre;
     wire [31:0] jalr_predict_offset;
@@ -135,8 +135,10 @@ module cpu_top(
     wire [31:0] dcache_data_w, dcache_mem_addr_w, dcache_mem_wdata_w, dcache_mem_data_w;
     wire [3:0] dcache_mem_be_w;
     wire dcache_busy_w, dcache_ld_ready_w, dcache_mem_req_w, dcache_mem_we_w, dcache_mem_valid_w;
-//dcache 的 busy 延拓拍（原来在顶层合成 d_hold_int，现在由 dcache 自己输出）＝ stall_dcache_miss
-    wire stall_dcache_miss_w;
+//dcache 的停顿（busy 的延拓拍，原来在顶层合成 d_hold_int，现在由 dcache 自己输出）。
+//★ 它【只给 lsu】：不进 flag_bus 的全核广播 —— "dcache 忙"与"前端该不该冻"是两件事，
+//  交给 lsu 之后，dcache 回填期间前端照常推进。
+    wire dcache_hold_w;
 //RV32M 乘除法单元（与 lsu 流水线同步，独立第三写口）
     wire [31:0] mul_data_final;
     wire mul_loaded, mul_we, stall_mulu_haz_w, stall_mulu_div_w;
@@ -161,8 +163,8 @@ module cpu_top(
         .pre_jalr(pre_jalr),
         .btb_hit(btb_hit),
 //★ 重定向输入走"门控后"的版本：判定那拍先只会冲刷，真正跳要等 ROB 排空（见上面排队逻辑）。
-//  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[13]（flush_con_exc）承担
-//  冲刷，不再单独进 pc；ROB 满改吃 flag_bus[9]（stall_rob_full），端口已删。
+//  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[11]（flush_con_exc）承担
+//  冲刷，不再单独进 pc；ROB 满改吃 flag_bus[7]（stall_rob_full），端口已删。
         .exc_irq(exc_irq),
 //★ 这两根都换成【交付资格】同源的版本（理由见 pc.v 排队那一块）：武装不能再用裸译码/裸载荷。
         .exc_irq_ret(exc_irq_ret_ok_w),
@@ -368,6 +370,8 @@ module cpu_top(
         .flag_bus(flag_bus),
         .flush_bju_pre(flush_bju_pre),
         .rob_head(rob_head_w),
+        .bju_idx_q(bju_idx_q_w),
+
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
         .b1_we(wp_b1_we), .b1_rd(wp_b1_rd), .b1_idx(wp_b1_idx),
         .payload_go(payload_go_w),
@@ -385,6 +389,7 @@ module cpu_top(
         .bus_data_dcache(dcache_data_w),
         .bus_data_tim(tim_data_out),
         .ready_dcache(dcache_ld_ready_w),
+        .dcache_hold(dcache_hold_w),
         .mem_inflight(lsu_inflight_w),
         .ready_tim(tim_ready),
         .ready_ext(bus_loaded_in),
@@ -585,7 +590,7 @@ module cpu_top(
         .bus_data_out(dcache_data_w),
         .ld_ready(dcache_ld_ready_w),
         .busy(dcache_busy_w),
-        .hold(stall_dcache_miss_w),
+        .hold(dcache_hold_w),
         .mem_req(dcache_mem_req_w),
         .mem_we(dcache_mem_we_w),
         .mem_addr(dcache_mem_addr_w),
@@ -659,13 +664,11 @@ module cpu_top(
         .rob_trap_tval(rob_trap_tval_w),
         .flush_con_rob(flush_con_rob_w),
         .flush_idx(flush_idx_w),
-//十条停顿源：一位一源，controller 只拼装、不做或运算
+//八条停顿源：一位一源，controller 只拼装、不做或运算
         .stall_lsu_haz(stall_lsu_haz_w),
-        .stall_lsu_unload(stall_lsu_unload_w),
         .stall_lsu_full(stall_lsu_full_w),
         .stall_mulu_haz(stall_mulu_haz_w),
         .stall_mulu_div(stall_mulu_div_w),
-        .stall_dcache_miss(stall_dcache_miss_w),
         .stall_icache_miss(icache_busy_q),
         .stall_bus_hold(bus_hold_in),
         .stall_rob_full(stall_rob_full_w),
