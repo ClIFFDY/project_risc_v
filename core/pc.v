@@ -89,9 +89,12 @@ module pc(
         stall_pc_redir  = (redir_kind != 2'd0) | redir_hold;
     end
     always @(posedge clk) begin
-        if (rst_q) redir_hold <= 1'b0;
-        else if (redir_go) redir_hold <= 1'b1;
-        else redir_hold <= 1'b0;
+        if (rst_q)
+            redir_hold <= 1'b0;
+        else if (redir_go)
+            redir_hold <= 1'b1;
+        else
+            redir_hold <= 1'b0;
     end
     always @(posedge clk) begin
         if (rst_q) begin
@@ -127,12 +130,12 @@ module pc(
             end
             else if (!flush_w && !stall_w) begin
                 if (br1) begin
-                    pc_addr <= pc_addr + offset_beq2 - 4'd4;
-                    aux_addr <= aux_addr + offset_beq2 - 4'd4;
+                    pc_addr <= pc_addr + offset_beq2;
+                    aux_addr <= aux_addr + offset_beq2;
                 end
                 else if (jal) begin
-                    pc_addr <= pc_addr + offset_jal2 - 4'd4;
-                    aux_addr <= pc_addr + offset_jal2 - 4'd4;
+                    pc_addr <= pc_addr + offset_jal2;
+                    aux_addr <= pc_addr + offset_jal2;
                 end
                 else if (jalr) begin
                     pc_addr <= offset_jalr2;

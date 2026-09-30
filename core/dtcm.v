@@ -49,7 +49,8 @@ module dtcm(
     (* ram_style = "block" *) reg [31:0] dtcm [0:8191];
     integer i;
     initial begin
-        for (i = 0; i < 8192; i = i + 1) dtcm[i] = 32'd0;
+        for (i = 0; i < 8192; i = i + 1)
+            dtcm[i] = 32'd0;
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/data.hex", dtcm);
     end
 
@@ -94,7 +95,8 @@ module dtcm(
                 cnt    <= cnt - 4'd1;
                 addr_v <= 1'b1;
             end
-            else addr_v <= 1'b0;
+            else
+                addr_v <= 1'b0;
         end
     end
 

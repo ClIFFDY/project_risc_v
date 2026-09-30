@@ -44,7 +44,8 @@ module itcm(
     (* ram_style = "block" *) reg [31:0] itcm [0:16383];
     integer i;
     initial begin
-        for (i = 0; i < 16384; i = i + 1) itcm[i] = 32'd0;
+        for (i = 0; i < 16384; i = i + 1)
+            itcm[i] = 32'd0;
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
@@ -78,7 +79,8 @@ module itcm(
                 cnt    <= cnt - 6'd1;
                 addr_v <= 1'b1;
             end
-            else addr_v <= 1'b0;
+            else
+                addr_v <= 1'b0;
         end
     end
 

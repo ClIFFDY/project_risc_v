@@ -67,7 +67,8 @@ module csr(
     reg [31:0] csr_wr_val;
     always @(*) begin
         csr_wr_val = csr_data_in;
-        if (csr_addr == 12'h305) csr_wr_val = {csr_data_in[31:2], 2'b00};
+        if (csr_addr == 12'h305)
+            csr_wr_val = {csr_data_in[31:2], 2'b00};
     end
 
     always @(posedge clk) begin
@@ -138,7 +139,8 @@ module csr(
                 end
                 12'h344: begin
 //软件中断挂起：按规范在 bit3（MSIP）；写 1 清挂起
-                    if (csr_data_in[3]) exc_sirq_pend <= 1'b0;
+                    if (csr_data_in[3])
+                        exc_sirq_pend <= 1'b0;
                 end
                 endcase
             end
@@ -196,7 +198,8 @@ module csr(
         end
         else begin
             mcycle_reg <= mcycle_reg + 32'd1;
-            if (retire) minstret_reg <= minstret_reg + 32'd1;
+            if (retire)
+                minstret_reg <= minstret_reg + 32'd1;
         end
     end
 
@@ -237,8 +240,10 @@ module csr(
     reg csr_latch_w;
     always @(*) begin
         csr_latch_w = 1'b0;
-        if (csr_addr[11:8] == 4'b0011) csr_latch_w = 1'b1;
-        if (csr_addr == 12'h301) csr_latch_w = 1'b0;
+        if (csr_addr[11:8] == 4'b0011)
+            csr_latch_w = 1'b1;
+        if (csr_addr == 12'h301)
+            csr_latch_w = 1'b0;
     end
     always@ (*) begin
         if (csr_wr_en && csr_latch_w && (csr_addr == csr_addr_pre)) begin
@@ -268,7 +273,9 @@ module csr(
 
 //读值寄存器：与上面同拍采样，故 cs_data 相对 c2 级地址晚一拍可用，正好落在该指令进 alu 的那一拍
     always@ (posedge clk) begin
-        if (rst) csr_data_out <= 32'd0;
-        else     csr_data_out <= csr_data_rd;
+        if (rst)
+            csr_data_out <= 32'd0;
+        else
+            csr_data_out <= csr_data_rd;
     end
 endmodule 

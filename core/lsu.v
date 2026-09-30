@@ -169,10 +169,22 @@ module lsu(
     always @(*) begin
         addr_sum = r1_data_final + offset_store0;
         case (func10[2:0])
-            3'b000: begin st_be = 4'b0001 << addr_sum[1:0]; st_wdata = {24'd0, r2_data_final[7:0]} << (8 * addr_sum[1:0]); end
-            3'b001: begin st_be = 4'b0011 << (2 * addr_sum[1]); st_wdata = {16'd0, r2_data_final[15:0]} << (16 * addr_sum[1]); end
-            3'b010: begin st_be = 4'b1111; st_wdata = r2_data_final; end
-            default: begin st_be = 4'd0; st_wdata = 32'd0; end
+            3'b000: begin
+                st_be = 4'b0001 << addr_sum[1:0];
+                st_wdata = {24'd0, r2_data_final[7:0]} << (8 * addr_sum[1:0]);
+            end
+            3'b001: begin
+                st_be = 4'b0011 << (2 * addr_sum[1]);
+                st_wdata = {16'd0, r2_data_final[15:0]} << (16 * addr_sum[1]);
+            end
+            3'b010: begin
+                st_be = 4'b1111;
+                st_wdata = r2_data_final;
+            end
+            default: begin
+                st_be = 4'd0;
+                st_wdata = 32'd0;
+            end
         endcase
     end
 
@@ -192,23 +204,33 @@ module lsu(
         size_bad_now = 1'b0;
         if (mem_op) begin
             if (func10[1:0] == 2'b01) begin
-                if (byte_addr[0] != 1'b0) exc_ldst_misalign = 1'b1;
+                if (byte_addr[0] != 1'b0)
+                    exc_ldst_misalign = 1'b1;
             end
             if (func10[1:0] == 2'b10) begin
-                if (byte_addr[1:0] != 2'd0) exc_ldst_misalign = 1'b1;
+                if (byte_addr[1:0] != 2'd0)
+                    exc_ldst_misalign = 1'b1;
             end
         end
         if (opcode == OPCODE_LOAD) begin
-            if (func10[2:0] == 3'b011) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b110) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b111) size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b011)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b110)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b111)
+                size_bad_now = 1'b1;
         end
         if (opcode == OPCODE_STORE) begin
-            if (func10[2:0] == 3'b011) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b100) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b101) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b110) size_bad_now = 1'b1;
-            if (func10[2:0] == 3'b111) size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b011)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b100)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b101)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b110)
+                size_bad_now = 1'b1;
+            if (func10[2:0] == 3'b111)
+                size_bad_now = 1'b1;
         end
     end
 
@@ -281,12 +303,16 @@ module lsu(
     always @(*) begin
         ls_use_hit = 1'b0;
         if (s2_v && s2_rd != 5'd0) begin
-            if (r1_post != 5'd0 && (s2_rd == r1_post)) ls_use_hit = 1'b1;
-            if (r2_post != 5'd0 && (s2_rd == r2_post)) ls_use_hit = 1'b1;
+            if (r1_post != 5'd0 && (s2_rd == r1_post))
+                ls_use_hit = 1'b1;
+            if (r2_post != 5'd0 && (s2_rd == r2_post))
+                ls_use_hit = 1'b1;
         end
         if (s3_v && ~s3_done && s3_rd != 5'd0) begin
-            if (r1_post != 5'd0 && (s3_rd == r1_post)) ls_use_hit = 1'b1;
-            if (r2_post != 5'd0 && (s3_rd == r2_post)) ls_use_hit = 1'b1;
+            if (r1_post != 5'd0 && (s3_rd == r1_post))
+                ls_use_hit = 1'b1;
+            if (r2_post != 5'd0 && (s3_rd == r2_post))
+                ls_use_hit = 1'b1;
         end
     end
 
@@ -308,12 +334,16 @@ module lsu(
         kyoung_s2 = flush_bju_pre & (s2_age > {1'b0, (bju_idx_q - rob_head)});
         kyoung_s3 = flush_bju_pre & (s3_age > {1'b0, (bju_idx_q - rob_head)});
         if (s2_v && ~s2_kind && (s2_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == s2_rd) && (b0_age > s2_age)) s2_hit = 1'b1;
-            if (b1_we && (b1_rd == s2_rd) && (b1_age > s2_age)) s2_hit = 1'b1;
+            if (b0_we && (b0_rd == s2_rd) && (b0_age > s2_age))
+                s2_hit = 1'b1;
+            if (b1_we && (b1_rd == s2_rd) && (b1_age > s2_age))
+                s2_hit = 1'b1;
         end
         if (s3_v && ~s3_kind && (s3_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == s3_rd) && (b0_age > s3_age)) s3_hit = 1'b1;
-            if (b1_we && (b1_rd == s3_rd) && (b1_age > s3_age)) s3_hit = 1'b1;
+            if (b0_we && (b0_rd == s3_rd) && (b0_age > s3_age))
+                s3_hit = 1'b1;
+            if (b1_we && (b1_rd == s3_rd) && (b1_age > s3_age))
+                s3_hit = 1'b1;
         end
     end
 
@@ -334,8 +364,10 @@ module lsu(
 //===============================================================
     always @(posedge clk) begin
         if (rst_q) begin
-            s2_v <= 1'b0; s3_v <= 1'b0;
-            s2_kl <= 1'b0; s3_kl <= 1'b0;
+            s2_v <= 1'b0;
+            s3_v <= 1'b0;
+            s2_kl <= 1'b0;
+            s3_kl <= 1'b0;
         end
         else begin
             if (kyoung_s3) begin                                        // 跳转冲刷作废：最高优先
@@ -363,17 +395,27 @@ module lsu(
             else begin
                 s2_kl <= s2_kl;
             end
-            if (s2_put_go) s2_sent <= 1'b1;                             // 补摆
+            if (s2_put_go)
+                s2_sent <= 1'b1;  // 补摆
             if (s2_move) begin                                          // 级2 → 级3（请求已摆过）
-                s3_v <= 1'b1; s3_kind <= s2_kind; s3_rd <= s2_rd; s3_size <= s2_size; s3_off <= s2_off;
+                s3_v <= 1'b1;
+                s3_kind <= s2_kind;
+                s3_rd <= s2_rd;
+                s3_size <= s2_size;
+                s3_off <= s2_off;
                 s3_idx <= s2_idx;
                 s3_kl <= s2_kl | s2_hit | kyoung_s2;                                // 杀状态跟着记录走（含"走的这拍被命中"）
                 s2_v <= 1'b0;
             end
             if (new_in && new_go) begin                                 // 新指令进级2（miss 当拍也进；没摆就留着）
-                s2_v <= 1'b1; s2_kind <= is_st; s2_rd <= rd_in; s2_size <= func10[2:0];
+                s2_v <= 1'b1;
+                s2_kind <= is_st;
+                s2_rd <= rd_in;
+                s2_size <= func10[2:0];
                 s2_off <= is_st ? 2'd0 : addr_sum[1:0];
-                s2_addr <= cur_addr; s2_wdat <= st_wdata; s2_be <= st_be;
+                s2_addr <= cur_addr;
+                s2_wdat <= st_wdata;
+                s2_be <= st_be;
                 s2_idx <= idx_in;
                 s2_kl <= 1'b0;
                 s2_sent <= new_put;                                     // 没摆出去就保持 0，等不 blank 了再补摆
@@ -418,7 +460,8 @@ module lsu(
 
 //写回口保持：离开级3 那拍给数据，落在 back2 槽的消费者取不到 ⇒ 再保持一拍
     always @(posedge clk) begin
-        if (rst_q) ld_hold <= 1'b0;
+        if (rst_q)
+            ld_hold <= 1'b0;
         else begin
             ld_hold <= ld_we;
             if (ld_we) begin
@@ -447,13 +490,22 @@ module lsu(
         kill_ld = s3_kl | kyoung_s3;   // 冲刷作废这一项必须组合：判定那一拍它就可能落地
         ld_we = s3_v & ~s3_kind & ready_in;
         if (ld_we) begin
-            loaded = 1'b1; rd_load = s3_rd; ld_data_out = ld_data_cur; ld_idx = s3_idx;
+            loaded = 1'b1;
+            rd_load = s3_rd;
+            ld_data_out = ld_data_cur;
+            ld_idx = s3_idx;
         end
         else if (ld_hold) begin
-            loaded = 1'b1; rd_load = ld_hold_rd; ld_data_out = ld_hold_data; ld_idx = idx_hold;
+            loaded = 1'b1;
+            rd_load = ld_hold_rd;
+            ld_data_out = ld_hold_data;
+            ld_idx = idx_hold;
         end
         else begin
-            loaded = 1'b0; rd_load = 5'd0; ld_data_out = bus_data_in; ld_idx = 3'd0;
+            loaded = 1'b0;
+            rd_load = 5'd0;
+            ld_data_out = bus_data_in;
+            ld_idx = 3'd0;
         end
     end
 

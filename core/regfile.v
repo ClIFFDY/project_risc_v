@@ -60,9 +60,12 @@ module regfile(
     function [31:0] bypass;
         input [4:0] rx;
         begin
-            if (we_b && rx == rd_b) bypass = data_b;      // 更年轻那口优先（同 rd 撞上时）
-            else if (we_a && rx == rd_a) bypass = data_a;
-            else bypass = regs[rx];
+            if (we_b && rx == rd_b)
+                bypass = data_b;  // 更年轻那口优先（同 rd 撞上时）
+            else if (we_a && rx == rd_a)
+                bypass = data_a;
+            else
+                bypass = regs[rx];
         end
     endfunction
 
@@ -112,8 +115,10 @@ module regfile(
 //  口 A = head（更老）、口 B = head+1（更年轻）⇒ 同拍同 rd 撞上时【更年轻的那笔必须赢】
 //  ⇒ 语句顺序反过来写：先 A 后 B，B 覆盖 A。（旧 wbu 时代是口 A 赢，正好相反。）
     always @(posedge clk) begin
-        if (we_a) regs[rd_a] <= data_a;
-        if (we_b) regs[rd_b] <= data_b;
+        if (we_a)
+            regs[rd_a] <= data_a;
+        if (we_b)
+            regs[rd_b] <= data_b;
     end
 
 endmodule

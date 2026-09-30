@@ -80,7 +80,8 @@ module tim_in(
                 end
 //写指令清除中断挂起
                 else if (bus_addr_in[3:0] == 4'd3) begin
-                    if (bus_we_in) timi <= 1'b0;
+                    if (bus_we_in)
+                        timi <= 1'b0;
                 end
             end
         end

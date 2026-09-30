@@ -46,16 +46,21 @@ module bra_predict(
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
-        if (rst_q) predict_en = 1'b0;
-        else predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
+        if (rst_q)
+            predict_en = 1'b0;
+        else
+            predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
     end
 
     always @(posedge clk) begin
         if (rst_q) begin
 //初始BHT回到弱不跳转
-            for (i = 0; i < 64; i = i + 1) bht[i] <= 2'd1;
-            for (i = 0; i < 64; i = i + 1) btb[i] <= 32'd0;
-            for (i = 0; i < 64; i = i + 1) btb_v[i] <= 1'b0;
+            for (i = 0; i < 64; i = i + 1)
+                bht[i] <= 2'd1;
+            for (i = 0; i < 64; i = i + 1)
+                btb[i] <= 32'd0;
+            for (i = 0; i < 64; i = i + 1)
+                btb_v[i] <= 1'b0;
         end
         else begin
 //分支在EX期判定：按随指令流水的载荷PC回写BHT

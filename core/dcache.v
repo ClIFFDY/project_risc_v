@@ -93,8 +93,10 @@ module dcache(
     integer i;
 
     initial begin
-        for (i = 0; i < 4096; i = i + 1) data[i] = 32'd0;
-        for (i = 0; i < 256;  i = i + 1) lru[i]  = 1'b0;
+        for (i = 0; i < 4096; i = i + 1)
+            data[i] = 32'd0;
+        for (i = 0; i < 256;  i = i + 1)
+            lru[i]  = 1'b0;
     end
 
 //===============================================================
@@ -135,8 +137,10 @@ module dcache(
             mem_be = wr_be;
         end
         else begin
-            if (rd_drive) mem_addr = fill_addr + (fill_cnt << 2);
-            else mem_addr = bus_addr_in << 2;
+            if (rd_drive)
+                mem_addr = fill_addr + (fill_cnt << 2);
+            else
+                mem_addr = bus_addr_in << 2;
             mem_wdata = bus_data_in;
             mem_be = bus_be_in;
         end
@@ -209,7 +213,8 @@ module dcache(
         else begin
             ld_ready <= 1'b0;
 
-            if (lru_we) lru[lru_widx] <= lru_wval;
+            if (lru_we)
+                lru[lru_widx] <= lru_wval;
 
             if (rd_req) begin
                 if (hit_way[0]) begin
@@ -239,11 +244,14 @@ module dcache(
                 end
             end
 
-            if (wr_pend && mem_ready) wr_pend <= 1'b0;
+            if (wr_pend && mem_ready)
+                wr_pend <= 1'b0;
 
             if (stage == 1'b1 && !fill_end && mem_valid) begin
-                if (fill_cnt == 4'd7) fill_end <= 1'b1;
-                else fill_cnt <= fill_cnt + 3'd1;
+                if (fill_cnt == 4'd7)
+                    fill_end <= 1'b1;
+                else
+                    fill_cnt <= fill_cnt + 3'd1;
             end
 
             if (fill_end) begin
@@ -265,8 +273,10 @@ module dcache(
 //busy 的 1 拍延拓（原 cpu_top 的 d_hold_int，按"顶层不运算"下放到此）：
 //fill_end 拍 busy 就掉、ld_ready 要再等一拍，这 1 拍空窗必须兜住。
     always @(posedge clk) begin
-        if (rst_q) busy_d1 <= 1'b0;
-        else     busy_d1 <= busy;
+        if (rst_q)
+            busy_d1 <= 1'b0;
+        else
+            busy_d1 <= busy;
     end
 
     always @(*) begin

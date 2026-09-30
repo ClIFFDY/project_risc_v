@@ -181,8 +181,10 @@ module controller(
 //  否则取到的是【下一条】指令的地址（实测 mepc 记成故障指令 +4：0x3c 而不是 0x38）。
     reg [31:0] exc_pc_in_d1;
     always @(posedge clk) begin
-        if (rst_q) exc_pc_in_d1 <= 32'd0;
-        else       exc_pc_in_d1 <= exc_pc_in;
+        if (rst_q)
+            exc_pc_in_d1 <= 32'd0;
+        else
+            exc_pc_in_d1 <= exc_pc_in;
     end
     always @(*) flush_older = flag_bus[10] | flag_bus[9];
 //更老的指令在本拍冲刷 ⇒ 这条是错路，它的操作数是垃圾，不能拿它报异常
@@ -282,14 +284,19 @@ module controller(
     end
 
     always @(posedge clk) begin
-        if (rst_q) ird_tmr <= 2'd0;
-        else if ((jal | jalr_pred | br1) && !flush_w) ird_tmr <= 2'd3;
-        else if (ird_tmr != 2'd0) ird_tmr <= ird_tmr - 2'd1;
+        if (rst_q)
+            ird_tmr <= 2'd0;
+        else if ((jal | jalr_pred | br1) && !flush_w)
+            ird_tmr <= 2'd3;
+        else if (ird_tmr != 2'd0)
+            ird_tmr <= ird_tmr - 2'd1;
     end
 
     always @(posedge clk) begin
-        if (rst_q) exec <= 1'b1;
-        else exec <= exec;
+        if (rst_q)
+            exec <= 1'b1;
+        else
+            exec <= exec;
     end
 
 endmodule

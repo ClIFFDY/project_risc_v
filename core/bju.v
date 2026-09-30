@@ -76,6 +76,12 @@ module bju(
     reg flush_w;
     always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
 
+//操作数装载门控：与边界推进（post_decoder 的 payload_go）同一组位 ——
+//stall 期间一位都不许动，能装进来的那一刻，源已经就绪。
+    reg adv;
+    always @(*) adv = flag_bus[8] & ~(flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4]
+                                    | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
+
 //===============================================================
 // 判定输入寄存级（新增）：把"这一拍要判的那条指令"整个寄存一级
 //===============================================================
@@ -83,27 +89,42 @@ module bju(
 //于是"计算单元 → 前送年龄比较/mux → 操作数 → 比较/加法 → jp_target/mtval"串成一条
 //实测 15.6ns 的链（逻辑只占 3ns，全是线）。操作数在这里落一次寄存器，链就被劈成两段。
 //★ 控制位必须跟着一起寄存：操作数晚一拍、控制位不晚，就会拿"下一条的 br_flag"去判"这一条"。
-//★ 每拍都装（不按推进门控）：操作数在途时会逐拍收敛，最后一拍装进去的就是最终值 ——
-//  载荷只在源就绪时推进（op_haz 挡住），所以判定跑的那一拍拿到的就是最终操作数。
+//★ 装载严格受 stall 门控（与边界推进同一条件）：stall 期间不装，装进来的那一刻源已就绪 ——
+//  进本级的操作数不受任何 stall 门控，判定/发表/前置冲刷照常出。
 //★ 冲刷拍必须清：否则错路那条会在下一拍被"补判"一次，变成冲刷后多拉一拍重定向。
     reg [31:0] r1_q, r2_q, aux_q, beq_q, jalr_pred_q, jal_tgt_q;
     reg [3:0]  func4_q;
     reg        brf_q, jalrf_q, pred_q, exc_jal_mis_q;
-    reg        op_haz_q;
     always @(posedge clk) begin
         if (rst_q) begin
-            r1_q <= 32'd0; r2_q <= 32'd0; aux_q <= 32'd0; beq_q <= 32'd0;
-            jalr_pred_q <= 32'd0; jal_tgt_q <= 32'd0; func4_q <= 4'd0;
-            brf_q <= 1'b0; jalrf_q <= 1'b0; pred_q <= 1'b0; exc_jal_mis_q <= 1'b0;
+            r1_q <= 32'd0;
+            r2_q <= 32'd0;
+            aux_q <= 32'd0;
+            beq_q <= 32'd0;
+            jalr_pred_q <= 32'd0;
+            jal_tgt_q <= 32'd0;
+            func4_q <= 4'd0;
+            brf_q <= 1'b0;
+            jalrf_q <= 1'b0;
+            pred_q <= 1'b0;
+            exc_jal_mis_q <= 1'b0;
             idx_i <= 3'd0;
         end
         else if (flush_w) begin
-            r1_q <= 32'd0; r2_q <= 32'd0; aux_q <= 32'd0; beq_q <= 32'd0;
-            jalr_pred_q <= 32'd0; jal_tgt_q <= 32'd0; func4_q <= 4'd0;
-            brf_q <= 1'b0; jalrf_q <= 1'b0; pred_q <= 1'b0; exc_jal_mis_q <= 1'b0;
+            r1_q <= 32'd0;
+            r2_q <= 32'd0;
+            aux_q <= 32'd0;
+            beq_q <= 32'd0;
+            jalr_pred_q <= 32'd0;
+            jal_tgt_q <= 32'd0;
+            func4_q <= 4'd0;
+            brf_q <= 1'b0;
+            jalrf_q <= 1'b0;
+            pred_q <= 1'b0;
+            exc_jal_mis_q <= 1'b0;
             idx_i <= 3'd0;
         end
-        else begin
+        else if (adv) begin
             r1_q <= r1_data_in;
             r2_q <= r2_data_in;
             aux_q <= aux_addr_in;
@@ -119,19 +140,10 @@ module bju(
         end
     end
 
-//操作数在途（lsu 的 load-use / 载荷未应答、mulu 的 mul-use / 除法）那几拍，采样到的还是旧值
-    wire op_haz = flag_bus[5] | flag_bus[3] | flag_bus[2];
-
 //F2 用：与"操作数被采样的那一拍"对齐的采样（判定级读当拍的 flush_older 会把自己掐掉）
     always @(posedge clk) begin
-        if (rst_q) begin
-            older_q  <= 1'b0;
-            op_haz_q <= 1'b0;
-        end
-        else begin
-            older_q  <= flag_bus[10] | flag_bus[9];
-            op_haz_q <= op_haz;
-        end
+        if (rst_q) older_q <= 1'b0;
+        else       older_q <= flag_bus[10] | flag_bus[9];
     end
 
 //判定组合逻辑用的寄存器
@@ -157,28 +169,40 @@ module bju(
         if (brf_q) begin
             case (func4_q[2:0])
                 3'b000: begin
-                    if (r1_q == r2_q) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if (r1_q == r2_q)
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 3'b001: begin
-                    if (r1_q != r2_q) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if (r1_q != r2_q)
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 3'b100: begin
-                    if ($signed(r1_q) < $signed(r2_q)) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if ($signed(r1_q) < $signed(r2_q))
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 3'b101: begin
-                    if ($signed(r1_q) >= $signed(r2_q)) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if ($signed(r1_q) >= $signed(r2_q))
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 3'b110: begin
-                    if (r1_q < r2_q) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if (r1_q < r2_q)
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 3'b111: begin
-                    if (r1_q >= r2_q) success_now = 1'b1;
-                    else br_fail_now = 1'b1;
+                    if (r1_q >= r2_q)
+                        success_now = 1'b1;
+                    else
+                        br_fail_now = 1'b1;
                 end
                 default: br_fail_now = 1'b0;
             endcase
@@ -186,7 +210,8 @@ module bju(
         else if (jalrf_q) begin
             jalr_target_now = (r1_q + r2_q) & 32'hFFFFFFFE;
             if (jalr_target_now != 32'd0) begin
-                if (jalr_target_now != jalr_pred_q) jalr_fail_now = 1'b1;
+                if (jalr_target_now != jalr_pred_q)
+                    jalr_fail_now = 1'b1;
             end
         end
     end
@@ -209,24 +234,26 @@ module bju(
 //flush_bju_pre 是同一判定的组合版本、早一拍：判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令
 //在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去动 FIFO 指针、
 //拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu/mulu 因此在入口多挡一拍。
-//★ 操作数在途（lsu 的 load-use / 载荷未应答、mulu 的 mul-use / 除法）那几拍，decoder 输出那一拍上的
-//  操作数还是【旧值】⇒ 这一拍的判定、组合前置冲刷、当拍异常标记都不许出。
-//  lsu/mulu 的冒险只冻住前端，管不住 bju 的寄存判定与 pc 的冲刷路（pc.v 里 flush_w 优先于 stall_w）。
-//  实测 CoreMark：`lw a5,0(a0)` 紧邻 `jr a5`，bju 用旧 a5 算出 jalr_fail ⇒ pc 按错落点跳进 dtcm
-//  数据区 ⇒ 反复非对齐 trap ⇒ 死循环（load-use 冒险本身是检出并压住的，问题在判定没被它管住）。
+//★ 进本级的操作数不受任何 stall 门控：装载那一拍 stall 位全 0（adv），拿到的就是最终值 ⇒
+//  判定、组合前置冲刷、当拍异常标记一律照常出，不再挂 hazard 门。
 
     always @(*) begin
         exc_br_misalign = success_now & beq_q[1];
         exc_jalr_misalign = jalrf_q & (jalr_low2 != 2'd0);
-        exc_bju = (exc_br_misalign | exc_jalr_misalign | exc_jal_mis_q) & ~op_haz;
+        exc_bju = exc_br_misalign | exc_jalr_misalign | exc_jal_mis_q;
         br2_now = success_now & ~pred_q;
         br3_now = br_fail_now & pred_q;
-        flush_bju_pre = (br2_now | br3_now | jalr_fail_now | exc_br_misalign | exc_jalr_misalign) & ~op_haz;
-        if (br2_now | exc_br_misalign) jp_target_now = aux_q + beq_q;
-        else if (br3_now) jp_target_now = aux_q;
-        else if (jalr_fail_now | exc_jalr_misalign) jp_target_now = jalr_target_now;
-        else if (exc_jal_mis_q) jp_target_now = jal_tgt_q;
-        else jp_target_now = 32'd0;
+        flush_bju_pre = br2_now | br3_now | jalr_fail_now | exc_br_misalign | exc_jalr_misalign;
+        if (br2_now | exc_br_misalign)
+            jp_target_now = aux_q + beq_q;
+        else if (br3_now)
+            jp_target_now = aux_q;
+        else if (jalr_fail_now | exc_jalr_misalign)
+            jp_target_now = jalr_target_now;
+        else if (exc_jal_mis_q)
+            jp_target_now = jal_tgt_q;
+        else
+            jp_target_now = 32'd0;
     end
 
 //===============================================================
@@ -260,17 +287,6 @@ module bju(
             br_pc_idx <= 6'd0;
             jalr_flag_q <= 1'b0;
             br_pred_taken_q <= 1'b0;
-            exc_pc_q <= 32'd0;
-        end
-//操作数在途那几拍【不出判定】（清了等它落下再判；否则下一拍就会带着错落点去重定向）
-//F5：门必须盖住"操作数被采样的那一拍"——op_haz 说的是采样拍在途，输出级晚它一拍，
-//  只用 op_haz 会把"用采样拍旧操作数判出来的结果"寄出去（CoreMark 的 lw a5,0(a0); jr a5 就是这一类）。
-        else if (op_haz | op_haz_q) begin
-            success <= 1'b0;
-            br_fail <= 1'b0;
-            jalr_fail <= 1'b0;
-            flush_bju_exc <= 1'b0;
-            jp_target <= 32'd0;
             exc_pc_q <= 32'd0;
         end
         else begin

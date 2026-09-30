@@ -179,8 +179,6 @@ module mulu(
     reg        hold;
 
 //冒险判定
-    reg [6:0] opcode_post;
-    reg [9:0] func10_post;
     reg [4:0] rd_post;
     reg       mstalled;
     reg        div_pend_v;
@@ -188,7 +186,6 @@ module mulu(
 
 //组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）
     reg        is_m, is_mul, is_div;
-    reg        is_m_post, is_mul_post;
     reg        stall;
     reg        m_push;
     reg        mul_sel;
@@ -209,8 +206,6 @@ module mulu(
         is_m         = (opcode == OPCODE_OP) && (func10[9:3] == 7'b0000001);
         is_mul       = is_m && (func10[2] == 1'b0);   // funct3 0xx：MUL 家族
         is_div       = is_m && (func10[2] == 1'b1);   // funct3 1xx：DIV 家族
-        is_m_post    = (opcode_post == OPCODE_OP) && (func10_post[9:3] == 7'b0000001);
-        is_mul_post  = is_m_post && (func10_post[2] == 1'b0);
     end
 
 //第一级：锁操作数。判据 !stall / !flush_w / !bus_hold_in 与 lsu 的 ld_enq 同形
@@ -222,7 +217,10 @@ module mulu(
     always @(posedge clk) begin
         if (rst_q) begin
             m_v <= 1'b0;
-            m_a <= 32'd0;  m_b <= 32'd0;  m_rd <= 5'd0;  m_op <= 3'd0;
+            m_a <= 32'd0;
+            m_b <= 32'd0;
+            m_rd <= 5'd0;
+            m_op <= 3'd0;
         end
         else if (!pipe_stall && !wr_pend) begin
             m_v <= m_push;
@@ -253,7 +251,9 @@ module mulu(
     always @(posedge clk) begin
         if (rst_q) begin
             m_pv <= 1'b0;
-            m_p <= 64'd0;  m_rd_q <= 5'd0;  m_op_q <= 3'd0;
+            m_p <= 64'd0;
+            m_rd_q <= 5'd0;
+            m_op_q <= 3'd0;
         end
         else if (!pipe_stall && !wr_pend) begin
             m_pv   <= m_v;
@@ -287,10 +287,15 @@ module mulu(
             d_cnt  <= 5'd0;
             d_q_rem <= 32'd0;
             d_q_quo <= 32'd0;
-            d_dvd <= 32'd0;  d_a <= 32'd0;  d_b <= 32'd0;
-            d_rd <= 5'd0;  d_rem <= 1'b0;
-            d_neg_q <= 1'b0; d_neg_r <= 1'b0;
-            d_zero <= 1'b0;  d_ovf <= 1'b0;
+            d_dvd <= 32'd0;
+            d_a <= 32'd0;
+            d_b <= 32'd0;
+            d_rd <= 5'd0;
+            d_rem <= 1'b0;
+            d_neg_q <= 1'b0;
+            d_neg_r <= 1'b0;
+            d_zero <= 1'b0;
+            d_ovf <= 1'b0;
             d_sign_b <= 1'b0;
         end
         else if (flush_w) begin
@@ -308,8 +313,10 @@ module mulu(
             d_a     <= {d_a[30:0], 1'b0};
             d_q_rem <= d_ge ? d_sub[31:0] : {d_q_rem[30:0], d_a[31]};
             d_q_quo <= {d_q_quo[30:0], d_ge};
-            if (d_last) d_busy <= 1'b0;
-            else        d_cnt  <= d_cnt + 5'd1;
+            if (d_last)
+                d_busy <= 1'b0;
+            else
+                d_cnt <= d_cnt + 5'd1;
             if (d_cnt == 5'd0) begin
                 d_zero  <= (d_b == 32'd0);
                 d_ovf   <= (func10[0] == 1'b0) && (d_dvd == 32'h80000000) &&
@@ -386,7 +393,8 @@ module mulu(
     end
 
     always @(posedge clk) begin
-        if (rst_q) hold <= 1'b0;
+        if (rst_q)
+            hold <= 1'b0;
         else if (!pipe_stall && !wr_pend) begin
             hold <= m_pv;
             if (m_pv) begin
@@ -398,22 +406,22 @@ module mulu(
     end
 
 //冒险判定（第二级载荷 + stall 输出）
-//冒险用的载荷寄存器（M 与普通 ALU 共用 OPCODE_OP，所以 func10 必须一起寄存）
     always @(posedge clk) begin
         if (rst_q) begin
-            opcode_post <= 7'd0;
-            func10_post <= 10'd0;
             rd_post     <= 5'd0;
             mstalled    <= 1'b0;
         end
         else begin
-            opcode_post <= opcode;
-            func10_post <= func10;
-            if (m_push)                rd_post  <= rd_in;
-            else                       rd_post  <= rd_post;
-            if (stall)                 mstalled <= 1'b1;
-            else if (mstalled && m_pv) mstalled <= 1'b0;
-            else                       mstalled <= mstalled;
+            if (m_push)
+                rd_post <= rd_in;
+            else
+                rd_post <= rd_post;
+            if (stall)
+                mstalled <= 1'b1;
+            else if (mstalled && m_pv)
+                mstalled <= 1'b0;
+            else
+                mstalled <= mstalled;
         end
     end
 
@@ -421,16 +429,19 @@ module mulu(
     always @(*) begin
 //除法：从"div 还在 mulu 级且尚未发起"那拍起一直停到收尾后。
 //d_issued 置起后本项让位给 d_busy/d_done，算完就放行，指令才能离开 mulu 级。
-        if (is_div && !d_issued && !bus_hold)  stall_mulu_div = 1'b1;
-        else if (d_busy || d_done)             stall_mulu_div = 1'b1;
-        else                                   stall_mulu_div = 1'b0;
+        if (is_div && !d_issued && !bus_hold)
+            stall_mulu_div = 1'b1;
+        else if (d_busy || d_done)
+            stall_mulu_div = 1'b1;
+        else
+            stall_mulu_div = 1'b0;
     end
 
 //乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
 //（结果还没上退口的那一格由 forw 点② 的【在途支路】覆盖，压在前端的那一拍不再需要）
     always @(*) begin
-        if (is_mul_post && ((rd_post == r1_post) | (rd_post == r2_post)))
-            stall_mulu_haz = (m_v | m_pv | hold) ? 1'b1 : 1'b0;
+        if ((rd_post == r1_post) | (rd_post == r2_post))
+            stall_mulu_haz = m_v ? 1'b1 : 1'b0;
         else
             stall_mulu_haz = 1'b0;
     end
@@ -456,16 +467,22 @@ module mulu(
         m_klq_hit = 1'b0;
         d_kl_hit  = 1'b0;
         if (m_v && (m_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == m_rd) && (b0_age > m_age)) m_kl_hit = 1'b1;
-            if (b1_we && (b1_rd == m_rd) && (b1_age > m_age)) m_kl_hit = 1'b1;
+            if (b0_we && (b0_rd == m_rd) && (b0_age > m_age))
+                m_kl_hit = 1'b1;
+            if (b1_we && (b1_rd == m_rd) && (b1_age > m_age))
+                m_kl_hit = 1'b1;
         end
         if (m_pv && (m_rd_q != 5'd0)) begin
-            if (b0_we && (b0_rd == m_rd_q) && (b0_age > mq_age)) m_klq_hit = 1'b1;
-            if (b1_we && (b1_rd == m_rd_q) && (b1_age > mq_age)) m_klq_hit = 1'b1;
+            if (b0_we && (b0_rd == m_rd_q) && (b0_age > mq_age))
+                m_klq_hit = 1'b1;
+            if (b1_we && (b1_rd == m_rd_q) && (b1_age > mq_age))
+                m_klq_hit = 1'b1;
         end
         if ((d_busy || d_pend) && (d_cur_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == d_cur_rd) && (b0_age > d_age)) d_kl_hit = 1'b1;
-            if (b1_we && (b1_rd == d_cur_rd) && (b1_age > d_age)) d_kl_hit = 1'b1;
+            if (b0_we && (b0_rd == d_cur_rd) && (b0_age > d_age))
+                d_kl_hit = 1'b1;
+            if (b1_we && (b1_rd == d_cur_rd) && (b1_age > d_age))
+                d_kl_hit = 1'b1;
         end
     end
 
@@ -476,16 +493,26 @@ module mulu(
             d_kl   <= 1'b0;
         end
         else begin
-            if (m_push)        m_kl <= 1'b0;
-            else if (m_kl_hit) m_kl <= 1'b1;
-            else               m_kl <= m_kl;
-            if (m_v && !pipe_stall && !wr_pend) m_kl_q <= m_kl | m_kl_hit;
-            else if (m_klq_hit)                 m_kl_q <= 1'b1;
-            else if (!m_pv)                     m_kl_q <= 1'b0;
-            else                                m_kl_q <= m_kl_q;
-            if (d_kl_hit)                d_kl <= 1'b1;
-            else if (~d_busy && ~d_pend) d_kl <= 1'b0;
-            else                         d_kl <= d_kl;
+            if (m_push)
+                m_kl <= 1'b0;
+            else if (m_kl_hit)
+                m_kl <= 1'b1;
+            else
+                m_kl <= m_kl;
+            if (m_v && !pipe_stall && !wr_pend)
+                m_kl_q <= m_kl | m_kl_hit;
+            else if (m_klq_hit)
+                m_kl_q <= 1'b1;
+            else if (!m_pv)
+                m_kl_q <= 1'b0;
+            else
+                m_kl_q <= m_kl_q;
+            if (d_kl_hit)
+                d_kl <= 1'b1;
+            else if (~d_busy && ~d_pend)
+                d_kl <= 1'b0;
+            else
+                d_kl <= d_kl;
         end
     end
 

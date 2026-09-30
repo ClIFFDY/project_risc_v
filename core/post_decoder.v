@@ -157,7 +157,8 @@ module post_decoder(
 //csr 的读值要提前一拍（见 csr.v 的读口注释），所以这条地址必须取组合版、不能取 csr_addr。
     always @(*) begin
         csr_addr_pre = 12'd0;
-        if (opcode == OPCODE_SYSTEM) csr_addr_pre = imm12_csr_in[11:0];
+        if (opcode == OPCODE_SYSTEM)
+            csr_addr_pre = imm12_csr_in[11:0];
     end
 
 //jal 的目标：本核的立即数 flavour 只在 pre_decoder 解（mid_decoder 不为 JAL 置 imm_c）
@@ -201,31 +202,44 @@ module post_decoder(
                 end
 //LOAD 合法宽度：LB/LH/LW/LBU/LHU = 000/001/010/100/101 ⇒ 011/110/111 非法
                 OPCODE_LOAD: begin
-                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b110) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b111) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b110)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b111)
+                        exc_illegal_now = 1'b1;
                 end
 //STORE 合法宽度：SB/SH/SW = 000/001/010 ⇒ 011/100/101/110/111 非法
                 OPCODE_STORE: begin
-                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b100) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b101) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b110) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b111) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b100)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b101)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b110)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b111)
+                        exc_illegal_now = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (inst_in[14:12] != 3'b000) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] != 3'b000)
+                        exc_illegal_now = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (inst_in[14:12] == 3'b010) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b010)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011)
+                        exc_illegal_now = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (inst_in[14:12] == 3'b001) begin
-                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0)
+                            exc_illegal_now = 1'b1;
                     end
                     if (inst_in[14:12] == 3'b101) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_now = 1'b1;
                     end
                 end
                 OPCODE_OP: begin
@@ -233,34 +247,44 @@ module post_decoder(
                         exc_illegal_now = 1'b0;
                     end
                     else if (inst_in[14:12] == 3'b000) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_now = 1'b1;
                     end
                     else if (inst_in[14:12] == 3'b001) begin
-                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0)
+                            exc_illegal_now = 1'b1;
                     end
                     else if (inst_in[14:12] == 3'b101) begin
-                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000)) exc_illegal_now = 1'b1;
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_now = 1'b1;
                     end
                     else begin
-                        if (inst_in[31:25] != 7'd0) exc_illegal_now = 1'b1;
+                        if (inst_in[31:25] != 7'd0)
+                            exc_illegal_now = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (inst_in[14:12] == 3'b010) exc_illegal_now = 1'b1;
-                    if (inst_in[14:12] == 3'b011) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b010)
+                        exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b011)
+                        exc_illegal_now = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (inst_in[14:12] == 3'b100) exc_illegal_now = 1'b1;
+                    if (inst_in[14:12] == 3'b100)
+                        exc_illegal_now = 1'b1;
 //sret（0x102）：只对 S 模式有意义，本核是 M-only ⇒ 按非法指令（规范允许"实现为非法"）。
 //★ wfi（0x105）保持【合法】并当 NOP：规范要求 WFI 是一条合法指令（可以什么都不做），
 //  只有 mstatus.TW=1 且在低权限模式执行时才非法。
                     if (inst_in[14:12] == 3'b000) begin
-                        if (inst_in[31:20] == 12'h102) exc_illegal_now = 1'b1;
+                        if (inst_in[31:20] == 12'h102)
+                            exc_illegal_now = 1'b1;
                     end
                     if (csr_is_access_now) begin
-                        if (!csr_exists_now) exc_illegal_now = 1'b1;
+                        if (!csr_exists_now)
+                            exc_illegal_now = 1'b1;
                         if (csr_ro_now) begin
-                            if (csr_wr_now) exc_illegal_now = 1'b1;
+                            if (csr_wr_now)
+                                exc_illegal_now = 1'b1;
                         end
                     end
                 end
@@ -278,8 +302,10 @@ module post_decoder(
  | stall_icache_miss | stall_bus_hold);
 
     always @(posedge clk) begin
-        if (rst_q) payload_go_q <= 1'b0;
-        else       payload_go_q <= payload_go;
+        if (rst_q)
+            payload_go_q <= 1'b0;
+        else
+            payload_go_q <= payload_go;
     end
 
     always @(posedge clk) begin

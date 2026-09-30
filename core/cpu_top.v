@@ -11,7 +11,8 @@ module cpu_top(
     wire [31:0] pc_addr, aux_addr_0;
     (* max_fanout = 32 *) wire [31:0] icache_inst_w;
     (* max_fanout = 32 *) wire [31:0] inst_1;
-    wire icache_busy_w, icache_busy_q;
+    wire icache_busy_w;
+    wire icache_inst_valid_w;
     wire br1, br2, br3;
     (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
@@ -199,8 +200,10 @@ module cpu_top(
         .exc_ecall(exc_ecall),
         .flag_bus(flag_bus),
         .inst_out(icache_inst_w),
+        .inst_valid(icache_inst_valid_w),
         .busy(icache_busy_w),
-        .busy_q(icache_busy_q),
+        .offset_jal2(offset_jal2),
+        .offset_beq2(offset_beq2),
         .mem_req(icache_mem_req_w),
         .mem_we(icache_mem_we_w),
         .mem_addr(icache_mem_addr_w),
@@ -221,6 +224,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
+        .inst_valid(icache_inst_valid_w),
         .inst_in(icache_inst_w),
         .aux_addr_in(aux_addr_0),
         .inst_out(inst_1),
@@ -669,7 +673,7 @@ module cpu_top(
         .stall_lsu_full(stall_lsu_full_w),
         .stall_mulu_haz(stall_mulu_haz_w),
         .stall_mulu_div(stall_mulu_div_w),
-        .stall_icache_miss(icache_busy_q),
+        .stall_icache_miss(icache_busy_w),
         .stall_bus_hold(bus_hold_in),
         .stall_rob_full(stall_rob_full_w),
         .stall_pc_redir(stall_pc_redir_w),

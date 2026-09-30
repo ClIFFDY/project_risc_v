@@ -23,6 +23,7 @@
 module pre_decoder(
     input clk, rst,
     input [11:0] flag_bus,
+    input inst_valid,
     input [31:0] inst_in,
     input [31:0] aux_addr_in,
     input br1_in,
@@ -82,8 +83,10 @@ module pre_decoder(
         exec    = flag_bus[8];
     end
 
-//指令来源：icache 为唯一取指源
-    always @(*) inst_effective = inst_in;
+//指令来源：icache 为唯一取指源。inst_valid=0 表示这一拍送来的是无效读数（缺失垃圾，
+//或那次回填已被冲刷作废），整条压成 0 ⇒ 组合块算不出 jal/br_en（不会拿垃圾去改取指地址），
+//时序块锁进去的是一条 NOP。回填期间流水线本来就被 stall 按住，门控只在回填落那一拍起作用。
+    always @(*) inst_effective = inst_valid ? inst_in : 32'd0;
 
 //本模块寄存器只留"必须跨拍携带"的四项：指令字本身、两个源寄存器号（regfile 读口要用）、
 //PC 载荷与取指期的预测信息。原来那 15 个译码字段各寄存一份、再被原样重寄一遍。
@@ -156,7 +159,8 @@ module pre_decoder(
                     jal = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (!flush_w) jalr = 1'b1;
+                    if (!flush_w)
+                        jalr = 1'b1;
                 end
                 OPCODE_BRANCH: begin
                     offset_beq2 = $signed(immB(inst_effective));
