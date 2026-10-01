@@ -2791,3 +2791,122 @@ Correct operation validated.
 ⇒ 撤广播确实砍掉了那一族（TNS 降到 1/3、失败端点 −42%）；现在压顶的换成了
 "`bju` 判定 → lsu 杀逻辑 → 写口身份（`wp_we_b`）→ regfile 读侧旁路"这条 17 级、route 占 76% 的结构性长链。
 口径提醒：WNS 单点在同脚本三次跑里能差 2ns 以上，**评这类改动只看 TNS + 失败端点数 + 最差族集合**。
+
+---
+
+## §33 BTIC：jal/br1 的跳转目标指令放进 `bra_predict` 的独立 btb（2026-09-30，`aafc054`）
+
+**症状**：icache 取指腿修好（见 §32 末）之后，最差 20 条**全部**是
+`bju/r2_q → icache/iram 的 BRAM 地址口`（23 级、14.49ns）。RTL 链 =
+`bju 判定 → br2/br3/jalr_fail → controller flush_con_jump → flag_bus[9] → icache flush_w →
+fetch_addr 的 mux → tag/idx/word → tag 阵列读 → hit_sel → rd_addr → iram 地址口`。
+根因：**取指地址依赖"当拍刚取回、刚被译码的指令"**（`fetch_addr` 里要为 jal/br1 现算落点）。
+
+**做法**：在 `bra_predict` 里另立一块"专门放 br/jal 目标指令的 itcm"（三张 distributed-RAM 表
+`bti_inst[0:255]/bti_tag[0:255]/bti_v[0:255]`）：
+
+| 拍 | 事件 |
+|---|---|
+| t0 | jal/br1 在 `pre_decoder` 译码；`bti` 按 `pc[9:2]`/`pc[31:10]` 查表 ⇒ `bti_hit`；`pc` 落 **T+4**（`pc_addr + offset`，与今天同式）；同时把目标 inst 寄存到 `bti_inst_q` |
+| t1 | `icache` 那拍的交付**作废**（`inst_valid=0`），`pre_decoder` 的 inst 输入 mux 选 `bti_inst_q` ⇒ 当拍译码目标指令；`pc` 已是 T+4 |
+| t2 | 零空泡；冷启动时 icache 按 `pc=T` 交付目标 inst ⇒ **捕获进 bti**（写口用 t0 那条分支的 index 跟两拍） |
+
+- **命中与否给 `pc` 的地址必须差一拍**：命中 ⇒ `pc_addr + offset`（= T+4）；未命中 ⇒ `pc_addr + offset - 4`（= T，让 icache 自己去取）。
+- `icache.fetch_addr` 退化成 **只取 `pc_addr >>> 2`**，`offset_jal2/offset_beq2/br1/jal` 四个端口一起摘掉。
+- tag 22 位（`pc[31:10]`）与 8 位索引合起来覆盖 `pc[31:2]` 全部位 ⇒ 两条不同指令不可能同 tag 同 index ⇒ **命中即条目属于这条指令**，jal/br 落点每地址恒定、无自修改代码 ⇒ 存下的 inst 恒真，**不需要校验**（jalr 那套预测+校验是另一张表）。
+- ★ **欠交付必须能被冲刷作废**：交付位 `bti_pend` 要能粘住（stall 不丢），但 `flush_w` 那一拍必须清 0 —— 实测漏了这条：分支预测跳、下一拍来 br3 冲刷，欠下的目标 inst 在冲刷后仍被交付 ⇒ **多执行一条**（CoreMark 只退 3471 条就卡住，smoke 从 SAME 变 DIFFER）。
+
+**结果**（a100t-1 @10ns，同机同脚本 A/B）：WNS −5.132→**−2.942**、TNS −8622.966→**−3156.190**（−63.4%）、
+失败端点 5068→**2690**（−46.9%）；最差 20 条里 iram 取指族 **0 条**（改前 20/20，整个 `timing.rpt` 里
+iram 只剩 `RAMB36E1/CLKARDCLK` 的原语检查行）。功能：`run_reg` 8/8、archtest 32 SAME/4 DIVERGE（均为
+参考模型对 mcycle/中断不可比的已记录系列）、CoreMark 三项 CRC 全对（`ticks` 352728→353087，+0.10%，只有 jal 冷启动的代价）。
+
+---
+
+## §34 `wport` 出口打拍 + 前送点① 5 源 + **冲刷只挡比边界更年轻的**（2026-10-01）
+
+### 34.1 做什么
+
+§33 之后台面上只剩两族：`mulu/idx_hold → alu/result`（7 条）与 `bju/r1_q → regfile`（**13 条**）。
+后者是"写口身份 → regfile 阵列 D 脚 + 读旁路"，实测 **3010 个失败端点里 1088 条终点就在阵列 D 脚**，锥靠布线摊到全片。
+
+**`wport` 出口整体寄存一拍**（入口级组合出 `*_e`，出口级寄存送出去）。**★ 哪些寄存、哪些不寄存是本方案正确性的关键**：
+
+| 输出 | 级别 | 理由 |
+|---|---|---|
+| `we_a/rd_a/data_a/idx_a`、`we_b/rd_b/data_b/idx_b` | **出口寄存** | 就是要打拍的那条深锥（→ regfile 阵列 D 脚 + `bypass`） |
+| `fin_alu/fin_mul/fin_ld`（+idx） | **出口寄存** | 必须与"写真的落地"同拍；提前一拍报 `ent_wr` 会让 ROB 在值进阵列前就退项 |
+| `taken_mul` | **入口级组合** | mul 与 div **共用**这根握手。寄存会让 `m_pv` 多举一拍（写口重复取 ⇒ 同 rd 写两次），并提前清掉 mulu 的 `wr_pend` ⇒ 挂在 `d_cmt_q[2]` 上还没被取走的**除法提交脉冲被冲走、结果永久丢失**（实测 `tightmul`：x12 写两次、x14 一次没写） |
+| `b0/b1`（落地广播） | **入口级组合** | ★ 单元侧的杀老写是"当拍组合比较、下一沿登记"（`lsu.v:337-346` + `s3_kl <= 1`）⇒ 广播必须与**候选上口那一拍**同步。寄存它就会开出跨拍重排窗口：年轻者进出口那拍、更老的那笔正好上另一个口，单元里的 kill 登记还差一拍 ⇒ **老的写在下一拍盖掉年轻的** |
+
+**前送点① 从 3 源扩到 5 源**（加写口出口寄存的两条）。理由：值在出口寄存器里多待一拍，
+这一拍它既不在阵列里（下一沿才写）、也不在单元结果口上（已换人），而 `regfile` 又是**寄存读**
+⇒ 这个窗口只有点① 补得住。**点② 保持 3 源**（它的下游是消费者自己的寄生逻辑）。
+点① 的**写口两源走固定序**（值先进写口、才可能还挂在结果口上 ⇒ 写口寄存器里的恒比结果口上的老），
+再由三条结果口按年龄覆盖 —— 但**三条结果口每一条都必须带年龄门**：
+`alu` 那一条原来是无条件覆盖（当时 `h1m` 恒 0，无害），加了写口两源之后必须补
+`&& (!h1m || (age_alu > g1m))`，否则"写口更年轻、alu 更老"时会挑到更老的那个。
+
+### 34.2 ★ 顺带挖出的既有隐患：`~flush_w` 一刀切会让中断落在 load/M 上时**自锁**
+
+打拍把流水线相位挪了一拍，踩中了 `lsu`/`mulu` 入口门里的一处既有缺陷，`i2c_irq` 从
+`PASS @cyc=7083` 变成 `TIMEOUT @cyc=60000 pc=0xa4`。逐拍实测的链条：
+
+1. `controller.v:146-151` 的 `flush_idx` 按冲刷类型取号：跳转/分支非对齐 = `bju_idx_in`（分支自己）；
+   **中断 = `issue_idx_in` = 载荷这条自己**；访存非对齐 = `exc_ldst_idx_in`。
+2. `lsu.v:252` / `mulu.v:213` 的入口门写的是 **`~flush_w` 一刀切** ⇒ 中断那一拍站在载荷上的
+   那条（`0x94` 的 `lw t0,320(s1)`）被挡在 lsu 门外 ⇒ 不建车厢、不拉总线 ⇒ **永远没有 `fin_ld`**。
+3. 而同一次冲刷的**边界又正好是它自己**（`flush_idx = issue_idx_in = 1`）⇒ `rob` 的部分冲刷把它**留下**。
+4. ⇒ `ent_wr` 恒 0 ⇒ `rob.v:146` `head_ok` 恒假 ⇒ 队头不动 ⇒ `pc.v:90`
+   `redir_go = (redir_kind!=0) && rob_empty` 永不成立 ⇒ `stall_pc_redir` 永久抬着 ⇒ **整核冻结**。
+
+**为什么只有 load/M 会死**：`alu.v:178-186` 对"冲刷那一拍站在载荷上的那条"专门留了口子
+（`(flush_con_exc | flush_con_irq) | ~(stall…)` 强制寄存、`kill_out <= flush_con_exc`）
+⇒ ALU 类边界指令照常完成；`lsu`/`mulu` 没有这个口子 —— **同一条约定，`alu` 认、`lsu`/`mulu` 不认**。
+
+**改法（口径：只挡比边界更年轻的错路条）**：在入口门里加两条按编号的判据，**原地改 `new_in_pre`/`m_push`**：
+
+```verilog
+        ent_bnd   = flush_w & (idx_in == flush_idx);    // 本拍这条 = 本次冲刷的边界（必须放行）
+        ent_young = flush_w & (idx_in != flush_idx);    // 比边界年轻（错路）
+        new_in_pre = mem_op & ~size_bad_now & ~ent_young & ~ls_use_hit
+                   & (payload_go | ent_bnd)
+                   & ~(flag_bus[3] | flag_bus[2] | flag_bus[1]);
+```
+
+- `lsu.idx_in`/`mulu.idx_in` 接的就是 `issue_idx_w`，与中断的 `flush_idx` **同源** ⇒ `idx_in == flush_idx`
+  是"我是边界"的精确判据，不会误判。
+- ★ **必须原地改，不能另立一条**：`new_in_pre` 还兼着 `lsu.v:447-448` 的访存非对齐故障判据。
+  访存非对齐那条进 lsu 的那一**没有冲刷**（控制器要到下一拍才收到 `exc_ldst_misalign_in`），
+  此时 `ent_bnd=ent_young=0`、`(payload_go|0)=payload_go`、`~ent_young=1` ⇒ 与原式**逐位相同**。
+  若另立一条、把 `new_in_pre` 留着，就会出现"边界那条被放行了、但它的非对齐故障因为 `new_in_pre=0`
+  没被捕获" ⇒ 故障静默丢失 + ROB 项永不完成 = 换一种死法。
+- 下游不用管：进了级2 之后 `s2_put_go`/`bus_go` 只挂 `exec`/`flush_w`（**下一拍就无冲刷**），
+  且 `stall_pc_redir` 根本不在 lsu 里 ⇒ 边界访存自己会跑完。`mulu` 的 `pipe_stall` 同。
+- ★ 同一形状**未改**的三处（既有隐患，与本轮无关）：`mulu.v:301` `else if (flush_w) d_busy <= 0`、
+  `mulu.v:365` `d_done` 的 `flush_w` 清零、`mulu.v:305` `!is_div` 放弃 —— **中断落在一条 `div` 上时同样会挂**，
+  要动 FSM 的作废/放弃路径，先做定向复现。
+
+### 34.3 验证与数字
+
+- `run_reg.sh` **8/8**（`i2c_irq` 回到 PASS @cyc=7087，基线 7083；`gpio_irq` PASS）；`forw_tb` 34/34（新增平局/写口更年轻用例）、`wport_tb` 60/60、`lsu_tb` 45/45。
+- archtest **36 支对 HEAD 全 SAME**（含 `half_misalign`/`exc_ldst_misalign`/`m_zicsr`/`tightmul`/`waw_kill`）。
+- CoreMark **三项 CRC `e714/1fd7/8e3a` 全对**、`Total ticks 353088`（HEAD 353087，差 1 拍）、IPC 0.865、窗口损失 10.52%。
+- **不变量监视器 0 违反**（HEAD 用同一判据也是 0）。
+  ★ 监视器本身有两处**过期判据**被这轮暴露并修好：① P16 的期望值只算了三个结果口、不知道点① 新增的写口两源；
+  ② P7 用**入口级**的 `u_wport.pa_idx` 去配**出口寄存**的 `we_a`，差一拍 —— 改用 `idx_a/idx_b`。
+  另外 P17 的地址匹配写的是 `(bus_addr_out << 2) == cap_off`，而 `bus_addr_out` 是**字地址**、左移两位后低两位恒 0
+  ⇒ 同一个字里两个不同偏移的半字 store 会被当成同一条（实测 `cap_be=0011` 而总线 `be=1100`、数据却没差）。
+  加一条"按 ROB 索引认人"（`mon_bus_idx == cap_idx`，跟总线同拍跟一份索引）后两棵树都归 0 —— **判据缺陷，不是设计问题**。
+
+**时序 A/B**（`xc7a100tfgg676-1` @10ns，同机同脚本）：
+
+| | `a332557`+§33（BTIC） | 打拍 v1 | **打拍 v2（含 `forw` 年龄门修正）** |
+| --- | --- | --- | --- |
+| WNS / TNS | −2.942 / −3156.19 | −2.254 / −1054.67 | −2.622 / **−770.905** |
+| 失败端点 | 2690 | 2021 | **1360** |
+| 最差 20 条的族 | `mulu/idx_hold→alu/result`(7) + **`bju/r1_q→regfile`(13)** | `mulu/d_cmt_q→alu`(17) | `post_decoder/issue_idx→alu/result`(**17**) + `mulu/d_cmt_q→alu/result`(3) |
+
+⇒ **打拍想摘的 `bju/r1_q → regfile` 整族离开台面**（TNS −75.6%、失败端点 −49.4%），
+台面上只剩"**前送点② 的选择 → ALU 操作数/加法器/结果 mux**"这一条腿（下一轮的靶子）。
+口径仍照旧：**评这类改动只看 TNS + 失败端点数 + 最差族集合，不看 WNS 单点**（同脚本复跑能差 0.2~0.5ns）。

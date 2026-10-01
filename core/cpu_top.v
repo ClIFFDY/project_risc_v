@@ -58,6 +58,7 @@ module cpu_top(
     wire        wp_we_a, wp_we_b, wp_taken_mul;
     wire [4:0]  wp_rd_a, wp_rd_b;
     wire [31:0] wp_data_a, wp_data_b;
+    wire [2:0]  wp_idx_a, wp_idx_b;
     wire        wp_fin_alu, wp_fin_mul, wp_fin_ld;
     wire [2:0]  wp_fin_alu_idx, wp_fin_mul_idx, wp_fin_ld_idx;
     wire        wp_b0_we, wp_b1_we;
@@ -376,6 +377,7 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus),
         .flush_bju_pre(flush_bju_pre),
+        .flush_idx(flush_idx_w),
         .rob_head(rob_head_w),
         .bju_idx_q(bju_idx_q_w),
 
@@ -427,6 +429,7 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus),
         .flush_bju_pre(flush_bju_pre),
+        .flush_idx(flush_idx_w),
         .rob_head(rob_head_w),
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
         .b1_we(wp_b1_we), .b1_rd(wp_b1_rd), .b1_idx(wp_b1_idx),
@@ -478,6 +481,7 @@ module cpu_top(
     );
 //写口级：三个结果口 → 两条物理写口（完成即写、同 rd 同拍年轻者胜）+ 处置回报 + 落地广播
     wport u_wport (
+        .clk(clk), .rst(rst),
         .rob_head(rob_head_w),
 //alu 那一笔：alu.v 里寄存一拍（算完的下一拍），正好是紧邻消费者取用那一拍
         .we_alu(we_4), .rd_alu(rd_4), .data_alu(result_4), .idx_alu(alu_idx_w),
@@ -487,8 +491,8 @@ module cpu_top(
         .kill_mul(kill_mul_w), .kill_ld(kill_ld_w), .kill_alu(kill_alu_w),
         .bju_exc(exc_bju_w), .bju_idx_i(bju_idx_i_w), .bju_idx_q(bju_idx_q_w),
         .flag_bus(flag_bus),
-        .we_a(wp_we_a), .rd_a(wp_rd_a), .data_a(wp_data_a),
-        .we_b(wp_we_b), .rd_b(wp_rd_b), .data_b(wp_data_b),
+        .we_a(wp_we_a), .rd_a(wp_rd_a), .data_a(wp_data_a), .idx_a(wp_idx_a),
+        .we_b(wp_we_b), .rd_b(wp_rd_b), .data_b(wp_data_b), .idx_b(wp_idx_b),
         .taken_mul(wp_taken_mul),
         .fin_alu(wp_fin_alu), .fin_alu_idx(wp_fin_alu_idx),
         .fin_mul(wp_fin_mul), .fin_mul_idx(wp_fin_mul_idx),
@@ -496,9 +500,9 @@ module cpu_top(
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
         .b1_we(wp_b1_we), .b1_rd(wp_b1_rd), .b1_idx(wp_b1_idx)
     );
-//前送级：两个前送点，共用同一组前送源（两个写回口）
-//  点①：寄存器堆数据 → post_decoder 之间（消费者 = mem_buf 那条）
-//  点②：post_decoder → 三个执行单元之间（消费者 = decoder 载荷那条）
+//前送级：两个前送点，源不同
+//  点①：寄存器堆数据 → post_decoder 之间（消费者 = mem_buf 那条）—— 吃 5 个源
+//  点②：post_decoder → 三个执行单元之间（消费者 = decoder 载荷那条）—— 只吃 3 个结果口
     forw u_forw (
         .clk(clk),
         .rst(rst),
@@ -509,6 +513,11 @@ module cpu_top(
         .we_alu(we_4), .rd_alu(rd_4), .data_alu(result_4), .idx_alu(alu_idx_w),
         .we_mul(mul_loaded), .rd_mul(rd_mul), .data_mul(mul_data_final), .idx_mul(mul_idx_w),
         .we_ld(loaded), .rd_ld(rd_load), .data_ld(ld_data_final), .idx_ld(ld_idx_w),
+//★ 第四、五条源 = 写口级出口寄存的两条物理写口（只服务点①）：写口打一拍后，
+//  "值已出单元结果口、还没落进阵列"这一拍只有这里补得住。
+//  取【出口寄存器】那一组（不是 b0/b1 —— 那两个留在 wport 入口级，比出口的值早一拍）。
+        .wp_we_a(wp_we_a), .wp_rd_a(wp_rd_a), .wp_data_a(wp_data_a), .wp_idx_a(wp_idx_a),
+        .wp_we_b(wp_we_b), .wp_rd_b(wp_rd_b), .wp_data_b(wp_data_b), .wp_idx_b(wp_idx_b),
         .r1_mid(rs1_2),
         .r2_mid(rs2_2),
         .r1_data_mid_in(r1_data),

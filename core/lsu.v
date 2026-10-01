@@ -33,6 +33,9 @@ module lsu(
 //动 FIFO 指针、拉总线（store 也在这条路上），等寄存器清已经收不回来，故入口要多挡一拍。
 //不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
     input flush_bju_pre,
+//本次冲刷的边界（controller 的 flush_idx：三种冲刷各取自己那条的号）：
+//入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
+    input [2:0]  flush_idx,
 //ROB 队头（年龄基准）+ 写口级的落地广播（b0/b1）：本模块据此杀自己更老的同 rd 在途记录
     input [2:0]  rob_head,
 //跳转冲刷的边界：那条分支/跳转自己那一项（bju 寄存的）。冲刷时要按它把车厢里的错路记录作废。
@@ -150,6 +153,7 @@ module lsu(
 
 //组合判据
     reg mem_op, is_st, new_in, new_in_pre, new_go, full_stall, bus_go;
+    reg ent_bnd, ent_young;
     reg s3_done, s3_ok, s2_move, s2_ok, s2_put_go;
     reg ld_out, blank_bus, s2_put, new_put;
     reg ls_use_hit, miss;
@@ -249,7 +253,15 @@ module lsu(
 //车厢占用由 new_go/s2_ok 自己把关，或进来就成组合环。
 //★ 不要再把 stall_rob_full(9) / stall_pc_redir(8) 也排进来：重定向要等 ROB 排空，
 //  而队头那条访存正是被它挡在 lsu 门外 ⇒ ROB 永不排空 ⇒ 死锁（实测 exc_ldst_misalign 卡死）。
-        new_in_pre = mem_op & ~size_bad_now & ~flush_w & ~ls_use_hit & payload_go
+//★ 冲刷只挡【比边界更年轻】的错路条，边界自己必须放行：
+//  · 跳转/分支非对齐：flush_idx = 分支自己 ⇒ 冲刷拍站在载荷上的后继比它年轻 ⇒ 照旧挡；
+//  · 中断：flush_idx = issue_idx_in = 载荷这条自己（与本模块的 idx_in 同源）⇒ 放行。
+//    它是【已被 post_decoder 发出、ROB 要留下】的那条；挡住它就永远拿不到 ld_we ⇒ ROB 排不空
+//    ⇒ pc 的重定向（等 rob_empty）自锁。实测：lw 撞中断 → i2c_irq 冻在 pc=0xa4。
+        ent_bnd    = flush_w & (idx_in == flush_idx);
+        ent_young  = flush_w & (idx_in != flush_idx);
+        new_in_pre = mem_op & ~size_bad_now & ~ent_young & ~ls_use_hit
+                   & (payload_go | ent_bnd)
                    & ~(flag_bus[3] | flag_bus[2] | flag_bus[1]);
         new_in     = new_in_pre & ~exc_ldst_misalign;
 //入口【不看 miss】：miss 当拍也要进级锁操作数；只有发送等 miss 落下。
@@ -430,7 +442,13 @@ module lsu(
 //★ 判定必须与 new_in_pre（入口条件）相与，不能只看 exc_ldst_misalign_now：
 //  被冲刷/停顿/冒险挡住的指令【本来就进不了 lsu】，它那一拍的 byte_addr 是错路指令的
 //  垃圾操作数（实测 CoreMark：一个被冲刷的错路 lh 判出 byte_addr=0xffffffff）⇒ 对它抛
-//  异常就是误判，会把好程序打断。new_in_pre 里已含 ~flush_w ⇒ 冲刷拍天然为 0。
+//  异常就是误判，会把好程序打断。
+//★ 入口条件的口径是"错路条进不来、边界条进得来"（见 new_in_pre 那段注释）⇒ 这里跟着新口径走：
+//  ① 错路条（含跳转冲刷那一拍站在载荷上的后继）ent_young=1 ⇒ new_in_pre=0 ⇒ 照旧不抛；
+//  ② 边界那条（中断落在它身上）ent_bnd=1 ⇒ 放行 ⇒ 若它自己非对齐，就必须在这里抛出来
+//     （否则故障静默丢失、它的 ROB 项永远等不到完成回报，又是一种自锁）。
+//  访存非对齐这条路原本也不会撞上冲刷：故障要寄存一拍、controller 下一拍才收到 exc_ldst_misalign_in
+//  ⇒ 故障条进 lsu 那一拍根本没有冲刷位，此时 ent_bnd=ent_young=0，new_in_pre 与原式逐位相同。
 //★ 寄存一拍之后，controller 侧的 pc 载荷(aux_addr_3)与 ROB 索引(issue_idx)已经换成下一条指令，
 //  所以它们也得配寄存版（见 controller 的 exc_pc_e4_q、cpu_top 的 exc_idx mux）。
     always @(posedge clk) begin

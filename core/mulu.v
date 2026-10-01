@@ -51,6 +51,9 @@ module mulu(
 //那两拍里它已经会去推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
 //不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
     input flush_bju_pre,
+//本次冲刷的边界（controller 的 flush_idx：三种冲刷各取自己那条的号）：
+//入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
+    input [2:0]  flush_idx,
 //ROB 队头（年龄基准）+ 写口级落地广播（b0/b1）：本模块据此杀自己更老的同 rd 在途记录
     input [2:0]  rob_head,
     input        b0_we,
@@ -112,6 +115,16 @@ module mulu(
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w;
     always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9] | flush_bju_pre;
+
+//入口门用的两条按【编号】的判据（口径同 lsu.v）：
+//  · 跳转/分支非对齐：flush_idx = 分支自己 ⇒ 冲刷拍站在载荷上的后继比它年轻 ⇒ 挡；
+//  · 中断：flush_idx = issue_idx_in = 载荷这条自己（与本模块的 idx_in 同源）⇒ 放行 ——
+//    它是【已被 post_decoder 发出、ROB 要留下】的那条，挡住它就永远拿不到 fin_mul。
+    reg ent_bnd, ent_young;
+    always @(*) begin
+        ent_bnd   = flush_w & (idx_in == flush_idx);
+        ent_young = flush_w & (idx_in != flush_idx);
+    end
 
 //冻结信号合流（本模块是消费者，或运算在这里做）：
 //  bus_hold   = 总线不可用（外部 hold）
@@ -208,9 +221,11 @@ module mulu(
         is_div       = is_m && (func10[2] == 1'b1);   // funct3 1xx：DIV 家族
     end
 
-//第一级：锁操作数。判据 !stall / !flush_w / !bus_hold_in 与 lsu 的 ld_enq 同形
+//第一级：锁操作数。判据 !stall / !flush_w / !bus_hold_in 与 lsu 的 ld_enq 同形。
+//★ 冲刷只挡【比边界更年轻】的错路条，边界自己放行（理由与 lsu 的 new_in_pre 同）。
     always @(*) begin
-        m_push = is_mul && !stall && !pipe_stall && !flush_w && !bus_hold && !wr_pend && payload_go;
+        m_push = is_mul && !stall && !pipe_stall && !ent_young && !bus_hold && !wr_pend
+               && (payload_go | ent_bnd);
     end
 
 //乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与 alu 的写回级同呼吸。

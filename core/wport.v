@@ -10,24 +10,36 @@
 // Target Devices:
 // Tool Versions:
 // Description:
-//   三个结果口（alu / mulu / lsu）→ 寄存器堆的两条物理写口。**纯组合**：三个单元各自负责
-//   自己那笔的时序（alu 在 alu.v 里寄存一拍、mulu 保持到 taken_mul、lsu 一拍脉冲），
-//   本级只做三件事：
+//   三个结果口（alu / mulu / lsu）→ 寄存器堆的两条物理写口。**两级：入口判定（组合）+ 出口寄存（一拍送出）**。
+//   本文件内 always 块按【流水级数】排列：
+//     入口级（组合）：flag_bus 翻译 → 候选有效性/年龄 → 选口 + 同 rd 压制 → 落 *_e、taken_mul、b0/b1
+//     出口级（寄存）  ：把面向寄存器堆与 ROB 的那些整体打一拍
+//   相位（以"这笔结果出现在结果口上"那拍 T 为参照）：入口 = T（组合）；出口 = T+1（寄存）。
 //
-//   ① 选口：口 A = alu → mul → 空；口 B = ld →（mul，若 A 没占）→ 空。
-//      流式源（alu 每拍一笔、ld 一拍脉冲）必须保住自己的口 —— 它们等不了；
-//      被挤的只能是 mul（它真能保持）。⇒ 这个优先序不能改成"三源平等"。
-//   ② 同 rd 撞两个口：只放行年轻那笔，老的那笔**当拍丢弃**（不是延后 —— 延后落地会把年轻的盖掉）。
-//      年龄用 head 相对值 {1'b0,(idx - rob_head)}，先截 4 位再比（3 位减法回绕会判错）。
-//   ③ 唯一广播点：只广播**真落地**的那笔 (rd, idx)，各单元据此杀自己更老的同 rd 在途记录。
-//      被杀的笔（kill_mul/kill_ld）不写、不广播，但照常"放行 + 回报" —— 否则单元死等、队头也不动。
+//   | 输出 | 级别 | 去向 |
+//   | --- | --- | --- |
+//   | we_a·rd_a·data_a·idx_a / we_b·rd_b·data_b·idx_b | 出口寄存 | → regfile（写阵列 + 读侧旁路）、forw 点①（第 4/5 条源） |
+//   | fin_alu·fin_mul·fin_ld（+idx） | 出口寄存 | → rob（置 ent_wr，队头才退得动） |
+//   | taken_mul | **入口级组合** | → mulu（放行它撤值） |
+//   | b0_* / b1_*（真落地那笔的 (rd,idx)） | **入口级组合** | → lsu / mulu（杀更老的同 rd 在途记录） |
 //
-// Dependencies:
+//   ★ 四条不变式：① 选口优先序不可改（口 A = alu→mul；口 B = ld→mul 捡漏；流式源 alu/ld 等不了）；
+//     ② 同 rd 撞两口只放行年轻那笔（老的当拍丢，年龄用 head 相对值、先截 4 位）；
+//     ③ 被杀的笔不写、不广播，但照常"放行 + 回报"（否则单元死等、队头也不动）；
+//     ④ **`taken_mul` 与 `b0/b1` 必须留在入口级**（理由见下）。
+//   ★ 出口为什么打一拍：打拍前"判定 → 写口身份/写使能"这条深锥直接拉到 regfile 的 32×32 阵列 D 脚
+//     与读旁路（实测 3010 个失败端点里 1088 条终点在阵列 D）⇒ 布线把锥摊到全片；打拍后锥只驱动本级的出口寄存器。
+//   ★ 配套：值在出口多待一拍 ⇒ regfile 当拍采的读值看不到它、单元结果口下一拍又已换人
+//     ⇒ 由 forw 点① 吃这两条写口寄存器补上（5 个前送源）。
+//   ★ 为什么不设"出口冲刷门"：入口级的 pa 只能来自 c0_v/c1_v，那两条里已经带了
+//     `flush_con_jump && (idx != bju_idx_q)` 的逐字判据，且 pa_idx 就是那个 idx
+//     ⇒ 出口再加一道同判据的门恒成立、是死逻辑。反过来把它"修"成延后一拍会误杀：
+//     冲刷那一拍躺在出口寄存器里的是【更老的、正确路】那笔（判定拍它就已在写口上）。
 //
 // Revision:
-//   Revision 0.01 - 新建（写口级 + 寄存版 alu 结果）
-//   Revision 0.02 - alu 那一笔的寄存器搬进 alu.v ⇒ 本级退化成纯组合；处置回报改三条通道
-//                   （fin_alu/fin_mul/fin_ld，与 ROB 现有三个完成口同形，只是不再带数据）
+//   0.01 新建（写口级 + 寄存版 alu 结果）
+//   0.02 alu 那一笔的寄存器搬进 alu.v ⇒ 本级退化成纯组合；处置回报改三条通道 fin_alu/fin_mul/fin_ld
+//   0.03 出口整体打一拍（面向 regfile 与 ROB 的那些）；taken_mul 与 b0/b1 留在入口级组合
 //
 // Additional Comments:
 //
@@ -35,6 +47,7 @@
 
 
 module wport(
+    input clk, rst,
 //ROB 队头（年龄基准）
     input [2:0]  rob_head,
 //alu 结果口（alu.v 内寄存一拍，一拍宽）
@@ -67,23 +80,25 @@ module wport(
     input [2:0]  bju_idx_q,
 //flag_bus：进模块先逐位翻译成原名，判定处直接用（不在模块内合成新名字）
     input [11:0] flag_bus,
-//写口（到寄存器堆）
+//写口（到寄存器堆，出口寄存一拍）
     output reg        we_a,
     output reg [4:0]  rd_a,
     output reg [31:0] data_a,
+    output reg [2:0]  idx_a,
     output reg        we_b,
     output reg [4:0]  rd_b,
     output reg [31:0] data_b,
-//放行 mulu 的那一笔（可以撤值了）
+    output reg [2:0]  idx_b,
+//放行 mulu 的那一笔（可以撤值了）—— **入口级组合**，不进出口寄存
     output reg        taken_mul,
-//处置回报（给 ROB：落地或被丢弃都算这一项完了）
+//处置回报（给 ROB：落地或被丢弃都算这一项完了）—— 与写口同拍，出口寄存一拍
     output reg        fin_alu,
     output reg [2:0]  fin_alu_idx,
     output reg        fin_mul,
     output reg [2:0]  fin_mul_idx,
     output reg        fin_ld,
     output reg [2:0]  fin_ld_idx,
-//落地广播（给 lsu/mulu 杀老写：只广播真落地的那笔）
+//落地广播（给 lsu/mulu 杀老写：只广播真落地的那笔）—— **入口级组合**，不进出口寄存
     output reg        b0_we,
     output reg [4:0]  b0_rd,
     output reg [2:0]  b0_idx,
@@ -92,12 +107,41 @@ module wport(
     output reg [2:0]  b1_idx
     );
 
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+//（本模块原来是纯组合、没有这一拍；出口寄存级加进来之后必须有。）
+    reg rst_q;
+    always @(posedge clk) rst_q <= rst;
+
 //flag_bus 逐位翻译成原名
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
     reg stall_rob_full, stall_pc_redir;
     reg stall_lsu_haz, stall_lsu_full;
     reg stall_mulu_haz, stall_mulu_div;
     reg stall_icache_miss, stall_bus_hold;
+
+//入口级（组合）的输出，由下一拍的出口寄存级采走
+    reg        we_a_e, we_b_e;
+    reg [4:0]  rd_a_e, rd_b_e;
+    reg [31:0] data_a_e, data_b_e;
+    reg [2:0]  idx_a_e, idx_b_e;
+    reg        fin_alu_e, fin_mul_e, fin_ld_e;
+
+//三个候选：有效性与年龄
+    reg        c0_v, c1_v, c2_v;
+    reg [3:0]  c0_age, c1_age, c2_age;
+//端口归属与同 rd 压制
+    reg [1:0]  pa, pb;
+    reg [4:0]  pa_rd, pb_rd;
+    reg [2:0]  pa_idx, pb_idx;
+    reg [3:0]  pa_age, pb_age;
+    reg        sup_a, sup_b;
+
+//===============================================================
+// 入口级（组合）：三个结果口 → "这一拍该处置谁"
+//   本级输出全部落 *_e，由下一拍的出口寄存级采走；taken_mul 与 b0/b1 例外，留在本级
+//===============================================================
     always @(*) begin
         flush_con_exc     = flag_bus[11];
         flush_con_irq     = flag_bus[10];
@@ -112,16 +156,6 @@ module wport(
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
     end
-
-//三个候选：有效性与年龄
-    reg        c0_v, c1_v, c2_v;
-    reg [3:0]  c0_age, c1_age, c2_age;
-//端口归属与同 rd 压制
-    reg [1:0]  pa, pb;
-    reg [4:0]  pa_rd, pb_rd;
-    reg [2:0]  pa_idx, pb_idx;
-    reg [3:0]  pa_age, pb_age;
-    reg        sup_a, sup_b;
 
 //候选有效性：不写 rd=0 的那笔不占口；已判死的笔也不占口（但下面照常放行/回报）
 //★ 三条口的撤销判据必须【同构】：跳转冲刷那一拍，挂在本口上的若不是发起者自己那一笔，
@@ -191,21 +225,28 @@ module wport(
         end
     end
 
-//写口 / 放行 / 回报 / 广播
+//写口 / 放行 / 回报 / 广播（落 *_e）
+//  放行口径 = "你这笔已经被处置掉了"（不是"你落地了"）—— rd=0 的写不占口也不落地，同样要放行，
+//  否则 mulu 会永远举着一笔没人取的值（死等）。
+//  ★ b0/b1 走【入口级组合】：单元侧（lsu/mulu）的杀老写是"当拍比较、下一沿登记"
+//    ⇒ 广播必须与候选上口那一拍同步，才能压住"下一拍照样上口的更老那笔"。
+//    把它挪进出口寄存器会开出跨拍重排窗口：年轻者进出口那拍、更老的那笔正好上另一个口，
+//    单元里的 kill 登记还差一拍 ⇒ 老的写在 T+2 盖掉年轻的（实测机理见 lsu.v 的 s3_kl 登记）。
+//  ★ taken_mul 也留在入口级：mul 与 div 共用这根握手，寄存会让 m_pv 多举一拍
+//    （写口重复取 ⇒ 同 rd 写两次），并提前清掉 mulu 的 wr_pend ⇒ 除法提交脉冲被冲走、结果永久丢失。
     always @(*) begin
-        we_a      = 1'b0;
-        rd_a      = 5'd0;
-        data_a    = 32'd0;
-        we_b      = 1'b0;
-        rd_b      = 5'd0;
-        data_b    = 32'd0;
+        we_a_e    = 1'b0;
+        rd_a_e    = 5'd0;
+        data_a_e  = 32'd0;
+        idx_a_e   = 3'd0;
+        we_b_e    = 1'b0;
+        rd_b_e    = 5'd0;
+        data_b_e  = 32'd0;
+        idx_b_e   = 3'd0;
         taken_mul = 1'b0;
-        fin_alu   = we_alu;
-        fin_alu_idx = idx_alu;
-        fin_mul   = we_mul && (kill_mul || (rd_mul == 5'd0) || (pa == 2'd1) || (pb == 2'd1));
-        fin_mul_idx = idx_mul;
-        fin_ld    = we_ld;
-        fin_ld_idx = idx_ld;
+        fin_alu_e = we_alu;
+        fin_mul_e = we_mul && (kill_mul || (rd_mul == 5'd0) || (pa == 2'd1) || (pb == 2'd1));
+        fin_ld_e  = we_ld;
         b0_we     = 1'b0;
         b0_rd     = 5'd0;
         b0_idx    = 3'd0;
@@ -213,35 +254,75 @@ module wport(
         b1_rd     = 5'd0;
         b1_idx    = 3'd0;
         if (pa == 2'd0) begin
-            data_a = data_alu;
+            data_a_e = data_alu;
         end
         else if (pa == 2'd1) begin
-            data_a = data_mul;
+            data_a_e = data_mul;
         end
         if (pb == 2'd1) begin
-            data_b = data_mul;
+            data_b_e = data_mul;
         end
         else if (pb == 2'd2) begin
-            data_b = data_ld;
+            data_b_e = data_ld;
         end
         if ((pa != 2'd3) && ~sup_a) begin
-            we_a   = 1'b1;
-            rd_a   = pa_rd;
-            b0_we  = 1'b1;
-            b0_rd  = pa_rd;
-            b0_idx = pa_idx;
+            we_a_e  = 1'b1;
+            rd_a_e  = pa_rd;
+            idx_a_e = pa_idx;
+            b0_we   = 1'b1;
+            b0_rd   = pa_rd;
+            b0_idx  = pa_idx;
         end
         if ((pb != 2'd3) && ~sup_b) begin
-            we_b   = 1'b1;
-            rd_b   = pb_rd;
-            b1_we  = 1'b1;
-            b1_rd  = pb_rd;
-            b1_idx = pb_idx;
+            we_b_e  = 1'b1;
+            rd_b_e  = pb_rd;
+            idx_b_e = pb_idx;
+            b1_we   = 1'b1;
+            b1_rd   = pb_rd;
+            b1_idx  = pb_idx;
         end
-//放行口径 = "你这笔已经被处置掉了"，不是"你落地了"：rd=0 的写不占口也不落地，
-//同样要放行 —— 否则 mulu 会永远举着一笔没人取的值（死等）。
-        if (fin_mul)
+        if (fin_mul_e)
             taken_mul = 1'b1;
+    end
+
+//===============================================================
+// 出口级（寄存一拍）：写口级"走出去"
+//   面向寄存器堆与 ROB 的整体打一拍；广播与放行留在上面那一级（见入口级的注释）
+//   fin_*_idx 取入口级原样的 idx_*：与 fin_*_e 是同一个沿、同一个周期取样，天然配对
+//===============================================================
+    always @(posedge clk) begin
+        if (rst_q) begin
+            we_a <= 1'b0;
+            rd_a <= 5'd0;
+            data_a <= 32'd0;
+            idx_a <= 3'd0;
+            we_b <= 1'b0;
+            rd_b <= 5'd0;
+            data_b <= 32'd0;
+            idx_b <= 3'd0;
+            fin_alu <= 1'b0;
+            fin_alu_idx <= 3'd0;
+            fin_mul <= 1'b0;
+            fin_mul_idx <= 3'd0;
+            fin_ld <= 1'b0;
+            fin_ld_idx <= 3'd0;
+        end
+        else begin
+            we_a <= we_a_e;
+            rd_a <= rd_a_e;
+            data_a <= data_a_e;
+            idx_a <= idx_a_e;
+            we_b <= we_b_e;
+            rd_b <= rd_b_e;
+            data_b <= data_b_e;
+            idx_b <= idx_b_e;
+            fin_alu <= fin_alu_e;
+            fin_alu_idx <= idx_alu;
+            fin_mul <= fin_mul_e;
+            fin_mul_idx <= idx_mul;
+            fin_ld <= fin_ld_e;
+            fin_ld_idx <= idx_ld;
+        end
     end
 
 endmodule
