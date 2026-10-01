@@ -33,8 +33,7 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input [31:0] offset_jal2, offset_beq2,
-    input br1, br2, br3, jal, pre_jalr, btb_hit, jalr_fail, exc_irq, exc_irq_ret, exc_ecall,
+    input br2, br3, pre_jalr, btb_hit, jalr_fail, exc_irq, exc_irq_ret, exc_ecall,
     input [11:0] flag_bus,
 //回填应答（接核内 itcm）
     input mem_valid,
@@ -72,13 +71,29 @@ module icache(
 //            stall_lsu_haz, stall_lsu_full,
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
-//控制位译码（行为块，放本模块最前）：本模块的取指推进由八条 stall 位合出来的 req_valid
-//与回填状态自己把关，不用流水线使能，故只取冲刷位与 stall 位（这里是消费者，或运算在本模块内做）。
+//控制位译码（行为块，放本模块最前）：**先把 flag_bus 各位还原成原名，再按名字做逻辑**
+//（模块内不直接用位号）；本模块的取指推进由八条 stall 位合出来的 req_valid 与回填状态自己把关。
+    reg flush_con_exc, flush_con_irq, flush_con_jump;
+    reg stall_rob_full, stall_pc_redir;
+    reg stall_lsu_haz, stall_lsu_full;
+    reg stall_mulu_haz, stall_mulu_div;
+    reg stall_icache_miss, stall_bus_hold;
     reg flush_w, req_valid;
     always @(*) begin
-        flush_w   = flag_bus[11] | flag_bus[10] | flag_bus[9];
-        req_valid = ~(flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
-                    | flag_bus[2] | flag_bus[1] | flag_bus[0]);
+        flush_con_exc     = flag_bus[11];
+        flush_con_irq     = flag_bus[10];
+        flush_con_jump    = flag_bus[9];
+        stall_rob_full    = flag_bus[7];
+        stall_pc_redir    = flag_bus[6];
+        stall_lsu_haz     = flag_bus[5];
+        stall_lsu_full    = flag_bus[4];
+        stall_mulu_haz    = flag_bus[3];
+        stall_mulu_div    = flag_bus[2];
+        stall_icache_miss = flag_bus[1];
+        stall_bus_hold    = flag_bus[0];
+        flush_w   = flush_con_exc | flush_con_irq | flush_con_jump;
+        req_valid = ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
+                    | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold);
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -96,6 +111,8 @@ module icache(
     reg [1:0] hit_sel;
     (* max_fanout = 32 *) reg [13:0] rd_addr;
     reg rd_en, fill_ok;
+    reg wr_en;
+    reg [13:0] wr_addr;
 //本次回填期间来过冲刷：起回填的那一拍（stage==0）清成当拍有没有冲刷，回填期间来一个就置起来。
 //回填期 pc 被 stall 按住，唯一能让它走的就是冲刷（flush_w / flush_pc_redir），
 //所以这一位就等价于"这次回填已经不是 pc 现在要的那条了"。
@@ -128,18 +145,29 @@ module icache(
 //===============================================================
 // 第 0 级：本拍组合（取指地址 + 命中判定与缺失锁）
 //===============================================================
-//取指地址：默认 pc_addr >>> 2；jal / 预测成立的分支当拍直接用目标，省掉那一拍取指空泡。
-//pc 侧用未减 4 的 offset（落 T+4），本侧用 pc_addr + offset − 4（取 T），两边按同一目标对齐。
-//jalr 不加：它的目标是 BTB 查表来的，只送 pc。
+//取指地址：**只取 pc_addr >>> 2**，不吃 jal/br1，也没有那个 32 位加法器。
+//jalr 早就是"落点只送 pc"；现在 jal/br1 也一样 —— 它们的改向落点只进 pc，
+//而"目标那条指令"由 bra_predict 里那块独立的 btb 直接交付给 pre_decoder。
+//这样一来，"译码器 + 加法器 → 取指地址 → tag 阵列读 → 命中选择 → iram 地址口"
+//那条 13 级/14.4ns 的链整条消失。
     always @(*) begin
         if (rst_q)
             fetch_addr = 32'd0;
-        else if (jal && !flush_w)
-            fetch_addr = (pc_addr + offset_jal2 - 32'd4) >>> 2;
-        else if (br1 && !flush_w)
-            fetch_addr = (pc_addr + offset_beq2 - 32'd4) >>> 2;
         else
             fetch_addr = pc_addr >>> 2;
+    end
+
+//写口：自举与回填共用【同一条写语句、同一个地址表达式】。写成两条写语句（两个地址表达式），
+//综合器会各推一个写口 ⇒ iram 变多写口 ⇒ 进不了 BRAM，会溶解成 12K×32 个触发器（实测综合 15 分钟以上）。
+    always @(*) begin
+        if (bts_run) begin
+            wr_en   = ~bts_end & mem_valid;
+            wr_addr = {2'd0, bts_line, bts_cnt};
+        end
+        else begin
+            wr_en   = (stage == 1'b1) & ~fill_end & mem_valid;
+            wr_addr = {fill_way, fill_idx, fill_cnt};
+        end
     end
 
     always @(*) begin
@@ -174,13 +202,20 @@ module icache(
             rd_en   = 1'b1;
             rd_addr = {fill_way, fill_idx, miss_word};
         end
+        else if (bts_run && (bts_line == BOOT_LINES) && bts_end) begin
+            rd_en   = 1'b1;
+            rd_addr = 14'd0;
+        end
         else begin
             rd_en   = req_valid;
             rd_addr = {hit_sel, idx, word};
         end
     end
 
-//打一拍：它是给"此刻躺在 inst_out 里那条"用的。没发生读的时候 inst_out 不变，标志跟着保持。
+//打一拍：它是给"此刻躺在 inst_out 里那条"用的。
+//★ 冲刷在这里合并：冲刷拍交付的必是错路（inst_out 那边同一拍已被刷成 NOP）⇒ valid 同时拉低。
+//  这样 flush 只出现在一个寄存器的 D 端，fetch_addr 就不必去吃 flag_bus 的全片广播
+//  （那条"广播 → fetch_addr → tag 阵列读 → 命中选择 → rd_addr → iram 地址口"实测 23 级/14.49ns）。没发生读的时候 inst_out 不变，标志跟着保持。
 //常态读要命中才有意义（没命中时 hit_sel 指向不存在的 way，读回来是未初始化值）；
 //回填旁路读到的永远是"我欠的那个字"，但那次回填期间来过冲刷就不能认（标 invalid）。
 //自举最后一行收满那一拍是"交接"：直接装入口指令并标有效，与回填路径再无关系。
@@ -190,7 +225,7 @@ module icache(
         else if (bts_run && (bts_line == BOOT_LINES) && bts_end)
             inst_valid <= 1'b1;
         else if (rd_en)
-            inst_valid <= fill_end ? ~fill_flushed : cache_hit;
+            inst_valid <= (fill_end ? ~fill_flushed : cache_hit) & ~flush_w;
         else
             inst_valid <= inst_valid;
     end
@@ -232,8 +267,8 @@ module icache(
         if (rst_q)
             inst_out <= 32'd0;
         else if (bts_run && (bts_line == BOOT_LINES) && bts_end)
-            inst_out <= iram[0];
-        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flag_bus[11] | flush_pc_redir) | (jalr && req_valid))
+            inst_out <= iram[rd_addr];
+        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | (jalr && req_valid))
             inst_out <= 32'd0;
         else if (rd_en)
             inst_out <= iram[rd_addr];
@@ -245,13 +280,8 @@ module icache(
 //iram 单写口：地址在自举与回填之间选。
 //自举的 way 是常量 2'd0（way0 只有自举写得进去），回填的 fill_way 恒 ∈ {1,2} —— way0 的写通路物理取消。
     always @(posedge clk) begin
-        if (bts_run) begin
-            if (!bts_end && mem_valid)
-                iram[{2'd0, bts_line, bts_cnt}] <= mem_data;
-        end
-        else if (stage == 1'b1 && !fill_end && mem_valid) begin
-            iram[{fill_way, fill_idx, fill_cnt}] <= mem_data;
-        end
+        if (wr_en)
+            iram[wr_addr] <= mem_data;
     end
 
 //自举序列：复位释放后逐行填充前 16KB（128 行 × 32 字），固定写 way0。

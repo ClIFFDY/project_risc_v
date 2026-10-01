@@ -25,6 +25,10 @@ module pre_decoder(
     input [11:0] flag_bus,
     input inst_valid,
     input [31:0] inst_in,
+//指令三态来源（bra_predict 里那块服务 br1/jal 的独立 btb）：
+//bti_sel=0 用 icache 正常交付；=1 用 btb 送来的"跳转目标那条指令"；=2 交付 NOP。
+    input [1:0]  bti_sel,
+    input [31:0] bti_inst,
     input [31:0] aux_addr_in,
     input br1_in,
     input [31:0] jalr_pred_addr_in,
@@ -83,10 +87,20 @@ module pre_decoder(
         exec    = flag_bus[8];
     end
 
-//指令来源：icache 为唯一取指源。inst_valid=0 表示这一拍送来的是无效读数（缺失垃圾，
-//或那次回填已被冲刷作废），整条压成 0 ⇒ 组合块算不出 jal/br_en（不会拿垃圾去改取指地址），
-//时序块锁进去的是一条 NOP。回填期间流水线本来就被 stall 按住，门控只在回填落那一拍起作用。
-    always @(*) inst_effective = inst_valid ? inst_in : 32'd0;
+//指令来源三态。bti_sel 那两态是跳转那一拍用的：目标那条指令由 bra_predict 的 btb 直接送来
+//（icache 那拍交出来的是顺序错路，一律不用）；若方向说跳但 btb 没缓存，就交付一条 NOP，
+//让 pc 落 T 由 icache 自己去取目标（冷启动 1 拍）。
+//第三态是原来的口径：inst_valid=0 表示这一拍送来的是无效读数（缺失垃圾，或那次回填已被
+//冲刷作废），整条压成 0 ⇒ 组合块算不出 jal/br_en（不会拿垃圾去改取指地址），时序块锁进去的
+//是一条 NOP。回填期间流水线本来就被 stall 按住，门控只在回填落那一拍起作用。
+    always @(*) begin
+        if (bti_sel == 2'd1)
+            inst_effective = bti_inst;
+        else if (bti_sel == 2'd2)
+            inst_effective = 32'd0;
+        else
+            inst_effective = inst_valid ? inst_in : 32'd0;
+    end
 
 //本模块寄存器只留"必须跨拍携带"的四项：指令字本身、两个源寄存器号（regfile 读口要用）、
 //PC 载荷与取指期的预测信息。原来那 15 个译码字段各寄存一份、再被原样重寄一遍。

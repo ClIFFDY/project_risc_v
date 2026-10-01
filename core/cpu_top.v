@@ -125,6 +125,10 @@ module cpu_top(
     wire flush_rob_trap_w;
     wire [4:0] rd_load;
     wire btb_hit;
+//服务 br1/jal 的独立 btb 出口：命中标志给 pc，目标指令与三态选择给 pre_decoder
+    wire        bti_hit;
+    wire [1:0]  bti_sel_q;
+    wire [31:0] bti_inst_q;
     wire [31:0] icache_mem_addr_w, icache_mem_wdata_w, icache_mem_data_w;
     wire [3:0] icache_mem_be_w;
     wire icache_mem_req_w, icache_mem_we_w, icache_mem_valid_w;
@@ -160,6 +164,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .br1(br1),
+        .bti_hit(bti_hit),
         .jal(jal),
         .pre_jalr(pre_jalr),
         .btb_hit(btb_hit),
@@ -188,10 +193,8 @@ module cpu_top(
         .rst(rst),
         .pc_addr(pc_addr),
         .flush_pc_redir(flush_pc_redir_w),
-        .br1(br1),
         .br2(br2),
         .br3(br3),
-        .jal(jal),
         .pre_jalr(pre_jalr),
         .btb_hit(btb_hit),
         .jalr_fail(jalr_fail),
@@ -202,8 +205,6 @@ module cpu_top(
         .inst_out(icache_inst_w),
         .inst_valid(icache_inst_valid_w),
         .busy(icache_busy_w),
-        .offset_jal2(offset_jal2),
-        .offset_beq2(offset_beq2),
         .mem_req(icache_mem_req_w),
         .mem_we(icache_mem_we_w),
         .mem_addr(icache_mem_addr_w),
@@ -226,6 +227,8 @@ module cpu_top(
         .flag_bus(flag_bus),
         .inst_valid(icache_inst_valid_w),
         .inst_in(icache_inst_w),
+        .bti_sel(bti_sel_q),
+        .bti_inst(bti_inst_q),
         .aux_addr_in(aux_addr_0),
         .inst_out(inst_1),
         .br1_in(br1),
@@ -459,7 +462,14 @@ module cpu_top(
         .br_fail(br_fail),
         .br_en(br_en),
         .jalr_flag(jalr_flag_q),
+        .jal(jal),
+        .inst_in(icache_inst_w),
+        .inst_valid(icache_inst_valid_w),
+        .flag_bus(flag_bus),
         .br_pred_taken_in(br_pred_taken_q),
+        .bti_hit(bti_hit),
+        .bti_inst_q(bti_inst_q),
+        .bti_sel_q(bti_sel_q),
         .br1(br1),
         .br2(br2),
         .br3(br3),

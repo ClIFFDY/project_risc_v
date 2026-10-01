@@ -24,6 +24,9 @@ module pc(
     input clk, rst,
     input br1, exc_irq, exc_irq_ret, exc_mark,
     input jal, pre_jalr, btb_hit,
+//bra_predict 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 pre_decoder
+//⇒ pc 落 T+4；未命中 ⇒ pc 落 T，让 icache 下一拍自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
+    input bti_hit,
     input [11:0] flag_bus,
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
@@ -129,13 +132,29 @@ module pc(
                 aux_addr <= isr_ret_addr2;
             end
             else if (!flush_w && !stall_w) begin
+//jal/br1 的改向分两档（"差一拍"就在这儿）：命中的那一拍目标 inst 已由 bra_predict 的 btb
+//交付给 pre_decoder，所以 pc 落**目标的下一个地址**（T+4）；未命中的那一拍没有 inst 可交付，
+//pc 落**目标地址本身**（T），由 icache 下一拍去取目标 —— 比命中晚一拍。
+//两个表达式都只落在 pc/aux 的 D 端（普通寄存器），不是 BRAM 地址脚 ⇒ 不进关键路径。
                 if (br1) begin
-                    pc_addr <= pc_addr + offset_beq2;
-                    aux_addr <= aux_addr + offset_beq2;
+                    if (bti_hit) begin
+                        pc_addr <= pc_addr + offset_beq2;
+                        aux_addr <= aux_addr + offset_beq2;
+                    end
+                    else begin
+                        pc_addr <= pc_addr + offset_beq2 - 32'd4;
+                        aux_addr <= aux_addr + offset_beq2 - 32'd4;
+                    end
                 end
                 else if (jal) begin
-                    pc_addr <= pc_addr + offset_jal2;
-                    aux_addr <= pc_addr + offset_jal2;
+                    if (bti_hit) begin
+                        pc_addr <= pc_addr + offset_jal2;
+                        aux_addr <= pc_addr + offset_jal2;
+                    end
+                    else begin
+                        pc_addr <= pc_addr + offset_jal2 - 32'd4;
+                        aux_addr <= pc_addr + offset_jal2 - 32'd4;
+                    end
                 end
                 else if (jalr) begin
                     pc_addr <= offset_jalr2;
