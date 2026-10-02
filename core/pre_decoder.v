@@ -32,9 +32,15 @@ module pre_decoder(
     input [31:0] aux_addr_in,
     input br1_in,
     input [31:0] jalr_pred_addr_in,
-//跨拍携带的指令字：各译码字段由下一级 mid_decoder 就地解出，本级不再各寄存一份
+//跨拍携带的指令字 + 译码字段。★ 删掉 mid_decoder 之后，rd/func10/imm 的解算回到本级 ——
+//历史上它本来就在这儿（37abe17 那次"组合解算"还是时序改善），71b7371 才把它挪进 mid。
+//imm12_csr/imm5_csr 不另寄存（下一级从 inst_in 就地切片）；pc_operand = aux_addr_out、
+//offset_jalr0/offset_beq0_aux = imm_alu_out（都是别名，顶层复用，不重复寄存）。
     output reg [31:0] inst_out,
     output reg [4:0] r1, r2,
+    output reg [4:0]  rd_out,
+    output reg [9:0]  func10_out,
+    output reg [31:0] imm_alu_out,
     output reg [31:0] offset_jal2, offset_beq2,
     output reg [31:0] aux_addr_out,
     output reg jal, br_en, jalr,
@@ -57,6 +63,7 @@ module pre_decoder(
     localparam OPCODE_LOAD   = 7'b0000011;
     localparam OPCODE_STORE  = 7'b0100011;
     localparam OPCODE_AUIPC  = 7'b0010111;
+    localparam OPCODE_LUI    = 7'b0110111;
     localparam OPCODE_SYSTEM = 7'b1110011;
 
     reg [31:0] inst_effective;
@@ -71,6 +78,74 @@ module pre_decoder(
         input [31:0] inst;
         immJ = {{12{inst[31]}}, inst[19:12], inst[20], inst[30:21], 1'b0};
     endfunction
+
+    function [31:0] immI;
+        input [31:0] inst;
+        immI = {{20{inst[31]}}, inst[31:20]};
+    endfunction
+
+    function [31:0] immS;
+        input [31:0] inst;
+        immS = {{20{inst[31]}}, inst[31:25], inst[11:7]};
+    endfunction
+
+    function [31:0] immU;
+        input [31:0] inst;
+        immU = {inst[31:12], 12'd0};
+    endfunction
+
+//译码字段的组合解算（rd / func10 / 立即数）：口径与 mid_decoder 原来那段 case 逐条一致，
+//只是解算源从"上一级的 inst_out"换成本级的 inst_effective —— 少一级就少一个寄存器边界。
+    reg [4:0]  rd_c;
+    reg [9:0]  func10_c;
+    reg [31:0] imm_c;
+    always @(*) begin
+        rd_c = 5'd0;
+        func10_c = 10'd0;
+        imm_c = 32'd0;
+        case (inst_effective[6:0])
+            OPCODE_OP: begin
+                rd_c = inst_effective[11:7];
+                func10_c = {inst_effective[31:25], inst_effective[14:12]};
+            end
+            OPCODE_OP_IMM: begin
+                imm_c = immI(inst_effective);
+                rd_c = inst_effective[11:7];
+                func10_c = {(inst_effective[14:12] == 3'b001 || inst_effective[14:12] == 3'b101) ? inst_effective[31:25] : 7'd0,
+                            inst_effective[14:12]};
+            end
+            OPCODE_JAL: begin
+                rd_c = inst_effective[11:7];
+            end
+            OPCODE_JALR: begin
+                rd_c = inst_effective[11:7];
+                imm_c = immI(inst_effective);
+            end
+            OPCODE_BRANCH: begin
+                imm_c = immB(inst_effective);
+                func10_c = {7'd0, inst_effective[14:12]};
+            end
+            OPCODE_LOAD: begin
+                imm_c = immI(inst_effective);
+                rd_c = inst_effective[11:7];
+            end
+            OPCODE_STORE: begin
+                imm_c = immS(inst_effective);
+            end
+            OPCODE_LUI: begin
+                imm_c = immU(inst_effective);
+                rd_c = inst_effective[11:7];
+            end
+            OPCODE_AUIPC: begin
+                imm_c = immU(inst_effective) - 4'd4;
+                rd_c = inst_effective[11:7];
+            end
+            OPCODE_SYSTEM: begin
+                rd_c = inst_effective[11:7];
+                func10_c = {7'd0, inst_effective[14:12]};
+            end
+        endcase
+    end
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
@@ -110,6 +185,9 @@ module pre_decoder(
             inst_out <= 32'd0;
             r1 <= 5'd0;
             r2 <= 5'd0;
+            rd_out <= 5'd0;
+            func10_out <= 10'd0;
+            imm_alu_out <= 32'd0;
             aux_addr_out <= 32'd0;
             br_pred_taken_out <= 1'b0;
             jalr_pred_addr_out <= 32'd0;
@@ -119,6 +197,9 @@ module pre_decoder(
                 inst_out <= inst_effective;
                 r1 <= 5'd0;
                 r2 <= 5'd0;
+                rd_out <= rd_c;
+                func10_out <= func10_c;
+                imm_alu_out <= imm_c;
                 aux_addr_out <= aux_addr_in;
                 br_pred_taken_out <= br1_in;
                 jalr_pred_addr_out <= jalr_pred_addr_in;
@@ -139,6 +220,9 @@ module pre_decoder(
                 inst_out <= inst_out;
                 r1 <= r1;
                 r2 <= r2;
+                rd_out <= rd_out;
+                func10_out <= func10_out;
+                imm_alu_out <= imm_alu_out;
                 aux_addr_out <= aux_addr_out;
                 br_pred_taken_out <= br_pred_taken_out;
                 jalr_pred_addr_out <= jalr_pred_addr_out;
@@ -147,6 +231,9 @@ module pre_decoder(
                 inst_out <= 32'd0;
                 r1 <= 5'd0;
                 r2 <= 5'd0;
+                rd_out <= 5'd0;
+                func10_out <= 10'd0;
+                imm_alu_out <= 32'd0;
                 aux_addr_out <= 32'd0;
                 br_pred_taken_out <= 1'b0;
                 jalr_pred_addr_out <= 32'd0;

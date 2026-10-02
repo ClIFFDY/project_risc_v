@@ -19,17 +19,11 @@ module cpu_top(
     wire jal, br_en, pre_jalr;
     wire br_pred_taken_1;
     wire [31:0] jalr_pred_addr_1;
-    wire [31:0] inst_2;
-    (* max_fanout = 32 *) wire [4:0] rs1_2, rs2_2, rd_2;
-    wire [4:0] imm5_csr_2;
-    wire [6:0] opcode_2, opcode_lsu_2;
-    wire [9:0] func10_2, func10_lsu_2;
-    wire [31:0] imm_alu_2, pc_operand_2;
-    wire [11:0] imm12_csr_2;
-    wire [31:0] offset_jalr0_2, offset_beq0_aux_2, offset_load0_2, offset_store0_2;
-    wire [31:0] aux_addr_2;
-    wire br_pred_taken_2;
-    wire [31:0] jalr_pred_addr_2;
+//删掉 mid_decoder 之后：译码字段由 pre 直接给出，载荷的操作数由 pd 组合装配后直送 forw
+    wire [4:0]  rd_1;
+    wire [9:0]  func10_1;
+    wire [31:0] imm_alu_1;
+    wire [31:0] r1_data_post_w, r2_data_post_w;
     wire [4:0] rd_3;
     wire [31:0] aux_addr_3, beq_off_q2, jalr_pred_addr_3;
     wire we_3, br_flag, br_pred_taken_3;
@@ -45,7 +39,7 @@ module cpu_top(
 //写序号（乱序写回）：post_decoder 出"本拍这条会写 rd"，controller 内发号（tag_w）
     wire issue_we_w;
 //★ 号源分两处，看消费者采的是哪一级：
-//  lsu / mulu 采的是 E4【组合输入】(rd_2/opcode_2) ⇒ 用实时计数器 tag_w —— 计数器现在
+//  lsu / mulu 采的是 E4【组合输入】(rd_1/inst_1) ⇒ 用实时计数器 tag_w —— 计数器现在
 //  只在"载荷推进且有写"那一拍加一次，这条指令等在输入口期间它不动，所以 tag_w 就是发给它自己的号；
 //  wbu 的 alu 口采的是 E4【寄存载荷】(rd_4/we_4) ⇒ 必须用与载荷同步锁存出来的 issue_tag_w
 //  （从前它接 tag_w = 下一跳的号 ⇒ 老指令看起来比年轻指令还新，杀老写杀反）。
@@ -76,8 +70,6 @@ module cpu_top(
     wire [31:0] rob_trap_pc_w, rob_trap_tval_w;
     wire        exc_mark_w, exc_bju_w;
     wire [2:0]  bju_idx_q_w, bju_idx_i_w;
-    wire [31:0] r1_data_3, r2_data_3;
-    wire [31:0] r1_data_mid_w, r2_data_mid_w;
     wire [6:0]  opc_3;
     wire [9:0]  fn10_3, fn10_ls_3;
     wire [31:0] off_mem_3;
@@ -243,6 +235,9 @@ module cpu_top(
         .bti_inst(bti_inst_q),
         .aux_addr_in(aux_addr_0),
         .inst_out(inst_1),
+        .rd_out(rd_1),
+        .func10_out(func10_1),
+        .imm_alu_out(imm_alu_1),
         .br1_in(br1),
         .jalr_pred_addr_in(jalr_predict_offset),
         .br_pred_taken_out(br_pred_taken_1),
@@ -256,66 +251,32 @@ module cpu_top(
         .br_en(br_en),
         .jalr(pre_jalr)
     );
-    mid_decoder u_mid_decoder (
-        .clk(clk),
-        .rst(rst),
-        .flag_bus(flag_bus),
-        .inst_in(inst_1),
-        .inst_out(inst_2),
-        .func10_out(func10_2),
-        .imm_alu_out(imm_alu_2),
-        .imm12_csr_out(imm12_csr_2),
-        .imm5_csr_out(imm5_csr_2),
-        .rd_out(rd_2),
-        .opcode_out(opcode_2),
-        .offset_jalr0_out(offset_jalr0_2),
-        .offset_beq0_aux_out(offset_beq0_aux_2),
-        .pc_operand_out(pc_operand_2),
-        .aux_addr_in(aux_addr_1),
-        .aux_addr_out(aux_addr_2),
-        .br_pred_taken_in(br_pred_taken_1),
-        .br_pred_taken_out(br_pred_taken_2),
-        .jalr_pred_addr_in(jalr_pred_addr_1),
-        .jalr_pred_addr_out(jalr_pred_addr_2),
-        .opcode_lsu_out(opcode_lsu_2),
-        .func10_lsu_out(func10_lsu_2),
-        .offset_load0_out(offset_load0_2),
-        .offset_store0_out(offset_store0_2),
-        .r1_in(rs1_1),
-        .r1_out(rs1_2),
-        .r2_in(rs2_1),
-        .r2_out(rs2_2)
-    );
     post_decoder u_post_decoder (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
-        .func10(func10_2),
-        .imm_alu_in(imm_alu_2),
-        .imm12_csr_in(imm12_csr_2),
-        .imm5_csr_in(imm5_csr_2),
+        .func10(func10_1),
+        .imm_alu_in(imm_alu_1),
         .csr_wr_en(csr_wr_en),
         .csr_addr(csr_addr),
         .csr_addr_pre(csr_addr_pre),
         .csr_data(csr_data_wr),
         .csr_func3(csr_func3),
-        .rd_in(rd_2),
-        .rs1_in(rs1_2),
-        .rs2_in(rs2_2),
-        .opcode(opcode_2),
-        .offset_jalr0(offset_jalr0_2),
-        .offset_beq0_aux(offset_beq0_aux_2),
-        .pc_operand_in(pc_operand_2),
-//★ 点①前送的结果必须接进来：pd 的操作数载体默认就是它（寄存器操作数随载荷带到点②）
-//  这两根线漏了 ⇒ 默认值写进 X ⇒ 所有 rs1 操作数（sw/lh/beq…）全是 X（实测整核挂死）
-        .r1_data_in(r1_data_mid_w),
-        .r2_data_in(r2_data_mid_w),
-//stall 期间的回灌：前送当前输出（门控在 post_decoder 里用本级自己的 r*_reg_en）
-        .r1_data_fb(r1_data_final), .r2_data_fb(r2_data_final),
-        .inst_in(inst_2),
-        .aux_addr_in(aux_addr_2),
-        .br_pred_taken_in(br_pred_taken_2),
-        .jalr_pred_addr_in(jalr_pred_addr_2),
+        .rd_in(rd_1),
+        .rs1_in(rs1_1),
+        .rs2_in(rs2_1),
+//★ 操作数不再经过本级的寄存器：底值直接取 regfile 的【寄存读】（它正好提供
+//  "pre 出拍 → 下一拍"那一拍延迟，与载荷同拍），非寄存器操作数在 pd 内组合覆盖，
+//  再作为 forw 点② 的默认值直送执行单元。
+        .pc_operand_in(aux_addr_1),
+        .offset_beq0_aux(imm_alu_1),
+        .r1_data_in(r1_data),
+        .r2_data_in(r2_data),
+        .r1_data_post(r1_data_post_w), .r2_data_post(r2_data_post_w),
+        .inst_in(inst_1),
+        .aux_addr_in(aux_addr_1),
+        .br_pred_taken_in(br_pred_taken_1),
+        .jalr_pred_addr_in(jalr_pred_addr_1),
         .br_flag(br_flag),
         .beq_off_q2(beq_off_q2),
         .br_pred_taken_out(br_pred_taken_3),
@@ -340,10 +301,6 @@ module cpu_top(
         .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
         .payload_go(payload_go_w),
         .payload_go_q(payload_go_q_w),
-        .r1_data_out(r1_data_3),
-        .r2_data_out(r2_data_3),
-        .r1_reg_en(),
-        .r2_reg_en(),
         .opc_out(opc_3),
         .fn10_out(fn10_3),
         .fn10_ls_out(fn10_ls_3),
@@ -528,34 +485,21 @@ module cpu_top(
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
         .b1_we(wp_b1_we), .b1_rd(wp_b1_rd), .b1_idx(wp_b1_idx)
     );
-//前送级：两个前送点，源不同
-//  点①：寄存器堆数据 → post_decoder 之间（消费者 = mem_buf 那条）—— 吃 5 个源
-//  点②：post_decoder → 三个执行单元之间（消费者 = decoder 载荷那条）—— 只吃 3 个结果口
+//前送级：删掉 mid_decoder 后只剩点② 一处 —— post_decoder → 三个执行单元之间
+//（消费者 = decoder 载荷那条），只吃 3 个结果口。点① 原来那 5 个源（3 结果口 + 2 写口）
+//改由 regfile 的读侧旁路承担（见 u_regfile 那一段）。
     forw u_forw (
         .clk(clk),
         .rst(rst),
-//★ 两个前送点共用同一套选择位：rob 的槽序扫描。点① 用**当拍组合版**（扫描口读的就是
-//  mid 那条的 rs1_2/rs2_2），点② 用随载荷锁存的版本 ⇒ 本模块不再需要 rob_head/idx_mid。
-        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
-        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
 //★ 三条源 = 三个执行单元的结果口（各自带 ROB 索引）。乱序写回下"谁更年轻"只由索引给，
 //  不能再按端口身份/语句顺序定优先级（旧的"口 B 更年轻"只对按序退成立）。
         .we_alu(we_4), .rd_alu(rd_4), .data_alu(result_4), .idx_alu(alu_idx_w),
         .we_mul(mul_loaded), .rd_mul(rd_mul), .data_mul(mul_data_final), .idx_mul(mul_idx_w),
         .we_ld(loaded), .rd_ld(rd_load), .data_ld(ld_data_final), .idx_ld(ld_idx_w),
-//★ 第四、五条源 = 写口级出口寄存的两条物理写口（只服务点①）：写口打一拍后，
-//  "值已出单元结果口、还没落进阵列"这一拍只有这里补得住。
-//  取【出口寄存器】那一组（不是 b0/b1 —— 那两个留在 wport 入口级，比出口的值早一拍）。
-        .wp_we_a(wp_we_a), .wp_rd_a(wp_rd_a), .wp_data_a(wp_data_a), .wp_idx_a(wp_idx_a),
-        .wp_we_b(wp_we_b), .wp_rd_b(wp_rd_b), .wp_data_b(wp_data_b), .wp_idx_b(wp_idx_b),
-        .r1_data_mid_in(r1_data),
-        .r2_data_mid_in(r2_data),
-        .r1_data_mid(r1_data_mid_w),
-        .r2_data_mid(r2_data_mid_w),
         .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
         .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
-        .r1_data_post_in(r1_data_3),
-        .r2_data_post_in(r2_data_3),
+        .r1_data_post_in(r1_data_post_w),
+        .r2_data_post_in(r2_data_post_w),
         .r1_data_final(r1_data_final),
         .r2_data_final(r2_data_final)
     );
@@ -600,9 +544,9 @@ module cpu_top(
         .ld_done(wp_fin_ld),   .ld_idx(wp_fin_ld_idx),
         .alloc_we(issue_we_w),
         .alloc_rd(issue_rd_w),
-//前送槽扫描：消费者是下一拍进载荷那条（本拍还在 mid 级）⇒ 用它的 rs1_2/rs2_2；
+//前送槽扫描：消费者是下一拍进载荷那条（本拍还在 pre 级）⇒ 用它的 rs1_1/rs2_1；
 //本模块按程序序分配 ⇒ 扫描那一拍在册的槽全是比它老的，"比我老"不需要比较。
-        .scan_rs1(rs1_2), .scan_rs2(rs2_2),
+        .scan_rs1(rs1_1), .scan_rs2(rs2_1),
         .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
         .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
 //分支/跳转误预测一律【部分冲刷】：边界号 = bju 随判定锁存的那条自己的项。
@@ -622,7 +566,7 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
-//读口地址由 pre_decoder 那一级给出（比 decoder 载荷早两级），读值寄存后随载荷往下走
+//读口地址由 pre_decoder 那一级给出（比 decoder 载荷早一拍），读值寄存后随载荷往下走
         .r1(rs1_1),
         .r2(rs2_1),
         .we_a(wp_we_a),
@@ -631,6 +575,17 @@ module cpu_top(
         .we_b(wp_we_b),
         .rd_b(wp_rd_b),
         .data_b(wp_data_b),
+//★ 读侧旁路也吃三个单元结果口（共 5 源）：结果离开单元口那一拍还没落进阵列，
+//  而消费者的操作数取自"读锁存沿" ⇒ 那一格只有这里补得住（原来由 forw 点① 承担）。
+//  选源用 rob 的槽扫描（与 payload 的 sel_slot 同源、取当拍组合版）：扫描口读的就是本模块的
+//  读口地址 rs1_1/rs2_1，同一条指令，所以当拍就能用。
+        .we_alu(we_4), .data_alu(result_4),
+        .we_mul(mul_loaded), .data_mul(mul_data_final),
+        .we_ld(loaded), .data_ld(ld_data_final),
+        .idx_alu(alu_idx_w), .idx_mul(mul_idx_w), .idx_ld(ld_idx_w),
+        .idx_a(wp_idx_a), .idx_b(wp_idx_b),
+        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
+        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
         .r1_data(r1_data),
         .r2_data(r2_data)
     );
@@ -740,9 +695,9 @@ module cpu_top(
         .csr_addr(csr_addr),
         .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_result),
-//中断的 mepc 取 mid_decoder 的 aux_addr_2（那条指令"地址+4"）：它是【正要进发射级、
+//中断的 mepc 取 pre_decoder 的 aux_addr_1（那条指令"地址+4"）：它是【正要进发射级、
 //还没被发出去】的那一条 = 中断返回点。取指 PC 在前端等 ROB 排空期间会漂，不能用。
-        .pc_addr_in(aux_addr_2),
+        .pc_addr_in(aux_addr_1),
         .csr_data_out(csr_data_rd),
         .isr_addr2(isr_addr2),
         .mcause(mcause),

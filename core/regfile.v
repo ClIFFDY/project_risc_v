@@ -23,8 +23,8 @@
 module regfile(
     input clk, rst,
     input [11:0] flag_bus,
-//读口地址 = 【decoder 载荷里那条】的 rs（消费者在"decoder→执行单元之间"那一拍），
-//前送点（forw）就在这一拍，所以这里是【组合读】：阵列值 + 同拍写旁路一起交给 forw。
+//读口地址 = pre 级那条（它下一拍就是 decoder 载荷那条）的 rs。读值在本模块寄存一拍、
+//正好与载荷同拍，所以这里就是把"本条指令要的操作数"从阵列+旁路里取出来的地方。
     input [4:0] r1, r2,
 //两个物理写口的请求（仲裁已在 wbu 内完成）：口 A = alu | mul，口 B = ld
     input we_a,
@@ -33,6 +33,22 @@ module regfile(
     input we_b,
     input [4:0] rd_b,
     input [31:0] data_b,
+//三个执行单元的结果口（与 forw 点② 同源）：值离开结果口那一拍它还不在阵列里
+//（阵列要下一沿才写）⇒ 读侧旁路必须把它们一起覆盖，否则"读完一拍、消费者才用"这一格是空的。
+    input        we_alu,
+    input [31:0] data_alu,
+    input        we_mul,
+    input [31:0] data_mul,
+    input        we_ld,
+    input [31:0] data_ld,
+//选源用：5 个源的 ROB 索引 + rob 的槽扫描结果（**与 payload 的 sel_slot 同源，取当拍组合版**）。
+//★ 为什么不能按"寄存器号相同"来选：rd 相同的笔可能同时在场上，而"谁更新"由端口身份/语句顺序
+//  定不下来 —— 写口出口寄存器里的值是【上一拍】的单元结果，mul/ld 结果口上守着的又是更早完成、
+//  还没被取走的笔 ⇒ 写口优先和结果口优先各有反例。槽号唯一 ⇒ 至多一个口命中，而且命中的必然
+//  是 rob 扫出来的那条"比我老里最年轻"的笔（这正是 forw 点① 原来的选法，搬过来一字不改）。
+    input [2:0]  idx_alu, idx_mul, idx_ld, idx_a, idx_b,
+    input [2:0]  fwd_slot1, fwd_slot2,
+    input        fwd_hit1,  fwd_hit2,
 //读数据：合并成一对（原来是 dec/lsu/mul 三份按限定分开填）。按消费者复制交给
 //max_fanout 在布局阶段做 —— 比手工拆三份更省逻辑，复制点也更贴实际负载。
     output reg [31:0] r1_data, r2_data
@@ -47,6 +63,13 @@ module regfile(
     reg [31:0] regs [0:31];
 
     reg [4:0] r1_q, r2_q;
+//地址与"谁来供值"一起冻住：停顿重读时用同一对（地址、槽号）。
+//★ 槽号在停顿期间不会失效：停顿拍不分配（payload_go=0）⇒ 槽不会被重用；生产者若在这期间把值
+//  落进阵列，`idx_* == slot` 自然不再命中，阵列值就是它。
+    reg [2:0] s1_q, s2_q;
+    reg       h1_q, h2_q;
+//旁路结果的临时名（含"有没有源口命中"那一位）：只在上面那个时序块里用
+    reg [32:0] bp1, bp2;
 
     integer i;
     initial begin
@@ -55,17 +78,34 @@ module regfile(
         end
     end
 
-//bypass 与写口用同一优先级（口 A > 口 B，即"后面那条 if 写的赢"）：真撞上时
-//"写进去的"与"前递出去的"是同一个值。
-    function [31:0] bypass;
+//bypass：读侧旁路，**覆盖 5 个源** —— 三条单元结果口（alu / mul / ld）+ 两条物理写口。
+//选源判据 = "源口的 ROB 索引 == 本条指令的槽号"，与 forw 点② 同形（它就是 forw 点① 那一套）。
+//返回 {有源口命中, 值}：槽号唯一 ⇒ 至多一个口命中；没命中就回落到阵列值（此时"生产者还没出
+//结果"或"它的值已经落进阵列"，两种情况下阵列值就是它）。
+//★ 顺序（alu → 口B → 口A → mul → ld）只是防御性的 tie-break。
+//★ x0 恒 0：单元结果口的 rd 可以是 0（`add x0,..`），写口的 rd 被 wport 挡过不会为 0
+//  ⇒ 这一句是挡掉前者在 rx=0 时的误命中（扫描口本身也带 x0 保护，这里是第二道）。
+    function [32:0] bypass;
         input [4:0] rx;
+        input       hit;
+        input [2:0] slot;
         begin
-            if (we_b && rx == rd_b)
-                bypass = data_b;  // 更年轻那口优先（同 rd 撞上时）
-            else if (we_a && rx == rd_a)
-                bypass = data_a;
+            if (rx == 5'd0)
+                bypass = 33'd0;
+            else if (!hit)
+                bypass = {1'b0, regs[rx]};
+            else if (we_alu && (idx_alu == slot))
+                bypass = {1'b1, data_alu};
+            else if (we_b && (idx_b == slot))
+                bypass = {1'b1, data_b};
+            else if (we_a && (idx_a == slot))
+                bypass = {1'b1, data_a};
+            else if (we_mul && (idx_mul == slot))
+                bypass = {1'b1, data_mul};
+            else if (we_ld && (idx_ld == slot))
+                bypass = {1'b1, data_ld};
             else
-                bypass = regs[rx];
+                bypass = {1'b0, regs[rx]};
         end
     endfunction
 
@@ -85,10 +125,14 @@ module regfile(
         exec    = flag_bus[8];
     end
 
-//读数据进行双写口旁路仲裁并输出。【时序读】：地址由 pre_decoder 那一级给出（比 decoder
-//载荷早两级），值在这里寄存后随载荷往下走；前送级（decoder→执行单元之间）只在有更新结果时
+//读数据进行 5 源旁路仲裁并输出。【时序读】：地址由 pre_decoder 那一级给出（比 decoder
+//载荷早一拍），值在这里寄存后随载荷往下走；前送级（decoder→执行单元之间）只在有更新结果时
 //覆盖它。★ 不要再退回"组合读"：那样阵列读会和旁路 mux、前送 mux 压进同一拍（关键路径变长），
 //而且 iverilog 不把存储器元素算进 `always @(*)` 的隐含敏感表 ⇒ 写阵列后读口不刷新（实测踩过）。
+//停顿重读走 `bypass(r1_q, h1_q, s1_q)`，用的是**单调刷新**：地址与槽号都冻着，命中源口就
+//换成源口上的值、没命中就**保持原值**（★ 不能每拍从阵列重算：生产者的值可能只在单元口上出现
+//过一拍，之后那笔又被写口丢掉、没做数组写 —— 重算会把它丢成阵列里的老值。HEAD 那版靠操作数
+//寄存器 + 停顿回灌达到同样效果，注释里记着 CoreMark 的 crcstate 错就是这个）。
 //原来的 dec/lsu/mul 三个限定只用来决定"填哪一份"，合并成一对后不再需要：
 //没有限定置位时算出来的值无人消费（JAL 之类），驱出去无害。
     always @(posedge clk) begin
@@ -97,17 +141,35 @@ module regfile(
             r2_data <= 32'd0;
             r1_q <= 5'd0;
             r2_q <= 5'd0;
+            s1_q <= 3'd0;
+            s2_q <= 3'd0;
+            h1_q <= 1'b0;
+            h2_q <= 1'b0;
         end
         else if (exec) begin
             if (stall_w) begin
-                r1_data <= bypass(r1_q);
-                r2_data <= bypass(r2_q);
+                bp1 = bypass(r1_q, h1_q, s1_q);
+                bp2 = bypass(r2_q, h2_q, s2_q);
+                if (bp1[32])
+                    r1_data <= bp1[31:0];
+                else
+                    r1_data <= r1_data;
+                if (bp2[32])
+                    r2_data <= bp2[31:0];
+                else
+                    r2_data <= r2_data;
             end
             else begin
-                r1_data <= bypass(r1);
-                r2_data <= bypass(r2);
+                bp1 = bypass(r1, fwd_hit1, fwd_slot1);
+                bp2 = bypass(r2, fwd_hit2, fwd_slot2);
+                r1_data <= bp1[31:0];
+                r2_data <= bp2[31:0];
                 r1_q <= r1;
                 r2_q <= r2;
+                s1_q <= fwd_slot1;
+                s2_q <= fwd_slot2;
+                h1_q <= fwd_hit1;
+                h2_q <= fwd_hit2;
             end
         end
     end

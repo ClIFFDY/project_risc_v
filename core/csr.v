@@ -26,7 +26,7 @@ module csr(
 //★ 资格版（controller 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
 //  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
     input exc_irq_ret_ok,
-    input [13:0] flag_bus,
+    input [11:0] flag_bus,
     input mem_inflight,
     input [11:0] csr_addr,
 //读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）

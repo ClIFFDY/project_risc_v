@@ -2998,3 +2998,70 @@ iram 只剩 `RAMB36E1/CLKARDCLK` 的原语检查行）。功能：`run_reg` 8/8�
 ⇒ **`bju` 判定锥驱动的那一族整体离开台面**，台面上只剩"前送点② / 载荷操作数"这条已知的腿。
 （−1.94 vs −2.62、626 vs 1360 都远在布局噪声带之外，无需补基线复现。）
 
+
+---
+
+## §36 删掉 `mid_decoder`：取指侧三级译码收成两级（2026-10-02）
+
+### 36.1 为什么做、做成什么样
+
+`mid_decoder`（原名 `mem_buf`）只干三件事：`rd`/`func10`/`imm` 的组合解算、一拍载荷寄存、
+若干别名派生。它不是双发射需要的那一级（归档的 `dual-opt` 支里成对判定并进的是 `pre_decoder`，
+`mid_decoder` 与 `main` 逐字节相同），而它承载的 imm 解算**历史上本来就在 `pre`**（`088c19c`；
+`37abe17` 改成"寄存 `inst_out` + 组合解算"时是为时序，`71b7371` 才挪进 mid 且没留 WNS 数字）。
+
+目标结构：
+
+```
+IF ─→ pre（全译码：三态来源 + rs + rd/func10/imm）─→ pd（只寄存控制载荷）─→ xxu
+                    └─→ regfile（寄存读 + 5 源读侧旁路）─→ [操作数装配] ─→ forw 点②（3 源）─→ xxu
+```
+
+- **`pre_decoder.v`** 吃下 `rd`/`func10`/`imm` 解算（口径逐条照抄 mid 那段 `case`，解算源换成
+  本级的 `inst_effective`），新增三个寄存输出 `rd_out`/`func10_out`/`imm_alu_out`；
+  `imm12_csr`/`imm5_csr`/`opcode` 不另寄存（下一级从 `inst_in` 就地切片）。
+- **`post_decoder.v`** 去操作数寄存、改**组合装配**：底值 = 「本级的组合输入」，删掉 mid 之后它就是
+  `regfile` 的**寄存读**（正好提供"pre 出拍 → 下一拍"那一拍延迟，与载荷同拍）；非寄存器操作数
+  （立即数 / pc / uimm）用上一拍锁好的常量覆盖（`r*_imm_val` + `r*_imm_sel`）。
+- **`forw.v`** 点① 整体删除，**点② 一个字不改、仍是 3 源**；点① 原来那 5 个源
+  （3 个单元结果口 + 2 条写口出口寄存）整体下移到 **`regfile` 的读侧旁路**。
+- **`regfile.v`** 读侧 `bypass` 覆盖 5 源，选源判据 = **「源口的 ROB 索引 == 本条指令的槽号」**
+  （`fwd_slot*/fwd_hit*`，与 payload 的 `sel_slot` 同源、取当拍组合版 —— 就是点① 原来的选法）。
+- **`rob.v`** 一行不改，只换顶层连线：`scan_rs1/scan_rs2` 从 `rs1_2/rs2_2`（mid 出）改接 `rs1_1/rs2_1`。
+- **`cpu_top.v`**：`controller.pc_addr_in` 由 `aux_addr_2` 改接 `aux_addr_1`（"正要进发射级"的那条）。
+- **`mid_decoder.v` 整文件删除**（顺带清掉 4 条无消费者的死线）。
+
+### 36.2 ★ 两个坑（都是 CoreMark 照出来的，微测看不见）
+
+| # | 现象 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| 1 | CoreMark `crclist`/`crcstate` 错（`crcmatrix` 对），"计数少加一次" | 操作数改成组合直出后，**兜底落回阵列值**。而生产者的值可能只在单元结果口上活一拍、下一拍被 wport 整笔丢掉（`kill_*`/冲刷门）⇒ **永远不进阵列** ⇒ 停顿放行那一刻源口上什么都没有、阵列里是老值 | `regfile` 的**停顿重读改单调刷新**：命中源口就换、没命中就**保持原值**（不能每拍从阵列重算）。这正是 HEAD 那版"操作数寄存器 + 停顿回灌"在做的事 |
+| 2 | CoreMark 周期 **+1.7%**（CRC 全对） | `bra_predict` 的 bti 冷启动捕获窗口"开闸两拍后写表"把 **stall 当"作废"清 0**。而 `pc_addr` 的推进条件就是 `!flush_w && !stall_w` ⇒ 停顿期间**取指侧和这条窗口是一起冻住的**，两拍对齐关系不变 ⇒ 停顿只该冻结、不该作废。删 mid 之后 bju 判定相对取指早一拍，停顿相位移了一拍、正好落进窗口 ⇒ 实测 **94% 的窗口被 stall 清掉**，bti 学不进去 ⇒ 每次跳转吃冷启动 NOP | `bra_predict.v`：`else if (flush_w) cap_q <= 0;`（错路作废）+ `else if (stall_w) cap_q <= cap_q;`（冻结） |
+
+### 36.3 排查手法（可复用）
+
+1. **逐拍对拍**：往 `tb_arch.v` 里加一条 22 路信号的宽探针（pc/aux/flag_bus/br1..3/jal/pre_jalr/
+   jalr_fail/bti 全家/inst_valid/payload_go/bju 的 success·br_fail·idx/tail/rob 头/inst_1），
+   前 20000 拍落盘，两棵树 `diff` ⇒ **第一处真分歧**（去掉只反映退休时序的列之后）。
+   本次结果：`bju.br_fail` 早一拍，pc 流随后分岔。
+2. **分类直方图**：给 bti 打"开闸 / 待写 / 写表 / 三态选择"计数 ⇒ 看出"写表次数不变、开闸多 31 倍
+   ⇒ 表写了却查不到"。
+3. **细分到具体条件**：再打"窗口开着的那一拍，flush 和 stall 各占多少" ⇒ stall 94% ⇒ 锁定改哪一条。
+
+### 36.4 验证
+
+- **CoreMark**：三项 CRC `e714/1fd7/8e3a` 全对；`Total ticks` **353088 → 347760**（比基线快 **1.5%**，
+  ≈ 每次误预测少花一拍，`flush_con_jump` 5118 次）。
+- **archtest 40 支**（vs 基线树 `287bb2b`）：每个 rd 终值 + store 流结构**全同**，且**每一支都快
+  −1 ~ −198 拍**。
+- **`run_reg.sh` 8/8**（`gpio_irq@105`、`i2c_irq@7081`）。
+- **a100t-1 @10ns**（`tools/a100t_impl2_m1.tcl`，同机同脚本）：**WNS −1.808 / TNS −319.207 / 失败端点 646**
+  （现状基线 WNS −1.940 / TNS −389.548 / 端点 626）⇒ **TNS −18%**，且**最差族换成**
+  `u_dcache/data_reg_0 → u_alu/result_reg[*]` 与 `→ u_lsu/bus_addr_out_reg[*]`（族 A），
+  **`rob/head_p → post_decoder/r1_data_out_reg`（族 B）整条离开台面** —— 这正是删 mid 的目标。
+  ⚠️ 失败端点数 **626 → 646（+20）**：族 B 消失后族 A 独大，面退化；按约定以 TNS 为主判据。
+
+### 36.5 不变量（按约定一字未动）
+
+hazard 检查点（`ls_use_hit`/`stall_mulu_haz`/`stall_mulu_div`）；`mulu` 提交时刻与 `lsu` 严格同偏移；
+顶层零逻辑（唯一动的是连线与例化）。

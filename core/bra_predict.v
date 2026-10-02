@@ -175,7 +175,13 @@ module bra_predict(
             bti_sel_q = 2'd0;
     end
 
-//捕获通路的使能与 index/tag 跟着走两拍
+//捕获通路的使能与 index/tag 跟着走两拍。
+//★ 停顿（stall_w）只能【冻结】窗口，不能作废：pc_addr 的推进条件就是 `!flush_w && !stall_w`
+//  ⇒ 停顿期间取指侧（含 icache 的"这一拍读、下一拍出"）和这条窗口是【一起冻住】的，两拍的
+//  对齐关系不变。原来把 stall 也当"作废"清呢，一旦停顿相位相对取指移了一拍（删 mid_decoder
+//  就是），窗口几乎每次都被清掉 —— 实测 40 万拍里开闸 16521 次、只有 257 次走到待写（94% 是
+//  stall 清掉的），bti 表学不进去 ⇒ 每次跳转吃冷启动 NOP ⇒ CoreMark +1.7%。
+//  冲刷（flush_w）仍作废：那是错路，pc 会跳走，写进去就是垃圾。
     always @(posedge clk) begin
         if (rst_q) begin
             cap_q      <= 2'd0;
@@ -184,8 +190,19 @@ module bra_predict(
             cap_tag_q1 <= 22'd0;
             cap_tag_q2 <= 22'd0;
         end
-        else if (flush_w | stall_w) begin
+        else if (flush_w) begin
             cap_q      <= 2'd0;
+            cap_idx_q1 <= cap_idx_q1;
+            cap_tag_q1 <= cap_tag_q1;
+            cap_idx_q2 <= cap_idx_q2;
+            cap_tag_q2 <= cap_tag_q2;
+        end
+        else if (stall_w) begin
+            cap_q      <= cap_q;
+            cap_idx_q1 <= cap_idx_q1;
+            cap_tag_q1 <= cap_tag_q1;
+            cap_idx_q2 <= cap_idx_q2;
+            cap_tag_q2 <= cap_tag_q2;
         end
         else begin
             cap_q      <= {cap_q[0], take & ~bti_hit};
