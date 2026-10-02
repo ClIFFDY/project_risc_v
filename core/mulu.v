@@ -87,7 +87,7 @@ module mulu(
     output reg kill_mul,
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
-    (* max_fanout = 8 *) output reg [2:0]  mul_idx,
+    output reg [2:0]  mul_idx,
 //两条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_mulu_haz,
     output reg stall_mulu_div

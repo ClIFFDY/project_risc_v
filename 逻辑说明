@@ -3065,3 +3065,58 @@ IF ─→ pre（全译码：三态来源 + rs + rd/func10/imm）─→ pd（只�
 
 hazard 检查点（`ls_use_hit`/`stall_mulu_haz`/`stall_mulu_div`）；`mulu` 提交时刻与 `lsu` 严格同偏移；
 顶层零逻辑（唯一动的是连线与例化）。
+
+---
+
+## §37 综合"假环"：`mulu/mul_idx` 的 `max_fanout` 属性 + `controller` 里一条老环（2026-10-03）
+
+### 37.1 现象
+
+a100t 实现（`synth_design`）每次都报 `[Synth 8-295] found timing loop`，然后 `set_disable_timing -from In -to O <cell>`
+断一条弧收场。**被断的弧不进时序分析** ⇒ 那块锥上有一点路径没被检查（分析盲区）。
+
+### 37.2 环长什么样
+
+- `u_mulu/mul_idx_inferred__0/__1` 一族（3~4 条）—— **每份历史日志都有**；
+- `u_controller` 里一条**两 LUT 互咬**的环（`i_125` LUT2 ↔ `i_39` LUT6）—— §35 之前的 13 份日志
+  **一条都没有**，HEAD（含 §35）用 `-flatten_hierarchy none` 综合即可看到（默认展开时它被报成
+  一条"没有 RTL 名"的块）。
+
+### 37.3 `mulu` 那族：是属性招的，不是 RTL 里有环
+
+`mulu.v` 原来写 `(* max_fanout = 8 *) output reg [2:0] mul_idx`。三点实验（同机同脚本，**只改这一个属性**）：
+
+| `mul_idx` 上的属性 | 环数 | 归属 |
+| --- | --- | --- |
+| `max_fanout = 8`（原样） | 4 | 全在 `u_mulu` |
+| `max_fanout = 32` | 4 | 全在 `u_mulu` |
+| **无属性** | 1 | mulu **0 条** |
+
+⇒ **属性值多少无所谓，有没有才重要**。
+
+RTL 里没有环：`mul_idx` 是三选一、三个源全是寄存器（`m_idx_q` / `d_cmt_idx` / `idx_hold`），
+mulu 内唯一的内部回边 `taken_mul → wr_pend` 只落在**时钟使能**上（不进数据路径）。
+机理：`max_fanout` 让综合在网上插复制缓冲并**保护该锥不被折叠**；而 `mul_idx` 的消费者
+（`forw` / `wport` / `regfile` 的比较与 mux）已被**跨模块边界吸收**进 mulu 的 LUT ——
+网表里 `u_mulu/mul_idx_w[0]` 在 mulu 内只驱动一个 LUT（名字还叫 `fin_mul_idx[0]_i_2`，**网名不可信**），
+wport 的写口仲裁又经 `taken_mul` 回指 mulu ⇒ 复制缓冲把这条回边围成了闭环。
+
+### 37.4 处理（B 方案）
+
+- `mulu.v`：删掉那个 `(* max_fanout = 8 *)` 属性；
+- 扇出控制改放 XDC（**只作用于 opt/place，综合期不再保护该锥**）：
+
+  ```tcl
+  set_max_fanout 8 [get_nets -hier -quiet u_cpu_top/u_mulu/mul_idx*]
+  ```
+
+  已加进 `tools/a100t_timing.xdc`，并同步进 `tools/a100t_impl2_m1.tcl` 生成的那份 `_timing.xdc`。
+  ★ **`tools/` 不在 git** ⇒ 换设备要手工补这两处。
+
+实测：综合侧 mulu 那族 **3~4 条 → 0**；a100t 实现 **TNS −319.207 → −316.612、失败端点 646 → 563**
+（WNS −1.808 → −1.905，在布局噪声带内，按约定不作判据）。
+
+### 37.5 剩下那条（controller）
+
+`u_controller` 的 2-LUT 环**不是本轮引入的**（HEAD 用 `-flatten_hierarchy none` 即可看到，
+§35 之前的日志都没有；`controller.v` 本轮只改了 `pc_addr_in` 的**源**，没动锥）。**未处理，留档**。
