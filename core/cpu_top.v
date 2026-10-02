@@ -23,7 +23,12 @@ module cpu_top(
     wire [4:0]  rd_1;
     wire [9:0]  func10_1;
     wire [31:0] imm_alu_1;
-    wire [31:0] r1_data_post_w, r2_data_post_w;
+//非寄存器操作数的载荷（装配已并进 forw）
+    wire [31:0] r1_imm_val_w, r2_imm_val_w;
+    wire        r1_imm_sel_w, r2_imm_sel_w;
+//三个单元各自算好的前送命中位（r1/r2 各一位）：forw 据此直接选源，本级不再比 idx
+    wire        hit1_alu_w, hit1_mul_w, hit1_ld_w;
+    wire        hit2_alu_w, hit2_mul_w, hit2_ld_w;
     wire [4:0] rd_3;
     wire [31:0] aux_addr_3, beq_off_q2, jalr_pred_addr_3;
     wire we_3, br_flag, br_pred_taken_3;
@@ -270,9 +275,8 @@ module cpu_top(
 //  再作为 forw 点② 的默认值直送执行单元。
         .pc_operand_in(aux_addr_1),
         .offset_beq0_aux(imm_alu_1),
-        .r1_data_in(r1_data),
-        .r2_data_in(r2_data),
-        .r1_data_post(r1_data_post_w), .r2_data_post(r2_data_post_w),
+        .r1_imm_val(r1_imm_val_w), .r2_imm_val(r2_imm_val_w),
+        .r1_imm_sel(r1_imm_sel_w), .r2_imm_sel(r2_imm_sel_w),
         .inst_in(inst_1),
         .aux_addr_in(aux_addr_1),
         .br_pred_taken_in(br_pred_taken_1),
@@ -404,7 +408,11 @@ module cpu_top(
         .stall_lsu_unload(stall_lsu_unload_w),
         .stall_lsu_full(stall_lsu_full_w),
         .rd_load(rd_load),
-        .kill_ld(kill_ld_w)
+        .kill_ld(kill_ld_w),
+//命中位：与结果口同拍组合给出（载荷里锁存的槽号/有效位 ⇒ 与 forw 当拍看到的同一份消费者）
+        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
+        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
+        .hit1(hit1_ld_w), .hit2(hit2_ld_w)
     );
 //RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
     mulu u_mulu (
@@ -438,7 +446,11 @@ module cpu_top(
         .idx_in(issue_idx_w),
         .mul_idx(mul_idx_w),
         .stall_mulu_haz(stall_mulu_haz_w),
-        .stall_mulu_div(stall_mulu_div_w)
+        .stall_mulu_div(stall_mulu_div_w),
+//命中位：与结果口同拍组合给出（载荷里锁存的槽号/有效位 ⇒ 与 forw 当拍看到的同一份消费者）
+        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
+        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
+        .hit1(hit1_mul_w), .hit2(hit2_mul_w)
     );
     bra_predict u_bra_predict (
         .clk(clk),
@@ -485,21 +497,20 @@ module cpu_top(
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
         .b1_we(wp_b1_we), .b1_rd(wp_b1_rd), .b1_idx(wp_b1_idx)
     );
-//前送级：删掉 mid_decoder 后只剩点② 一处 —— post_decoder → 三个执行单元之间
-//（消费者 = decoder 载荷那条），只吃 3 个结果口。点① 原来那 5 个源（3 结果口 + 2 写口）
-//改由 regfile 的读侧旁路承担（见 u_regfile 那一段）。
+//前送级：**只剩一级数据 mux** —— 裁决（"我这一拍是不是在给消费者供值"）已在三个单元里做完
+//（alu 在结果寄存沿、mulu/lsu 与各自结果口同拍），这里只按算好的命中位选源。
+//  默认源 = regfile 的寄存读（含 5 源读侧旁路）与非寄存器操作数的常量载荷，两者也在这一次选择里落定。
     forw u_forw (
         .clk(clk),
         .rst(rst),
-//★ 三条源 = 三个执行单元的结果口（各自带 ROB 索引）。乱序写回下"谁更年轻"只由索引给，
-//  不能再按端口身份/语句顺序定优先级（旧的"口 B 更年轻"只对按序退成立）。
-        .we_alu(we_4), .rd_alu(rd_4), .data_alu(result_4), .idx_alu(alu_idx_w),
-        .we_mul(mul_loaded), .rd_mul(rd_mul), .data_mul(mul_data_final), .idx_mul(mul_idx_w),
-        .we_ld(loaded), .rd_ld(rd_load), .data_ld(ld_data_final), .idx_ld(ld_idx_w),
-        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
-        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
-        .r1_data_post_in(r1_data_post_w),
-        .r2_data_post_in(r2_data_post_w),
+        .data_alu(result_4),
+        .data_mul(mul_data_final),
+        .data_ld(ld_data_final),
+        .hit1_alu(hit1_alu_w), .hit1_mul(hit1_mul_w), .hit1_ld(hit1_ld_w),
+        .hit2_alu(hit2_alu_w), .hit2_mul(hit2_mul_w), .hit2_ld(hit2_ld_w),
+        .r1_data(r1_data), .r2_data(r2_data),
+        .r1_imm_val(r1_imm_val_w), .r2_imm_val(r2_imm_val_w),
+        .r1_imm_sel(r1_imm_sel_w), .r2_imm_sel(r2_imm_sel_w),
         .r1_data_final(r1_data_final),
         .r2_data_final(r2_data_final)
     );
@@ -525,7 +536,11 @@ module cpu_top(
         .idx_out(alu_idx_w),
         .kill_out(kill_alu_w),
         .result(result_4),
-        .we(we_4)
+        .we(we_4),
+//命中位：与 result 同沿寄存（那一沿消费者在 pre 级 ⇒ 用当拍槽扫描）
+        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
+        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
+        .hit1(hit1_alu_w), .hit2(hit2_alu_w)
     );
 //tb 的事件探针按这两个名字抓"寄存器堆写口" ⇒ 让它们跟着写口级的两条口走（语义不变）
     assign we_a_w = wp_we_a;

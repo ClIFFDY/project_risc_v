@@ -52,6 +52,11 @@ module lsu(
 //  payload_go 当拍就是 0，用上一拍那种"事后脉冲"会让这一条在新车厢里被静默丢掉
 //  （它已经进了 E4、ROB 也分配了项，却永远等不到 ld_we）⇒ 队头永远退不掉 ⇒ 自锁（实测）。
     input payload_go,
+//前送命中判据（消费者载荷里锁存的槽号/有效位，与 forw 当拍看到的同一份）：本模块结果口这一拍供的值是不是它的。
+//★ 本模块的"新值"（`ld_data_cur`）是组合的 ⇒ 命中位也走组合、与 `loaded`/`ld_idx` 同步给出，
+//  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
+    input [2:0]  sel_slot1, sel_slot2,
+    input        sel_v1,    sel_v2,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -73,6 +78,8 @@ module lsu(
     output reg bus_valid_out,
     (* max_fanout = 8 *) output reg [31:0] ld_data_out,
     (* max_fanout = 8 *) output reg loaded,
+//本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 loaded/ld_idx 同拍给出，供 forw 直接选源
+    output reg hit1, hit2,
     output reg ld_we,
 //被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
     output reg kill_ld,
@@ -503,6 +510,8 @@ module lsu(
     end
 
 //写口侧的"永不落地"标记：只由本模块的 killed 记录驱动（原组合版冲刷作废已摘除，见上）
+//命中位跟着同一路数据走：`ld_we` 拍用 `s3_idx`、`ld_hold` 第二拍用 `idx_hold` —— 与 `ld_idx`
+//逐支同步，保证命中的那一路就是数据的那一路。
     always @(*) begin
         kill_ld = s3_kl;
         ld_we = s3_v & ~s3_kind & ready_in;
@@ -511,18 +520,24 @@ module lsu(
             rd_load = s3_rd;
             ld_data_out = ld_data_cur;
             ld_idx = s3_idx;
+            hit1 = sel_v1 & (s3_idx == sel_slot1);
+            hit2 = sel_v2 & (s3_idx == sel_slot2);
         end
         else if (ld_hold) begin
             loaded = 1'b1;
             rd_load = ld_hold_rd;
             ld_data_out = ld_hold_data;
             ld_idx = idx_hold;
+            hit1 = sel_v1 & (idx_hold == sel_slot1);
+            hit2 = sel_v2 & (idx_hold == sel_slot2);
         end
         else begin
             loaded = 1'b0;
             rd_load = 5'd0;
             ld_data_out = bus_data_in;
             ld_idx = 3'd0;
+            hit1 = 1'b0;
+            hit2 = 1'b0;
         end
     end
 

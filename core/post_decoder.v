@@ -27,18 +27,15 @@ module post_decoder(
     input [4:0] rd_in,
     input [4:0] rs1_in, rs2_in,
     input [31:0] imm_alu_in,
-//操作数（寄存器操作数走点①前送后的值；非寄存器操作数在下面被立即数覆盖）
-    input [31:0] r1_data_in, r2_data_in,
     input [31:0] inst_in,
     input [31:0] offset_beq0_aux, pc_operand_in,
     input [31:0] aux_addr_in,
     input br_pred_taken_in,
     input [31:0] jalr_pred_addr_in,
-//操作数装配结果（**组合直出**）：删掉 mid_decoder 后，regfile 的寄存读正好提供"pre 出拍 →
-//下一拍"那一拍延迟，与载荷同拍 ⇒ 载荷里不必再存一份数据。
-//★ 兜底（没有源口命中时）取的就是 regfile 那个寄存器 —— 它在停顿期间是【单调刷新】的
-//  （命中源口才换、没命中保持），所以"源口上出现过之后又没了"的值不会丢。细节见 regfile.v。
-    output reg [31:0] r1_data_post, r2_data_post,
+//非寄存器操作数（立即数 / pc / uimm）的载荷与资格位：装配已并进 forw 的那一次选择，
+//本模块只负责把它们锁好、交出去（哪一路生效由 forw 按 imm_sel / 命中位定）。
+    output reg [31:0] r1_imm_val, r2_imm_val,
+    output reg        r1_imm_sel, r2_imm_sel,
     output reg [4:0] rd_out,
 //发射级（E4）写口广播：这一拍要不要写 rd、写的是哪个 rd（给 controller 发写序号用）
     output reg issue_we,
@@ -308,18 +305,9 @@ module post_decoder(
             payload_go_q <= payload_go;
     end
 
-    reg [31:0] r1_imm_val, r2_imm_val;
-    reg        r1_imm_sel, r2_imm_sel;
-
-//操作数装配（组合直出）：**寄存器操作数取 live 的 regfile 寄存读**（删掉 mid_decoder 后，
-//它正好提供"pre 出拍 → 下一拍"那一拍延迟、与本级载荷同拍）；**非寄存器操作数（立即数/pc/uimm）
-//取上一拍就锁好的常量**（`*_imm_val`，与原来 r*_data_out 里那一份同位宽、只是资格位单列）。
-//★ 常量必须寄存、不能在这里按 inst_in 组合选：本级的载荷装的是"上一拍进本级那条"，
-//  而当拍 inst_in 已经是下一条 ⇒ 组合选会晚一条指令（实测 smoke 第一条写就错）。
-    always @(*) begin
-        r1_data_post = r1_imm_sel ? r1_imm_val : r1_data_in;
-        r2_data_post = r2_imm_sel ? r2_imm_val : r2_data_in;
-    end
+//（操作数装配已并进 forw：本模块只把非寄存器操作数的常量与资格位锁好交出去。
+//  ★ 常量必须寄存、不能按当拍 inst_in 组合选：本级载荷装的是"上一拍进本级那条"，
+//    而当拍 inst_in 已经是下一条 ⇒ 组合选会晚一条指令。）
 
     always @(posedge clk) begin
         if (rst_q) begin

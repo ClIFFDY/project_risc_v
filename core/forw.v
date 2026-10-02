@@ -10,30 +10,21 @@
 // Target Devices:
 // Tool Versions:
 // Description:
-//   前送级：**只剩一个前送点**（消费者 = decoder 载荷那条）。裁决不在本级 ——
-//   选择位 `sel_slot1/sel_slot2/sel_v1/sel_v2` 是**载荷**：由 `rob` 在**上一拍**
-//   （本条指令还在 pre 级、`rs*_1` 有效时）用**槽序扫描**算好、随载荷一起锁存寄下来
-//   ⇒ 本级只剩"源口的 `idx_*` == 目标槽号"的**一位比较 + 一级 mux**。
-//   `rs==rd` 匹配 / 年龄相减 / 取最年轻的优先裁决**全部不在这里**。
+//   前送级：**只剩一个数据 mux**。裁决**全部提前到生产单元里做完**：
 //
-//   默认值 `r1_data_post_in/r2_data_post_in` = `post_decoder` 的**组合装配**输出
-//   （底值 = regfile 寄存读的值、已含它的 5 源读侧旁路；非寄存器操作数在那里被立即数/pc/uimm 覆盖）。
-//
-//   ★ 为什么能这样：ROB 按程序序、一拍一条分配（`alloc_en = payload_go`，与进载荷同沿）
-//     ⇒ 扫描那一拍在册的槽**全是比消费者老的**，"比我老"不需要任何比较。选中的槽必然满足
-//     `rd == rs`，所以 `lsu`/`mulu` **原样的** rd 键 hazard 同一条件必然命中，值就绪由它们兜
-//     （这两处检查点按设计约定一字不动）。
-//
-//   | 源 | 产生者 | 有效窗口 |
+//   | 源 | 命中位怎么来 | 有效窗口 |
 //   | --- | --- | --- |
-//   | we_alu / rd_alu / data_alu / idx_alu | alu.v（算完的下一拍，紧邻消费者取用那一拍） | 一拍 |
-//   | we_mul / rd_mul / data_mul / idx_mul | mulu（m_pv / d_pend / hold） | 保持到 taken_mul |
-//   | we_ld / rd_ld / data_ld / idx_ld | lsu（数据回来拍 + ld_hold） | 两拍 |
+//   | alu  | `alu.v` 在【结果寄存那一沿】用当拍槽扫描比好、与 result 同沿寄存（一整拍余量） | 一拍 |
+//   | mulu | `mulu.v` 在三条结果路（m_pv / d_pend / hold）里与 `mul_idx` 逐支同步给出 | 保持到被取走 |
+//   | lsu  | `lsu.v` 在 `ld_we` / `ld_hold` 两支里与 `ld_idx` 同步给出 | 两拍 |
 //
-//   ★【前送点① 已随 mid_decoder 一起删除】：原来"mid 级那一拍"的前送点（5 源 = 3 结果口 +
-//     2 写口出口寄存）在删掉 mid_decoder 之后没有消费者了 —— 它那 5 个源整体下移到
-//     `regfile` 的**读侧旁路**（读锁存沿 + 停顿重读都在那里），本级只剩点②、仍是 3 源。
-//     `rob_head` / `idx_mid` / 8 个 `wp_*` 端口随之整体退出。
+//   ★ 为什么能这样：单元寄存结果那一沿，消费者正好在 pre 级，槽扫描给出的就是它的期望槽号 ⇒ 单元自己
+//     （拿自己的 idx）就能判定"我这一拍是不是在给它供值"。alu 的结果口只一拍宽，所以那一沿寄存即准；
+//     mulu/lsu 的数据是当拍组合给出的（寄一份会与数据错开一拍），故用【载荷里锁存的】槽号比。
+//   ★ 本模块不再有 `idx_* == slot` 比较器、也没有 alu→mul→ld 优先链：收到的是三根已算好的命中位
+//     （槽号唯一 ⇒ 至多一个为 1，`if-else` 只是防御性 tie-break）。
+//   ★ 命中位全 0 时落回 `r1_data`（regfile 的寄存读，含它的 5 源读侧旁路）：那一拍生产者还没出结果
+//     （消费它的指令被单元侧 hazard 顶着），或者它的值已经落进阵列 —— 两种情况下落回值要么正确、要么不被消费。
 //
 // Dependencies:
 //
@@ -43,8 +34,9 @@
 //   Revision 0.05 - 乱序写回：源改接三个结果口，优先级改按 ROB 索引年龄取最年轻
 //   Revision 0.06 - 点① 扩成 5 源（加 wport 出口寄存的两条写口），点② 保持 3 源
 //   Revision 0.07 - 点② 改"槽序"：裁决搬到 rob 的扫描（上一拍），本级只剩一位比较 + 一级 mux
-//   Revision 0.08 - 删 mid_decoder：点① 整体删除，它的 5 个源下移到 regfile 读侧旁路；
-//                   本级只剩点②、仍是 3 源
+//   Revision 0.08 - 删 mid_decoder：点① 整体删除，5 个源下移到 regfile 读侧旁路；本级只剩点②
+//   Revision 0.09 - 命中位搬进三个单元（各在结果那一沿/同一拍比好），本级退化成"一级 mux + 一个编码"；
+//                   装配（imm/pc/uimm 覆盖）也从 post_decoder 并进来，操作数只穿这一级
 //
 // Additional Comments:
 //
@@ -53,60 +45,71 @@
 
 module forw(
     input clk, rst,
-//前送源①：alu 结果口（寄存一拍，一拍宽）
-    input        we_alu,
-    input [4:0]  rd_alu,
+//前送源①：alu 结果口
     input [31:0] data_alu,
-    input [2:0]  idx_alu,
-//前送源②：mulu 结果口（保持到被写口取走）
-    input        we_mul,
-    input [4:0]  rd_mul,
+//前送源②：mulu 结果口
     input [31:0] data_mul,
-    input [2:0]  idx_mul,
-//前送源③：lsu 结果口（数据回来拍 + 保持拍）
-    input        we_ld,
-    input [4:0]  rd_ld,
+//前送源③：lsu 结果口
     input [31:0] data_ld,
-    input [2:0]  idx_ld,
-//点②：消费者 = decoder 载荷那条。★ 它的"该选谁"已经由 `rob` 的槽扫描在**上一拍**算完、
-//  随载荷一起寄下来了（sel_slot/sel_v）⇒ 本拍只剩"源口的 ROB 索引 == 目标槽号"的**一位比较 + 一级 mux**；
-//  `rs==rd` 匹配、年龄相减、取最年轻的优先裁决**全部不在这里**（也不再需要 r1_post/r2_post/r1_en/r2_en）。
-    input [2:0]  sel_slot1, sel_slot2,
-    input        sel_v1,    sel_v2,
-    input [31:0] r1_data_post_in, r2_data_post_in,
+//三个单元算好的命中位（各 2 位：r1/r2 各一位）——本模块不再做任何比较
+    input        hit1_alu, hit1_mul, hit1_ld,
+    input        hit2_alu, hit2_mul, hit2_ld,
+//操作数默认源（原来在 post_decoder 里装配的两组，并到这里同一次选择）
+    input [31:0] r1_data,    r2_data,
+    input [31:0] r1_imm_val, r2_imm_val,
+    input        r1_imm_sel, r2_imm_sel,
     (* max_fanout = 32 *) output reg [31:0] r1_data_final, r2_data_final
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
-//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
+//14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就放在本模块旁边；全核都只打一拍，
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
-//点②：消费者是 decoder 载荷那条。选择位是【载荷】（上一拍由 rob 的槽扫描算好）⇒
-//本拍只剩"源口的 ROB 索引 == 目标槽号"的一位比较 + 一级 mux（槽号唯一 ⇒ 至多一个口命中）。
-//★ 顺序仍按 alu→mul→ld 书写：槽号唯一时不会并列，这是防御性的 tie-break。
-//★ 选中的槽若这一拍没有任何口命中，就落回载荷值 —— 那一拍必然是单元侧 stall 抬着
-//  （选中的槽必然满足 rd == rs，`lsu`/`mulu` 的旧 hazard 同一条件必然命中），而各单元
-//  在 stall 拍不锁结果 ⇒ 落回值不会被消费。
+//点②唯一的数据 mux（源值 → 消费者）：选择端全部早到，晚到的只有数据。
+//★ 选择码与 mux 必须写在【同一个】always 块里：拆成两块时 case 的表达式由另一块驱动，
+//  块间求值次序不定（iverilog 实测首拍就选空、输出留 X）—— 合成无所谓，仿真会错。
+//★ 选择码：0=reg 1=imm 2=alu 3=mul 4=ld。"命中优先于 imm"在下面落定：先按 imm_sel 落默认，
+//  命中再覆盖（与旧 forw 的合成语义一致；槽号唯一 ⇒ 至多一个命中，命中间的顺序只是防御性 tie-break）。
+    reg [2:0] src1, src2;
     always @(*) begin
-        r1_data_final = r1_data_post_in;
-        if (sel_v1) begin
-            if (we_alu && (idx_alu == sel_slot1))
-                r1_data_final = data_alu;
-            else if (we_mul && (idx_mul == sel_slot1))
-                r1_data_final = data_mul;
-            else if (we_ld && (idx_ld == sel_slot1))
-                r1_data_final = data_ld;
-        end
-        r2_data_final = r2_data_post_in;
-        if (sel_v2) begin
-            if (we_alu && (idx_alu == sel_slot2))
-                r2_data_final = data_alu;
-            else if (we_mul && (idx_mul == sel_slot2))
-                r2_data_final = data_mul;
-            else if (we_ld && (idx_ld == sel_slot2))
-                r2_data_final = data_ld;
-        end
+        if (r1_imm_sel)
+            src1 = 3'd1;
+        else
+            src1 = 3'd0;
+        if (hit1_alu)
+            src1 = 3'd2;
+        else if (hit1_mul)
+            src1 = 3'd3;
+        else if (hit1_ld)
+            src1 = 3'd4;
+        if (r2_imm_sel)
+            src2 = 3'd1;
+        else
+            src2 = 3'd0;
+        if (hit2_alu)
+            src2 = 3'd2;
+        else if (hit2_mul)
+            src2 = 3'd3;
+        else if (hit2_ld)
+            src2 = 3'd4;
+        case (src1)
+            3'd0: r1_data_final = r1_data;
+            3'd1: r1_data_final = r1_imm_val;
+            3'd2: r1_data_final = data_alu;
+            3'd3: r1_data_final = data_mul;
+            3'd4: r1_data_final = data_ld;
+            default: r1_data_final = r1_data;
+        endcase
+        case (src2)
+            3'd0: r2_data_final = r2_data;
+            3'd1: r2_data_final = r2_imm_val;
+            3'd2: r2_data_final = data_alu;
+            3'd3: r2_data_final = data_mul;
+            3'd4: r2_data_final = data_ld;
+            default: r2_data_final = r2_data;
+        endcase
     end
+
 endmodule

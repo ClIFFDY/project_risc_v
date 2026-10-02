@@ -68,6 +68,11 @@ module mulu(
 //入口门（每条指令只收一次）：decoder 载荷【这一拍就要推进】才允许收（理由同 lsu：
 //  用上一拍的脉冲会让"被挤住那条"在新的一拍里成了上一拍的旧货 ⇒ 静默丢掉）
     input payload_go,
+//前送命中判据（消费者载荷里锁存的槽号/有效位，与 forw 当拍看到的同一份）：本模块结果口这一拍供的值是不是它的。
+//★ 三条结果路（m_pv / d_pend / hold）的数据都是组合给出的 ⇒ 命中位也走组合、与 `mul_idx` 逐支同步
+//  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
+    input [2:0]  sel_slot1, sel_slot2,
+    input        sel_v1,    sel_v2,
 //冻结信号从 flag_bus 取位（本模块不设专用 stall 端口）：
 //本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
 //严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
@@ -83,6 +88,8 @@ module mulu(
     input [31:0] r1_data_final, r2_data_final,
     (* max_fanout = 8 *) output reg [31:0] mul_data_out,
     (* max_fanout = 8 *) output reg mul_loaded, mul_we,
+//本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 mul_idx 逐支同步，供 forw 直接选源
+    output reg hit1, hit2,
 //被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
     output reg kill_mul,
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
@@ -564,6 +571,8 @@ module mulu(
             mul_idx      = m_idx_q;
             mul_data_out = mul_sel ? m_p[31:0] : m_p[63:32];
             kill_mul     = m_kl_q;
+            hit1         = sel_v1 & (m_idx_q == sel_slot1);
+            hit2         = sel_v2 & (m_idx_q == sel_slot2);
         end
         else if (d_pend) begin
             mul_loaded   = 1'b1;
@@ -571,17 +580,23 @@ module mulu(
             mul_idx      = d_cmt_idx;
             mul_data_out = d_cmt_data;
             kill_mul     = d_cmt ? d_kl : 1'b0;
+            hit1         = sel_v1 & (d_cmt_idx == sel_slot1);
+            hit2         = sel_v2 & (d_cmt_idx == sel_slot2);
         end
         else if (hold) begin
             mul_loaded   = 1'b1;
             rd_mul       = hold_rd;
             mul_idx      = idx_hold;
             mul_data_out = hold_data;
+            hit1         = sel_v1 & (idx_hold == sel_slot1);
+            hit2         = sel_v2 & (idx_hold == sel_slot2);
         end
         else begin
             mul_loaded   = 1'b0;
             rd_mul       = 5'd0;
             mul_data_out = 32'd0;
+            hit1         = 1'b0;
+            hit2         = 1'b0;
         end
     end
 
