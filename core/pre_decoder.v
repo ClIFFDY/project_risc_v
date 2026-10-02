@@ -206,8 +206,16 @@ module pre_decoder(
 //只有真正读这两个源寄存器的指令才填：别的指令留 0，免得在冒险比较里误命中
                 case (inst_effective[6:0])
                     OPCODE_OP, OPCODE_OP_IMM, OPCODE_JALR, OPCODE_BRANCH,
-                    OPCODE_LOAD, OPCODE_STORE, OPCODE_SYSTEM: r1 <= inst_effective[19:15];
+                    OPCODE_LOAD, OPCODE_STORE: r1 <= inst_effective[19:15];
                 endcase
+//csrrwi/si/ci 的 [19:15] 是 zimm 立即数、不是寄存器号：照填进去会让 rob 的槽扫描误命中
+//（只要在途有一条 rd 撞上这个数），前送值就会盖掉 uimm，再经 alu 的 result_csr 写进 CSR。
+//只对 rs1 形（funct3=001/010/011）填；其余保持本分支开头的 5'd0。
+                if ((inst_effective[6:0] == OPCODE_SYSTEM)
+                 && (inst_effective[14:12] != 3'b101)
+                 && (inst_effective[14:12] != 3'b110)
+                 && (inst_effective[14:12] != 3'b111))
+                    r1 <= inst_effective[19:15];
                 case (inst_effective[6:0])
                     OPCODE_OP, OPCODE_BRANCH, OPCODE_STORE: r2 <= inst_effective[24:20];
                 endcase

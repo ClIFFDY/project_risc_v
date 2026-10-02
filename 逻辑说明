@@ -3120,3 +3120,84 @@ wport 的写口仲裁又经 `taken_mul` 回指 mulu ⇒ 复制缓冲把这条回
 
 `u_controller` 的 2-LUT 环**不是本轮引入的**（HEAD 用 `-flatten_hierarchy none` 即可看到，
 §35 之前的日志都没有；`controller.v` 本轮只改了 `pc_addr_in` 的**源**，没动锥）。**未处理，留档**。
+
+---
+
+## §38 实测否决：`alu` 结果收口 mux 拆"早稳/晚到"两路（2026-10-03）
+
+### 背景
+
+§36/§37 之后最差路径（leg A，−1.905ns、16 级、route 59.2%）是
+`dcache 数据 BRAM 输出 → lsu 取数整形 → forw 点② → alu 比较/收口 → alu/result_reg[0]`。
+逐级分解后级数大头在**拍内收口**：`alu.v` 的十路 `case`（ADD/SLL/SLT/SLTU/XOR/SRL/OR/AND/SUB/SRA）
+全写同一个 `result_nx`，bit0 要收全部十路输入 ⇒ 综合成 **5 级 LUT6**；
+`forw` 点② 的 `if/else if` 优先链让 `data_ld` 穿 **3 级**。
+
+### 改法（已实装、已跑完全部功能判据、然后**回滚**）
+
+把 `alu` 的十路拆成两条并行路：按位/算术类（早稳）走 `result_bit`，`SLT/SLTU` 走 `result_lt`
+（只挂进位链输出），末尾用**早到的 `alu_func4`** 选一次；原三分支优先级（CSR / jal-jalr / ALU）一字不动。
+预期 bit0 的收口从 5 级降到 1~2 级、省 3~4 级逻辑、0 新寄存器。
+
+### 实测（a100t-1 @10ns，同机同脚本）
+
+| | 基线 `_a100t_b3`（=HEAD `039d492`） | 本改动 |
+| --- | --- | --- |
+| WNS | −1.905 | −1.995 |
+| **TNS** | **−316.612** | **−688.969（恶化 2.2×）** |
+| **失败端点** | **563** | **1033（+470）** |
+| 最差路 | `dcache/data_reg_3 → alu/result_reg[0]` | `lsu/rst_q → lsu/bus_addr_out`（换人） |
+
+**⇒ 按项目口径（TNS + 失败端点数）判为负优化，已回滚。**
+
+功能侧当时是**全绿**的（可作对照）：`alu_tb` 28/28、`run_reg.sh` 8/8、archtest 40 支 rd 终值 +
+store 结构全同、CoreMark 三项 CRC `e714/1fd7/8e3a` 且 `ticks 347760`（与改前逐位相同）。
+
+### 教训（与 §22.5、§5.1 同族）
+
+- **在 route 占 59~79% 的设计里，拍内"逻辑塑形"（拆 mux / 平衡化）会因为新增 LUT 与新增扇出
+  反而恶化整体**：这条链的端点从 `alu/result_reg` 换到 `lsu/bus_addr_out`、TNS 翻倍 ⇒
+  省下的 3~4 级逻辑抵不过多出来的逻辑量与拥塞。
+- 与历史一致：本工程真正有量级收益的都是**结构性挪拍/换拓扑**（BTIC、`wport` 出口打拍、
+  `bju` 判定输入级、删 `mid_decoder`）；纯塑形/属性类改动基本都是噪声或负（§22.5、§33、§34）。
+- ⇒ **§34 那"四批计划"里的第一批（`forw` 并行化）与第三批（ALU 结果 mux 形状）按本条实测
+  均应视为负优化候选**，不再单独尝试；后续只做"把东西挪出关键路径"的那条路（批 2）。
+
+---
+
+## §39 修掉 `csrrwi/si/ci` 的 zimm 被当前送（2026-10-03）
+
+### 症状与链路
+
+`csrrwi/si/ci` 写进 CSR 的值可能是**某条在途指令的结果**，而不是指令里的 zimm 立即数。链路：
+
+| 环节 | 位置 | 事实 |
+| --- | --- | --- |
+| 填源 | `pre_decoder.v` 的 r1 填充 | 对 `OPCODE_SYSTEM` **无条件**填 `r1 = inst[19:15]`；而 `csrrwi/si/ci`（funct3=101/110/111）这 5 位是 **zimm 立即数**，不是寄存器号 |
+| 扫描 | `rob.v:256` | 只挡 `scan_rs1 != 0` 与 `ent_rd == scan_rs1` ⇒ 在途只要有一条指令的 `rd` 撞上这个数，就给出 `fwd_hit1=1` |
+| 前送 | `forw.v:94-100` | 命中**优先于**默认值 ⇒ 前送值盖掉 uimm |
+| 后果 | `alu.v:105` | `CSRRW/CSRRWI: result_csr = r1_data` ⇒ **错值写进 CSR**（写回的 rd 走 `cs_data`，不受影响 ⇒ 只坏 CSR，更隐蔽） |
+
+### 修法
+
+`pre_decoder.v` 的 r1 填充里，`OPCODE_SYSTEM` 只对 **rs1 形**（funct3 ≠ 101/110/111）填；
+其余保持该分支开头的 `5'd0` ⇒ `scan_rs1=0` ⇒ `rob.v:256` 的 `!=0` 保护天然挡住。
+
+副作用（已核）：uimm/priv 形的 `rs1_1` 由 zimm 变 0，只有三处消费 —— rob 槽扫描（正是要修的）、
+regfile 读地址（`regs[0]`，且该指令的操作数走 `imm_sel` 不取它）、`rs1_out → lsu/mulu` 的 hazard 比较
+（SYSTEM 不激活这两个单元）。
+
+### 判据（定向微测 `tools/archtest/prog/wp_csrrwi_zimm.S`）
+
+`li x5,7; csrrwi x3, mscratch, 5; csrr x4, mscratch`（zimm=5 撞上在途 x5 的号，且紧邻 ⇒ 其结果表明落在 alu 口上）：
+
+| | 修复后 | 修复前（基线 `287bb2b`） |
+| --- | --- | --- |
+| `mscratch` 实际写入 | **5**（zimm） | **7**（被前送） |
+| 读回 x4 | **5** | **7** |
+
+⇒ **这是一个真实的正确性缺口**，本次先单独修掉、单独验证（不改时序，不跑实现）。
+
+### 回归
+
+`run_reg.sh` **8/8**；CoreMark 三项 CRC `e714/1fd7/8e3a`、`Total ticks 347760`（与改前逐位相同 ⇒ 功能中性）。
