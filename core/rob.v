@@ -60,6 +60,14 @@ module rob(
 //分配口（decoder ID/EX 入口拍；本模块无自有流水级 ⇒ 所有口的相位都相对"这条指令进载荷那一拍"）
     input        alloc_en,
     input        alloc_we,
+    input [4:0]  alloc_rd,
+//前送槽扫描口：消费者（下一拍进载荷那条）的两个源寄存器号，用 mid 级的 rs1_2/rs2_2。
+//本模块按【程序序】分配（`alloc_en = payload_go`，与进载荷同沿）⇒ 扫描那一拍所有 `ent_v`
+//的槽**一格不多一格不少**全是比它老的指令 ⇒ "比我老"不需要任何比较，`ent_v[s]` 即等价；
+//"取最年轻的匹配" = 窗口里年龄最大的那个（年龄一律 4 位截断，见下面 red line）。
+    input [4:0]  scan_rs1, scan_rs2,
+    output reg [2:0] fwd_slot1, fwd_slot2,
+    output reg       fwd_hit1,  fwd_hit2,
 //完成口（写口级处置完一笔就回报：落地 / 被杀 / 不写；只认 valid 的槽）
     input        alu_done,
     input [2:0]  alu_idx,
@@ -83,6 +91,8 @@ module rob(
 //状态 / 退口（组合，当拍退当拍写寄存器堆）/ 前送结果
     output reg [2:0]  alloc_idx,
 //队头索引：写口级与各单元算年龄的基准（年龄 = {1'b0,(idx - head_p)}）
+//年龄基准：全核 4 个模块（`forw`/`wport`/`lsu`/`mulu`）共 21 个负载点都在拿它做减法基准，
+//是个纯广播网。
     output reg [2:0]  head_p,
 //停顿源：ROB 满（stall_rob_full，喂 controller 的发射级压制）
     output reg        full,
@@ -103,6 +113,18 @@ reg        ent_ex [0:DEPTH-1];
 reg [3:0]  ent_cs [0:DEPTH-1];
 reg [31:0] ent_pc [0:DEPTH-1];
 reg [31:0] ent_tv [0:DEPTH-1];
+//每槽的目的寄存器号（写 x0 与"不写 rd"一律存 0）—— 前送槽扫描用。
+//只在复位与分配两处写，退项/冲刷都【不必】清：扫描判据里 `ent_v[s]` 与它相与，空槽天然被挡。
+//（与 ent_cs/ent_pc/ent_tv 同款：那三个也只在复位/分配/异常标记时写。）
+reg [4:0]  ent_rd [0:DEPTH-1];
+
+//扫描的工作量（纯组合，逐槽一份）
+reg [3:0]  scan_ag [0:DEPTH-1];
+reg        scan_m1 [0:DEPTH-1];
+reg        scan_m2 [0:DEPTH-1];
+reg        scan_y1 [0:DEPTH-1];
+reg        scan_y2 [0:DEPTH-1];
+integer si, sj;
 
 reg [2:0]  tail_p;
 reg [3:0]  cnt;
@@ -223,6 +245,44 @@ always @(posedge clk) rst_q <= rst;
         end
     end
 
+//前送槽扫描（纯组合）：给两个消费者操作数各找一条"比它老、rd 匹配、且最年轻"的在册项。
+//★ 年龄一律用 4 位截断 `{1'b0,(idx - head_p)}`，**禁止 3 位裸比大小** —— 3 位相减的回绕在
+//  与 4 位量比较时会被按 4 位上下文求值（算出 9 而不是 1），判据整体翻错（见文件头 / flush_age 那处）。
+//★ 槽号唯一 ⇒ "最年轻"不会有并列，同年龄优先序在这里无意义。
+//★ 窗口：所有 `ent_v=1` 的槽都在 `[head_p, tail_p-1]` 里，窗口外的槽 `ent_v=0` ⇒ 自动被 `m` 挡掉。
+    always @(*) begin
+        for (si = 0; si < DEPTH; si = si + 1) begin
+            scan_ag[si] = {1'b0, (si[2:0] - head_p)};
+            scan_m1[si] = ent_v[si] & (scan_rs1 != 5'd0) & (ent_rd[si] == scan_rs1);
+            scan_m2[si] = ent_v[si] & (scan_rs2 != 5'd0) & (ent_rd[si] == scan_rs2);
+            scan_y1[si] = scan_m1[si];
+            scan_y2[si] = scan_m2[si];
+        end
+//"有人比你更年轻"就把你摁掉；两两比较只依赖 head，两个操作数共用同一批（不重复算）
+        for (si = 0; si < DEPTH; si = si + 1) begin
+            for (sj = 0; sj < DEPTH; sj = sj + 1) begin
+                if (scan_m1[sj] && (scan_ag[sj] > scan_ag[si]))
+                    scan_y1[si] = 1'b0;
+                if (scan_m2[sj] && (scan_ag[sj] > scan_ag[si]))
+                    scan_y2[si] = 1'b0;
+            end
+        end
+        fwd_hit1  = 1'b0;
+        fwd_hit2  = 1'b0;
+        fwd_slot1 = 3'd0;
+        fwd_slot2 = 3'd0;
+        for (si = 0; si < DEPTH; si = si + 1) begin
+            if (scan_y1[si]) begin
+                fwd_hit1  = 1'b1;
+                fwd_slot1 = si[2:0];
+            end
+            if (scan_y2[si]) begin
+                fwd_hit2  = 1'b1;
+                fwd_slot2 = si[2:0];
+            end
+        end
+    end
+
 //时序：分配 / 回填 / 退 / 冲刷 / 陷阱标记
 //  退掉的槽立刻失效，防止迟到回填污染；完成回填只认 valid 的槽；
 //  冲刷把比 flush_idx 更年轻的项作废（tail 的回绕在组合块里算）。
@@ -239,6 +299,7 @@ always @(posedge clk) rst_q <= rst;
                 ent_cs[ri] <= 4'd0;
                 ent_pc[ri] <= 32'd0;
                 ent_tv[ri] <= 32'd0;
+                ent_rd[ri] <= 5'd0;
             end
         end
         else begin
@@ -261,6 +322,10 @@ always @(posedge clk) rst_q <= rst;
 //  漏了这条：它永远卡在 head 上 ⇒ ROB 排不空 ⇒ 满 ⇒ 顶死前端（实测整核跑飞）。
                 ent_wr[tail_p] <= ~alloc_we;
                 ent_ex[tail_p] <= 1'b0;
+//前送表的目的寄存器号：`alloc_we` 是 post_decoder 的 `issue_we`（保守侧：SYSTEM 一律算写），
+//但它的判据里已经带了 `rd_in != 0` ⇒ 标准编码下 ecall/ebreak/mret 的 rd 都是 0、`issue_we=0`，
+//所以"报了写但其实不写"的只剩非法编码，不会造成"选中一个永不产值的槽"。
+                ent_rd[tail_p] <= (alloc_we && (alloc_rd != 5'd0)) ? alloc_rd : 5'd0;
             end
             if (alu_done && ent_v[alu_idx])
                 ent_wr[alu_idx] <= 1'b1;

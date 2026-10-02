@@ -34,6 +34,11 @@ module bju(
     input br_pred_taken_in,
     input exc_jal_misalign_in,
     input [31:0] jal_target_in,
+//异常源（从 post_decoder 载荷进来）：与操作数/控制位【同沿】锁进判定输入寄存级。
+//这样它们天然比载荷晚一拍出，正好与"更老那条的寄存版冲刷"【同拍配对】——
+//  本拍出的是 X_m 的异常，本拍 flag_bus[9]/flush_bju_exc 出的是 X_{m-1} 的冲刷，
+//  于是消费端用现成的 ~flush_older 就盖住了影子槽，不再需要组合的 pre。
+    input exc_ecall_in, exc_ebreak_in, exc_illegal_in, exc_irq_ret_in,
 //判定结果与跳转落点（寄存一拍后有效）
     output reg success, br_fail, jalr_fail,
 //本拍被判那条指令的 ROB 索引（判定打一拍 ⇒ 冲刷边界必须用【寄存后的】这个号）：
@@ -53,6 +58,12 @@ module bju(
 //判定输入级那一条自己的 ROB 号（与 exc_bju 同拍）：wport 用它认"本级挂的是不是它"
     output reg [2:0] idx_i,
     output reg [31:0] exc_pc_q,
+//判定【输入级】那一条自己带的异常（与 flush_bju_pre 同拍、描述同一条）：ecall/ebreak/illegal/mret。
+//★ 必须从【输入寄存级】出、不能从延迟寄存级出：从延迟级出就与"更老那条的寄存版冲刷"错开两拍，
+//  消费端的 ~flush_older 盖不住影子槽（那正是当初要 pre 的原因）。
+    output reg exc_ecall_i, exc_ebreak_i, exc_illegal_i, exc_irq_ret_i,
+//同一条自己的 PC（= 输入级的 aux_q），给 mepc 用
+    output reg [31:0] exc_pc_i,
 //F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[10]|flag_bus[9]）。
 //  寄存判定那一拍上 flag_bus[9] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
 //  去门标记会自己掐掉自己（br 预测不跳+真跳+非对齐那一支的异常会静默丢失）。
@@ -73,6 +84,7 @@ module bju(
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：判定延迟拍只关心"本拍是不是冲刷拍"。
+//★ flush_con_exc 已经是精确版（不再含 pre）⇒ 直接取 [11]。
     reg flush_w;
     always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
 
@@ -95,6 +107,9 @@ module bju(
     reg [31:0] r1_q, r2_q, aux_q, beq_q, jalr_pred_q, jal_tgt_q;
     reg [3:0]  func4_q;
     reg        brf_q, jalrf_q, pred_q, exc_jal_mis_q;
+//异常源也进这一级（与操作数/控制位同生共死）—— 这是"过 bju"的核心：它们比载荷晚一拍出，
+//正好与【更老那条】的寄存版冲刷同拍。
+    reg        ecall_q, ebreak_q, illegal_q, irq_ret_q;
     always @(posedge clk) begin
         if (rst_q) begin
             r1_q <= 32'd0;
@@ -108,6 +123,10 @@ module bju(
             jalrf_q <= 1'b0;
             pred_q <= 1'b0;
             exc_jal_mis_q <= 1'b0;
+            ecall_q <= 1'b0;
+            ebreak_q <= 1'b0;
+            illegal_q <= 1'b0;
+            irq_ret_q <= 1'b0;
             idx_i <= 3'd0;
         end
         else if (flush_w) begin
@@ -122,6 +141,10 @@ module bju(
             jalrf_q <= 1'b0;
             pred_q <= 1'b0;
             exc_jal_mis_q <= 1'b0;
+            ecall_q <= 1'b0;
+            ebreak_q <= 1'b0;
+            illegal_q <= 1'b0;
+            irq_ret_q <= 1'b0;
             idx_i <= 3'd0;
         end
         else if (adv) begin
@@ -136,8 +159,23 @@ module bju(
             jalrf_q <= jalr_flag_in;
             pred_q <= br_pred_taken_in;
             exc_jal_mis_q <= exc_jal_misalign_in;
+            ecall_q <= exc_ecall_in;
+            ebreak_q <= exc_ebreak_in;
+            illegal_q <= exc_illegal_in;
+            irq_ret_q <= exc_irq_ret_in;
             idx_i <= idx_in;
         end
+    end
+
+//判定输入级那一条自己的异常 / PC（与 flush_bju_pre 同拍、描述同一条）。
+//组合给出即可（源是寄存器）：controller 在"更老那条的寄存版冲刷"那一拍拿到它们，
+//用现成的 ~flush_older 就把影子槽盖住了。
+    always @(*) begin
+        exc_ecall_i   = ecall_q;
+        exc_ebreak_i  = ebreak_q;
+        exc_illegal_i = illegal_q;
+        exc_irq_ret_i = irq_ret_q;
+        exc_pc_i      = aux_q;
     end
 
 //F2 用：与"操作数被采样的那一拍"对齐的采样（判定级读当拍的 flush_older 会把自己掐掉）

@@ -46,11 +46,12 @@
 module mulu(
     input clk, rst,
     input [11:0] flag_bus,
-//前置冲刷（早一拍），由 bju 的组合判定直接给出（源名 flush_bju_pre）：判定结果寄存后只能
-//覆盖 c1..c4 与 wb，而错路指令在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），
-//那两拍里它已经会去推乘法流水、发起除法，等寄存器清已经收不回来，故入口要多挡一拍。
-//不进 flag_bus：绕 controller 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
-    input flush_bju_pre,
+//本模块【不再吃组合的 flush_bju_pre】：那个"宽一拍窗口"对乘法不必要 —— 影子乘法改由
+//"寄存版 bju 冲刷那一拍按号杀"兜住（见下面的 m_shadow_kill）。组合版 pre 只留给 lsu
+//（它的副作用在判定拍就出核门、收不回来）。要的这两根都是 bju 的【寄存】输出，进广播网没有
+//"晚到组合"的时序代价：
+    input flush_bju_exc,          //bju 寄存器版"指令地址非对齐"
+    input [2:0]  bju_idx_q,       //判定那条自己的 ROB 号（与 flag_bus[9]/flush_bju_exc 同拍）
 //本次冲刷的边界（controller 的 flush_idx：三种冲刷各取自己那条的号）：
 //入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
     input [2:0]  flush_idx,
@@ -110,11 +111,14 @@ module mulu(
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取三条冲刷位。
-//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 flush_bju_pre）：m_push、除法 FSM 的作废、
-//d_done 的清零都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
+//本模块的冲刷窗口回到【与别的模块同宽】：m_push、除法 FSM 的作废、d_done 的清零都挂在这同一个
+//flush_w 上。影子乘法不在入口挡，而由"寄存版 bju 冲刷那一拍按号杀"兜住（见 m_shadow_kill）。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
-    reg flush_w;
-    always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9] | flush_bju_pre;
+    reg flush_w, flush_con_exc;
+    always @(*) begin
+        flush_con_exc = flag_bus[11];
+        flush_w = flush_con_exc | flag_bus[10] | flag_bus[9];
+    end
 
 //入口门用的两条按【编号】的判据（口径同 lsu.v）：
 //  · 跳转/分支非对齐：flush_idx = 分支自己 ⇒ 冲刷拍站在载荷上的后继比它年轻 ⇒ 挡；
@@ -466,6 +470,14 @@ module mulu(
 //  ★ 年龄一律用 head 相对值 {1'b0,(idx - rob_head)}，先截 4 位再比（3 位减法回绕会判错）。
 //  ★ killed 的累积【不受 wr_pend 冻结】—— 写口被挤住期间恰恰是最容易被更年轻写杀掉的时候。
     reg m_kl, m_kl_q, d_kl;
+//影子乘法的作废：寄存版 bju 冲刷那一拍，m_v 里停的必然是"边界那条的后继"（m_v <= m_push 每拍
+//更新，所以冲刷拍在 m_v 里的一定是上一拍推入的那条）⇒ 按号（边界+1）把它在写口判死。
+//★ 复用现成的 m_kl 链路、而不是去清 m_v/m_pv：m_kl 是【已寄存】的、且"累积不受 wr_pend 冻结"
+//  ⇒ pipe_stall/wr_pend 把第一级冻住时也不会漏杀（清 m_v 会被冻结分支整个跳过）。
+//★ 号限定为什么安全：窗口内 8 个号互不相同，比边界更老的合法乘法号 < 边界号，永远 ≠ 边界+1。
+    reg flush_bju_reg, m_shadow_kill;
+    always @(*) flush_bju_reg = flag_bus[9] | flush_bju_exc;
+    always @(*) m_shadow_kill = flush_bju_reg & m_v & (m_idx == (bju_idx_q + 3'd1));
     reg m_kl_hit, m_klq_hit, d_kl_hit;
     reg [3:0] m_age, mq_age, d_age, b0_age, b1_age;
     reg [4:0] d_cur_rd;
@@ -510,12 +522,14 @@ module mulu(
         else begin
             if (m_push)
                 m_kl <= 1'b0;
-            else if (m_kl_hit)
+            else if (m_kl_hit | m_shadow_kill)
                 m_kl <= 1'b1;
             else
                 m_kl <= m_kl;
+//★ 搬运那一沿必须把 m_shadow_kill 也算进来：置 m_kl 与"影子从 m_v 搬到 m_pv"是**同一个沿**，
+//  只写 m_kl 的话 m_kl_q 拿到的是旧值 ⇒ 下一拍写口看不见杀、影子照样落地（实测 CoreMark 三项 CRC 全错）。
             if (m_v && !pipe_stall && !wr_pend)
-                m_kl_q <= m_kl | m_kl_hit;
+                m_kl_q <= m_kl | m_kl_hit | m_shadow_kill;
             else if (m_klq_hit)
                 m_kl_q <= 1'b1;
             else if (!m_pv)

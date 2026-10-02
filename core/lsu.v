@@ -107,9 +107,10 @@ module lsu(
 //控制位译码（行为块，放本模块最前）：冲刷优先于停顿；exec 即本模块的停开机使能。
 //本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 flush_bju_pre，那是 bju 判定的组合版、早一拍）：
 //入队门控与总线选通都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
-    reg exec, flush_w;
+    reg exec, flush_w, flush_con_exc;
     always @(*) begin
-        flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9] | flush_bju_pre;
+        flush_con_exc = flag_bus[11];
+        flush_w = flush_con_exc | flag_bus[10] | flag_bus[9] | flush_bju_pre;
         exec    = flag_bus[8];
     end
 
@@ -331,7 +332,14 @@ module lsu(
 //杀老写：写口级广播"某笔更年轻的同 rd 写已落地" ⇒ 本模块更老的同 rd 在途 load 置 killed。
 //  killed 的记录照旧走完（总线读本来就计划要发，不引入新副作用），只是永不落地（写口用 kill_ld 门掉）。
 //  ★ 年龄一律用 head 相对值 {1'b0,(idx - rob_head)}，先截 4 位再比（3 位减法回绕会判错）。
-    reg kyoung_s2, kyoung_s3;
+//  ★ 这里原有一条【组合版冲刷作废】判据 kyoung_s2/s3 = flush_bju_pre & (sX_age > 边界年龄)：bju 的
+//    组合判定直接驱动它，于是"bju 判定锥 → 本模块杀逻辑 → kill_ld → wport 入口仲裁 → wport 组合写口
+//    广播 b0_* → mulu 杀老写"串成一条跨四个模块的单拍回环（实测 12.4ns，其中走线 9.41ns 占 76%）。
+//    它在【单发射、且分支不与访存同拍进流水】下恒为 0 —— bju 的装载门 adv 与 post_decoder 的载荷推进
+//    只差那 3 个冲刷位、而 bju 的 flush_w 恰好就是那 3 位且优先级更高 ⇒ E4(t) ≡ E3(t-1)；又
+//    flush_bju_pre ≠ 0 ⇒ E4(t) 必是 br/jalr ⇒ 不是访存 ⇒ t-1 那沿写不进 s2 ⇒ s2_idx ≤ idx_q，
+//    s3 由 s2 搬来同理 ⇒ 年龄比较恒假。故整条判据已摘除，只剩文件尾 `ifdef SIM_PROBE 里的监视。
+//  ★ 摘除的前提一旦被破坏（载荷/推进的相位改动，或双发射放开"分支与访存同拍"），必须把判据接回来。
     reg s2_hit, s3_hit;
     reg [3:0] s2_age, s3_age, b0_age, b1_age;
     always @(*) begin
@@ -341,10 +349,6 @@ module lsu(
         b1_age = {1'b0, (b1_idx - rob_head)};
         s2_hit = 1'b0;
         s3_hit = 1'b0;
-//跳转冲刷作废：只在【判定那一拍】比（flush_bju_pre = bju 判定的组合版）。此刻边界那条项还活着、
-//索引唯一，用 bju_idx_q 比年龄才可靠；等 flag_bus[9] 那一拍边界项可能已退、槽被回收，索引会撞车。
-        kyoung_s2 = flush_bju_pre & (s2_age > {1'b0, (bju_idx_q - rob_head)});
-        kyoung_s3 = flush_bju_pre & (s3_age > {1'b0, (bju_idx_q - rob_head)});
         if (s2_v && ~s2_kind && (s2_rd != 5'd0)) begin
             if (b0_we && (b0_rd == s2_rd) && (b0_age > s2_age))
                 s2_hit = 1'b1;
@@ -382,10 +386,7 @@ module lsu(
             s3_kl <= 1'b0;
         end
         else begin
-            if (kyoung_s3) begin                                        // 跳转冲刷作废：最高优先
-                s3_kl <= 1'b1;
-            end
-            else if (s3_done) begin                                     // 级3 走掉
+            if (s3_done) begin                                          // 级3 走掉
                 s3_v <= 1'b0;
                 s3_kl <= 1'b0;
             end
@@ -395,10 +396,7 @@ module lsu(
             else begin
                 s3_kl <= s3_kl;
             end
-            if (kyoung_s2) begin                                        // 跳转冲刷作废：最高优先
-                s2_kl <= 1'b1;
-            end
-            else if (s2_v && ~s2_move && s2_hit) begin                  // 级2 留着且被广播命中
+            if (s2_v && ~s2_move && s2_hit) begin                       // 级2 留着且被广播命中
                 s2_kl <= 1'b1;
             end
             else if (s2_move) begin
@@ -416,7 +414,7 @@ module lsu(
                 s3_size <= s2_size;
                 s3_off <= s2_off;
                 s3_idx <= s2_idx;
-                s3_kl <= s2_kl | s2_hit | kyoung_s2;                                // 杀状态跟着记录走（含"走的这拍被命中"）
+                s3_kl <= s2_kl | s2_hit;                                // 杀状态跟着记录走（含"走的这拍被命中"）
                 s2_v <= 1'b0;
             end
             if (new_in && new_go) begin                                 // 新指令进级2（miss 当拍也进；没摆就留着）
@@ -504,8 +502,9 @@ module lsu(
         endcase
     end
 
+//写口侧的"永不落地"标记：只由本模块的 killed 记录驱动（原组合版冲刷作废已摘除，见上）
     always @(*) begin
-        kill_ld = s3_kl | kyoung_s3;   // 冲刷作废这一项必须组合：判定那一拍它就可能落地
+        kill_ld = s3_kl;
         ld_we = s3_v & ~s3_kind & ready_in;
         if (ld_we) begin
             loaded = 1'b1;
@@ -531,5 +530,29 @@ module lsu(
 
 //在途 load 写记录（→ 发射级互锁）
 //在途 load 写记录（→ 发射级互锁）
+
+`ifdef SIM_PROBE
+//===============================================================================
+// 仿真期监视（综合期整块不存在：零面积、零时序代价）
+//===============================================================================
+//被摘除的"组合版冲刷作废"判据（见本文件杀老写那节的注释：kyoung_s2/s3 = flush_bju_pre &
+//(sX_age > 边界年龄)）在【单发射、分支不与访存同拍】下恒为 0，这里把它算回来做守卫。
+//★ 必须带 s2_v/s3_v：原式没有有效性项，空槽上会被"陈旧 idx"点着 —— 实测 CoreMark 全程点着 3464 次
+//  全是 s2_v=0 且 s3_v=0，而有在途项时 0 次（对空槽置 s2_kl/s3_kl 是空操作：s2_move = s2_v & …、
+//  ld_we = s3_v & … 本就为 0）。所以守卫要看的正是"有在途项时会不会抬"。
+//★ 它一旦抬起，说明"E4(t) ≡ E3(t-1)"与"flush_bju_pre ≠ 0 ⇒ E4(t) 非访存"这两条前提被破坏
+//  （载荷/推进相位改动，或双发射放开了"分支与访存同拍"）⇒ 必须把判据接回 s2_kl/s3_kl/kill_ld。
+    reg kyoung_s2, kyoung_s3, kyoung_live;
+    always @(*) begin
+        kyoung_s2 = flush_bju_pre & (s2_age > {1'b0, (bju_idx_q - rob_head)});
+        kyoung_s3 = flush_bju_pre & (s3_age > {1'b0, (bju_idx_q - rob_head)});
+        kyoung_live = (s2_v & kyoung_s2) | (s3_v & kyoung_s3);
+    end
+    always @(posedge clk) begin
+        if (kyoung_live)
+            $display("[LSU-KYOUNG] LIVE @%0t s2_v=%b s2_idx=%0d s3_v=%b s3_idx=%0d bju_idx_q=%0d rob_head=%0d",
+                     $time, s2_v, s2_idx, s3_v, s3_idx, bju_idx_q, rob_head);
+    end
+`endif
 
 endmodule

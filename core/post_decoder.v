@@ -57,7 +57,18 @@ module post_decoder(
 //ROB 索引载荷（与其它载荷【同使能】锁存）：ROB 每分配一条指令就发一个索引，
 //  它随指令走到自己的完成点，回来时用它把结果写进 ROB 自己那一项。
     input [2:0] idx_in,
+//载荷的 ROB 索引：当拍要喂 7 个消费者（`forw.idx_post`、`alu`/`lsu`/`mulu`/`bju` 的 `idx_in`、
+//`rob.exc_idx`、`controller.issue_idx_in`），而它是关键路径的第一跳。
     output reg [2:0] issue_idx,
+//前送槽号（← rob 的扫描口）：本条指令的两个操作数该由【哪个 ROB 槽】供值。
+//★ 它是【载荷】：只在同一个 `payload_go` 沿锁存（与 `issue_idx` 同生共死）。
+//  冻结期间**绝不能重算** —— rob 的退项是沿生效、扫描是组合读 `ent_v`，重算会让扫描
+//  漂到更老的匹配项 ⇒ 前送陈旧值。这是本方案的头号红线。
+//★ 冲刷分支要【显式清 0】：让下游 mux 落回载荷默认值，免得冲刷拍选到垃圾。
+    output reg [2:0] sel_slot1, sel_slot2,
+    output reg       sel_v1,    sel_v2,
+    input  [2:0] fwd_slot1_in, fwd_slot2_in,
+    input        fwd_hit1_in,  fwd_hit2_in,
 //★ 三个执行单元（alu/lsu/mulu）的输入【级数对齐】：都吃这一级（decoder 载荷）。
 //  lsu/mulu 原来吃的是 mem_buf 的组合输出（比 alu 早一级），索引也得跟着差一拍；
 //  搬到这里之后三者同相：索引一律 issue_idx，操作数一律由 forw（decoder→单元之间）给出。
@@ -329,6 +340,10 @@ module post_decoder(
             jal_target_out <= 32'd0;
             exc_illegal_out <= 1'b0;
             issue_idx <= 3'd0;
+            sel_slot1 <= 3'd0;
+            sel_slot2 <= 3'd0;
+            sel_v1 <= 1'b0;
+            sel_v2 <= 1'b0;
             opc_out <= 7'd0;
             fn10_out <= 10'd0;
             fn10_ls_out <= 10'd0;
@@ -347,6 +362,10 @@ module post_decoder(
                  | stall_lsu_full | stall_mulu_haz | stall_mulu_div
  | stall_icache_miss | stall_bus_hold)) begin
                 issue_idx <= idx_in;
+                sel_slot1 <= fwd_slot1_in;
+                sel_slot2 <= fwd_slot2_in;
+                sel_v1 <= fwd_hit1_in;
+                sel_v2 <= fwd_hit2_in;
                 opc_out <= opcode;
                 fn10_out <= func10;
                 fn10_ls_out <= {7'd0, inst_in[14:12]};
@@ -525,6 +544,10 @@ module post_decoder(
  | stall_icache_miss | stall_bus_hold)
                    & ~(flush_con_exc | flush_con_irq | flush_con_jump)) begin
                 issue_idx <= issue_idx;
+                sel_slot1 <= sel_slot1;
+                sel_slot2 <= sel_slot2;
+                sel_v1 <= sel_v1;
+                sel_v2 <= sel_v2;
                 opc_out <= opc_out;
                 fn10_out <= fn10_out;
                 fn10_ls_out <= fn10_ls_out;
@@ -568,6 +591,10 @@ module post_decoder(
             end
             else begin
                     issue_idx <= 3'd0;
+                    sel_slot1 <= 3'd0;
+                    sel_slot2 <= 3'd0;
+                    sel_v1 <= 1'b0;
+                    sel_v2 <= 1'b0;
                 opc_out <= 7'd0;
                 fn10_out <= 10'd0;
                 off_mem_out <= 32'd0;

@@ -2910,3 +2910,91 @@ iram 只剩 `RAMB36E1/CLKARDCLK` 的原语检查行）。功能：`run_reg` 8/8�
 ⇒ **打拍想摘的 `bju/r1_q → regfile` 整族离开台面**（TNS −75.6%、失败端点 −49.4%），
 台面上只剩"**前送点② 的选择 → ALU 操作数/加法器/结果 mux**"这一条腿（下一轮的靶子）。
 口径仍照旧：**评这类改动只看 TNS + 失败端点数 + 最差族集合，不看 WNS 单点**（同脚本复跑能差 0.2~0.5ns）。
+
+## §35 删掉组合 `pre`：异常源统一过 bju 的判定输入级（2026-10-02）
+
+### 35.1 问题
+
+`flush_bju_pre`（下称 `pre`）是 `bju` 判定块的**组合**输出，比它的寄存版早一拍。它有两个身份：
+
+- **正向**：`lsu`/`mulu` 的 `flush_w` 里多 OR 一个 `pre`（"宽一拍冲刷窗口"）；
+- **反向**：`controller` 的 `exc_gated` / `exc_irq_ret_ok` 里作为**当拍抑制项** `~pre`
+  （"这条解码级异常在不在更老那条的影子里"）。
+
+反向那一项把 bju 的判定锥（`bju/r2_q → 32 位相等树 → br_fail_now → redir_kind → …`）
+一路拖进了 `flag_bus[11]` 的全核广播网，实测 **868 条违例**（终点在 `icache` 的 iram 端口使能等）。
+
+### 35.2 手段：让异常源"过 bju"，与 fail 同一拍配对
+
+设 post_decoder 载荷（E4）在第 `m` 拍持有 `X_m`：
+
+| 拍 | 载荷 | bju **判定输入寄存级** | bju **延迟寄存级** |
+| --- | --- | --- | --- |
+| `m` | `X_m` | `X_{m-1}` | `X_{m-2}` |
+| `m+1` | `X_{m+1}` | **`X_m`**：`flush_bju_pre`、`exc_*_i`、`idx_i`、`aux_q` | **`X_{m-1}`**：`flag_bus[9]`、`flush_bju_exc` |
+
+⇒ 在 `m+1` 这一拍，`X_m` 的异常标志与 `X_{m-1}` 的**寄存版冲刷**同时有效
+⇒ 现成的 `~flush_older` 就是"比 `X_m` 更老的那条在改向"，`~pre` 可以整体删除。
+
+> ★ 必须从**输入寄存级**出，不能从延迟寄存级出：再晚一拍就与"更老那条的冲刷"错开两拍，盖不住。
+> ★ 这一级上 `idx_i` / `aux_q` **已经在寄存器里**，于是 ecall 的 ROB 号与 PC 白拿（不必另加一束延迟寄存器）。
+
+这不是新招 —— `lsu` 的访存非对齐本来就是这个形状（`exc_ldst_misalign_out <= exc_ldst_misalign & new_in_pre`），
+所以它到 controller 时天然与寄存版 fail 同拍，**从来不需要 `pre`**。
+
+### 35.3 逐项实现
+
+- **`bju.v`**：新增 `exc_ecall_in/exc_ebreak_in/exc_illegal_in/exc_irq_ret_in` 四个输入，
+  与操作数/控制位**同沿**锁进判定输入寄存级（`rst`/`flush_w` 分支照 `r1_q` 清 0），
+  组合输出 `exc_ecall_i/exc_ebreak_i/exc_illegal_i/exc_irq_ret_i/exc_pc_i`（`exc_pc_i = aux_q`）。
+- **`controller.v`**：删 `flush_bju_pre` 口；`exc_dec = (exc_ecall_i|exc_illegal_i) & ~flush_older_dec`，
+  其中 `flush_older_dec = flush_older | flush_bju_exc`
+  （寄存版 bju 冲刷是**两路**：`flag_bus[9]` 与 `flush_bju_exc`；"已预测跳、目标非对齐"那一支里
+  `[9]` 恰为 0，不并就会漏抑制影子 ecall）。
+  `exc_irq_ret_ok = exc_irq_ret_i & ~flush_w_other`（自冲刷项显式排掉）。
+  `exc_pc_c` / `exc_idx` / `flush_idx` 三路各自按相位取号（解码级用 `bju_idx_i`；中断分支里
+  mret 自冲刷用 `bju_idx_i`、真中断仍用 `issue_idx_in`）。`exc_idx` 的三路 mux 从 `cpu_top` 搬进本模块。
+- **`mulu.v`**：删 `pre` 口，改接 `flush_bju_exc` + `bju_idx_q`；`flush_w` 回到与别的模块同宽。
+  影子乘法改由"寄存版 bju 冲刷那一拍按号杀"：
+  `m_shadow_kill = (flag_bus[9]|flush_bju_exc) & m_v & (m_idx == bju_idx_q + 3'd1)`
+  —— 并进现成的 `m_kl` 杀老写链路（它是**已寄存**的、"累积不受 `wr_pend` 冻结"，
+  所以 `pipe_stall`/`wr_pend` 冻住第一级时也不会漏杀）。除法 FSM 与 `d_done` 的作废本来挂 `flush_w`，
+  寄存版那一拍自动覆盖，不用改。
+- **`lsu.v`**：**唯一保留 `pre` 的模块**（它的副作用在判定拍就出核门 —— `bus_*` 五个寄存器一装就收不回），
+  保留 `input flush_bju_pre` 直连端口，其余一字不动。
+- **收尾**：`flag_bus` 退回 **12 位**，上一轮为"剥开"临时加的 `[13]=exc_hard` / `[12]=flush_bju_pre`
+  与 9 个译码消费端的 `flush_exc_hard | (flush_con_exc_raw & ~flush_bju_pre)` 重组式**整体删除**。
+
+### 35.4 ★ 踩到的坑（值得记死）
+
+**`m_kl_q` 的搬运那一沿必须把 `m_shadow_kill` 一起带上。** 置 `m_kl` 与"影子从 `m_v` 搬到 `m_pv`"
+是**同一个沿**；只写 `m_kl` 的话 `m_kl_q` 拿到的是旧值 ⇒ 下一拍写口看不见杀、影子照样落地。
+实测：**CoreMark 三项 CRC 全错**（`ca88/67dd/841e`），补上 `m_kl_q <= m_kl | m_kl_hit | m_shadow_kill` 后立刻全对。
+
+> ★ 更值得记的是：**36 支原有 archtest 对这个 bug 完全没有分辨力**（全 SAME）。
+> 是 CoreMark 咬出来的。为此新增了 4 支定向微测：`wp_mul_shadow`（错路影子乘法）、
+> `wp_mul_shadow_div`（错路影子除法）、`wp_ecall_shadow2`（影子槽在第二格）、`wp_ecall_ecall`（两条相邻真 ecall）。
+
+### 35.5 验证与数字
+
+- `run_reg.sh` **8/8**（`i2c_irq` 7087 → **7088**，正好是异常晚一拍；`gpio_irq` 107 → 108）。
+- archtest **40 支对基线全 SAME**（36 支原有 + 上述 4 支新增），逐事件（每条 rd 写值 + 每条 store 数据）相同。
+- CoreMark **三项 CRC `e714/1fd7/8e3a` 全对**、`Total ticks = 353088`（与基线逐拍相同）。
+- `flag_bus` 由 14 位回到 **12 位**；`pre` 的消费者只剩 `lsu` 一个（一根 `bju → lsu` 直连线，不进总线）。
+
+**有意保留的不对称**（按"跑通再合并"的口径）：解码级那一路的资格用 `flush_older_dec`（含 `flush_bju_exc`），
+访存非对齐那一路仍用 `flush_older`。对齐之后两者描述的是同一条指令，原则上可以合并；
+但合并会新引入"分支非对齐与访存非对齐同拍"这一格的行为改变，需要单独配微测再动。
+
+**时序 A/B**（`xc7a100tfgg676-1` @10ns，同机同脚本 `tools/a100t_impl2_m1.tcl`）：
+
+| | 基线 `_a100t_wpfix2` | **本轮 `_a100t_nopre`** |
+| --- | --- | --- |
+| WNS (ns) | −2.622 | **−1.940** |
+| TNS (ns) | −770.905 | **−389.548**（−49.5%） |
+| 失败端点 | 1360 | **626**（−54.0%） |
+| 最差族（起点→终点） | `post_decoder/issue_idx → alu/result`(17) + `mulu/d_cmt_q → alu/result`(3) | `dcache/data_reg_3 → alu/result_reg[*]`、`rob/head_p → post_decoder/r1_data_out_reg[*]` |
+
+⇒ **`bju` 判定锥驱动的那一族整体离开台面**，台面上只剩"前送点② / 载荷操作数"这条已知的腿。
+（−1.94 vs −2.62、626 vs 1360 都远在布局噪声带之外，无需补基线复现。）
+

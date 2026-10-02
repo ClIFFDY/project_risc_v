@@ -52,6 +52,11 @@ module cpu_top(
 //ROB（重排序缓冲）：分配口/完成口/退口。阶段 B-1 先只接线、退口暂不驱动寄存器堆（行为零变化）。
     wire [2:0]  rob_alloc_idx_w;
     wire [2:0]  issue_idx_w;
+//前送槽号：rob 按槽序扫出"本条指令的操作数该由哪个槽供值"，作为载荷经 post_decoder 寄到载荷拍
+    wire [2:0]  fwd_slot1_w, fwd_slot2_w;
+    wire        fwd_hit1_w,  fwd_hit2_w;
+    wire [2:0]  sel_slot1_w, sel_slot2_w;
+    wire        sel_v1_w,    sel_v2_w;
     wire        payload_go_w, payload_go_q_w;
 //写口级（wport）：三条结果口 → 两条写口 + 处置回报 + 落地广播
     wire [2:0]  rob_head_w;
@@ -73,10 +78,11 @@ module cpu_top(
     wire [2:0]  bju_idx_q_w, bju_idx_i_w;
     wire [31:0] r1_data_3, r2_data_3;
     wire [31:0] r1_data_mid_w, r2_data_mid_w;
-    wire        r1_reg_en_3, r2_reg_en_3;
     wire [6:0]  opc_3;
     wire [9:0]  fn10_3, fn10_ls_3;
     wire [31:0] off_mem_3;
+//载荷的两个源寄存器号：当拍同时喂 `forw`（点② 的 `r1_post`/`r2_post`）、`lsu`、`mulu`、`bju`
+//各自的匹配比较，是个纯广播网。
     wire [4:0]  rs1_3, rs2_3;
     wire [31:0] bju_exc_pc_w;
     wire        bju_older_w;
@@ -108,6 +114,11 @@ module cpu_top(
     wire br_fail, success, jalr_fail, jal_flag, jalr_flag, jalr_flag_q, br_pred_taken_q, exc_irq_ret, exc_ecall, exc_ebreak;
     wire exc_irq_ret_ok_w;
     wire flush_bju_exc, exc_jal_misalign_out, exc_illegal_out, exc_ldst_misalign_out, exc_ldst_st_out;
+//bju 判定输入级出来的异常（与 flush_bju_pre 同拍、描述同一条）：喂 controller 的异常仲裁
+    wire exc_ecall_i_w, exc_ebreak_i_w, exc_illegal_i_w, exc_irq_ret_i_w;
+    wire [31:0] exc_pc_i_w;
+//controller 输出的 ROB 标记索引（三路 mux 已搬进 controller）
+    wire [2:0]  exc_idx_w;
 //非对齐故障【自己】的 ROB 索引（跟故障脉冲同拍寄出来）
     wire [2:0] exc_ldst_idx_out;
     wire [31:0] exc_ldst_addr_out;
@@ -170,7 +181,7 @@ module cpu_top(
         .pre_jalr(pre_jalr),
         .btb_hit(btb_hit),
 //★ 重定向输入走"门控后"的版本：判定那拍先只会冲刷，真正跳要等 ROB 排空（见上面排队逻辑）。
-//  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[11]（flush_con_exc）承担
+//  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[11]（flush_con_exc，精确版）承担
 //  冲刷，不再单独进 pc；ROB 满改吃 flag_bus[7]（stall_rob_full），端口已删。
         .exc_irq(exc_irq),
 //★ 这两根都换成【交付资格】同源的版本（理由见 pc.v 排队那一块）：武装不能再用裸译码/裸载荷。
@@ -322,12 +333,17 @@ module cpu_top(
         .issue_rd(issue_rd_w),
         .idx_in(rob_alloc_idx_w),
         .issue_idx(issue_idx_w),
+//前送槽号：当拍由 rob 按槽序扫出，与 issue_idx 同一个 payload_go 沿锁存成载荷
+        .fwd_slot1_in(fwd_slot1_w), .fwd_slot2_in(fwd_slot2_w),
+        .fwd_hit1_in(fwd_hit1_w),   .fwd_hit2_in(fwd_hit2_w),
+        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
+        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
         .payload_go(payload_go_w),
         .payload_go_q(payload_go_q_w),
         .r1_data_out(r1_data_3),
         .r2_data_out(r2_data_3),
-        .r1_reg_en(r1_reg_en_3),
-        .r2_reg_en(r2_reg_en_3),
+        .r1_reg_en(),
+        .r2_reg_en(),
         .opc_out(opc_3),
         .fn10_out(fn10_3),
         .fn10_ls_out(fn10_ls_3),
@@ -370,6 +386,16 @@ module cpu_top(
         .br_pred_taken_q(br_pred_taken_q),
         .exc_jal_misalign_in(exc_jal_misalign_out),
         .jal_target_in(jal_target_e4),
+//异常源进判定输入寄存级（与操作数/控制位同沿）
+        .exc_ecall_in(exc_ecall),
+        .exc_ebreak_in(exc_ebreak),
+        .exc_illegal_in(exc_illegal_out),
+        .exc_irq_ret_in(exc_irq_ret),
+        .exc_ecall_i(exc_ecall_i_w),
+        .exc_ebreak_i(exc_ebreak_i_w),
+        .exc_illegal_i(exc_illegal_i_w),
+        .exc_irq_ret_i(exc_irq_ret_i_w),
+        .exc_pc_i(exc_pc_i_w),
         .flush_bju_pre(flush_bju_pre)
     );
     lsu u_lsu (
@@ -428,7 +454,9 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus),
-        .flush_bju_pre(flush_bju_pre),
+//不再吃组合的 flush_bju_pre：影子乘法改由"寄存版 bju 冲刷那一拍按号杀"兜住（见 mulu.v）
+        .flush_bju_exc(flush_bju_exc),
+        .bju_idx_q(bju_idx_q_w),
         .flush_idx(flush_idx_w),
         .rob_head(rob_head_w),
         .b0_we(wp_b0_we), .b0_rd(wp_b0_rd), .b0_idx(wp_b0_idx),
@@ -506,8 +534,10 @@ module cpu_top(
     forw u_forw (
         .clk(clk),
         .rst(rst),
-        .rob_head(rob_head_w),
-        .idx_mid(rob_alloc_idx_w), .idx_post(issue_idx_w),
+//★ 两个前送点共用同一套选择位：rob 的槽序扫描。点① 用**当拍组合版**（扫描口读的就是
+//  mid 那条的 rs1_2/rs2_2），点② 用随载荷锁存的版本 ⇒ 本模块不再需要 rob_head/idx_mid。
+        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
+        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
 //★ 三条源 = 三个执行单元的结果口（各自带 ROB 索引）。乱序写回下"谁更年轻"只由索引给，
 //  不能再按端口身份/语句顺序定优先级（旧的"口 B 更年轻"只对按序退成立）。
         .we_alu(we_4), .rd_alu(rd_4), .data_alu(result_4), .idx_alu(alu_idx_w),
@@ -518,16 +548,12 @@ module cpu_top(
 //  取【出口寄存器】那一组（不是 b0/b1 —— 那两个留在 wport 入口级，比出口的值早一拍）。
         .wp_we_a(wp_we_a), .wp_rd_a(wp_rd_a), .wp_data_a(wp_data_a), .wp_idx_a(wp_idx_a),
         .wp_we_b(wp_we_b), .wp_rd_b(wp_rd_b), .wp_data_b(wp_data_b), .wp_idx_b(wp_idx_b),
-        .r1_mid(rs1_2),
-        .r2_mid(rs2_2),
         .r1_data_mid_in(r1_data),
         .r2_data_mid_in(r2_data),
         .r1_data_mid(r1_data_mid_w),
         .r2_data_mid(r2_data_mid_w),
-        .r1_post(rs1_3),
-        .r2_post(rs2_3),
-        .r1_en(r1_reg_en_3),
-        .r2_en(r2_reg_en_3),
+        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
+        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
         .r1_data_post_in(r1_data_3),
         .r2_data_post_in(r2_data_3),
         .r1_data_final(r1_data_final),
@@ -573,14 +599,19 @@ module cpu_top(
         .mul_done(wp_fin_mul), .mul_idx(wp_fin_mul_idx),
         .ld_done(wp_fin_ld),   .ld_idx(wp_fin_ld_idx),
         .alloc_we(issue_we_w),
+        .alloc_rd(issue_rd_w),
+//前送槽扫描：消费者是下一拍进载荷那条（本拍还在 mid 级）⇒ 用它的 rs1_2/rs2_2；
+//本模块按程序序分配 ⇒ 扫描那一拍在册的槽全是比它老的，"比我老"不需要比较。
+        .scan_rs1(rs1_2), .scan_rs2(rs2_2),
+        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
+        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
 //分支/跳转误预测一律【部分冲刷】：边界号 = bju 随判定锁存的那条自己的项。
 //  边界项若已失效（分支已退，说明没有更老的活项）⇒ ROB 内部自动退化成全冲。
         .flush_con_rob(flush_con_rob_w), .flush_idx(flush_idx_w), .flush_all(1'b0),
         .flush_con_exc(flush_con_exc),
-//标记落哪一项：非对齐那条用故障自带的索引（它比载荷晚一拍）；其余三条与 issue_idx 同拍
+//标记落哪一项：三路 mux 已在 controller 内按各自相位选好（见 controller 的 exc_idx）
         .exc_en(exc_mark_w),
-        .exc_idx(flush_bju_exc ? bju_idx_q_w
-                 : (exc_ldst_misalign_out ? exc_ldst_idx_out : issue_idx_w)),
+        .exc_idx(exc_idx_w),
         .exc_cause(exc_cause), .exc_pc(exc_pc), .exc_tval(exc_tval),
         .trap_fire(flush_rob_trap_w),
         .trap_cause(rob_trap_cause_w), .trap_pc(rob_trap_pc_w), .trap_tval(rob_trap_tval_w),
@@ -661,13 +692,16 @@ module cpu_top(
         .flush_bju_exc(flush_bju_exc),
 //异常仲裁源（原 trap_unit 的例化并入 controller）
         .bju_pc_in(bju_exc_pc_w),
-        .flush_bju_pre(flush_bju_pre),
         .exc_irq_ret_ok(exc_irq_ret_ok_w),
         .bju_tgt_in(jp_target),
         .bju_older_in(bju_older_w),
-        .exc_ecall_in(exc_ecall),
-        .exc_ebreak_in(exc_ebreak),
-        .exc_illegal_in(exc_illegal_out),
+//★ 不再有 flush_bju_pre：ecall/ebreak/illegal/mret 改吃 bju 的【判定输入级】输出（同拍配对）
+        .exc_ecall_i(exc_ecall_i_w),
+        .exc_ebreak_i(exc_ebreak_i_w),
+        .exc_illegal_i(exc_illegal_i_w),
+        .exc_irq_ret_i(exc_irq_ret_i_w),
+        .exc_pc_i(exc_pc_i_w),
+        .bju_idx_i(bju_idx_i_w),
         .exc_ldst_misalign_in(exc_ldst_misalign_out),
         .exc_ldst_st_in(exc_ldst_st_out),
         .exc_ldst_addr_in(exc_ldst_addr_out),
@@ -678,6 +712,8 @@ module cpu_top(
         .bju_idx_in(bju_idx_q_w),
         .flush_con_exc(flush_con_exc),
         .exc_mark(exc_mark_w),
+//ROB 标记索引（三路 mux 已在 controller 内）
+        .exc_idx(exc_idx_w),
         .exc_cause(exc_cause),
         .exc_pc(exc_pc),
         .exc_tval(exc_tval),

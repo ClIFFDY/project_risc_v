@@ -79,9 +79,10 @@ module pre_decoder(
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】；
 //或运算在本模块内做（源在 controller 里已逐条分开，见其 flag_bus 拼装）。
-    reg exec, flush_w, stall_w;
+    reg exec, flush_w, stall_w, flush_con_exc;
     always @(*) begin
-        flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
+        flush_con_exc     = flag_bus[11];
+        flush_w = flush_con_exc | flag_bus[10] | flag_bus[9];
         stall_w = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
                  | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
         exec    = flag_bus[8];

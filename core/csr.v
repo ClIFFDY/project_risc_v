@@ -26,7 +26,7 @@ module csr(
 //★ 资格版（controller 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
 //  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
     input exc_irq_ret_ok,
-    input [11:0] flag_bus,
+    input [13:0] flag_bus,
     input mem_inflight,
     input [11:0] csr_addr,
 //读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
@@ -54,7 +54,7 @@ module csr(
     always @(*) begin
         stall    = flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
                  | flag_bus[2] | flag_bus[1] | flag_bus[0];
-        flush_w  = flag_bus[11] | flag_bus[10] | flag_bus[9];
+        flush_w  = flush_con_exc | flag_bus[10] | flag_bus[9];
         exc_irq_gate = (ird_tmr != 2'd0);
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
         retire   = !(flush_w | stall | mem_inflight);

@@ -57,9 +57,9 @@ module pc(
     reg exec, flush_w, stall_w, flush_jump_w;
     reg exc_w;
     always @(*) begin
-        flush_jump_w = flag_bus[9] & ~flag_bus[11];
         exc_w        = flag_bus[11];
-        flush_w      = flag_bus[11] | flag_bus[10] | flag_bus[9];
+        flush_jump_w = flag_bus[9] & ~exc_w;
+        flush_w      = exc_w | flag_bus[10] | flag_bus[9];
         stall_w      = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
                       | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
         exec         = flag_bus[8];

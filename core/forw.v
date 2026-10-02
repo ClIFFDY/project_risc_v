@@ -10,34 +10,42 @@
 // Target Devices:
 // Tool Versions:
 // Description:
-//   前送级：**两个前送点，源不同：点① 5 源 / 点② 3 源**。
+//   前送级：**两个前送点，选法同形** —— 都是"槽号的一位比较 + 一级 mux"，裁决都不在本级。
 //   本文件内 always 块按【前送点（= 消费者所在流水级）】排列：点①（mid 级，寄存器号 _2）→ 点②（post 级，_3）。
 //
-//   点①：寄存器堆数据出来 → post_decoder 之间（消费者是 mem_buf 那条，寄存器号用 _2）。
+//   点①：寄存器堆数据出来 → post_decoder 之间（消费者是 mid 级那条，用 rs1_2/rs2_2）。
+//        选择位 = rob 的槽扫描**当拍组合输出**（`fwd_slot*/fwd_hit*`）——扫描口读的就是
+//        mid 那条的 `rs1_2/rs2_2`，与点② 是同一对线，只是点① 用当拍版、点② 用锁存版。
 //        它保证"进载荷之前"的值是最新的；I 型的 r2 随后会被 post_decoder 用立即数覆盖，
 //        所以这一点上即使按 rs2 字段（其实是立即数）误命中，也影响不到最终操作数。
-//   点②：post_decoder → 三个执行单元之间（消费者是 decoder 载荷那条，寄存器号用 _3）。
-//        它盖住"载荷寄存器采样之后、单元取用之前"这一拍里才就绪的那一笔。
+//   点②：post_decoder → 三个执行单元之间（消费者是 decoder 载荷那条）。
+//        ★ 它**不在这一级做裁决**：选择位 `sel_slot1/sel_slot2/sel_v1/sel_v2` 是**载荷**，
+//          由 `rob` 在**上一拍**（本条指令还在 mid 级、`rs1_2/rs2_2` 有效时）用**槽序扫描**算好，
+//          与 `issue_idx` 同一个 `payload_go` 沿锁存寄下来。本级只剩
+//          "源口的 `idx_*` == 目标槽号"的**一位比较 + 一级 mux**，
+//          `rs==rd` 匹配 / 年龄相减 / 取最年轻的优先裁决**全部不在这里**。
+//        ★ 为什么能这样：ROB 按程序序、一拍一条分配（`alloc_en = payload_go`，与进载荷同沿）
+//          ⇒ 扫描那一拍在册的槽**全是比消费者老的**，"比我老"不需要任何比较；"最年轻"= 槽序里
+//          离 tail 最近那个。选中的槽必然满足 `rd == rs`，所以 `lsu`/`mulu` **原样的** rd 键
+//          hazard 同一条件必然命中，值就绪由它们兜（这两处检查点按设计约定一字不动）。
 //
 //   | 源 | 产生者 | 有效窗口 | 点① | 点② |
 //   | --- | --- | --- | --- | --- |
-//   | we_alu / rd_alu / data_alu / idx_alu | alu.v（算完的下一拍，紧邻消费者取用那一拍） | 一拍 | ✓ | ✓ |
-//   | we_mul / rd_mul / data_mul / idx_mul | mulu（m_pv / d_pend / hold） | 保持到 taken_mul | ✓ | ✓ |
-//   | we_ld / rd_ld / data_ld / idx_ld | lsu（数据回来拍 + ld_hold） | 两拍 | ✓ | ✓ |
+//   | we_alu / rd_alu / data_alu / idx_alu | alu.v（算完的下一拍，紧邻消费者取用那一拍） | 一拍 | ✓ | ✓（按 idx 选） |
+//   | we_mul / rd_mul / data_mul / idx_mul | mulu（m_pv / d_pend / hold） | 保持到 taken_mul | ✓ | ✓（按 idx 选） |
+//   | we_ld / rd_ld / data_ld / idx_ld | lsu（数据回来拍 + ld_hold） | 两拍 | ✓ | ✓（按 idx 选） |
 //   | wp_we_a·rd_a·data_a·idx_a（口 A） | wport 出口寄存（与阵列写同拍） | 一拍 | ✓ | — |
 //   | wp_we_b·rd_b·data_b·idx_b（口 B） | 同上 | 一拍 | ✓ | — |
 //
 //   ★ 点① 为什么多两条：写口整体打一拍之后，值在出口寄存器里多待一拍 —— 这一拍它既不在
 //     寄存器堆阵列里（阵列到下一沿才写），也不在单元结果口上（下一拍已换人）。regfile 的读
 //     本身又是【寄存读】⇒ 这个窗口只有点① 补得住。
-//   ★ 点② 为什么不加：它的下游是消费者自己的寄生逻辑（lsu 的地址加法器/移位器、mulu 入级 CE），
-//     源一多那条锥就更深。
-//
-//   优先级 = **按年龄取最年轻**（年龄 = {1'b0,(idx - rob_head)}，先截 4 位再比）：
-//     乱序写回之后源的先后【不由源的身份决定】，同 rd 多命中时必须挑更年轻的那笔。
-//     用语句顺序定优先级是错的（旧的"口 B 更年轻"口径只对按序退成立）。
-//   写口那两条可走固定序：值先进写口、才可能还挂在结果口上 ⇒ 写口寄存器里的恒比结果口上的老，
-//   所以先比 B、再比 A，最后由三条结果口按年龄覆盖。
+//   ★ 点① 一度不能改成槽序，理由是"消费者是 mid 级那条，上一拍还没被分配、拿不到槽号"。
+//     **那个理由不成立**：前送要的是【生产者】的槽号，而扫描给的正是它 —— 扫描口
+//     `scan_rs1/scan_rs2` 读的就是 `rs1_2/rs2_2`（点① 自己的消费者号），且扫描是组合输出、
+//     当拍就能用。消费者自己的槽号从来不是前送需要的东西。
+//   ★ 两个前送点的选择位来源同一处（rob 的槽序扫描）⇒ "rd 匹配 / 年龄相减 / 取最年轻"
+//     这一整棵裁决树在两个点上都不存在了；`rob_head` 也从本模块整体退出。
 //
 // Dependencies:
 //
@@ -46,6 +54,7 @@
 //   Revision 0.04 - 判据从 function 改回【块内直接比较】（iverilog 敏感表）
 //   Revision 0.05 - 乱序写回：源改接三个结果口，优先级改按 ROB 索引年龄取最年轻
 //   Revision 0.06 - 点① 扩成 5 源（加 wport 出口寄存的两条写口），点② 保持 3 源
+//   Revision 0.07 - 点② 改"槽序"：裁决搬到 rob 的扫描（上一拍），本级只剩一位比较 + 一级 mux
 //
 // Additional Comments:
 //
@@ -54,10 +63,11 @@
 
 module forw(
     input clk, rst,
-//年龄基准 + 两个消费者各自的 ROB 索引（"只取比我更老的"要用）
-    input [2:0]  rob_head,
-    input [2:0]  idx_mid,
-    input [2:0]  idx_post,
+//点① 用的槽扫描结果（rob 的组合输出）：扫的就是【点① 自己的消费者】——mid 那条的 rs1_2/rs2_2，
+//与点② 那条是同一对线，只是相位早一拍（点① 当拍用、点② 用锁存版）。
+//⇒ 点① 不再需要"年龄基准 rob_head + idx_mid + 取最年轻"这一整套。
+    input [2:0]  fwd_slot1, fwd_slot2,
+    input        fwd_hit1,  fwd_hit2,
 //前送源①：alu 结果口（寄存一拍，一拍宽）
     input        we_alu,
     input [4:0]  rd_alu,
@@ -85,13 +95,14 @@ module forw(
     input [4:0]  wp_rd_b,
     input [31:0] wp_data_b,
     input [2:0]  wp_idx_b,
-//点①：消费者 = mem_buf 那条
-    input [4:0]  r1_mid, r2_mid,
+//点①：消费者 = mid 级那条
     input [31:0] r1_data_mid_in, r2_data_mid_in,
     output reg [31:0] r1_data_mid, r2_data_mid,
-//点②：消费者 = decoder 载荷那条（r1_en/r2_en = 该操作数是不是寄存器操作数）
-    input [4:0]  r1_post, r2_post,
-    input        r1_en, r2_en,
+//点②：消费者 = decoder 载荷那条。★ 它的"该选谁"已经由 `rob` 的槽扫描在**上一拍**算完、
+//  随载荷一起寄下来了（sel_slot/sel_v）⇒ 本拍只剩"源口的 ROB 索引 == 目标槽号"的**一位比较 + 一级 mux**；
+//  `rs==rd` 匹配、年龄相减、取最年轻的优先裁决**全部不在这里**（也不再需要 r1_post/r2_post/r1_en/r2_en）。
+    input [2:0]  sel_slot1, sel_slot2,
+    input        sel_v1,    sel_v2,
     input [31:0] r1_data_post_in, r2_data_post_in,
     (* max_fanout = 32 *) output reg [31:0] r1_data_final, r2_data_final
     );
@@ -102,141 +113,69 @@ module forw(
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
 
-//三条源的年龄（head 相对值，先截 4 位再比）+ 两个消费者自己的年龄
-    reg [3:0] age_alu, age_mul, age_ld, age_mid, age_post;
-//写口寄存器那两条源的年龄（只服务点①）
-    reg [3:0] age_wpa, age_wpb;
-//两个前送点各自的"已命中/当前最优年龄"（不能共用：两个块都会写，等于竞争）
-    reg        h1m, h2m;
-    reg [3:0]  g1m, g2m;
-    reg        h1f, h2f;
-    reg [3:0]  g1f, g2f;
-
-//★ 必须算"消费者自己"的年龄：结果口是前送源之后，【消费者自己那一笔也在源上】——
-//  比如 `addi x28,x28,14` 紧跟在一条写 x28 的 load 后面时，它自己的结果口就在 x28 上，
-//  不加这条限制，"取最年轻"会把【它自己的结果】喂回给它当操作数（实测 exc_irq_lsu：
-//  算出 0+14，写口又把 load 那笔正确值压掉）。
-    always @(*) begin
-        age_alu  = {1'b0, (idx_alu  - rob_head)};
-        age_mul  = {1'b0, (idx_mul  - rob_head)};
-        age_ld   = {1'b0, (idx_ld   - rob_head)};
-        age_mid  = {1'b0, (idx_mid  - rob_head)};
-        age_post = {1'b0, (idx_post - rob_head)};
-        age_wpa  = {1'b0, (wp_idx_a - rob_head)};
-        age_wpb  = {1'b0, (wp_idx_b - rob_head)};
-    end
-
-//点①：源五条，同 rd 命中时按年龄取最年轻的
-//★ 判据必须【直接写在本块里】，不许再塞进 function：
-//  iverilog 的 `always @(*)` 只把直接出现在表达式里的信号收进隐含敏感表，函数体里读的
-//  模块级信号不收 ⇒ 那些信号单独变化时本块不重新求值，输出停在旧值（单模块微测实测过）。
-//★ x0 保护：x0 恒为 0，不许被任何源覆盖（`lw x0`/`mul x0` 会让 rd=0 的结果举在结果口上）。
-//★ 写口那两条【先比】：值先进写口、才可能还挂在结果口上 ⇒ 写口寄存器里的恒比结果口上的老，
-//  所以"取最年轻"由下面的三条结果口按年龄覆盖 —— 语句顺序 + 年龄门一起兜住。
+//点①：与点②【同形】—— "该选谁"由 rob 的槽扫描给出（它扫的就是 mid 这条的 rs1_2/rs2_2，
+//  当拍组合有效）⇒ 这里不再有"rd 匹配 + 年龄相减 + 取最年轻"的裁决，只剩
+//  "源口的 ROB 索引 == 扫描出的槽号"的**一位比较 + 一级 mux**。
+//★ 槽号唯一（8 个槽互不相同）⇒ 至多一个口命中；下面的优先序只是与点② 同序的防御性 tie-break。
+//★ x0 保护：扫描的命中项本身带 `ent_rd != 0` 与 `scan_rs != 0`（见 rob.v 的 scan_m）⇒
+//  读 x0 时 fwd_hit=0、落回寄存器堆读值（x0 恒 0），与旧式的 `r1_mid != 0` 门等价。
+//★ 扫到的槽这一拍若没有任何口命中，就落回寄存器堆读值 —— 那一拍生产者在执行单元里还没出结果，
+//  消费者必然被 lsu/mulu 的 hazard 顶住（与点② 那条注释同一个理由）。
+//★ 判据必须【直接写在本块里】，不许塞进 function：iverilog 的 `always @(*)` 只把直接出现在
+//  表达式里的信号收进隐含敏感表，函数体里读的模块级信号不收 ⇒ 本块不会重新求值（踩过）。
     always @(*) begin
         r1_data_mid = r1_data_mid_in;
-        r2_data_mid = r2_data_mid_in;
-        if (r1_mid != 5'd0) begin
-            h1m = 1'b0;
-            g1m = 4'd0;
-            if (wp_we_b && (r1_mid == wp_rd_b) && (age_wpb < age_mid)) begin
+        if (fwd_hit1) begin
+            if (wp_we_b && (wp_idx_b == fwd_slot1))
                 r1_data_mid = wp_data_b;
-                g1m = age_wpb;
-                h1m = 1'b1;
-            end
-            if (wp_we_a && (r1_mid == wp_rd_a) && (age_wpa < age_mid) && (!h1m || (age_wpa > g1m))) begin
+            else if (wp_we_a && (wp_idx_a == fwd_slot1))
                 r1_data_mid = wp_data_a;
-                g1m = age_wpa;
-                h1m = 1'b1;
-            end
-            if (we_alu && (r1_mid == rd_alu) && (age_alu < age_mid) && (!h1m || (age_alu > g1m))) begin
+            else if (we_alu && (idx_alu == fwd_slot1))
                 r1_data_mid = data_alu;
-                g1m = age_alu;
-                h1m = 1'b1;
-            end
-            if (we_mul && (r1_mid == rd_mul) && (age_mul < age_mid) && (!h1m || (age_mul > g1m))) begin
+            else if (we_mul && (idx_mul == fwd_slot1))
                 r1_data_mid = data_mul;
-                g1m = age_mul;
-                h1m = 1'b1;
-            end
-            if (we_ld && (r1_mid == rd_ld) && (age_ld < age_mid) && (!h1m || (age_ld > g1m))) begin
+            else if (we_ld && (idx_ld == fwd_slot1))
                 r1_data_mid = data_ld;
-                g1m = age_ld;
-                h1m = 1'b1;
-            end
         end
-        if (r2_mid != 5'd0) begin
-            h2m = 1'b0;
-            g2m = 4'd0;
-            if (wp_we_b && (r2_mid == wp_rd_b) && (age_wpb < age_mid)) begin
+        r2_data_mid = r2_data_mid_in;
+        if (fwd_hit2) begin
+            if (wp_we_b && (wp_idx_b == fwd_slot2))
                 r2_data_mid = wp_data_b;
-                g2m = age_wpb;
-                h2m = 1'b1;
-            end
-            if (wp_we_a && (r2_mid == wp_rd_a) && (age_wpa < age_mid) && (!h2m || (age_wpa > g2m))) begin
+            else if (wp_we_a && (wp_idx_a == fwd_slot2))
                 r2_data_mid = wp_data_a;
-                g2m = age_wpa;
-                h2m = 1'b1;
-            end
-            if (we_alu && (r2_mid == rd_alu) && (age_alu < age_mid) && (!h2m || (age_alu > g2m))) begin
+            else if (we_alu && (idx_alu == fwd_slot2))
                 r2_data_mid = data_alu;
-                g2m = age_alu;
-                h2m = 1'b1;
-            end
-            if (we_mul && (r2_mid == rd_mul) && (age_mul < age_mid) && (!h2m || (age_mul > g2m))) begin
+            else if (we_mul && (idx_mul == fwd_slot2))
                 r2_data_mid = data_mul;
-                g2m = age_mul;
-                h2m = 1'b1;
-            end
-            if (we_ld && (r2_mid == rd_ld) && (age_ld < age_mid) && (!h2m || (age_ld > g2m))) begin
+            else if (we_ld && (idx_ld == fwd_slot2))
                 r2_data_mid = data_ld;
-                g2m = age_ld;
-                h2m = 1'b1;
-            end
         end
     end
 
-//点②：同上，消费者是 decoder 载荷那条（只有真寄存器操作数才前送）
+//点②：消费者是 decoder 载荷那条。选择位是【载荷】（上一拍由 rob 的槽扫描算好）⇒
+//本拍只剩"源口的 ROB 索引 == 目标槽号"的一位比较 + 一级 mux（槽号唯一 ⇒ 至多一个口命中）。
+//★ 顺序仍按 alu→mul→ld 书写：槽号唯一时不会并列，这是防御性的 tie-break。
+//★ 选中的槽若这一拍没有任何口命中，就落回载荷值 —— 那一拍必然是单元侧 stall 抬着
+//  （选中的槽必然满足 rd == rs，`lsu`/`mulu` 的旧 hazard 同一条件必然命中），而各单元
+//  在 stall 拍不锁结果 ⇒ 落回值不会被消费。
     always @(*) begin
         r1_data_final = r1_data_post_in;
-        r2_data_final = r2_data_post_in;
-        if (r1_en && (r1_post != 5'd0)) begin
-            h1f = 1'b0;
-            g1f = 4'd0;
-            if (we_alu && (r1_post == rd_alu) && (age_alu < age_post)) begin
+        if (sel_v1) begin
+            if (we_alu && (idx_alu == sel_slot1))
                 r1_data_final = data_alu;
-                g1f = age_alu;
-                h1f = 1'b1;
-            end
-            if (we_mul && (r1_post == rd_mul) && (age_mul < age_post) && (!h1f || (age_mul > g1f))) begin
+            else if (we_mul && (idx_mul == sel_slot1))
                 r1_data_final = data_mul;
-                g1f = age_mul;
-                h1f = 1'b1;
-            end
-            if (we_ld && (r1_post == rd_ld) && (age_ld < age_post) && (!h1f || (age_ld > g1f))) begin
+            else if (we_ld && (idx_ld == sel_slot1))
                 r1_data_final = data_ld;
-                g1f = age_ld;
-                h1f = 1'b1;
-            end
         end
-        if (r2_en && (r2_post != 5'd0)) begin
-            h2f = 1'b0;
-            g2f = 4'd0;
-            if (we_alu && (r2_post == rd_alu) && (age_alu < age_post)) begin
+        r2_data_final = r2_data_post_in;
+        if (sel_v2) begin
+            if (we_alu && (idx_alu == sel_slot2))
                 r2_data_final = data_alu;
-                g2f = age_alu;
-                h2f = 1'b1;
-            end
-            if (we_mul && (r2_post == rd_mul) && (age_mul < age_post) && (!h2f || (age_mul > g2f))) begin
+            else if (we_mul && (idx_mul == sel_slot2))
                 r2_data_final = data_mul;
-                g2f = age_mul;
-                h2f = 1'b1;
-            end
-            if (we_ld && (r2_post == rd_ld) && (age_ld < age_post) && (!h2f || (age_ld > g2f))) begin
+            else if (we_ld && (idx_ld == sel_slot2))
                 r2_data_final = data_ld;
-                g2f = age_ld;
-                h2f = 1'b1;
-            end
         end
     end
 endmodule
