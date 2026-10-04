@@ -15,12 +15,15 @@
 //
 //   分配：一条指令进 E4 就占一项（**包括不写 rd 的和 store** —— "谁比谁老"必须覆盖每一条指令，
 //         否则陷阱不知道自己在程序序里的位置）。alloc_idx 是组合输出的环位，作为载荷沿流水线传下去。
-//   完成：写口级（wport）把一笔结果处置完（落地 / 被杀 / 不写）就按索引回报一次，置 wr；
-//         非 valid 的槽一律忽略，防止一条已退项的迟到回报污染槽里的新住户。
-//   退：  head（和 head+1）valid 且 wr 才退，2 宽、严格按序。
-//   ★ 乱序写回之后，本模块【不再驱动寄存器堆】（写口在 wport：完成即写、新指令覆盖在途老指令），
-//     也不再存数据（ent_dt 整块删掉 —— 值在 alu/mulu/lsu 各自的结果口上，写口不经过这里）。
-//     `wr` = "这一笔的写已落地（或它本来就不写 / 被更年轻的写杀掉了）" ⇒ 队头才能退。
+//   完成：执行单元把一笔结果（值 + 索引 + 世代）报到完成口，本模块按索引把 `wr` 与 `data`
+//         【同条件、同一沿】写进那一项。非 valid 的槽、或世代对不上的（槽被冲刷/复用后的
+//         迟到上报）一律忽略。
+//   退：  head（和 head+1）valid 且 wr 才退，2 宽、严格按序。**退口就是寄存器堆的两条写口**
+//         （口 A = head、口 B = head+1，见 cmt_*）⇒ 架构态永远是精确的、同 rd 的先后由结构保证。
+//   ★ 每槽一个世代位：分配时翻转，随载荷走到执行单元，完成上报时带回来校验。它是"迟到上报
+//     打进新住户"的唯一根治手段 —— 冲刷会把槽当场还回去，而 `ent_v` 挡不住"新住户也 valid"。
+//   前送：扫描给出的"比我老里最年轻"那一槽，除槽号外还输出【值】（fwd_data1/2）与"已算完"位
+//         （fwd_done1/2）—— 结果口只宽一两拍、阵列要等提交才更新，中间那段窗口只有这里兜得住。
 //   前送：只在【比消费者更老】的项里找，取其中【最年轻】的 done 项 —— 需要"更老"这个条件，
 //         因为比消费者年轻的写者绝不能前送给他。
 //   冲刷：把比 flush_idx 更年轻的项作废，tail 回绕到它后面一格；flush_idx 不在窗口内就整条忽略。
@@ -66,15 +69,34 @@ module rob(
 //的槽**一格不多一格不少**全是比它老的指令 ⇒ "比我老"不需要任何比较，`ent_v[s]` 即等价；
 //"取最年轻的匹配" = 窗口里年龄最大的那个（年龄一律 4 位截断，见下面 red line）。
     input [4:0]  scan_rs1, scan_rs2,
+//扫描的推进条件（= pre_decoder 本级的锁存条件）：为 1 才把这一拍的扫描结果打拍换新
+    input        scan_go,
     output reg [2:0] fwd_slot1, fwd_slot2,
     output reg       fwd_hit1,  fwd_hit2,
+//前送值读口①【正常读】：索引就是本模块当拍扫描出的 fwd_slot1/2（不外引、不经任何选择）
+//  ⇒ 这条路上没有任何 stall/flush 组合量，bju 的判定锥进不来。
+    output reg [31:0] fwd_data1, fwd_data2,
+    output reg        fwd_done1, fwd_done2,
+//前送值读口②【停顿重读】：索引是消费者读锁存时锁下的槽（s1_q/s2_q，由 regfile 给）。
+//  为什么要两组：消费者被停顿拖住时要用【锁存的】槽重读，而正常读用的是扫描槽 ——
+//  若把两者在一根地址上 mux，stall_w（来自 flag_bus、即 bju 判定）就会被串进操作数数据路。
+    input [2:0]  st_slot1, st_slot2,
+    output reg [31:0] st_data1, st_data2,
+    output reg        st_done1, st_done2,
 //完成口（写口级处置完一笔就回报：落地 / 被杀 / 不写；只认 valid 的槽）
+//  data 与 gen 与 done/idx 同拍同源（完成口把"值"和"这一笔的世代"一起带回来）
     input        alu_done,
     input [2:0]  alu_idx,
+    input [31:0] alu_data,
+    input        alu_gen,
     input        mul_done,
     input [2:0]  mul_idx,
+    input [31:0] mul_data,
+    input        mul_gen,
     input        ld_done,
     input [2:0]  ld_idx,
+    input [31:0] ld_data,
+    input        ld_gen,
 //冲刷口（wb 拍发：分支/跳转误预测；只作废比 flush_idx 更年轻的项。源名 flush_con_rob）
     input        flush_con_rob,
     input        flush_all,
@@ -90,6 +112,16 @@ module rob(
     input [31:0] exc_tval,
 //状态 / 退口（组合，当拍退当拍写寄存器堆）/ 前送结果
     output reg [2:0]  alloc_idx,
+//本条分配拿到的世代位（= 槽在分配那一沿翻转【之后】的值），随载荷走到执行单元，
+//完成上报时带回来与 ent_gen[槽] 比对做身份校验（见文件头"完成："那节）
+    output reg        alloc_gen,
+//提交口：寄存器堆的两条写口（口 A = head 更老、口 B = head+1 更年轻）
+    output reg        cmt_we0,
+    output reg [4:0]  cmt_rd0,
+    output reg [31:0] cmt_data0,
+    output reg        cmt_we1,
+    output reg [4:0]  cmt_rd1,
+    output reg [31:0] cmt_data1,
 //队头索引：写口级与各单元算年龄的基准（年龄 = {1'b0,(idx - head_p)}）
 //年龄基准：全核 4 个模块（`forw`/`wport`/`lsu`/`mulu`）共 21 个负载点都在拿它做减法基准，
 //是个纯广播网。
@@ -117,9 +149,35 @@ reg [31:0] ent_tv [0:DEPTH-1];
 //只在复位与分配两处写，退项/冲刷都【不必】清：扫描判据里 `ent_v[s]` 与它相与，空槽天然被挡。
 //（与 ent_cs/ent_pc/ent_tv 同款：那三个也只在复位/分配/异常标记时写。）
 reg [4:0]  ent_rd [0:DEPTH-1];
+//每槽的结果数据：完成口那一沿与 ent_wr 同条件写入，提交时由提交口读出。
+//与 ent_cs/ent_pc/ent_tv/ent_rd 同款：只在复位/完成口写，退项/冲刷/陷阱【不清】（ent_v 门控挡空槽）。
+reg [31:0] ent_data [0:DEPTH-1];
+//每槽的世代位：每次分配翻转一次。完成上报必须与槽内存的世代一致才被接受 ——
+//否则被冲刷/已释放的槽在新住户身上的【迟到上报】会把 ent_wr/ent_data 打错人（静默错值）。
+reg        ent_gen  [0:DEPTH-1];
 
 //扫描的工作量（纯组合，逐槽一份）
 reg [3:0]  scan_ag [0:DEPTH-1];
+//"在册且写真实 rd"：只依赖触发器、与 rs 无关 ⇒ 与比较那一段平行算好。
+//有它，候选判据才能压成一次 6 输入比较（见扫描块）。
+reg        scan_wv [0:DEPTH-1];
+//候选掩码（含"同拍正在分配那一项"）与它对应的世代
+reg        scan_c1 [0:DEPTH-1];
+reg        scan_c2 [0:DEPTH-1];
+reg        scan_g1 [0:DEPTH-1];
+reg        scan_g2 [0:DEPTH-1];
+//打拍后的扫描结果（读拍用）
+reg        scan_y1q [0:DEPTH-1];
+reg        scan_y2q [0:DEPTH-1];
+reg        scan_g1q [0:DEPTH-1];
+reg        scan_g2q [0:DEPTH-1];
+reg        hit_c1, hit_c2;
+reg [2:0]  slot_c1, slot_c2;
+//一位有效热码 + "这一项已算完"：读口把【热码 & 数据】直接 OR 起来，不走"先算槽号再 mux"
+reg        scan_w1 [0:DEPTH-1];
+reg        scan_w2 [0:DEPTH-1];
+reg        scan_v1 [0:DEPTH-1];
+reg        scan_v2 [0:DEPTH-1];
 reg        scan_m1 [0:DEPTH-1];
 reg        scan_m2 [0:DEPTH-1];
 reg        scan_y1 [0:DEPTH-1];
@@ -133,6 +191,10 @@ reg [2:0]  head_nx;
 reg [2:0]  tail_nx;
 reg [3:0]  cnt_nx;
 
+//提交口的组合版（打拍前）：head_ok / ent_rd[head_p] / ent_data[head_p]
+reg        cmt_we0_e, cmt_we1_e;
+reg [4:0]  cmt_rd0_e, cmt_rd1_e;
+reg [31:0] cmt_data0_e, cmt_data1_e;
 reg [2:0]  head1_p;
 reg        flush_any;
 reg        head_ok;
@@ -195,9 +257,19 @@ always @(posedge clk) rst_q <= rst;
         flush_keep = flush_age + 4'd1;
         flush_ok   = flush_con_rob && (flush_age < cnt) && ent_v[flush_idx];
         alloc_idx  = tail_p;
+        alloc_gen  = ~ent_gen[tail_p];
         occupancy  = cnt;
         empty      = (cnt == 4'd0);
         full       = (cnt == DEPTH);
+//提交口：只有队头两项可退，且【写 rd 的项】才写寄存器堆。
+//★ `ent_rd != 0` 与 head_ok 里的 `!ent_ex` 是两道独立的门，缺一不可：
+//  post_decoder 的 issue_we 把 SYSTEM 保守算作会写 ⇒ 故障项的 ent_rd 可能非 0。
+        cmt_we0_e   = head_ok && (ent_rd[head_p] != 5'd0);
+        cmt_rd0_e   = ent_rd[head_p];
+        cmt_data0_e = ent_data[head_p];
+        cmt_we1_e   = head1_ok && (ent_rd[head1_p] != 5'd0);
+        cmt_rd1_e   = ent_rd[head1_p];
+        cmt_data1_e = ent_data[head1_p];
 
     end
 
@@ -246,40 +318,168 @@ always @(posedge clk) rst_q <= rst;
     end
 
 //前送槽扫描（纯组合）：给两个消费者操作数各找一条"比它老、rd 匹配、且最年轻"的在册项。
-//★ 年龄一律用 4 位截断 `{1'b0,(idx - head_p)}`，**禁止 3 位裸比大小** —— 3 位相减的回绕在
-//  与 4 位量比较时会被按 4 位上下文求值（算出 9 而不是 1），判据整体翻错（见文件头 / flush_age 那处）。
-//★ 槽号唯一 ⇒ "最年轻"不会有并列，同年龄优先序在这里无意义。
-//★ 窗口：所有 `ent_v=1` 的槽都在 `[head_p, tail_p-1]` 里，窗口外的槽 `ent_v=0` ⇒ 自动被 `m` 挡掉。
+//★ 年龄一律用 4 位截断 `{1'b0,(idx - head_p)}`，禁止 3 位裸比大小（回绕会判错）。
+//★ 槽号唯一 ⇒ "最年轻"不会有并列。
+//★★ 输入是【上一级】的 rs（pre_decoder 的 r1_pre/r2_pre：本拍正在进 pre_decoder 那条），
+//   结果打拍、下一拍用。为什么要提前：否则"8×8 比较 + 归约"这一段会串进读拍
+//   （`rs → 扫描 → 取数 → 旁路 → r1_data`），那正是读锥最深的一段。
+//★ 「同拍正在分配的那一项」必须一起进候选：扫描读的是【上一拍】的 ent_v，而紧邻那条指令
+//   正好在这一拍 alloc ⇒ 漏掉它 ⇒ hit=0 ⇒ 旁路取到阵列旧值。
+//★ 进候选要【三样都补】：scan_c（参与"更年轻的摁掉更老的"的掩码）、scan_y（胜出者，
+//   被归约成 hit 的那一份）、scan_g（世代）。第一版只补了 c 和 g —— scan_y 是循环开头由
+//   scan_c 定的，后来改 c 不会回写它 ⇒ 新分配那条永远进不了命中集（实测 add a1,a0,x0 假 0）。
+//★ 世代必须取【翻转后】的 alloc_gen：扫描在 alloc 那一拍，下一拍 ent_gen[tail_p] 就是它。
     always @(*) begin
         for (si = 0; si < DEPTH; si = si + 1) begin
             scan_ag[si] = {1'b0, (si[2:0] - head_p)};
-            scan_m1[si] = ent_v[si] & (scan_rs1 != 5'd0) & (ent_rd[si] == scan_rs1);
-            scan_m2[si] = ent_v[si] & (scan_rs2 != 5'd0) & (ent_rd[si] == scan_rs2);
-            scan_y1[si] = scan_m1[si];
-            scan_y2[si] = scan_m2[si];
+//候选判据压成一次 6 输入比较：`scan_wv` 只依赖触发器（与 rs 平行算好），剩下 5 个 XNOR + 这一次
+//与 = 2 级。写成 `ent_v & (rs!=0) & (ent_rd==rs)` 是 7 个输入 ⇒ 3 级（多一级）。
+//★ 别再想"给 rs=0 预置一个永不匹配的比较值"—— ent_rd 的残留值覆盖 0..31，不存在这样的值。
+//  `scan_wv` 自带 `|ent_rd`，而写 x0 的项 ent_rd=0 ⇒ rs=0 时天然不会命中。
+            scan_wv[si] = ent_v[si] & |ent_rd[si];
+            scan_c1[si] = scan_wv[si] & (ent_rd[si] == scan_rs1);
+            scan_c2[si] = scan_wv[si] & (ent_rd[si] == scan_rs2);
+            scan_g1[si] = ent_gen[si];
+            scan_g2[si] = ent_gen[si];
+            scan_y1[si] = scan_c1[si];
+            scan_y2[si] = scan_c2[si];
         end
-//"有人比你更年轻"就把你摁掉；两两比较只依赖 head，两个操作数共用同一批（不重复算）
+//同拍正在分配那一项：世代取【翻转后】的值（下一拍 ent_gen[tail_p] 就是它）
+        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1)) begin
+            scan_c1[tail_p] = 1'b1;
+            scan_y1[tail_p] = 1'b1;
+            scan_g1[tail_p] = alloc_gen;
+        end
+        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs2)) begin
+            scan_c2[tail_p] = 1'b1;
+            scan_y2[tail_p] = 1'b1;
+            scan_g2[tail_p] = alloc_gen;
+        end
+//"有人比你更年轻"就把你摁掉（用含分配项的候选掩码，保证热码唯一）
         for (si = 0; si < DEPTH; si = si + 1) begin
             for (sj = 0; sj < DEPTH; sj = sj + 1) begin
-                if (scan_m1[sj] && (scan_ag[sj] > scan_ag[si]))
+                if (scan_c1[sj] && (scan_ag[sj] > scan_ag[si]))
                     scan_y1[si] = 1'b0;
-                if (scan_m2[sj] && (scan_ag[sj] > scan_ag[si]))
+                if (scan_c2[sj] && (scan_ag[sj] > scan_ag[si]))
                     scan_y2[si] = 1'b0;
             end
         end
-        fwd_hit1  = 1'b0;
-        fwd_hit2  = 1'b0;
-        fwd_slot1 = 3'd0;
-        fwd_slot2 = 3'd0;
+        hit_c1  = 1'b0;
+        hit_c2  = 1'b0;
+        slot_c1 = 3'd0;
+        slot_c2 = 3'd0;
         for (si = 0; si < DEPTH; si = si + 1) begin
             if (scan_y1[si]) begin
-                fwd_hit1  = 1'b1;
-                fwd_slot1 = si[2:0];
+                hit_c1  = 1'b1;
+                slot_c1 = si[2:0];
             end
             if (scan_y2[si]) begin
-                fwd_hit2  = 1'b1;
-                fwd_slot2 = si[2:0];
+                hit_c2  = 1'b1;
+                slot_c2 = si[2:0];
             end
+        end
+    end
+
+//扫描结果打拍：换新与否跟 pre_decoder 的锁存条件同形（同一条指令走到读口那一拍才换）。
+//★ 冲刷拍必须清：被冲掉的那条不会再走到读口。
+    always @(posedge clk) begin
+        if (rst_q || flush_any) begin
+            fwd_slot1 <= 3'd0;
+            fwd_slot2 <= 3'd0;
+            for (si = 0; si < DEPTH; si = si + 1) begin
+                scan_y1q[si] <= 1'b0;
+                scan_y2q[si] <= 1'b0;
+                scan_g1q[si] <= 1'b0;
+                scan_g2q[si] <= 1'b0;
+            end
+        end
+        else if (scan_go) begin
+            fwd_slot1 <= slot_c1;
+            fwd_slot2 <= slot_c2;
+            for (si = 0; si < DEPTH; si = si + 1) begin
+                scan_y1q[si] <= scan_y1[si];
+                scan_y2q[si] <= scan_y2[si];
+                scan_g1q[si] <= scan_g1[si];
+                scan_g2q[si] <= scan_g2[si];
+            end
+        end
+        else begin
+            fwd_slot1 <= fwd_slot1;
+            fwd_slot2 <= fwd_slot2;
+            for (si = 0; si < DEPTH; si = si + 1) begin
+                scan_y1q[si] <= scan_y1q[si];
+                scan_y2q[si] <= scan_y2q[si];
+                scan_g1q[si] <= scan_g1q[si];
+                scan_g2q[si] <= scan_g2q[si];
+            end
+        end
+    end
+
+//前送值读口（组合，读拍用）：热码来自【打拍后的扫描】，数据与"算完了没"取【当拍】的 ——
+//这样值总是最新的，而扫描那一段已经不在本拍的锥里了。
+//★ 世代守卫：打拍的热码描述的是上一拍的住户；槽可能已经退项/复用 ⇒ 世代对不上就作废。
+//★ `hit`（而非只有 `done`）也必须在这一拍由同一份守卫算出，且必须要求【在册】：
+//  ① 槽被复用（世代变）⇒ 那一位已经不属于原来那条指令，命中位必须跟着落；
+//  ② 生产者已退休（ent_v=0，世代还没变）⇒ 它已不在 ROB，命中位也要落 ——
+//     否则旁路会跳过"刚提交（阵列还没写）"那一档兜底，落到阵列的老值上（实测 store 数据为 0）。
+//  槽号 `fwd_slot` 仍打拍：世代守卫只在"这条指令的槽被复用"时落，槽号本身不参与选值。
+    always @(*) begin
+        for (si = 0; si < DEPTH; si = si + 1) begin
+            scan_w1[si] = scan_y1q[si] & (ent_gen[si] == scan_g1q[si]) & ent_v[si];
+            scan_w2[si] = scan_y2q[si] & (ent_gen[si] == scan_g2q[si]) & ent_v[si];
+            scan_v1[si] = scan_w1[si] & ent_wr[si] & ~ent_ex[si];
+            scan_v2[si] = scan_w2[si] & ent_wr[si] & ~ent_ex[si];
+        end
+//★ 命中位必须与"算完了没"用【同一份当拍判据】：世代对不上（槽已换人）时命中位也要落，
+//  否则旁路会以为"有个还没算完的 ROB 源"而不回落到阵列读，取到的是新住户的脏值。
+        fwd_hit1  = 1'b0;
+        fwd_hit2  = 1'b0;
+        fwd_done1 = 1'b0;
+        fwd_done2 = 1'b0;
+        fwd_data1 = 32'd0;
+        fwd_data2 = 32'd0;
+        st_done1  = 1'b0;
+        st_done2  = 1'b0;
+        st_data1  = 32'd0;
+        st_data2  = 32'd0;
+        for (si = 0; si < DEPTH; si = si + 1) begin
+            fwd_hit1  = fwd_hit1  | scan_w1[si];
+            fwd_hit2  = fwd_hit2  | scan_w2[si];
+            fwd_done1 = fwd_done1 | scan_v1[si];
+            fwd_done2 = fwd_done2 | scan_v2[si];
+            fwd_data1 = fwd_data1 | (scan_v1[si] ? ent_data[si] : 32'd0);
+            fwd_data2 = fwd_data2 | (scan_v2[si] ? ent_data[si] : 32'd0);
+            st_done1  = st_done1  | ((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
+            st_done2  = st_done2  | ((st_slot2 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
+            st_data1  = st_data1  | (((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]) ? ent_data[si] : 32'd0);
+            st_data2  = st_data2  | (((st_slot2 == si[2:0]) & ent_wr[si] & ~ent_ex[si]) ? ent_data[si] : 32'd0);
+        end
+    end
+
+//提交口打一拍：把"要不要写 / 写哪个 / 写什么"在提交拍算好、寄存，下一拍再写寄存器堆。
+//★ 为什么要打：regfile 是【变址写一个寄存器阵列】，综合器没法用 CE 表达"32 个里只使能一个"，
+//  只能合成 `D_i = (we && rd==i) ? data : Q_i` ⇒ 使能 + 32 路 rd 译码 + 保持 mux 全落进 D 锥。
+//  而 cmt_we 里的 head_ok 含 !flush_any / !exc_hit0（都来自 flag_bus、即中断/异常/分支判定锥）
+//  ⇒ 整条中断锥压在阵列的 D 引脚上（实测默认流程 13 级、11ns，是当前最大失败族）。
+//  打一拍后长锥止于本寄存器，阵列的 D 锥只剩"寄存器 → 译码 → 数据 mux"。
+//★ 绝不能在 trap_fire / 冲刷拍清 cmt_*：head_ok 与 trap_fire 天然互斥（一个要 !ent_ex、
+//  一个要 ent_ex）；冲刷只作废比边界年轻的项，而打拍里那笔在边界之前 ⇒ 清了会丢一笔合法写。
+    always @(posedge clk) begin
+        if (rst_q) begin
+            cmt_we0   <= 1'b0;
+            cmt_rd0   <= 5'd0;
+            cmt_data0 <= 32'd0;
+            cmt_we1   <= 1'b0;
+            cmt_rd1   <= 5'd0;
+            cmt_data1 <= 32'd0;
+        end
+        else begin
+            cmt_we0   <= cmt_we0_e;
+            cmt_rd0   <= cmt_rd0_e;
+            cmt_data0 <= cmt_data0_e;
+            cmt_we1   <= cmt_we1_e;
+            cmt_rd1   <= cmt_rd1_e;
+            cmt_data1 <= cmt_data1_e;
         end
     end
 
@@ -300,6 +500,8 @@ always @(posedge clk) rst_q <= rst;
                 ent_pc[ri] <= 32'd0;
                 ent_tv[ri] <= 32'd0;
                 ent_rd[ri] <= 5'd0;
+                ent_data[ri] <= 32'd0;
+                ent_gen[ri] <= 1'b0;
             end
         end
         else begin
@@ -326,13 +528,22 @@ always @(posedge clk) rst_q <= rst;
 //但它的判据里已经带了 `rd_in != 0` ⇒ 标准编码下 ecall/ebreak/mret 的 rd 都是 0、`issue_we=0`，
 //所以"报了写但其实不写"的只剩非法编码，不会造成"选中一个永不产值的槽"。
                 ent_rd[tail_p] <= (alloc_we && (alloc_rd != 5'd0)) ? alloc_rd : 5'd0;
+                ent_gen[tail_p] <= ~ent_gen[tail_p];
             end
-            if (alu_done && ent_v[alu_idx])
-                ent_wr[alu_idx] <= 1'b1;
-            if (mul_done && ent_v[mul_idx])
-                ent_wr[mul_idx] <= 1'b1;
-            if (ld_done && ent_v[ld_idx])
-                ent_wr[ld_idx] <= 1'b1;
+//完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
+//★ 世代校验是必需的：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（ent_v 挡不住"新住户也 valid"）。
+            if (alu_done && ent_v[alu_idx] && (ent_gen[alu_idx] == alu_gen)) begin
+                ent_wr[alu_idx]   <= 1'b1;
+                ent_data[alu_idx] <= alu_data;
+            end
+            if (mul_done && ent_v[mul_idx] && (ent_gen[mul_idx] == mul_gen)) begin
+                ent_wr[mul_idx]   <= 1'b1;
+                ent_data[mul_idx] <= mul_data;
+            end
+            if (ld_done && ent_v[ld_idx] && (ent_gen[ld_idx] == ld_gen)) begin
+                ent_wr[ld_idx]   <= 1'b1;
+                ent_data[ld_idx] <= ld_data;
+            end
 //★ 标记陷阱时必须【同时置 wr】：故障指令的写被 pd 挡掉、也不会再有任何单元回报它
 //  ⇒ 只置 exc 不置 wr，
 //  它到队头也退不掉 ⇒ ROB 排不空 ⇒ redir 永远等不到 rob_empty ⇒ 整核挂死（实测 exc_illegal）。

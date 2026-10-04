@@ -38,6 +38,10 @@ module pre_decoder(
 //offset_jalr0/offset_beq0_aux = imm_alu_out（都是别名，顶层复用，不重复寄存）。
     output reg [31:0] inst_out,
     output reg [4:0] r1, r2,
+//★ 槽扫描用的【本级推进条件】：读拍在 mid 那一级给出，ROB 在【本级输出那一拍】扫描、
+//  结果打拍寄一拍 —— 下一拍正好喂 mid 的读口（同一条指令、同一个 rs）。
+//  扫描吃的是 r1/r2（本级的输出寄存器），不再需要一份组合版的 rs。
+    output reg       inst_go,
     output reg [4:0]  rd_out,
     output reg [9:0]  func10_out,
     output reg [31:0] imm_alu_out,
@@ -176,6 +180,12 @@ module pre_decoder(
             inst_effective = 32'd0;
         else
             inst_effective = inst_valid ? inst_in : 32'd0;
+    end
+
+//本级的推进条件：与下面时钟块的推进条件【逐字同形】。ROB 用它做槽扫描的打拍使能
+//（扫描读的是本级的输出寄存器 r1/r2，本级一推进它就换人）。
+    always @(*) begin
+        inst_go = exec & ~flush_w & ~stall_w;
     end
 
 //本模块寄存器只留"必须跨拍携带"的四项：指令字本身、两个源寄存器号（regfile 读口要用）、

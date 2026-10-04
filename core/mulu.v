@@ -46,23 +46,9 @@
 module mulu(
     input clk, rst,
     input [11:0] flag_bus,
-//本模块【不再吃组合的 flush_bju_pre】：那个"宽一拍窗口"对乘法不必要 —— 影子乘法改由
-//"寄存版 bju 冲刷那一拍按号杀"兜住（见下面的 m_shadow_kill）。组合版 pre 只留给 lsu
-//（它的副作用在判定拍就出核门、收不回来）。要的这两根都是 bju 的【寄存】输出，进广播网没有
-//"晚到组合"的时序代价：
-    input flush_bju_exc,          //bju 寄存器版"指令地址非对齐"
-    input [2:0]  bju_idx_q,       //判定那条自己的 ROB 号（与 flag_bus[9]/flush_bju_exc 同拍）
 //本次冲刷的边界（controller 的 flush_idx：三种冲刷各取自己那条的号）：
 //入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
     input [2:0]  flush_idx,
-//ROB 队头（年龄基准）+ 写口级落地广播（b0/b1）：本模块据此杀自己更老的同 rd 在途记录
-    input [2:0]  rob_head,
-    input        b0_we,
-    input [4:0]  b0_rd,
-    input [2:0]  b0_idx,
-    input        b1_we,
-    input [4:0]  b1_rd,
-    input [2:0]  b1_idx,
 //写口级"这一笔已处置（落地/被杀/不写）"：本模块据此撤值放行；没被取走就一直举着
     input        taken_mul,
 //入口门（每条指令只收一次）：decoder 载荷【这一拍就要推进】才允许收（理由同 lsu：
@@ -84,17 +70,18 @@ module mulu(
     input [4:0] rd_in, r1_post, r2_post,
 //写序号（与 rd_in 同沿锁进本级）与当前最新号（滞留兜底用）
     input [2:0]  idx_in,
+//那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
+    input        gen_in,
 //落地广播（来自写回级两个写口）：据此把更老的同 rd 在途写（乘法/除法）作废
     input [31:0] r1_data_final, r2_data_final,
     (* max_fanout = 8 *) output reg [31:0] mul_data_out,
     (* max_fanout = 8 *) output reg mul_loaded, mul_we,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 mul_idx 逐支同步，供 forw 直接选源
     output reg hit1, hit2,
-//被杀标记（给写口级）：这一笔永不落地 —— 写口不发、照常回报，让队头能退
-    output reg kill_mul,
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
     output reg [2:0]  mul_idx,
+    (* max_fanout = 8 *) output reg        mul_gen,
 //两条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_mulu_haz,
     output reg stall_mulu_div
@@ -119,7 +106,7 @@ module mulu(
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取三条冲刷位。
 //本模块的冲刷窗口回到【与别的模块同宽】：m_push、除法 FSM 的作废、d_done 的清零都挂在这同一个
-//flush_w 上。影子乘法不在入口挡，而由"寄存版 bju 冲刷那一拍按号杀"兜住（见 m_shadow_kill）。
+//flush_w 上。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w, flush_con_exc;
     always @(*) begin
@@ -157,12 +144,14 @@ module mulu(
     reg [31:0] m_a, m_b;
     reg [4:0]  m_rd;
     reg [2:0]  m_idx;
+    reg        m_gen;
     reg [2:0]  m_op;
     reg        m_v;
 
     reg [63:0] m_p;
     reg [4:0]  m_rd_q;
     reg [2:0]  m_idx_q;
+    reg        m_gen_q;
     reg [2:0]  m_op_q;
     (* max_fanout = 8 *)
     reg        m_pv;
@@ -177,6 +166,7 @@ module mulu(
     reg        d_sign_b;
     reg [4:0]  d_rd;
     reg [2:0]  d_idx;
+    reg        d_gen;
     reg [4:0]  d_cnt;
     reg        d_busy;
     reg        d_issued;          // 本条 div 已发起过（防止离开 mulu 级之前重复发起）
@@ -194,11 +184,13 @@ module mulu(
     reg [2:0]  d_cmt_q;
     reg [4:0]  d_cmt_rd;
     reg [2:0]  d_cmt_idx;
+    reg        d_cmt_gen;
     reg [31:0] d_cmt_data;
 
 //输出保持
     reg [4:0]  hold_rd;
     reg [2:0]  idx_hold;
+    reg        gen_hold;
     reg [31:0] hold_data;
     reg        hold;
 
@@ -255,6 +247,7 @@ module mulu(
                 m_b  <= r2_data_final;
                 m_rd <= rd_in;
                 m_idx <= idx_in;
+                m_gen <= gen_in;
                 m_op <= func10[2:0];
             end
         end
@@ -286,6 +279,7 @@ module mulu(
             m_p    <= m_p_int[63:0];
             m_rd_q <= m_rd;
             m_idx_q <= m_idx;
+            m_gen_q <= m_gen;
             m_op_q <= m_op;
         end
     end
@@ -363,6 +357,7 @@ module mulu(
 //★ 临时调试（验完删）：把发起那一拍的输入原样锁进寄存器，供 tb 事后打印（避免组合竞争）
             d_rd     <= rd_in;
             d_idx    <= idx_in;
+            d_gen    <= gen_in;
             d_rem    <= func10[1];
             d_dvd    <= r1_data_final;
             d_sign_b <= r2_data_final[31];
@@ -413,6 +408,7 @@ module mulu(
             if (d_done) begin
                 d_cmt_rd   <= d_rd;
                 d_cmt_idx  <= d_idx;
+                d_cmt_gen  <= d_gen;
                 d_cmt_data <= d_res;
             end
         end
@@ -426,6 +422,7 @@ module mulu(
             if (m_pv) begin
                 hold_rd   <= m_rd_q;
                 idx_hold  <= m_idx_q;
+                gen_hold  <= m_gen_q;
                 hold_data <= mul_sel ? m_p[31:0] : m_p[63:32];
             end
         end
@@ -472,86 +469,6 @@ module mulu(
             stall_mulu_haz = 1'b0;
     end
 
-//杀老写（乱序写回）：写口级广播"某笔更年轻的同 rd 写已落地" ⇒ 本模块更老的同 rd 在途记录置 killed。
-//  被杀的笔照常走完流程（照常占级、照常被写口级"放行 + 回报"），只是写口不发它的写使能。
-//  ★ 年龄一律用 head 相对值 {1'b0,(idx - rob_head)}，先截 4 位再比（3 位减法回绕会判错）。
-//  ★ killed 的累积【不受 wr_pend 冻结】—— 写口被挤住期间恰恰是最容易被更年轻写杀掉的时候。
-    reg m_kl, m_kl_q, d_kl;
-//影子乘法的作废：寄存版 bju 冲刷那一拍，m_v 里停的必然是"边界那条的后继"（m_v <= m_push 每拍
-//更新，所以冲刷拍在 m_v 里的一定是上一拍推入的那条）⇒ 按号（边界+1）把它在写口判死。
-//★ 复用现成的 m_kl 链路、而不是去清 m_v/m_pv：m_kl 是【已寄存】的、且"累积不受 wr_pend 冻结"
-//  ⇒ pipe_stall/wr_pend 把第一级冻住时也不会漏杀（清 m_v 会被冻结分支整个跳过）。
-//★ 号限定为什么安全：窗口内 8 个号互不相同，比边界更老的合法乘法号 < 边界号，永远 ≠ 边界+1。
-    reg flush_bju_reg, m_shadow_kill;
-    always @(*) flush_bju_reg = flag_bus[9] | flush_bju_exc;
-    always @(*) m_shadow_kill = flush_bju_reg & m_v & (m_idx == (bju_idx_q + 3'd1));
-    reg m_kl_hit, m_klq_hit, d_kl_hit;
-    reg [3:0] m_age, mq_age, d_age, b0_age, b1_age;
-    reg [4:0] d_cur_rd;
-    reg [2:0] d_cur_idx;
-    always @(*) begin
-        m_age     = {1'b0, (m_idx - rob_head)};
-        mq_age    = {1'b0, (m_idx_q - rob_head)};
-        b0_age    = {1'b0, (b0_idx - rob_head)};
-        b1_age    = {1'b0, (b1_idx - rob_head)};
-        d_cur_rd  = d_pend ? d_cmt_rd : d_rd;
-        d_cur_idx = d_pend ? d_cmt_idx : d_idx;
-        d_age     = {1'b0, (d_cur_idx - rob_head)};
-        m_kl_hit  = 1'b0;
-        m_klq_hit = 1'b0;
-        d_kl_hit  = 1'b0;
-        if (m_v && (m_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == m_rd) && (b0_age > m_age))
-                m_kl_hit = 1'b1;
-            if (b1_we && (b1_rd == m_rd) && (b1_age > m_age))
-                m_kl_hit = 1'b1;
-        end
-        if (m_pv && (m_rd_q != 5'd0)) begin
-            if (b0_we && (b0_rd == m_rd_q) && (b0_age > mq_age))
-                m_klq_hit = 1'b1;
-            if (b1_we && (b1_rd == m_rd_q) && (b1_age > mq_age))
-                m_klq_hit = 1'b1;
-        end
-        if ((d_busy || d_pend) && (d_cur_rd != 5'd0)) begin
-            if (b0_we && (b0_rd == d_cur_rd) && (b0_age > d_age))
-                d_kl_hit = 1'b1;
-            if (b1_we && (b1_rd == d_cur_rd) && (b1_age > d_age))
-                d_kl_hit = 1'b1;
-        end
-    end
-
-    always @(posedge clk) begin
-        if (rst_q) begin
-            m_kl   <= 1'b0;
-            m_kl_q <= 1'b0;
-            d_kl   <= 1'b0;
-        end
-        else begin
-            if (m_push)
-                m_kl <= 1'b0;
-            else if (m_kl_hit | m_shadow_kill)
-                m_kl <= 1'b1;
-            else
-                m_kl <= m_kl;
-//★ 搬运那一沿必须把 m_shadow_kill 也算进来：置 m_kl 与"影子从 m_v 搬到 m_pv"是**同一个沿**，
-//  只写 m_kl 的话 m_kl_q 拿到的是旧值 ⇒ 下一拍写口看不见杀、影子照样落地（实测 CoreMark 三项 CRC 全错）。
-            if (m_v && !pipe_stall && !wr_pend)
-                m_kl_q <= m_kl | m_kl_hit | m_shadow_kill;
-            else if (m_klq_hit)
-                m_kl_q <= 1'b1;
-            else if (!m_pv)
-                m_kl_q <= 1'b0;
-            else
-                m_kl_q <= m_kl_q;
-            if (d_kl_hit)
-                d_kl <= 1'b1;
-            else if (~d_busy && ~d_pend)
-                d_kl <= 1'b0;
-            else
-                d_kl <= d_kl;
-        end
-    end
-
 //  口被 alu 占住时乘法让路是常态里的极少数（三笔同拍才轮到它让），量级可忽略。
     always @(*) wr_pend = (m_pv && ~taken_mul) | (d_cmt_q[2] && ~taken_mul);
 
@@ -562,15 +479,14 @@ module mulu(
 //组合输出：写回仲裁（乘法第二级与除法收尾共用，同一时刻只有一个在途结果）
     always @(*) begin
         d_cmt  = d_cmt_q[2];                          // 除法写口脉冲 = d_done+3
-        kill_mul = 1'b0;
         d_pend = d_cmt_q[0] | d_cmt_q[1] | d_cmt_q[2]; // 除法结果前递窗口
         mul_we = m_pv | d_cmt;              // 只在提交拍（对应 lsu 的 ld_pop）
         if (m_pv) begin
             mul_loaded   = 1'b1;
             rd_mul       = m_rd_q;
             mul_idx      = m_idx_q;
+            mul_gen      = m_gen_q;
             mul_data_out = mul_sel ? m_p[31:0] : m_p[63:32];
-            kill_mul     = m_kl_q;
             hit1         = sel_v1 & (m_idx_q == sel_slot1);
             hit2         = sel_v2 & (m_idx_q == sel_slot2);
         end
@@ -578,8 +494,8 @@ module mulu(
             mul_loaded   = 1'b1;
             rd_mul       = d_cmt_rd;
             mul_idx      = d_cmt_idx;
+            mul_gen      = d_cmt_gen;
             mul_data_out = d_cmt_data;
-            kill_mul     = d_cmt ? d_kl : 1'b0;
             hit1         = sel_v1 & (d_cmt_idx == sel_slot1);
             hit2         = sel_v2 & (d_cmt_idx == sel_slot2);
         end
@@ -587,6 +503,7 @@ module mulu(
             mul_loaded   = 1'b1;
             rd_mul       = hold_rd;
             mul_idx      = idx_hold;
+            mul_gen      = gen_hold;
             mul_data_out = hold_data;
             hit1         = sel_v1 & (idx_hold == sel_slot1);
             hit2         = sel_v2 & (idx_hold == sel_slot2);
@@ -594,6 +511,7 @@ module mulu(
         else begin
             mul_loaded   = 1'b0;
             rd_mul       = 5'd0;
+            mul_gen      = 1'b0;
             mul_data_out = 32'd0;
             hit1         = 1'b0;
             hit2         = 1'b0;

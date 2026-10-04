@@ -30,7 +30,8 @@ module alu(
     input [4:0] rd_in,
 //ROB 索引：与结果同沿寄存（结果晚一拍，索引必须一起晚一拍，否则完成口会回填到错项）
     input [2:0] idx_in,
-    input [2:0] bju_idx,
+//那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
+    input       gen_in,
     input [3:0] alu_func4,
     input [2:0] csr_func3,
     input [31:0] aux_addr_in,
@@ -44,8 +45,7 @@ module alu(
     input        fwd_hit1,  fwd_hit2,
     (* max_fanout = 8 *) output reg [4:0] rd_out,
     (* max_fanout = 8 *) output reg [2:0] idx_out,
-//这一笔永不落地（异常冲刷把"错路那条"标掉）：写口不发写、但照常回报，项才能退
-    (* max_fanout = 8 *) output reg kill_out,
+    output reg gen_out,
     (* max_fanout = 8 *) output reg [31:0] result, result_csr,
     (* max_fanout = 8 *) output reg we,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 result 同沿同门控寄存，供 forw 直接选源
@@ -170,9 +170,9 @@ module alu(
         if (rst_q) begin
             rd_out   <= 5'd0;
             idx_out  <= 3'd0;
+            gen_out  <= 1'b0;
             result   <= 32'd0;
             we       <= 1'b0;
-            kill_out <= 1'b0;
             hit1     <= 1'b0;
             hit2     <= 1'b0;
         end
@@ -182,9 +182,9 @@ module alu(
 //是发起者自己（分支不写 rd、jalr 的 link 在判定拍已进写口）⇒ 照旧保持，不误杀。
             rd_out   <= rd_out;
             idx_out  <= idx_out;
+            gen_out  <= gen_out;
             result   <= result;
             we       <= we;
-            kill_out <= kill_out | (idx_out != bju_idx);
             hit1     <= hit1;
             hit2     <= hit2;
         end
@@ -193,18 +193,18 @@ module alu(
                 ~(stall_lsu_haz | stall_lsu_full | stall_mulu_haz | stall_mulu_div)) begin
                 rd_out   <= rd_nx;
                 idx_out  <= idx_in;
+                gen_out  <= gen_in;
                 result   <= result_nx;
                 we       <= we_nx;
-                kill_out <= flush_con_exc;
                 hit1     <= fwd_hit1 & (idx_in == fwd_slot1);
                 hit2     <= fwd_hit2 & (idx_in == fwd_slot2);
             end
             else begin                               // 单元侧 stall 抬着：操作数还没定，结果连着 rd/idx/we 一起保持
                 rd_out   <= rd_out;
                 idx_out  <= idx_out;
+                gen_out  <= gen_out;
                 result   <= result;
                 we       <= we;
-                kill_out <= kill_out;
                 hit1     <= hit1;
                 hit2     <= hit2;
             end
@@ -212,9 +212,9 @@ module alu(
         else begin
             rd_out   <= 5'd0;
             idx_out  <= 3'd0;
+            gen_out  <= 1'b0;
             result   <= 32'd0;
             we       <= 1'b0;
-            kill_out <= 1'b0;
             hit1     <= 1'b0;
             hit2     <= 1'b0;
         end

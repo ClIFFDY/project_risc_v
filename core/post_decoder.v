@@ -46,6 +46,9 @@ module post_decoder(
 //载荷的 ROB 索引：当拍要喂 7 个消费者（`forw.idx_post`、`alu`/`lsu`/`mulu`/`bju` 的 `idx_in`、
 //`rob.exc_idx`、`controller.issue_idx_in`），而它是关键路径的第一跳。
     output reg [2:0] issue_idx,
+//与 idx_in 同生共死的世代位：载荷沿锁存、随持有期一起保持，交执行单元带回来做完成上报的身份校验
+    input        alloc_gen_in,
+    output reg   issue_gen,
 //前送槽号（← rob 的扫描口）：本条指令的两个操作数该由【哪个 ROB 槽】供值。
 //★ 它是【载荷】：只在同一个 `payload_go` 沿锁存（与 `issue_idx` 同生共死）。
 //  冻结期间**绝不能重算** —— rob 的退项是沿生效、扫描是组合读 `ent_v`，重算会让扫描
@@ -334,6 +337,7 @@ module post_decoder(
             jal_target_out <= 32'd0;
             exc_illegal_out <= 1'b0;
             issue_idx <= 3'd0;
+            issue_gen <= 1'b0;
             sel_slot1 <= 3'd0;
             sel_slot2 <= 3'd0;
             sel_v1 <= 1'b0;
@@ -352,6 +356,7 @@ module post_decoder(
                  | stall_lsu_full | stall_mulu_haz | stall_mulu_div
  | stall_icache_miss | stall_bus_hold)) begin
                 issue_idx <= idx_in;
+                issue_gen <= alloc_gen_in;
                 sel_slot1 <= fwd_slot1_in;
                 sel_slot2 <= fwd_slot2_in;
                 sel_v1 <= fwd_hit1_in;
@@ -530,6 +535,7 @@ module post_decoder(
  | stall_icache_miss | stall_bus_hold)
                    & ~(flush_con_exc | flush_con_irq | flush_con_jump)) begin
                 issue_idx <= issue_idx;
+                issue_gen <= issue_gen;
                 sel_slot1 <= sel_slot1;
                 sel_slot2 <= sel_slot2;
                 sel_v1 <= sel_v1;
@@ -567,6 +573,7 @@ module post_decoder(
             end
             else begin
                     issue_idx <= 3'd0;
+                    issue_gen <= 1'b0;
                     sel_slot1 <= 3'd0;
                     sel_slot2 <= 3'd0;
                     sel_v1 <= 1'b0;
