@@ -23,13 +23,12 @@
 module pc(
     input clk, rst,
     input br1, exc_irq, exc_irq_ret, exc_mark,
-    input jal, pre_jalr, btb_hit,
+    input jal, fch_jalr_eff,
 //lane1 的 jal：lane1 的地址 = lane0 + 4 = pc − 4（pc 是"下一个待取地址"）⇒ 落点 T1 = pc + immJ1 − 4。
 //★ 与 lane0 那一支不同：lane0 的 jal 命中有 bti 注入、pc 落 T+8（注入把 (T,T+4) 补上了）；
 //  lane1 没有注入通路，pc 必须直接落 T1，让取指侧从 T1 起取。
 //lane1 的改向（fifo 判完的三类合一）与落点（fifo 里算好，本级只落地址）
-    input lane1_redir,
-    input [31:0] lane1_target,
+
 //bra_predict 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 pre_decoder
 //⇒ pc 落 T+4；未命中 ⇒ pc 落 T，让 icache 下一拍自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
     input bti_hit,
@@ -76,7 +75,7 @@ module pc(
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
     reg jalr;
-    always @(*) jalr = pre_jalr & btb_hit;
+    always @(*) jalr = fch_jalr_eff;
 
 //程序计数器，传递取指地址
 //重定向排队：判定那一拍照旧【先冲刷更年轻的】，但真正的跳转要等 ROB 排空 —— 这样
@@ -182,10 +181,6 @@ module pc(
 //  ⇒ 本拍改向、下一拍生效，于是**下下拍**交付的才是 pc(改向后) 对应的那一对。
 //  要让下下拍交付 T1 那一对，pc 就该落 T1 本身 ⇒ `pc + immJ1 − 4`。
 //  （改成 +4 实测把开机 bss 清零循环的循环体整个跳过 —— pc 卡在 0x20/0x28 不动。）
-                else if (lane1_redir) begin
-                    pc_addr <= lane1_target;
-                    aux_addr <= lane1_target;
-                end
                 else begin
 //★ 顺序推进【恒定 +8】：一次把两个字吃满，没有别的选项。
 //  pc_addr 是"下一个待取地址"，fetch_addr = pc_addr>>2，eff = instr(pc_addr−4)、inst_next = instr(pc_addr)；

@@ -33,6 +33,15 @@ module bra_predict(
     input jal,
 //本拍交付的 lane0 是不是控制转移（fetch_fifo 在 inst_eff 上译的）：决定三张表这一拍服务哪条
     input lane0_ct,
+//★ 这一拍【有没有改向】（两个 lane 的三类合一，fetch_fifo 出）：有 ⇒ 欠 BTIC 一次交付 ——
+//  命中就送目标对、未命中就让"冲刷那拍出 NOP"顶掉 icache 的字（三态里的 state 2）。jalr 也算，
+//  它那拍必须出 NOP，否则改向后那对错路会进队。
+    input ct_redir,
+//★ BTIC 的键（fetch_fifo 给）：正在改向那条指令自己的键 —— 与 rd_key 不同源
+    input [31:0] bti_key,
+//★ 这一拍改向的是不是【jalr】：是的话**不许捕获**进表 —— 本表存的是目标那一对 inst，
+//  只对落点恒定的指令成立（jalr 落点随寄存器变，缓存下来就是脏的）。
+    input ct_jalr,
     input [31:0] inst_in, inst_next_in,
     input inst_valid,
     input [11:0] flag_bus,
@@ -164,10 +173,10 @@ module bra_predict(
             take       = 1'b0;
         end
         else begin
-            bti_rd_idx = pc_addr_in[9:2];
-            bti_rd_tag = pc_addr_in[31:10];
+            bti_rd_idx = bti_key[9:2];
+            bti_rd_tag = bti_key[31:10];
             bti_hit    = bti_v[bti_rd_idx] & (bti_tag[bti_rd_idx] == bti_rd_tag);
-            take       = (jal | br1) & adv;
+            take       = ct_redir & adv;
         end
     end
 
@@ -235,9 +244,10 @@ module bra_predict(
             cap_tag_q2 <= cap_tag_q2;
         end
         else begin
-            cap_q      <= {cap_q[0], take & ~bti_hit};
-            cap_idx_q1 <= pc_addr_in[9:2];
-            cap_tag_q1 <= pc_addr_in[31:10];
+            cap_q      <= {cap_q[0], take & ~bti_hit & ~ct_jalr};
+//★ 捕获键值必须与读口同口径（rd_key），否则 lane1 学不进去（读 pc+4、写 pc ⇒ 钥匙差 4）
+            cap_idx_q1 <= bti_key[9:2];
+            cap_tag_q1 <= bti_key[31:10];
             cap_idx_q2 <= cap_idx_q1;
             cap_tag_q2 <= cap_tag_q1;
         end

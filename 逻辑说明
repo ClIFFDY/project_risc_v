@@ -3266,13 +3266,25 @@ alu/mul/ld 结果口 ─┘
 · 队列条目要带 lane1 自己的方向预测与 jalr 预测落点（push1_br_pred / push1_jalr_pred）：
   pre_decoder 的成对判据不收分支 ⇒ lane1 上的分支必然下一拍当 head0 再发，那时 bju 读的 br_pred
   就是条目里这一位 —— 填错要么白来一次 br2 冲刷、要么把"没跳"说成"跳了"（**错路直接执行**）。
-· ★ lane1 的 BTIC 注入（"命中档"：pc 落 T1 + 8、下一拍把目标对直送队列）**未启用**：实测那套
-  （命中位 + redir_q 抑制 + 改向拍压 NOP）让 CoreMark 跑飞（archtest 42 支全过、CoreMark 卡在
-  number() 的循环里）。lane1 现在只走"未命中档"：压一拍 NOP + 由 icache 下一拍去取目标。
+· 改向**统一成一组信号、lane0 优先**（fetch_fifo 出 fch_br_eff / fch_jal_eff / fch_jalr_eff +
+  有效偏移；pc.v 四条支一字不改）：lane1 的偏移 = 它自己的立即数 + 4（pc 恒定 +8 之后 lane1 的
+  指令地址是 pc − 4 ⇒ `pc + (imm+4) − 8` 正好是它的落点），与 lane0 只差这一个 lane 偏移。
+· ★ BTIC 注入（两 lane 都能吃）：`take = ct_redir & adv`（**任何改向**都欠一次交付，含 jalr ——
+  它那拍必须出 NOP，否则改向后那对错路会进队）；命中 ⇒ 下一拍把目标对直送队列、pc 落命中档；
+  未命中 ⇒ 三态出 NOP、pc 落未命中档。jalr **不许捕获**进表（落点随寄存器变，缓存下来就是脏的）。
+· ★★ 两个**必须**由取指侧给的信号（pc 不能自己判）：
+  ① `fch_hit_ok` = 本拍有改向 ∧ 能推进 ∧ BTIC 真有**选中 lane 的**条目 —— 这是"命中档"的前提，
+     把裸的 bti_hit 交给 pc 会与"能否武装 FSM"脱钩；
+  ② `fch_bti_key` = **正在改向那条指令自己的键**（lane0 → pc；lane1 → pc+4）—— 与 BHT/BTB 的
+     rd_key（选"哪个 lane 需要预测"）**不是一回事**：注入那一拍交付的是注入对、lane0_ct 常为 0，
+     两者会分叉 ⇒ 读错/写错一格 ⇒ 表被错键建立 ⇒ 之后在别的指令上以正确 tag 命中 ⇒ 注入一对
+     不属于当前 pc 的指令 ⇒ 错路 ⇒ flush 回环自锁（这一条实测害死了四种写法）。
 · 顺手修的两条：
   ① fetch_fifo 的 h1_r1 / h1_r2 必须跟 h1_v 一起压 0（它们直通 pre_decoder → rob 的扫槽/冒险比较，
      第二槽不在册时槽里的残余 rs 会冒充真源寄存器号 ⇒ 假冒险）；
   ② 队头不在册（!h0_v）时把队头**内容**压成 0：下游（pre_decoder / rob）都不看 h0_v，
      不压的话槽里的残余字会被当指令锁进载荷 ⇒ rob 多一个幽灵项。
 · 判据：archtest 与改前的树逐笔相同（只有读 mcycle 的程序例外 —— 它读的是拍数）；
-  跳转冲刷（flag_bus[9] 置位拍）在微测上 31 → 2、41 支合计 710 → 59。
+  跳转冲刷（flag_bus[9] 置位拍）在微测上 31 → 2、41 支合计 710 → 59；
+  CoreMark ITERATIONS=1 三项 CRC e714 / 1fd7 / 8e3a 全对、Total ticks **358020**
+  （无注入那版 368511 ⇒ 注入值 −10491 拍 / −2.8%）。

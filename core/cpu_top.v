@@ -61,9 +61,12 @@ module cpu_top(
     (* max_fanout = 32 *) wire [4:0] rs1_1, rs2_1;
     wire [31:0] aux_addr_1;
     wire jal, br_en, pre_jalr;
-//lane1 的取指侧改向（fifo 判完）+ 落点；以及 lane1 的方向预测
-    wire lane1_redir;
-    wire [31:0] lane1_target;
+//★ 统一改向（fetch_fifo 出、lane0 优先）：pc.v 与 bra_predict 都只吃这一组
+    wire fch_br_eff, fch_jal_eff, fch_jalr_eff;
+    wire [31:0] fch_off_beq_eff, fch_off_jal_eff, fch_off_jalr_eff;
+//这一拍有没有改向（两 lane 三类合一）+ 改向的是不是 jalr + 命中档前提
+    wire fch_ct_redir, fch_ct_jalr, fch_hit_ok;
+    wire [31:0] fch_bti_key;
     wire br1_1;
 //lane0 是不是控制转移（fifo 出）：bra_predict 靠它选三张表的读 key
     wire lane0_ct;
@@ -233,11 +236,10 @@ module cpu_top(
     pc u_pc (
         .clk(clk),
         .rst(rst),
-        .br1(br1),
-        .bti_hit(bti_hit),
-        .jal(jal),
-        .pre_jalr(pre_jalr),
-        .btb_hit(btb_hit),
+        .br1(fch_br_eff),
+        .bti_hit(fch_hit_ok),
+        .jal(fch_jal_eff),
+        .fch_jalr_eff(fch_jalr_eff),
 //★ 重定向输入走"门控后"的版本：判定那拍先只会冲刷，真正跳要等 ROB 排空（见上面排队逻辑）。
 //  trap 那一路与 irq 共用落点，已合进 pc_irq_g；exc_w 由 flag_bus[11]（flush_con_exc，精确版）承担
 //  冲刷，不再单独进 pc；ROB 满改吃 flag_bus[7]（stall_rob_full），端口已删。
@@ -251,11 +253,9 @@ module cpu_top(
         .flush_pc_redir(flush_pc_redir_w),
         .flag_bus(flag_bus),
         .jp_target(jp_target),
-        .offset_jal2(offset_jal2),
-        .lane1_redir(lane1_redir),
-        .lane1_target(lane1_target),
-        .offset_jalr2(jalr_predict_offset),
-        .offset_beq2(offset_beq2),
+        .offset_jal2(fch_off_jal_eff),
+        .offset_jalr2(fch_off_jalr_eff),
+        .offset_beq2(fch_off_beq_eff),
         .isr_addr2(isr_addr2),
         .isr_ret_addr2(iret_addr2),
         .pc_addr(pc_addr),
@@ -309,6 +309,7 @@ module cpu_top(
         .inst_next(icache_inst_next_w),
         .inst_valid(icache_inst_valid_w),
         .inst_valid_b(icache_inst_valid_b_w),
+        .bti_hit(bti_hit),
         .bti_sel(bti_sel_q),
         .bti_inst(bti_inst_q),
         .br1(br1),
@@ -335,8 +336,16 @@ module cpu_top(
         .fch_jalr(pre_jalr),
         .fch_off_beq(offset_beq2),
         .fch_off_jal(offset_jal2),
-        .lane1_redir(lane1_redir),
-        .lane1_target(lane1_target),
+        .fch_br_eff(fch_br_eff),
+        .fch_jal_eff(fch_jal_eff),
+        .fch_jalr_eff(fch_jalr_eff),
+        .fch_off_beq_eff(fch_off_beq_eff),
+        .fch_off_jal_eff(fch_off_jal_eff),
+        .fch_off_jalr_eff(fch_off_jalr_eff),
+        .fch_ct_redir(fch_ct_redir),
+        .fch_ct_jalr(fch_ct_jalr),
+        .fch_hit_ok(fch_hit_ok),
+        .fch_bti_key(fch_bti_key),
         .lane0_ct(lane0_ct),
         .br1_1(br1_1)
     );
@@ -610,6 +619,9 @@ module cpu_top(
         .inst_in(icache_inst_w),
         .inst_valid(icache_inst_valid_w),
         .lane0_ct(lane0_ct),
+        .ct_redir(fch_ct_redir),
+        .ct_jalr(fch_ct_jalr),
+        .bti_key(fch_bti_key),
         .fifo_full(fifo_full_w),
         .flag_bus(flag_bus),
         .br_pred_taken_in(br_pred_taken_q),

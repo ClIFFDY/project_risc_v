@@ -65,6 +65,8 @@ module fetch_fifo(
 //  实测 41 支里 19 支变了（ld_st_dep +39、x0fwd 跑飞）—— 因为**错路交付这件事本来就已经
 //  由 icache 的 inst_valid 标废了**（冲刷过的读数压成 NOP），队列这边无条件推进即可；
 //  再叠一套 redir_q 就是同一件事的第二套机制，且相位对不上（译码期改向对、冲刷期改向错）。
+//这一拍（组合）bti 命不命中（与 pc.v 吃的原本是同一根）：命中档前提要用
+    input        bti_hit,
     input [1:0]  bti_sel,
     input [63:0] bti_inst,
 //分支预测"跳"（bra_predict 的 br1）与 btb 命中（jalr 预测落点有效）：
@@ -94,8 +96,22 @@ module fetch_fifo(
 //lane1 的 jal 预译码（只此一条）：pc 恒定 +8 之后控制转移可以落在第二个字上，而后端的
 //jp_target 对普通 jal【没有出口】（它历来由取指侧兜）。branch/jalr 后端接得住（br2/jalr_fail
 //只看自己的载荷），只有 jal 必须在这儿补。
-    output reg        lane1_redir,
-    output reg [31:0] lane1_target,
+    output reg        fch_br_eff,
+    output reg        fch_jal_eff,
+    output reg        fch_jalr_eff,
+    output reg [31:0] fch_off_beq_eff,
+    output reg [31:0] fch_off_jal_eff,
+    output reg [31:0] fch_off_jalr_eff,
+//★ 这一拍有没有改向（两 lane 三类合一）+ 改向的是不是 jalr：给 bra_predict 当 take 与"禁捕获"判据
+    output reg        fch_ct_redir,
+    output reg        fch_ct_jalr,
+//★★ 命中档的前提：本拍有改向 且 BTIC 在 rd_key 上真有条目 —— pc 落 +8 档要求的正是这个，
+//   不能把裸的 bti_hit 交给 pc：那会与"能否武装 FSM"脱钩 ⇒ 落点与交付对错位 ⇒ 下游组合判定自锁
+    output reg        fch_hit_ok,
+//BTIC 的键：**正在改向那条指令自己的键**（lane0 → pc；lane1 → pc+4）。
+//与 BHT/BTB 的 rd_key 不是一回事：rd_key 选的是哪个 lane 需要预测，
+//而注入那一拍交付的是注入对、lane0_ct 常常为 0 ⇒ 两者在这一拍会分叉（读错一格）。
+    output reg [31:0] fch_bti_key,
 //lane0 是不是控制转移（只看 opcode，在 inst_eff 上译）：给 bra_predict 定三张表服务哪条 lane
     output reg        lane0_ct,
 //取指侧停：本拍放不下。icache 与 pc 的推进被它按住
@@ -165,8 +181,6 @@ module fetch_fifo(
 //inst_valid / inst_valid_b 为 0 表示那一个字送来的是无效读数（缺失垃圾 / 那次回填已被冲刷作废），
 //压成 0 ⇒ 一条 NOP。
     reg [31:0] inst_eff, inst1_eff, inst1_eff_raw;
-//lane1 jal 的空拍状态：那一拍起、取指推进一次止
-    reg jal1_pend;
     always @(*) begin
         if (bti_sel == 2'd1) begin
             inst_eff  = bti_inst[63:32];
@@ -184,22 +198,6 @@ module fetch_fifo(
 //★ lane1 jal 那一拍【必须空一拍】：pc 已经跳到 T1，下一拍交付的整对都是错路。
 //  lane0 的 jal 靠 bti 注入/压 NOP 补上，lane1 没有注入通路，只能在本模块就地压一拍 NOP
 //  （把两个字都清 0、且不许成对），否则错路两条会进队列 —— 实测 fence 的 j 5c 就是这么漏的。
-        if (jal1_pend) begin
-            inst_eff  = 32'd0;
-            inst1_eff = 32'd0;
-        end
-    end
-
-    always @(posedge clk) begin
-        if (rst_q) begin
-            jal1_pend <= 1'b0;
-        end
-        else if (lane1_redir) begin
-            jal1_pend <= 1'b1;
-        end
-        else if (f_adv) begin
-            jal1_pend <= 1'b0;
-        end
     end
 
 //取指侧分支/跳转预译码（原 icache 末尾那块，2026-10-27 搬来）：口径逐字同形 ——
@@ -275,20 +273,42 @@ module fetch_fifo(
 //  `bgez a3,520` 落点包 (0x520,0x524) 由注入交付，包里 lane1 的 `j 530` 被挡 ⇒ 不改向
 //  ⇒ 错路那对 (0x528,0x52C) 被当正常指令执行，链表游走被带偏，最后取到无人应答的地址
 //  把核锁死。三态里那个"压 NOP"（bti_sel=2）交付的是全 0，等价于没有 jal ⇒ 不需要单独挡。
+//lane0 与 lane1 这一拍各自的改向条件（组合译在最终交付的字上）
+    reg lane0_redir;
     always @(*) begin
-        lane1_redir = (fch1_jal_r | fch1_br_r | fch1_jalr_r) & f_adv & ~jal1_pend
-                    & ~(fch_jal | br1 | (fch_jalr & btb_hit));
+        lane0_redir = fch_jal | br1 | (fch_jalr & btb_hit);
     end
 
-//lane1 的落点 T1 = pc + imm − 4（与 lane0 未命中档只差一个 lane 偏移）。
-//  这里只做"未命中"档；"命中档"（注入目标对 ⇒ 落 T1 + 8）留到注入那一步。
     always @(*) begin
-        if (fch1_jal_r)
-            lane1_target = push_addr + fch1_off_jal - 32'd4;
-        else if (fch1_br_r)
-            lane1_target = push_addr + fch1_off_beq - 32'd4;
+        fch_ct_redir = lane0_redir | fch1_jal_r | fch1_br_r | fch1_jalr_r;
+        fch_ct_jalr  = lane0_redir ? (fch_jalr & btb_hit) : fch1_jalr_r;
+    end
+
+//命中档前提：本拍有改向、取指这一拍能推进（take 会武装 FSM）、且 BTIC 在 rd_key 上命中
+    always @(*) begin
+        fch_hit_ok = fch_ct_redir & f_adv & bti_hit;
+    end
+
+    always @(*) begin
+        if (lane0_redir)
+            fch_bti_key = push_addr;
         else
-            lane1_target = push_jalr_pred;
+            fch_bti_key = push_addr + 32'd4;
+    end
+
+//★ 改向【统一成一组信号、lane0 优先】：lane0 这一拍改向就用 lane0 的，否则用 lane1 的。
+//  pc.v 的四条支一字不改 —— 它吃的是这一组"有效"信号，lane 的差别全在这里消化掉。
+//  ★ lane1 的偏移 = 它自己的立即数 + 4：pc 恒定 +8 之后 lane1 的指令地址是 pc − 4，
+//    于是 `pc + (imm + 4) − 8 = (pc − 4) + imm` 正好是它的落点 —— 与 lane0 只差一个 lane 偏移。
+//  ★ "冲刷那拍 icache 出 NOP、BTIC 下一拍顶替"由本模块前端那个三态 mux 承担
+//    （bti_sel=2 出 NOP、=1 出注入对）⇒ 这里不需要任何"抑制/不推"的额外逻辑。
+    always @(*) begin
+        fch_br_eff       = lane0_redir ? br1 : fch1_br_r;
+        fch_jal_eff      = lane0_redir ? fch_jal : fch1_jal_r;
+        fch_jalr_eff     = lane0_redir ? (fch_jalr & btb_hit) : fch1_jalr_r;
+        fch_off_beq_eff  = lane0_redir ? fch_off_beq : (fch1_off_beq + 32'd4);
+        fch_off_jal_eff  = lane0_redir ? fch_off_jal : (fch1_off_jal + 32'd4);
+        fch_off_jalr_eff = push_jalr_pred;   // 两 lane 的 jalr 落点都来自当拍 btb 读（服务谁就是谁的）
     end
 
 //写口这一拍两条各自的源寄存器号：只有真读这两个源的指令才填，别的留 0，免得在冒险比较里
@@ -343,8 +363,7 @@ module fetch_fifo(
         else if (bti_sel == 2'd2)
             push1_en = 1'b0;
         else
-            push1_en = inst_valid_b & ~(fch_jal | br1 | (fch_jalr & btb_hit))
-                     & ~jal1_pend;
+            push1_en = inst_valid_b & ~(fch_jal | br1 | (fch_jalr & btb_hit));
     end
 
     localparam [3:0] DEPTH = 4'd8;
