@@ -3253,3 +3253,26 @@ alu/mul/ld 结果口 ─┘
 
 §38 实测否决的是**"拍内塑形"（拆 mux、加并行路）**——那是**加**逻辑与扇出；本条是**把比较器搬出锥 +
 减掉一个 mux 实例与一跳跨模块网**——是**减**。方向相反，结果也相反。**判据仍然是 TNS + 失败端点数。**
+
+§30 双发射前端：lane1 预测通路（2026-10-06）
+
+· 取指侧（bra_predict）三张表（bht / btb / bti）**只留一个读口**，读 key 做一次 2:1 选择：
+  lane0 是控制转移（fetch_fifo 在 inst_eff 上译出的 lane0_ct）就查 lane0 的键（= 当拍 pc），
+  否则查 lane1 的键（= pc + 4）。三张表的输出都被 lane0 自己的类位门控（br1 = br_en & predict_en、
+  jalr 配 fch_jalr、bti 配 take）⇒ **这一改行为逐位不变**（实测与改前逐笔相同）。
+· lane1 的控制转移也在取指侧判（fetch_fifo）：方向表预测跳的分支、btb 命中的 jalr、确定性落点的
+  jal 三类合一 = lane1_redir；配套两件事：① 本拍就地压一拍 NOP（jal1_pend，否则改向后那对错路会进队）；
+  ② pc 落 T1 = pc + imm − 4（与 lane0 的未命中档只差一个 lane 偏移）。
+· 队列条目要带 lane1 自己的方向预测与 jalr 预测落点（push1_br_pred / push1_jalr_pred）：
+  pre_decoder 的成对判据不收分支 ⇒ lane1 上的分支必然下一拍当 head0 再发，那时 bju 读的 br_pred
+  就是条目里这一位 —— 填错要么白来一次 br2 冲刷、要么把"没跳"说成"跳了"（**错路直接执行**）。
+· ★ lane1 的 BTIC 注入（"命中档"：pc 落 T1 + 8、下一拍把目标对直送队列）**未启用**：实测那套
+  （命中位 + redir_q 抑制 + 改向拍压 NOP）让 CoreMark 跑飞（archtest 42 支全过、CoreMark 卡在
+  number() 的循环里）。lane1 现在只走"未命中档"：压一拍 NOP + 由 icache 下一拍去取目标。
+· 顺手修的两条：
+  ① fetch_fifo 的 h1_r1 / h1_r2 必须跟 h1_v 一起压 0（它们直通 pre_decoder → rob 的扫槽/冒险比较，
+     第二槽不在册时槽里的残余 rs 会冒充真源寄存器号 ⇒ 假冒险）；
+  ② 队头不在册（!h0_v）时把队头**内容**压成 0：下游（pre_decoder / rob）都不看 h0_v，
+     不压的话槽里的残余字会被当指令锁进载荷 ⇒ rob 多一个幽灵项。
+· 判据：archtest 与改前的树逐笔相同（只有读 mcycle 的程序例外 —— 它读的是拍数）；
+  跳转冲刷（flag_bus[9] 置位拍）在微测上 31 → 2、41 支合计 710 → 59。

@@ -31,14 +31,20 @@ module bra_predict(
 //新增：jal 译码信号（pre_decoder 当拍组合输出）、i-cache 当拍交付的指令与有效位（冷启动捕获用）、
 //flag_bus（本模块自己译出 flush/stall，按"模块内先还原原名再做逻辑"的规矩）
     input jal,
-    input [31:0] inst_in,
+//本拍交付的 lane0 是不是控制转移（fetch_fifo 在 inst_eff 上译的）：决定三张表这一拍服务哪条
+    input lane0_ct,
+    input [31:0] inst_in, inst_next_in,
     input inst_valid,
     input [11:0] flag_bus,
+//取指队列满：与本级的推进门同源（本级也在取指侧）
+    input fifo_full,
     output reg [31:0] jalr_predict_offset,
     output reg br1, br2, br3, jalr,
+//lane1 的方向预测（三张表服务 lane1 时才有意义）
+    output reg br1_1,
 //新增：命中标志（给 pc 选"落 T+4 / 落 T"）、交付给 pre_decoder 的目标指令与三态选择
     output reg bti_hit,
-    output reg [31:0] bti_inst_q,
+    output reg [63:0] bti_inst_q,
     output reg [1:0] bti_sel_q
     );
 
@@ -47,6 +53,10 @@ module bra_predict(
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg rst_q;
     always @(posedge clk) rst_q <= rst;
+
+//索引口径 = "指令地址 + 4"：pc 是"下一个待取地址"、一次吃两个字，本拍交付的 lane0 是
+//instr(pc − 8)，它的"指令地址 + 4"就是 pc − 4。★ 读口必须与写口 br_pc_idx 同口径，
+//否则 bht/btb/bti 永远命中不了（详见下面那段注释）。
 
 //flag_bus 译码（行为块，放本模块最前）：**先把各位还原成原名，再按名字做逻辑**（不用位号）。
 //adv 与 pc.v 那个 `!flush_w && !stall_w` 是同一个门，两边必须一致，否则"该改向却没交付"。
@@ -70,9 +80,9 @@ module bra_predict(
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
         flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
-        stall_w = (stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                 | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold) & ~flush_w;
-        adv     = ~flush_w & ~stall_w;
+//★ 本级在【取指侧】：只吃"重定向排队 + 取指自己 miss"；后端停顿由取指队列吸收。
+        stall_w = (stall_pc_redir | stall_icache_miss) & ~flush_w;
+        adv     = ~flush_w & ~stall_w & ~fifo_full;
     end
 
 //==================================================================================
@@ -85,14 +95,25 @@ module bra_predict(
 //所以 btb_v[i] 恒等于原来的 (btb[i] != 0)，逐位等价。
     reg btb_v [0:63];
     reg predict_en;
+//三张表的读 key：**2:1 选择，不加载第二个读口**（同一拍只有一条指令要用预测器）。
+//  lane0 是控制转移 ⇒ 查 lane0（key = 当拍 pc）；否则查 lane1（key = pc + 4）。
+//★ 行为逐位不变：三张表的输出全都被 lane0 自己的译码门控（br1/jalr/bti 都配 lane0 的类位）。
+    reg [31:0] rd_key;
+    always @(*) begin
+        if (lane0_ct)
+            rd_key = pc_addr_in;
+        else
+            rd_key = pc_addr_in + 32'd4;
+    end
     integer i;
+
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
         if (rst_q)
             predict_en = 1'b0;
         else
-            predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
+            predict_en = (bht[rd_key[8:3]] > 2'd1);
     end
 
 //==================================================================================
@@ -109,10 +130,16 @@ module bra_predict(
 // 恒真，不需要校验（jalr 那套预测+校验是另一张表，别混）。
 // 复位只清 bti_v：bti_inst/bti_tag 陈旧无害，带复位会撑爆 slice 打包（icache 的 tag1/tag2 同理）。
 //==================================================================================
-    (* ram_style = "distributed" *) reg [31:0] bti_inst [0:255];
+    (* ram_style = "distributed" *) reg [63:0] bti_inst [0:255];
     (* ram_style = "distributed" *) reg [21:0] bti_tag  [0:255];
     (* ram_style = "distributed" *) reg        bti_v    [0:255];
 
+//★ 索引口径 = "指令地址 + 4"（= 条目的 addr 口径，也 = 写口 br_pc_idx 的口径）。
+//  pc 现在是"下一个待取地址"、一次吃两个字 ⇒ 本拍交付的 lane0 是 instr(pc − 8)、它的
+//  "指令地址 + 4" 就是 pc − 4。★ 读口与写口必须同口径：老设计里交付那拍 pc 恰为
+//  "指令地址+4"，直接拿 pc_addr_in 索引两边就是同值；pc 改 +8 之后若还拿 pc 索引，
+//  读比写整整偏一格 ⇒ bht/btb/bti 永远命中不了（实测：pre_jalr=1 而 btb_hit=0，
+//  ret 无从改向、一路冲进零区，非法指令跳回 0 把整个程序重跑）。
     reg [7:0]  bti_rd_idx;
     reg [21:0] bti_rd_tag;
     reg        take;
@@ -149,7 +176,7 @@ module bra_predict(
         if (rst_q) begin
             bti_pend    <= 1'b0;
             bti_kind_q  <= 1'b0;
-            bti_inst_q  <= 32'd0;
+            bti_inst_q  <= 64'd0;
         end
         else if (take) begin
             bti_pend    <= 1'b1;
@@ -197,7 +224,10 @@ module bra_predict(
             cap_idx_q2 <= cap_idx_q2;
             cap_tag_q2 <= cap_tag_q2;
         end
-        else if (stall_w) begin
+//★ 冻结门必须与取指侧那道门【一致】：队列满时前端与 icache 交付都冻住了，
+//  捕获窗口若照常推进，两拍后取到的就不是"目标 inst 交付那一拍" ⇒ 表里存进错的一条
+//  （实测 ret_raw：bti 里存成目标的下一条 ⇒ 自环指令的目标指令被替换错 ⇒ pc 跑飞重来）。
+        else if (stall_w | fifo_full) begin
             cap_q      <= cap_q;
             cap_idx_q1 <= cap_idx_q1;
             cap_tag_q1 <= cap_tag_q1;
@@ -244,7 +274,11 @@ module bra_predict(
             end
 //冷启动捕获：这一拍 icache 交付的就是目标 inst（pc 已于 take 那拍落 T）
             if (cap_q[1] & inst_valid) begin
-                bti_inst[cap_idx_q2] <= inst_in;
+//★ 存【一对连续指令】：[63:32] 是目标那条（lane0）、[31:0] 是它后面那条（lane1）。
+//  注入那一拍两条一起进队列、pc 走 +8 —— 注入拍与常态拍的口径这才完全一致，pc（也就是本表的
+//  索引）才稳定。单字注入会让 pc 在 T+8/T+4 之间来回跳 ⇒ 自环指令 hit/miss 交替、控制流转圈
+//  （实测 smoke 在 0x58→0x60→0x5c 死转）。
+                bti_inst[cap_idx_q2] <= {inst_in, inst_next_in};
                 bti_tag[cap_idx_q2]  <= cap_tag_q2;
                 bti_v[cap_idx_q2]    <= 1'b1;
             end
@@ -255,6 +289,7 @@ module bra_predict(
     always @(*) begin
         if (rst_q) begin
             br1 = 1'b0;
+            br1_1 = 1'b0;
             br2 = 1'b0;
             br3 = 1'b0;
             jalr = 1'b0;
@@ -262,10 +297,11 @@ module bra_predict(
         end
         else begin
             br1 = br_en & predict_en;
+            br1_1 = ~lane0_ct & predict_en;
             br2 = success & !br_pred_taken_in;
             br3 = br_fail & br_pred_taken_in;
-            jalr_predict_offset = btb[pc_addr_in[8:3]];
-            jalr = btb_v[pc_addr_in[8:3]];
+            jalr_predict_offset = btb[rd_key[8:3]];
+            jalr = btb_v[rd_key[8:3]];
         end
     end
 

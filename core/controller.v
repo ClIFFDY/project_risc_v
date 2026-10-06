@@ -66,6 +66,8 @@ module controller(
     input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
+//取指队列头在册（透传给 csr 的中断受理门）
+    input        fifo_h0_v,
 //异常检测拍的载荷（cause/pc/tval）不再进 csr：csr 只在 ROB 交付那一拍锁上下文，
 //载荷由 ROB 按"队头那条故障指令自己那份"给出（见 csr 的 exc_retire 口）
     output reg [31:0] csr_data_out, isr_addr2, mcause,
@@ -278,6 +280,7 @@ module controller(
         .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_data_in),
         .pc_addr_in(pc_addr_in),
+        .h0_v(fifo_h0_v),
         .ird_tmr(ird_tmr),
         .jalr_fail(jalr_fail),
         .br2(br2),

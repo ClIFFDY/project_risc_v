@@ -64,31 +64,53 @@ module rob(
     input        alloc_en,
     input        alloc_we,
     input [4:0]  alloc_rd,
+//lane1 的分配口：语义是【本包有没有 lane1】（= 载荷里的 lane1_v），**不是**"这拍要不要分配"。
+//★ 绝不能接 payload_go 或任何含 full 的量：`alloc_need` 由它决定，而 `full` 又由 `alloc_need` 决定
+//  ⇒ payload_go → alloc_en1 → need → full → stall_rob_full → flag_bus → payload_go 就是一条
+//  零延时组合环（xsim 实测 Iteration limit 10000，正好停在自举结束、开始成对那一拍）。
+//  真正的"这拍要不要写"由下面的 `alloc_en` 一起门控。
+    input        alloc_en1,
+    input        alloc_we1,
+    input [4:0]  alloc_rd1,
 //前送槽扫描口：消费者（下一拍进载荷那条）的两个源寄存器号，用 mid 级的 rs1_2/rs2_2。
 //本模块按【程序序】分配（`alloc_en = payload_go`，与进载荷同沿）⇒ 扫描那一拍所有 `ent_v`
 //的槽**一格不多一格不少**全是比它老的指令 ⇒ "比我老"不需要任何比较，`ent_v[s]` 即等价；
 //"取最年轻的匹配" = 窗口里年龄最大的那个（年龄一律 4 位截断，见下面 red line）。
     input [4:0]  scan_rs1, scan_rs2,
+//lane1 的两个源（同一个包的第二条）。扫描口与 1/2 完全同形、同拍、同 scan_go。
+    input [4:0]  scan_rs1_1, scan_rs2_1,
 //扫描的推进条件（= pre_decoder 本级的锁存条件）：为 1 才把这一拍的扫描结果打拍换新
     input        scan_go,
     output reg [2:0] fwd_slot1, fwd_slot2,
+    output reg [2:0] fwd_slot3, fwd_slot4,
     output reg       fwd_hit1,  fwd_hit2,
+    output reg       fwd_hit3,  fwd_hit4,
 //前送值读口①【正常读】：索引就是本模块当拍扫描出的 fwd_slot1/2（不外引、不经任何选择）
 //  ⇒ 这条路上没有任何 stall/flush 组合量，bju 的判定锥进不来。
     output reg [31:0] fwd_data1, fwd_data2,
+    output reg [31:0] fwd_data3, fwd_data4,
     output reg        fwd_done1, fwd_done2,
+    output reg        fwd_done3, fwd_done4,
 //前送值读口②【停顿重读】：索引是消费者读锁存时锁下的槽（s1_q/s2_q，由 regfile 给）。
 //  为什么要两组：消费者被停顿拖住时要用【锁存的】槽重读，而正常读用的是扫描槽 ——
 //  若把两者在一根地址上 mux，stall_w（来自 flag_bus、即 bju 判定）就会被串进操作数数据路。
     input [2:0]  st_slot1, st_slot2,
+    input [2:0]  st_slot3, st_slot4,
     output reg [31:0] st_data1, st_data2,
+    output reg [31:0] st_data3, st_data4,
     output reg        st_done1, st_done2,
+    output reg        st_done3, st_done4,
 //完成口（写口级处置完一笔就回报：落地 / 被杀 / 不写；只认 valid 的槽）
 //  data 与 gen 与 done/idx 同拍同源（完成口把"值"和"这一笔的世代"一起带回来）
     input        alu_done,
     input [2:0]  alu_idx,
     input [31:0] alu_data,
     input        alu_gen,
+//lane1 的完成口：lane1 只可能是 ALU 类，所以只需要这一条（mulu/lsu 永远只服务 lane0）
+    input        alu_done1,
+    input [2:0]  alu_idx1,
+    input [31:0] alu_data1,
+    input        alu_gen1,
     input        mul_done,
     input [2:0]  mul_idx,
     input [31:0] mul_data,
@@ -115,6 +137,9 @@ module rob(
 //本条分配拿到的世代位（= 槽在分配那一沿翻转【之后】的值），随载荷走到执行单元，
 //完成上报时带回来与 ent_gen[槽] 比对做身份校验（见文件头"完成："那节）
     output reg        alloc_gen,
+//lane1 那一项的环位与世代（= tail_p + 1 与它的翻转后世代）
+    output reg [2:0]  alloc_idx1,
+    output reg        alloc_gen1,
 //提交口：寄存器堆的两条写口（口 A = head 更老、口 B = head+1 更年轻）
     output reg        cmt_we0,
     output reg [4:0]  cmt_rd0,
@@ -182,10 +207,34 @@ reg        scan_m1 [0:DEPTH-1];
 reg        scan_m2 [0:DEPTH-1];
 reg        scan_y1 [0:DEPTH-1];
 reg        scan_y2 [0:DEPTH-1];
+//lane1 的两个源（扫描口 3/4）：结构与 1/2 逐字并联，只是各自的 rs 不同。
+//★ 它们是【并联】的 ⇒ 扫描那一拍的深度一行不变（rs → 比较 → 8×8 → 槽号），
+//  多出来的是面积与扇出，不是路径长度。8×8 归约的条数从 2 份变 4 份。
+reg        scan_c3 [0:DEPTH-1];
+reg        scan_c4 [0:DEPTH-1];
+reg        scan_g3 [0:DEPTH-1];
+reg        scan_g4 [0:DEPTH-1];
+reg        scan_y3q [0:DEPTH-1];
+reg        scan_y4q [0:DEPTH-1];
+reg        scan_g3q [0:DEPTH-1];
+reg        scan_g4q [0:DEPTH-1];
+reg        hit_c3, hit_c4;
+reg [2:0]  slot_c3, slot_c4;
+reg        scan_w3 [0:DEPTH-1];
+reg        scan_w4 [0:DEPTH-1];
+reg        scan_v3 [0:DEPTH-1];
+reg        scan_v4 [0:DEPTH-1];
+reg        scan_m3 [0:DEPTH-1];
+reg        scan_m4 [0:DEPTH-1];
+reg        scan_y3 [0:DEPTH-1];
+reg        scan_y4 [0:DEPTH-1];
 integer si, sj;
 
 reg [2:0]  tail_p;
 reg [3:0]  cnt;
+//本包要占几个槽：lane1 有效就 2，否则 1。满的判据必须按【整包】算 ——
+//只余 1 槽而成对时，整包等下一拍，绝不进一半（进一半就破了"一个包是一个单位"）。
+reg [2:0]  alloc_need;
 
 reg [2:0]  head_nx;
 reg [2:0]  tail_nx;
@@ -258,9 +307,11 @@ always @(posedge clk) rst_q <= rst;
         flush_ok   = flush_con_rob && (flush_age < cnt) && ent_v[flush_idx];
         alloc_idx  = tail_p;
         alloc_gen  = ~ent_gen[tail_p];
+        alloc_idx1 = tail_p + 3'd1;
+        alloc_gen1 = ~ent_gen[tail_p + 3'd1];
         occupancy  = cnt;
         empty      = (cnt == 4'd0);
-        full       = (cnt == DEPTH);
+        full       = ({1'b0, cnt} + {1'b0, alloc_need} > {1'b0, DEPTH});
 //提交口：只有队头两项可退，且【写 rd 的项】才写寄存器堆。
 //★ `ent_rd != 0` 与 head_ok 里的 `!ent_ex` 是两道独立的门，缺一不可：
 //  post_decoder 的 issue_we 把 SYSTEM 保守算作会写 ⇒ 故障项的 ent_rd 可能非 0。
@@ -271,6 +322,14 @@ always @(posedge clk) rst_q <= rst;
         cmt_rd1_e   = ent_rd[head1_p];
         cmt_data1_e = ent_data[head1_p];
 
+    end
+
+//本包要占几个槽。lane1 有效就 2 —— 被 full 的判据与 tail 的推进两处共用。
+    always @(*) begin
+        if (alloc_en1)
+            alloc_need = 3'd2;
+        else
+            alloc_need = 3'd1;
     end
 
 //下一拍的指针与占用数：先算退掉的（0/1/2 笔），再算分配的，冲刷最后覆盖（与旧写法优先级一致）
@@ -291,8 +350,8 @@ always @(posedge clk) rst_q <= rst;
             cnt_nx = cnt_nx - 4'd1;
         end
         if (alloc_en && !full) begin
-            tail_nx = tail_p + 3'd1;
-            cnt_nx  = cnt_nx + 4'd1;
+            tail_nx = tail_p + alloc_need;
+            cnt_nx  = cnt_nx + {1'b0, alloc_need};
         end
 //★ 判据必须与时钟块那条【逐字一致】：边界项失效时走的是"全冲"，
 //  时钟块清项、这里也必须把 cnt/tail 一起归零 —— 漏了就是"项全清掉、计数还留着"，
@@ -339,10 +398,16 @@ always @(posedge clk) rst_q <= rst;
             scan_wv[si] = ent_v[si] & |ent_rd[si];
             scan_c1[si] = scan_wv[si] & (ent_rd[si] == scan_rs1);
             scan_c2[si] = scan_wv[si] & (ent_rd[si] == scan_rs2);
+            scan_c3[si] = scan_wv[si] & (ent_rd[si] == scan_rs1_1);
+            scan_c4[si] = scan_wv[si] & (ent_rd[si] == scan_rs2_1);
             scan_g1[si] = ent_gen[si];
             scan_g2[si] = ent_gen[si];
+            scan_g3[si] = ent_gen[si];
+            scan_g4[si] = ent_gen[si];
             scan_y1[si] = scan_c1[si];
             scan_y2[si] = scan_c2[si];
+            scan_y3[si] = scan_c3[si];
+            scan_y4[si] = scan_c4[si];
         end
 //同拍正在分配那一项：世代取【翻转后】的值（下一拍 ent_gen[tail_p] 就是它）
         if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1)) begin
@@ -355,6 +420,41 @@ always @(posedge clk) rst_q <= rst;
             scan_y2[tail_p] = 1'b1;
             scan_g2[tail_p] = alloc_gen;
         end
+//lane1 的两个源：这一拍正在分配的【两项】都要进候选（tail_p 是 lane0、tail_p+1 是 lane1）。
+//它俩都比"下一拍进载荷那个消费者"老，所以都是合法生产者。
+        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1_1)) begin
+            scan_c3[tail_p] = 1'b1;
+            scan_y3[tail_p] = 1'b1;
+            scan_g3[tail_p] = alloc_gen;
+        end
+//★ 反向也要补：这一拍分配的 lane1 那项（tail_p+1）同样是"比消费者老"的生产者 ——
+//  漏了它，紧跟成对包之后的消费者就扫不到 lane1 刚写的那个 rd（实测 tightdep：
+//  a4 的项晚一拍进表，addi a5,a4,1 扫不到它、回落阵列读到旧值 0，a5 得 1 而不是 10）。
+        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs1)) begin
+            scan_c1[tail_p + 3'd1] = 1'b1;
+            scan_y1[tail_p + 3'd1] = 1'b1;
+            scan_g1[tail_p + 3'd1] = alloc_gen1;
+        end
+        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs2)) begin
+            scan_c2[tail_p + 3'd1] = 1'b1;
+            scan_y2[tail_p + 3'd1] = 1'b1;
+            scan_g2[tail_p + 3'd1] = alloc_gen1;
+        end
+        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs1_1)) begin
+            scan_c3[tail_p + 3'd1] = 1'b1;
+            scan_y3[tail_p + 3'd1] = 1'b1;
+            scan_g3[tail_p + 3'd1] = alloc_gen1;
+        end
+        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs2_1)) begin
+            scan_c4[tail_p] = 1'b1;
+            scan_y4[tail_p] = 1'b1;
+            scan_g4[tail_p] = alloc_gen;
+        end
+        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs2_1)) begin
+            scan_c4[tail_p + 3'd1] = 1'b1;
+            scan_y4[tail_p + 3'd1] = 1'b1;
+            scan_g4[tail_p + 3'd1] = alloc_gen1;
+        end
 //"有人比你更年轻"就把你摁掉（用含分配项的候选掩码，保证热码唯一）
         for (si = 0; si < DEPTH; si = si + 1) begin
             for (sj = 0; sj < DEPTH; sj = sj + 1) begin
@@ -362,12 +462,20 @@ always @(posedge clk) rst_q <= rst;
                     scan_y1[si] = 1'b0;
                 if (scan_c2[sj] && (scan_ag[sj] > scan_ag[si]))
                     scan_y2[si] = 1'b0;
+                if (scan_c3[sj] && (scan_ag[sj] > scan_ag[si]))
+                    scan_y3[si] = 1'b0;
+                if (scan_c4[sj] && (scan_ag[sj] > scan_ag[si]))
+                    scan_y4[si] = 1'b0;
             end
         end
         hit_c1  = 1'b0;
         hit_c2  = 1'b0;
+        hit_c3  = 1'b0;
+        hit_c4  = 1'b0;
         slot_c1 = 3'd0;
         slot_c2 = 3'd0;
+        slot_c3 = 3'd0;
+        slot_c4 = 3'd0;
         for (si = 0; si < DEPTH; si = si + 1) begin
             if (scan_y1[si]) begin
                 hit_c1  = 1'b1;
@@ -376,6 +484,14 @@ always @(posedge clk) rst_q <= rst;
             if (scan_y2[si]) begin
                 hit_c2  = 1'b1;
                 slot_c2 = si[2:0];
+            end
+            if (scan_y3[si]) begin
+                hit_c3  = 1'b1;
+                slot_c3 = si[2:0];
+            end
+            if (scan_y4[si]) begin
+                hit_c4  = 1'b1;
+                slot_c4 = si[2:0];
             end
         end
     end
@@ -386,31 +502,49 @@ always @(posedge clk) rst_q <= rst;
         if (rst_q || flush_any) begin
             fwd_slot1 <= 3'd0;
             fwd_slot2 <= 3'd0;
+            fwd_slot3 <= 3'd0;
+            fwd_slot4 <= 3'd0;
             for (si = 0; si < DEPTH; si = si + 1) begin
                 scan_y1q[si] <= 1'b0;
                 scan_y2q[si] <= 1'b0;
+                scan_y3q[si] <= 1'b0;
+                scan_y4q[si] <= 1'b0;
                 scan_g1q[si] <= 1'b0;
                 scan_g2q[si] <= 1'b0;
+                scan_g3q[si] <= 1'b0;
+                scan_g4q[si] <= 1'b0;
             end
         end
         else if (scan_go) begin
             fwd_slot1 <= slot_c1;
             fwd_slot2 <= slot_c2;
+            fwd_slot3 <= slot_c3;
+            fwd_slot4 <= slot_c4;
             for (si = 0; si < DEPTH; si = si + 1) begin
                 scan_y1q[si] <= scan_y1[si];
                 scan_y2q[si] <= scan_y2[si];
+                scan_y3q[si] <= scan_y3[si];
+                scan_y4q[si] <= scan_y4[si];
                 scan_g1q[si] <= scan_g1[si];
                 scan_g2q[si] <= scan_g2[si];
+                scan_g3q[si] <= scan_g3[si];
+                scan_g4q[si] <= scan_g4[si];
             end
         end
         else begin
             fwd_slot1 <= fwd_slot1;
             fwd_slot2 <= fwd_slot2;
+            fwd_slot3 <= fwd_slot3;
+            fwd_slot4 <= fwd_slot4;
             for (si = 0; si < DEPTH; si = si + 1) begin
                 scan_y1q[si] <= scan_y1q[si];
                 scan_y2q[si] <= scan_y2q[si];
+                scan_y3q[si] <= scan_y3q[si];
+                scan_y4q[si] <= scan_y4q[si];
                 scan_g1q[si] <= scan_g1q[si];
                 scan_g2q[si] <= scan_g2q[si];
+                scan_g3q[si] <= scan_g3q[si];
+                scan_g4q[si] <= scan_g4q[si];
             end
         end
     end
@@ -427,28 +561,48 @@ always @(posedge clk) rst_q <= rst;
         for (si = 0; si < DEPTH; si = si + 1) begin
             scan_w1[si] = scan_y1q[si] & (ent_gen[si] == scan_g1q[si]) & ent_v[si];
             scan_w2[si] = scan_y2q[si] & (ent_gen[si] == scan_g2q[si]) & ent_v[si];
+            scan_w3[si] = scan_y3q[si] & (ent_gen[si] == scan_g3q[si]) & ent_v[si];
+            scan_w4[si] = scan_y4q[si] & (ent_gen[si] == scan_g4q[si]) & ent_v[si];
             scan_v1[si] = scan_w1[si] & ent_wr[si] & ~ent_ex[si];
             scan_v2[si] = scan_w2[si] & ent_wr[si] & ~ent_ex[si];
+            scan_v3[si] = scan_w3[si] & ent_wr[si] & ~ent_ex[si];
+            scan_v4[si] = scan_w4[si] & ent_wr[si] & ~ent_ex[si];
         end
 //★ 命中位必须与"算完了没"用【同一份当拍判据】：世代对不上（槽已换人）时命中位也要落，
 //  否则旁路会以为"有个还没算完的 ROB 源"而不回落到阵列读，取到的是新住户的脏值。
         fwd_hit1  = 1'b0;
         fwd_hit2  = 1'b0;
+        fwd_hit3  = 1'b0;
+        fwd_hit4  = 1'b0;
         fwd_done1 = 1'b0;
         fwd_done2 = 1'b0;
+        fwd_done3 = 1'b0;
+        fwd_done4 = 1'b0;
         fwd_data1 = 32'd0;
         fwd_data2 = 32'd0;
+        fwd_data3 = 32'd0;
+        fwd_data4 = 32'd0;
         st_done1  = 1'b0;
         st_done2  = 1'b0;
+        st_done3  = 1'b0;
+        st_done4  = 1'b0;
         st_data1  = 32'd0;
         st_data2  = 32'd0;
+        st_data3  = 32'd0;
+        st_data4  = 32'd0;
         for (si = 0; si < DEPTH; si = si + 1) begin
             fwd_hit1  = fwd_hit1  | scan_w1[si];
             fwd_hit2  = fwd_hit2  | scan_w2[si];
+            fwd_hit3  = fwd_hit3  | scan_w3[si];
+            fwd_hit4  = fwd_hit4  | scan_w4[si];
             fwd_done1 = fwd_done1 | scan_v1[si];
             fwd_done2 = fwd_done2 | scan_v2[si];
+            fwd_done3 = fwd_done3 | scan_v3[si];
+            fwd_done4 = fwd_done4 | scan_v4[si];
             fwd_data1 = fwd_data1 | (scan_v1[si] ? ent_data[si] : 32'd0);
             fwd_data2 = fwd_data2 | (scan_v2[si] ? ent_data[si] : 32'd0);
+            fwd_data3 = fwd_data3 | (scan_v3[si] ? ent_data[si] : 32'd0);
+            fwd_data4 = fwd_data4 | (scan_v4[si] ? ent_data[si] : 32'd0);
             st_done1  = st_done1  | ((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
             st_done2  = st_done2  | ((st_slot2 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
             st_data1  = st_data1  | (((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]) ? ent_data[si] : 32'd0);
@@ -530,11 +684,23 @@ always @(posedge clk) rst_q <= rst;
                 ent_rd[tail_p] <= (alloc_we && (alloc_rd != 5'd0)) ? alloc_rd : 5'd0;
                 ent_gen[tail_p] <= ~ent_gen[tail_p];
             end
+//lane1 那一项：与 lane0 同拍、同门控（full 已按整包算过，这里只要跟它一致就不会只进一半）。
+            if (alloc_en && alloc_en1 && !full) begin
+                ent_v[tail_p + 3'd1]  <= 1'b1;
+                ent_wr[tail_p + 3'd1] <= ~alloc_we1;
+                ent_ex[tail_p + 3'd1] <= 1'b0;
+                ent_rd[tail_p + 3'd1] <= (alloc_we1 && (alloc_rd1 != 5'd0)) ? alloc_rd1 : 5'd0;
+                ent_gen[tail_p + 3'd1] <= ~ent_gen[tail_p + 3'd1];
+            end
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验是必需的：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（ent_v 挡不住"新住户也 valid"）。
             if (alu_done && ent_v[alu_idx] && (ent_gen[alu_idx] == alu_gen)) begin
                 ent_wr[alu_idx]   <= 1'b1;
                 ent_data[alu_idx] <= alu_data;
+            end
+            if (alu_done1 && ent_v[alu_idx1] && (ent_gen[alu_idx1] == alu_gen1)) begin
+                ent_wr[alu_idx1]   <= 1'b1;
+                ent_data[alu_idx1] <= alu_data1;
             end
             if (mul_done && ent_v[mul_idx] && (ent_gen[mul_idx] == mul_gen)) begin
                 ent_wr[mul_idx]   <= 1'b1;

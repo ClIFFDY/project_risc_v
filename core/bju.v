@@ -254,6 +254,13 @@ module bju(
         end
     end
 
+//预测表的写索引 = "指令地址 + 8" 的 [8:3]（口径见下面 br_pc_idx 那条注释）。
+//Verilog 不允许对表达式做位选，所以先算出来一格。
+    reg [31:0] aux_q_p4;
+    always @(*) begin
+        aux_q_p4 = aux_q + 32'd4;
+    end
+
     always @(*) begin
         jalr_low2 = 2'd0;
         if (jalrf_q) begin
@@ -335,7 +342,10 @@ module bju(
             jp_target <= jp_target_now;
             exc_pc_q <= aux_q;
             jalr_target_q2 <= jalr_target_now;
-            br_pc_idx <= aux_q[8:3];
+//★ 预测表索引 = "指令地址 + 8"：pc 恒定 +8、一次吃两个字 ⇒ 本条指令被【呈现】那一拍的
+//  pc_addr 正好是 指令地址 + 8，读口（bra_predict 直接用 pc_addr_in）就是这个口径。写口跟着改，
+//  两边才是同一个 key（老口径 aux_q = 指令地址+4，那是 pc 还走 +4/+8 时的对齐方式）。
+            br_pc_idx <= aux_q_p4[8:3];
             jalr_flag_q <= jalrf_q & ~exc_jalr_misalign;
             br_pred_taken_q <= pred_q;
             idx_q <= idx_i;

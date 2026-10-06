@@ -45,20 +45,30 @@
 
 module forw(
     input clk, rst,
-//前送源①：alu 结果口
+//前送源①：alu 结果口（lane0 那条的 ALU）
     input [31:0] data_alu,
-//前送源②：mulu 结果口
+//前送源②：alu2 结果口（lane1 那条的 ALU）—— 它同样是生产者，后面的包可能读到它
+    input [31:0] data_alu2,
+//前送源③：mulu 结果口
     input [31:0] data_mul,
-//前送源③：lsu 结果口
+//前送源④：lsu 结果口
     input [31:0] data_ld,
-//三个单元算好的命中位（各 2 位：r1/r2 各一位）——本模块不再做任何比较
-    input        hit1_alu, hit1_mul, hit1_ld,
-    input        hit2_alu, hit2_mul, hit2_ld,
+//四个生产者算好的命中位（每个消费者一位）——本模块不做任何比较。
+//★ 槽号唯一 ⇒ 至多一个生产者命中，所以这几路的先后只是防御性 tie-break，不是优先链。
+    input        hit1_alu, hit1_alu2, hit1_mul, hit1_ld,
+    input        hit2_alu, hit2_alu2, hit2_mul, hit2_ld,
+//lane1（同一个包的第二条）的两个操作数：与 1/2 逐字同形的一套
+    input        hit3_alu, hit3_alu2, hit3_mul, hit3_ld,
+    input        hit4_alu, hit4_alu2, hit4_mul, hit4_ld,
 //操作数默认源（原来在 post_decoder 里装配的两组，并到这里同一次选择）
     input [31:0] r1_data,    r2_data,
     input [31:0] r1_imm_val, r2_imm_val,
     input        r1_imm_sel, r2_imm_sel,
-    (* max_fanout = 32 *) output reg [31:0] r1_data_final, r2_data_final
+    input [31:0] r3_data,    r4_data,
+    input [31:0] r3_imm_val, r4_imm_val,
+    input        r3_imm_sel, r4_imm_sel,
+    (* max_fanout = 32 *) output reg [31:0] r1_data_final, r2_data_final,
+    (* max_fanout = 32 *) output reg [31:0] r3_data_final, r4_data_final
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -72,7 +82,7 @@ module forw(
 //  块间求值次序不定（iverilog 实测首拍就选空、输出留 X）—— 合成无所谓，仿真会错。
 //★ 选择码：0=reg 1=imm 2=alu 3=mul 4=ld。"命中优先于 imm"在下面落定：先按 imm_sel 落默认，
 //  命中再覆盖（与旧 forw 的合成语义一致；槽号唯一 ⇒ 至多一个命中，命中间的顺序只是防御性 tie-break）。
-    reg [2:0] src1, src2;
+    reg [2:0] src1, src2, src3, src4;
     always @(*) begin
         if (r1_imm_sel)
             src1 = 3'd1;
@@ -80,35 +90,83 @@ module forw(
             src1 = 3'd0;
         if (hit1_alu)
             src1 = 3'd2;
-        else if (hit1_mul)
+        else if (hit1_alu2)
             src1 = 3'd3;
-        else if (hit1_ld)
+        else if (hit1_mul)
             src1 = 3'd4;
+        else if (hit1_ld)
+            src1 = 3'd5;
         if (r2_imm_sel)
             src2 = 3'd1;
         else
             src2 = 3'd0;
         if (hit2_alu)
             src2 = 3'd2;
-        else if (hit2_mul)
+        else if (hit2_alu2)
             src2 = 3'd3;
-        else if (hit2_ld)
+        else if (hit2_mul)
             src2 = 3'd4;
+        else if (hit2_ld)
+            src2 = 3'd5;
+        if (r3_imm_sel)
+            src3 = 3'd1;
+        else
+            src3 = 3'd0;
+        if (hit3_alu)
+            src3 = 3'd2;
+        else if (hit3_alu2)
+            src3 = 3'd3;
+        else if (hit3_mul)
+            src3 = 3'd4;
+        else if (hit3_ld)
+            src3 = 3'd5;
+        if (r4_imm_sel)
+            src4 = 3'd1;
+        else
+            src4 = 3'd0;
+        if (hit4_alu)
+            src4 = 3'd2;
+        else if (hit4_alu2)
+            src4 = 3'd3;
+        else if (hit4_mul)
+            src4 = 3'd4;
+        else if (hit4_ld)
+            src4 = 3'd5;
         case (src1)
             3'd0: r1_data_final = r1_data;
             3'd1: r1_data_final = r1_imm_val;
             3'd2: r1_data_final = data_alu;
-            3'd3: r1_data_final = data_mul;
-            3'd4: r1_data_final = data_ld;
+            3'd3: r1_data_final = data_alu2;
+            3'd4: r1_data_final = data_mul;
+            3'd5: r1_data_final = data_ld;
             default: r1_data_final = r1_data;
         endcase
         case (src2)
             3'd0: r2_data_final = r2_data;
             3'd1: r2_data_final = r2_imm_val;
             3'd2: r2_data_final = data_alu;
-            3'd3: r2_data_final = data_mul;
-            3'd4: r2_data_final = data_ld;
+            3'd3: r2_data_final = data_alu2;
+            3'd4: r2_data_final = data_mul;
+            3'd5: r2_data_final = data_ld;
             default: r2_data_final = r2_data;
+        endcase
+        case (src3)
+            3'd0: r3_data_final = r3_data;
+            3'd1: r3_data_final = r3_imm_val;
+            3'd2: r3_data_final = data_alu;
+            3'd3: r3_data_final = data_alu2;
+            3'd4: r3_data_final = data_mul;
+            3'd5: r3_data_final = data_ld;
+            default: r3_data_final = r3_data;
+        endcase
+        case (src4)
+            3'd0: r4_data_final = r4_data;
+            3'd1: r4_data_final = r4_imm_val;
+            3'd2: r4_data_final = data_alu;
+            3'd3: r4_data_final = data_alu2;
+            3'd4: r4_data_final = data_mul;
+            3'd5: r4_data_final = data_ld;
+            default: r4_data_final = r4_data;
         endcase
     end
 

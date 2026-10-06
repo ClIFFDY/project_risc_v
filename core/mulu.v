@@ -58,7 +58,9 @@ module mulu(
 //★ 三条结果路（m_pv / d_pend / hold）的数据都是组合给出的 ⇒ 命中位也走组合、与 `mul_idx` 逐支同步
 //  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
     input [2:0]  sel_slot1, sel_slot2,
+    input [2:0]  sel_slot3, sel_slot4,
     input        sel_v1,    sel_v2,
+    input        sel_v3,    sel_v4,
 //冻结信号从 flag_bus 取位（本模块不设专用 stall 端口）：
 //本级的两级乘法流水、除法提交链、输出保持全部按它【冻结】，写口沿才能与 alu 的写回沿
 //严格同偏移（照 lsu 对 stage 的门控手法）。不冻结的后果：icache 一 miss 就把 mul 冻在 c2，
@@ -68,6 +70,9 @@ module mulu(
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
+//lane1 的两个源：它自己不可能是 M 类，但可能读到在途乘法的 rd ⇒ 冒险要带上它。
+//★ 独立成项、只或进广播，`stall_mulu_haz` 原式一字不动。
+    input [4:0] r3_post, r4_post,
 //写序号（与 rd_in 同沿锁进本级）与当前最新号（滞留兜底用）
     input [2:0]  idx_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
@@ -78,6 +83,7 @@ module mulu(
     (* max_fanout = 8 *) output reg mul_loaded, mul_we,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 mul_idx 逐支同步，供 forw 直接选源
     output reg hit1, hit2,
+    output reg hit3, hit4,
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
     output reg [2:0]  mul_idx,
@@ -147,6 +153,7 @@ module mulu(
     reg        m_gen;
     reg [2:0]  m_op;
     reg        m_v;
+    reg        stall_mulu_haz_self, stall_mulu_haz_1;
 
     reg [63:0] m_p;
     reg [4:0]  m_rd_q;
@@ -349,7 +356,7 @@ module mulu(
 //★ 发起条件必须等操作数真的就绪：`!stall_mulu_haz`（前一条乘法的结果还没回来）与 `!pipe_stall`
 //  （别的单元在停：载入用法相关、总线/缓存 hold）都要排掉。不能判 `!stall` —— stall 里含
 //  `stall_v` 而 stall_v 又含 is_div 本身，判了永远发不出去（死锁）。
-        else if (is_div && !d_issued && !bus_hold && !stall_mulu_haz && !pipe_stall && (d_cmt_q == 3'd0)) begin
+        else if (is_div && !d_issued && !bus_hold && !stall_mulu_haz_self && !pipe_stall && (d_cmt_q == 3'd0)) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //【不能判 !stall】—— stall 里含 is_div 本身，判了就永远发不出去（死锁）。
 //d_issued 保证一条 div 只发起一次；否则算完后 is_div 仍在（指令还冻在 mulu 级），
@@ -462,11 +469,26 @@ module mulu(
 
 //乘法：前一条是 MUL 且当前指令要用它的 rd → 停 1 拍，结果到了就放
 //（结果还没上退口的那一格由 forw 点② 的【在途支路】覆盖，压在前端的那一拍不再需要）
+//lane1 的同形判据：独立成项，`stall_mulu_haz` 原式一字不动。
+    always @(*) begin
+        if ((rd_post == r3_post) | (rd_post == r4_post))
+            stall_mulu_haz_1 = m_v ? 1'b1 : 1'b0;
+        else
+            stall_mulu_haz_1 = 1'b0;
+    end
+
     always @(*) begin
         if ((rd_post == r1_post) | (rd_post == r2_post))
-            stall_mulu_haz = m_v ? 1'b1 : 1'b0;
+            stall_mulu_haz_self = m_v ? 1'b1 : 1'b0;
         else
-            stall_mulu_haz = 1'b0;
+            stall_mulu_haz_self = 1'b0;
+    end
+
+//对外广播的那一份 = 本来的项 | lane1 那一项。
+//★ 模块内部（除法发起条件）用的仍只有 `stall_mulu_haz_self` —— 那是"本条自己操作数没就绪"，
+//  与 lane1 的读无关，混进去会让除法发起条件多一个无关项。
+    always @(*) begin
+        stall_mulu_haz = stall_mulu_haz_self | stall_mulu_haz_1;
     end
 
 //  口被 alu 占住时乘法让路是常态里的极少数（三笔同拍才轮到它让），量级可忽略。
@@ -489,6 +511,8 @@ module mulu(
             mul_data_out = mul_sel ? m_p[31:0] : m_p[63:32];
             hit1         = sel_v1 & (m_idx_q == sel_slot1);
             hit2         = sel_v2 & (m_idx_q == sel_slot2);
+            hit3         = sel_v3 & (m_idx_q == sel_slot3);
+            hit4         = sel_v4 & (m_idx_q == sel_slot4);
         end
         else if (d_pend) begin
             mul_loaded   = 1'b1;
@@ -498,6 +522,8 @@ module mulu(
             mul_data_out = d_cmt_data;
             hit1         = sel_v1 & (d_cmt_idx == sel_slot1);
             hit2         = sel_v2 & (d_cmt_idx == sel_slot2);
+            hit3         = sel_v3 & (d_cmt_idx == sel_slot3);
+            hit4         = sel_v4 & (d_cmt_idx == sel_slot4);
         end
         else if (hold) begin
             mul_loaded   = 1'b1;
@@ -507,6 +533,8 @@ module mulu(
             mul_data_out = hold_data;
             hit1         = sel_v1 & (idx_hold == sel_slot1);
             hit2         = sel_v2 & (idx_hold == sel_slot2);
+            hit3         = sel_v3 & (idx_hold == sel_slot3);
+            hit4         = sel_v4 & (idx_hold == sel_slot4);
         end
         else begin
             mul_loaded   = 1'b0;
@@ -515,6 +543,8 @@ module mulu(
             mul_data_out = 32'd0;
             hit1         = 1'b0;
             hit2         = 1'b0;
+            hit3         = 1'b0;
+            hit4         = 1'b0;
         end
     end
 

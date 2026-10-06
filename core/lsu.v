@@ -45,10 +45,15 @@ module lsu(
 //★ 本模块的"新值"（`ld_data_cur`）是组合的 ⇒ 命中位也走组合、与 `loaded`/`ld_idx` 同步给出，
 //  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
     input [2:0]  sel_slot1, sel_slot2,
+    input [2:0]  sel_slot3, sel_slot4,
     input        sel_v1,    sel_v2,
+    input        sel_v3,    sel_v4,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
+//lane1（同一个包的第二条）的两个源：它不进 lsu，但可能读到在途 load 的 rd ⇒ 冒险扫描要带上它。
+//★ 单独成项、只或进 stall 广播，不进 `ls_use_hit`（它兼着非对齐故障判据的形状）。
+    input [4:0] r3_post, r4_post,
 //ROB 索引载荷：与其它载荷同使能锁存，回填时用它写进 ROB 自己那一项
     input [2:0]  idx_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
@@ -71,6 +76,7 @@ module lsu(
     (* max_fanout = 8 *) output reg loaded,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 loaded/ld_idx 同拍给出，供 forw 直接选源
     output reg hit1, hit2,
+    output reg hit3, hit4,
     output reg ld_we,
 //三条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_lsu_haz,
@@ -164,6 +170,7 @@ module lsu(
     reg ld_out, blank_bus, s2_put, new_put;
     reg ls_use_hit, miss;
     reg ls_use_ans;
+    reg ls_use_hit_1;
     reg [31:0] addr_sum, st_wdata, cur_addr;
     reg [3:0]  st_be;
     reg [31:0] byte_addr;
@@ -356,8 +363,32 @@ module lsu(
 //  full   = 本级这条访存进不了级2（车厢满）
 //★ haz 与 unload 在「级3 有在途 load」这一段上是重叠的：haz 只顶上命中 rs 的那条（精确），
 //  unload 是无条件冻结（把不相关的条一起顶住）。重叠不影响正确性，且为"撤掉 unload 的对外广播"留后路。
+//lane1 的 load-use：与上面同形，只是比的是 lane1 的两个源。级2/级3 两槽都扫。
+//★ 独立成项（不改 `ls_use_hit` 的形状）：它只参与停顿广播，不参与入口门/故障判据。
     always @(*) begin
-        stall_lsu_haz    = ls_use_hit | ls_use_ans;
+        ls_use_hit_1 = 1'b0;
+        if (s2_v && s2_rd != 5'd0) begin
+            if (r3_post != 5'd0 && (s2_rd == r3_post))
+                ls_use_hit_1 = 1'b1;
+            if (r4_post != 5'd0 && (s2_rd == r4_post))
+                ls_use_hit_1 = 1'b1;
+        end
+        if (s3_v && ~s3_done && s3_rd != 5'd0) begin
+            if (r3_post != 5'd0 && (s3_rd == r3_post))
+                ls_use_hit_1 = 1'b1;
+            if (r4_post != 5'd0 && (s3_rd == r4_post))
+                ls_use_hit_1 = 1'b1;
+        end
+        if (ld_ans && s3_rd != 5'd0) begin
+            if (r3_post != 5'd0 && (s3_rd == r3_post))
+                ls_use_hit_1 = 1'b1;
+            if (r4_post != 5'd0 && (s3_rd == r4_post))
+                ls_use_hit_1 = 1'b1;
+        end
+    end
+
+    always @(*) begin
+        stall_lsu_haz    = ls_use_hit | ls_use_ans | ls_use_hit_1;
         stall_lsu_unload = s3_v & ~s3_done;
         stall_lsu_full   = full_stall;
     end
@@ -515,6 +546,8 @@ module lsu(
             ld_gen = ld_wb_gen;
             hit1 = sel_v1 & (ld_wb_idx == sel_slot1);
             hit2 = sel_v2 & (ld_wb_idx == sel_slot2);
+            hit3 = sel_v3 & (ld_wb_idx == sel_slot3);
+            hit4 = sel_v4 & (ld_wb_idx == sel_slot4);
         end
         else if (ld_hold) begin
             loaded = 1'b1;
@@ -525,6 +558,8 @@ module lsu(
             ld_gen = gen_hold;
             hit1 = sel_v1 & (idx_hold == sel_slot1);
             hit2 = sel_v2 & (idx_hold == sel_slot2);
+            hit3 = sel_v3 & (idx_hold == sel_slot3);
+            hit4 = sel_v4 & (idx_hold == sel_slot4);
         end
         else begin
             loaded = 1'b0;
@@ -538,6 +573,8 @@ module lsu(
             ld_gen = 1'b0;
             hit1 = 1'b0;
             hit2 = 1'b0;
+            hit3 = 1'b0;
+            hit4 = 1'b0;
         end
     end
 

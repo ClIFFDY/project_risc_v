@@ -39,12 +39,24 @@ module csr(
     input [3:0]  exc_retire_cause,
     input [31:0] exc_retire_pc, exc_retire_tval,
     input [1:0] ird_tmr,
+//队头此刻是否真的在册（fetch_fifo 的 h0_v）。★ 受理那一拍要拿 pc_addr_in 当 mepc，而它的源
+//  （pre_decoder 的 aux_addr_out 寄存器）在 flush_w 那一支是【清零】的 ⇒ 冲刷拍它变成 0，
+//  下一拍受理就把 mepc 锁成 −4、mret 跳到 0xfffffffc（实测 gpio 闭环：整段配置被重跑）。
+//  受理必须等队列里真有一条指令的那一拍。
+    input       h0_v,
     input jalr_fail, br2, br3,
     output reg [31:0] csr_data_out, isr_addr2, mcause, iret_addr2,
     output reg exc_irq_act, exc_irq_processing
     );
 
     reg exc_irq_en_reg, exc_irq_en_post_reg, exc_eirq_en, exc_tirq_en, exc_sirq_en;
+//★ pc 载荷就地打一拍：中断受理锁的 mepc 必须取【EXE 级】那条指令（与异常路径的 exc_pc_in 同源）。
+//  cpu_top 送进来的 pc_addr_in 是 pre 级的（aux_addr_2），比 EXE 早一级 —— 用它会让中断恢复点
+//  跳过在途指令（实测 i2c 闭环：mepc 锁成 0xcc、mret 回到 j fail）。打一拍正好等于 EXE 那条，
+//  而且路径只有"寄存器→寄存器"，不把 post 级的组合锥引进来（直接把顶层换成 aux_addr_3 会
+//  把 WNS 从 +0.106 拉到 −1.315）。
+    reg [31:0] pc_in_q;
+    always @(posedge clk) pc_in_q <= pc_addr_in;
     reg exc_eirq_pend, exc_tirq_pend, exc_sirq_pend, exc_irq_process, exc_global_pend;
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_reg, mcycle_reg, minstret_reg, mscratch_reg, mtval_reg;
     reg [31:0] iret_addr1;
@@ -55,7 +67,7 @@ module csr(
         stall    = flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
                  | flag_bus[2] | flag_bus[1] | flag_bus[0];
         flush_w  = flush_con_exc | flag_bus[10] | flag_bus[9];
-        exc_irq_gate = (ird_tmr != 2'd0);
+        exc_irq_gate = (ird_tmr != 2'd0) | ~h0_v;
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
         retire   = !(flush_w | stall | mem_inflight);
     end
@@ -158,8 +170,8 @@ module csr(
 //  （那条指令"地址 + 4"），也就是【正要进发射级、还没被发出去】的那一条 = 中断返回点。
 //  旧写法是"取指 PC 减一个气泡计数"，ROB 之后前端在等 ROB 排空期间还在取指，那个计数已对不上。
             else if (exc_irq_act && !exc_irq_process) begin
-                iret_addr1 <= pc_addr_in - 32'd4;
-                iret_addr2 <= pc_addr_in - 32'd4;
+                iret_addr1 <= pc_in_q - 32'd4;
+                iret_addr2 <= pc_in_q - 32'd4;
                 if (exc_eirq_en && exc_eirq_pend) begin
                     mcause_reg <= 32'h8000000B;
                 end

@@ -58,6 +58,18 @@ module post_decoder(
     output reg       sel_v1,    sel_v2,
     input  [2:0] fwd_slot1_in, fwd_slot2_in,
     input        fwd_hit1_in,  fwd_hit2_in,
+//lane1（一个包的第二条）：只可能是 OP / OP-IMM / LUI（判据在 pre_decoder），
+//所以它不需要 opc/fn10_ls/off_mem/csr/分支/异常这一整套，只要一组操作数与一个 alu_func4。
+    input        lane1_v_in,
+    input [31:0] inst1_in,
+    input [4:0]  rd1_in,
+    input [9:0]  func10_1_in,
+    input [31:0] imm1_alu_in,
+    input [4:0]  rs1_1_in, rs2_1_in,
+    input [2:0]  idx1_in,
+    input        alloc_gen1_in,
+    input [2:0]  fwd_slot1_1_in, fwd_slot2_1_in,
+    input        fwd_hit1_1_in,  fwd_hit2_1_in,
 //★ 三个执行单元（alu/lsu/mulu）的输入【级数对齐】：都吃这一级（decoder 载荷）。
 //  lsu/mulu 原来吃的是 mem_buf 的组合输出（比 alu 早一级），索引也得跟着差一拍；
 //  搬到这里之后三者同相：索引一律 issue_idx，操作数一律由 forw（decoder→单元之间）给出。
@@ -88,7 +100,20 @@ module post_decoder(
     output reg br_flag, br_pred_taken_out,
     output reg exc_jal_misalign_out,
     output reg [31:0] jal_target_out,
-    output reg exc_illegal_out
+    output reg exc_illegal_out,
+//lane1 的发射载荷：与 lane0 那组逐项对应，但只有 alu2 需要的那些
+    output reg        lane1_v_out,
+    output reg [31:0] r1_1_imm_val, r2_1_imm_val,
+    output reg        r1_1_imm_sel, r2_1_imm_sel,
+    output reg [4:0]  rd1_out, rs1B_out, rs2B_out,
+    output reg        issue_we1,
+    output reg [4:0]  issue_rd1,
+    output reg [2:0]  issue_idx1,
+    output reg        issue_gen1,
+    output reg [2:0]  sel_slot1_1, sel_slot2_1,
+    output reg        sel_v1_1,    sel_v2_1,
+    output reg [3:0]  alu_func4_1,
+    output reg        we1
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -150,6 +175,15 @@ module post_decoder(
                 OPCODE_JALR, OPCODE_LUI, OPCODE_AUIPC, OPCODE_SYSTEM: issue_we = 1'b1;
             endcase
         end
+    end
+
+//lane1 的写口广播：它的三种 opcode（OP/OP-IMM/LUI）都会写 rd ⇒ 判据就是 lane1_v 本身。
+//rd1_in 为 0 那一路与 lane0 同处理（ROB 的 ent_rd 会取 0，不写寄存器堆）。
+    always @(*) begin
+        issue_we1 = 1'b0;
+        issue_rd1 = rd1_in;
+        if (exec && ~(flush_con_exc | flush_con_irq | flush_con_jump) && lane1_v_in && (rd1_in != 5'd0))
+            issue_we1 = 1'b1;
     end
 
 //csr 读口地址：就是本级【组合输入】里那条指令的 csr 号（即 csr_addr 的下一条流水位置），
@@ -342,6 +376,22 @@ module post_decoder(
             sel_slot2 <= 3'd0;
             sel_v1 <= 1'b0;
             sel_v2 <= 1'b0;
+            lane1_v_out <= 1'b0;
+            rs1B_out <= 5'd0;
+            rs2B_out <= 5'd0;
+            r1_1_imm_val <= 32'd0;
+            r2_1_imm_val <= 32'd0;
+            r1_1_imm_sel <= 1'b0;
+            r2_1_imm_sel <= 1'b0;
+            rd1_out <= 5'd0;
+            issue_idx1 <= 3'd0;
+            issue_gen1 <= 1'b0;
+            sel_slot1_1 <= 3'd0;
+            sel_slot2_1 <= 3'd0;
+            sel_v1_1 <= 1'b0;
+            sel_v2_1 <= 1'b0;
+            alu_func4_1 <= 4'd0;
+            we1 <= 1'b0;
             opc_out <= 7'd0;
             fn10_out <= 10'd0;
             fn10_ls_out <= 10'd0;
@@ -361,6 +411,41 @@ module post_decoder(
                 sel_slot2 <= fwd_slot2_in;
                 sel_v1 <= fwd_hit1_in;
                 sel_v2 <= fwd_hit2_in;
+                lane1_v_out <= lane1_v_in;
+                rs1B_out <= rs1_1_in;
+                rs2B_out <= rs2_1_in;
+                issue_idx1 <= idx1_in;
+                issue_gen1 <= alloc_gen1_in;
+                sel_slot1_1 <= fwd_slot1_1_in;
+                sel_slot2_1 <= fwd_slot2_1_in;
+                sel_v1_1 <= fwd_hit1_1_in;
+                sel_v2_1 <= fwd_hit2_1_in;
+                rd1_out <= 5'd0;
+                we1 <= 1'b0;
+                alu_func4_1 <= 4'd0;
+                r1_1_imm_val <= r1_1_imm_val;
+                r2_1_imm_val <= r2_1_imm_val;
+                r1_1_imm_sel <= 1'b0;
+                r2_1_imm_sel <= 1'b0;
+                if (lane1_v_in) begin
+                    rd1_out <= rd1_in;
+                    we1 <= 1'b1;
+                    case (inst1_in[6:0])
+                        OPCODE_OP: begin
+                            alu_func4_1 <= {func10_1_in[8], func10_1_in[2:0]};
+                        end
+                        OPCODE_OP_IMM: begin
+                            r2_1_imm_val <= imm1_alu_in;
+                            r2_1_imm_sel <= 1'b1;
+                            alu_func4_1 <= {func10_1_in[8], func10_1_in[2:0]};
+                        end
+                        OPCODE_LUI: begin
+                            r2_1_imm_val <= imm1_alu_in;
+                            r2_1_imm_sel <= 1'b1;
+                            alu_func4_1 <= 4'd0;
+                        end
+                    endcase
+                end
                 opc_out <= inst_in[6:0];
                 fn10_out <= func10;
                 fn10_ls_out <= {7'd0, inst_in[14:12]};
@@ -540,6 +625,22 @@ module post_decoder(
                 sel_slot2 <= sel_slot2;
                 sel_v1 <= sel_v1;
                 sel_v2 <= sel_v2;
+                lane1_v_out <= lane1_v_out;
+                rs1B_out <= rs1B_out;
+                rs2B_out <= rs2B_out;
+                r1_1_imm_val <= r1_1_imm_val;
+                r2_1_imm_val <= r2_1_imm_val;
+                r1_1_imm_sel <= r1_1_imm_sel;
+                r2_1_imm_sel <= r2_1_imm_sel;
+                rd1_out <= rd1_out;
+                issue_idx1 <= issue_idx1;
+                issue_gen1 <= issue_gen1;
+                sel_slot1_1 <= sel_slot1_1;
+                sel_slot2_1 <= sel_slot2_1;
+                sel_v1_1 <= sel_v1_1;
+                sel_v2_1 <= sel_v2_1;
+                alu_func4_1 <= alu_func4_1;
+                we1 <= we1;
                 opc_out <= opc_out;
                 fn10_out <= fn10_out;
                 fn10_ls_out <= fn10_ls_out;
@@ -578,6 +679,22 @@ module post_decoder(
                     sel_slot2 <= 3'd0;
                     sel_v1 <= 1'b0;
                     sel_v2 <= 1'b0;
+                    lane1_v_out <= 1'b0;
+                    rs1B_out <= 5'd0;
+                    rs2B_out <= 5'd0;
+                    r1_1_imm_val <= 32'd0;
+                    r2_1_imm_val <= 32'd0;
+                    r1_1_imm_sel <= 1'b0;
+                    r2_1_imm_sel <= 1'b0;
+                    rd1_out <= 5'd0;
+                    issue_idx1 <= 3'd0;
+                    issue_gen1 <= 1'b0;
+                    sel_slot1_1 <= 3'd0;
+                    sel_slot2_1 <= 3'd0;
+                    sel_v1_1 <= 1'b0;
+                    sel_v2_1 <= 1'b0;
+                    alu_func4_1 <= 4'd0;
+                    we1 <= 1'b0;
                 opc_out <= 7'd0;
                 fn10_out <= 10'd0;
                 off_mem_out <= 32'd0;

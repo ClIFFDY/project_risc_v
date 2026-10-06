@@ -43,13 +43,18 @@ module alu(
 //  ls_use_hit / stall_mulu_haz 顶着（这两个检查点不动），放行那拍值已进写口/阵列。本模块结果口只一拍宽。
     input [2:0]  fwd_slot1, fwd_slot2,
     input        fwd_hit1,  fwd_hit2,
+//lane1 的两个操作数要的槽：同一个包的第二条也可能被本单元的结果供值
+    input [2:0]  fwd_slot3, fwd_slot4,
+    input        fwd_hit3,  fwd_hit4,
     (* max_fanout = 8 *) output reg [4:0] rd_out,
     (* max_fanout = 8 *) output reg [2:0] idx_out,
     output reg gen_out,
     (* max_fanout = 8 *) output reg [31:0] result, result_csr,
     (* max_fanout = 8 *) output reg we,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 result 同沿同门控寄存，供 forw 直接选源
-    output reg hit1, hit2
+    output reg hit1, hit2,
+//lane1 的那两位：同一个包的第二条的两个源
+    output reg hit3, hit4
     );
 
     localparam [3:0]
@@ -175,6 +180,8 @@ module alu(
             we       <= 1'b0;
             hit1     <= 1'b0;
             hit2     <= 1'b0;
+            hit3     <= 1'b0;
+            hit4     <= 1'b0;
         end
         else if (flush_con_jump) begin
 //跳转冲刷：本级挂着的如果【不是发起者自己】那一笔，那就是判定拍溜进来的错路条
@@ -187,6 +194,8 @@ module alu(
             we       <= we;
             hit1     <= hit1;
             hit2     <= hit2;
+            hit3     <= hit3;
+            hit4     <= hit4;
         end
         else if (we_in) begin
             if ((flush_con_exc | flush_con_irq) |
@@ -196,8 +205,25 @@ module alu(
                 gen_out  <= gen_in;
                 result   <= result_nx;
                 we       <= we_nx;
-                hit1     <= fwd_hit1 & (idx_in == fwd_slot1);
-                hit2     <= fwd_hit2 & (idx_in == fwd_slot2);
+//命中位是"我这一拍口上的值供谁"——只在【载荷真推进】那一沿算：
+//  载荷被 ROB 满/重定向/取指/总线顶住时，下一条指令进不来、本级自己还占着单元入口,
+//  而当拍的槽扫描已经走到后面那条了 ⇒ 算出来是"给后面那条"的位，却会落回本级自己
+//  （实测 ret_raw 循环体：读拍已正确取到 30，却因此把自己算的 29 当操作数又读一遍 ⇒ 少减一次）。
+//  单元侧 stall（lsu 在途/车厢满、mulu 乘除）抬着时同理：口上那份还是自己，没有消费者在单元入口。
+//  ★ 单元口的值本身照旧重复上报（ROB 要靠它退得动），只有这四位清零。
+                if (stall_rob_full | stall_pc_redir | stall_icache_miss | stall_bus_hold |
+                    stall_lsu_haz | stall_lsu_full | stall_mulu_haz | stall_mulu_div) begin
+                    hit1     <= 1'b0;
+                    hit2     <= 1'b0;
+                    hit3     <= 1'b0;
+                    hit4     <= 1'b0;
+                end
+                else begin
+                    hit1     <= fwd_hit1 & (idx_in == fwd_slot1);
+                    hit2     <= fwd_hit2 & (idx_in == fwd_slot2);
+                    hit3     <= fwd_hit3 & (idx_in == fwd_slot3);
+                    hit4     <= fwd_hit4 & (idx_in == fwd_slot4);
+                end
             end
             else begin                               // 单元侧 stall 抬着：操作数还没定，结果连着 rd/idx/we 一起保持
                 rd_out   <= rd_out;
@@ -205,8 +231,10 @@ module alu(
                 gen_out  <= gen_out;
                 result   <= result;
                 we       <= we;
-                hit1     <= hit1;
-                hit2     <= hit2;
+                hit1     <= 1'b0;
+                hit2     <= 1'b0;
+                hit3     <= 1'b0;
+                hit4     <= 1'b0;
             end
         end
         else begin
@@ -217,6 +245,8 @@ module alu(
             we       <= 1'b0;
             hit1     <= 1'b0;
             hit2     <= 1'b0;
+            hit3     <= 1'b0;
+            hit4     <= 1'b0;
         end
     end
 

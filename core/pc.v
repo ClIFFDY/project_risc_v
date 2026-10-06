@@ -24,6 +24,12 @@ module pc(
     input clk, rst,
     input br1, exc_irq, exc_irq_ret, exc_mark,
     input jal, pre_jalr, btb_hit,
+//lane1 的 jal：lane1 的地址 = lane0 + 4 = pc − 4（pc 是"下一个待取地址"）⇒ 落点 T1 = pc + immJ1 − 4。
+//★ 与 lane0 那一支不同：lane0 的 jal 命中有 bti 注入、pc 落 T+8（注入把 (T,T+4) 补上了）；
+//  lane1 没有注入通路，pc 必须直接落 T1，让取指侧从 T1 起取。
+//lane1 的改向（fifo 判完的三类合一）与落点（fifo 里算好，本级只落地址）
+    input lane1_redir,
+    input [31:0] lane1_target,
 //bra_predict 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 pre_decoder
 //⇒ pc 落 T+4；未命中 ⇒ pc 落 T，让 icache 下一拍自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
     input bti_hit,
@@ -31,6 +37,9 @@ module pc(
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
     input rob_empty,
+//取指队列满：本级与 icache 用【同一个门】冻住（icache 的 req_valid 里也含它）。
+//★ 两边必须逐字一致：差一条就是"pc 被按住、交付寄存器却被换掉/被清掉"这类错位。
+    input fifo_full,
     output reg [31:0] pc_addr, aux_addr,
 //停顿源：重定向排队中（等 ROB 排空）/ 落点后多压一拍（stall_pc_redir）；
 //冲刷源：本拍把 pc 落到新目标（flush_pc_redir，icache 用它挡掉陈旧交付）。
@@ -60,8 +69,8 @@ module pc(
         exc_w        = flag_bus[11];
         flush_jump_w = flag_bus[9] & ~exc_w;
         flush_w      = exc_w | flag_bus[10] | flag_bus[9];
-        stall_w      = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
-                      | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
+//★ 本级在【取指侧】：只吃"重定向排队 + 取指自己 miss"；后端停顿由取指队列吸收。
+        stall_w      = (flag_bus[6] | flag_bus[1]) & ~flush_w;
         exec         = flag_bus[8];
     end
 
@@ -119,8 +128,10 @@ module pc(
 
     always @(posedge clk) begin
         if (rst_q) begin
-            pc_addr <= 32'd4;
-            aux_addr <= 32'd4;
+//★ 复位值是 8 不是 4：pc 现在是"下一个待取地址"、恒定 +8 ⇒ 本拍交付的那个字是 instr(pc − 8)。
+//  写 4 的话，自举交接（直接装 instr(0)/instr(4)）之后的第一拍会再取一次 instr(4) —— 重复一条。
+            pc_addr <= 32'd8;
+            aux_addr <= 32'd8;
         end
         else if (exec) begin
             if (redir_go && (redir_kind == 2'd1)) begin
@@ -131,38 +142,57 @@ module pc(
                 pc_addr <= isr_ret_addr2;
                 aux_addr <= isr_ret_addr2;
             end
-            else if (!flush_w && !stall_w) begin
+            else if (!flush_w && !stall_w && !fifo_full) begin
 //jal/br1 的改向分两档（"差一拍"就在这儿）：命中的那一拍目标 inst 已由 bra_predict 的 btb
 //交付给 pre_decoder，所以 pc 落**目标的下一个地址**（T+4）；未命中的那一拍没有 inst 可交付，
 //pc 落**目标地址本身**（T），由 icache 下一拍去取目标 —— 比命中晚一拍。
 //两个表达式都只落在 pc/aux 的 D 端（普通寄存器），不是 BRAM 地址脚 ⇒ 不进关键路径。
                 if (br1) begin
+//命中：bti 直送目标那一对 {T, T+4}（一次占满两个字），所以 pc 落 T+8；
+//未命中：交付一条 NOP，pc 落 T 本身，由 icache 下一拍去取目标（差一拍，只有冷启动吃这一拍）。
                     if (bti_hit) begin
                         pc_addr <= pc_addr + offset_beq2;
                         aux_addr <= aux_addr + offset_beq2;
                     end
                     else begin
-                        pc_addr <= pc_addr + offset_beq2 - 32'd4;
-                        aux_addr <= aux_addr + offset_beq2 - 32'd4;
+                        pc_addr <= pc_addr + offset_beq2 - 32'd8;
+                        aux_addr <= aux_addr + offset_beq2 - 32'd8;
                     end
                 end
                 else if (jal) begin
                     if (bti_hit) begin
                         pc_addr <= pc_addr + offset_jal2;
-                        aux_addr <= pc_addr + offset_jal2;
+                        aux_addr <= aux_addr + offset_jal2;
                     end
                     else begin
-                        pc_addr <= pc_addr + offset_jal2 - 32'd4;
-                        aux_addr <= pc_addr + offset_jal2 - 32'd4;
+                        pc_addr <= pc_addr + offset_jal2 - 32'd8;
+                        aux_addr <= aux_addr + offset_jal2 - 32'd8;
                     end
                 end
                 else if (jalr) begin
                     pc_addr <= offset_jalr2;
                     aux_addr <= offset_jalr2;
                 end
+//★ lane1 是 jal：它不在取指侧的 lane0 译码里（那一份只看两个字里的第一个），而后端对普通
+//  jal 没有改向出口 ⇒ 不在这儿补就整条漏掉（实测 fence 的 j 5c 落在 lane1：pc 顺着冲过
+//  trap_handler、把 mret 当指令执行，整程序重跑）。
+//  优先级放在 lane0 的四条之后：lane0 一旦改向，lane1 就是错路，不该再改 pc。
+//★ 落点是 `− 4`（不是 +4）：lane1 的指令地址是 pc−4（lane0 是 pc−8），它的落点地址
+//  T1 = pc + immJ1 − 4。而 icache 的读【滞后一拍】：交付口第 N 拍上是 pc(N−1) 对应的那一对
+//  ⇒ 本拍改向、下一拍生效，于是**下下拍**交付的才是 pc(改向后) 对应的那一对。
+//  要让下下拍交付 T1 那一对，pc 就该落 T1 本身 ⇒ `pc + immJ1 − 4`。
+//  （改成 +4 实测把开机 bss 清零循环的循环体整个跳过 —— pc 卡在 0x20/0x28 不动。）
+                else if (lane1_redir) begin
+                    pc_addr <= lane1_target;
+                    aux_addr <= lane1_target;
+                end
                 else begin
-                    pc_addr <= pc_addr + 4'd4;
-                    aux_addr <= pc_addr + 4'd4;
+//★ 顺序推进【恒定 +8】：一次把两个字吃满，没有别的选项。
+//  pc_addr 是"下一个待取地址"，fetch_addr = pc_addr>>2，eff = instr(pc_addr−4)、inst_next = instr(pc_addr)；
+//  取指侧【不需要知道这两个字配不配】—— 配不配由队列读侧按条目的类位判，配不上就只弹一条。
+//  pc 只被两种事搬走：停顿（stall / 队满）按住不动、改向（上面那几支）落到别处。
+                    pc_addr <= pc_addr + 32'd8;
+                    aux_addr <= pc_addr + 32'd8;
                 end
             end
             else if (flush_w) begin
