@@ -52,8 +52,10 @@ module forw(
 //前送源③：lsu 结果口
     input [31:0] data_ld,
 //三个单元算好的命中位（各 2 位：r1/r2 各一位）——本模块不再做任何比较
-    input        hit1_alu, hit1_mul, hit1_ld,
-    input        hit2_alu, hit2_mul, hit2_ld,
+    input        we_alu, we_mul, we_ld,
+    input [2:0]  idx_alu, idx_mul, idx_ld,
+    input [2:0]  sel_slot1, sel_slot2,
+    input        sel_v1,    sel_v2,
 //操作数默认源（原来在 post_decoder 里装配的两组，并到这里同一次选择）
     input [31:0] r1_data,    r2_data,
     input [31:0] r1_imm_val, r2_imm_val,
@@ -72,44 +74,19 @@ module forw(
 //  块间求值次序不定（iverilog 实测首拍就选空、输出留 X）—— 合成无所谓，仿真会错。
 //★ 选择码：0=reg 1=imm 2=alu 3=mul 4=ld。"命中优先于 imm"在下面落定：先按 imm_sel 落默认，
 //  命中再覆盖（与旧 forw 的合成语义一致；槽号唯一 ⇒ 至多一个命中，命中间的顺序只是防御性 tie-break）。
-    reg [2:0] src1, src2;
+//写口 live idx × 载荷锁存的期望槽号，在本级比：命中就取写口的值，否则取
+//regfile 的寄存读（已含它的读侧旁路）/ 立即数。生产者不再自己算命中位。
     always @(*) begin
-        if (r1_imm_sel)
-            src1 = 3'd1;
-        else
-            src1 = 3'd0;
-        if (hit1_alu)
-            src1 = 3'd2;
-        else if (hit1_mul)
-            src1 = 3'd3;
-        else if (hit1_ld)
-            src1 = 3'd4;
-        if (r2_imm_sel)
-            src2 = 3'd1;
-        else
-            src2 = 3'd0;
-        if (hit2_alu)
-            src2 = 3'd2;
-        else if (hit2_mul)
-            src2 = 3'd3;
-        else if (hit2_ld)
-            src2 = 3'd4;
-        case (src1)
-            3'd0: r1_data_final = r1_data;
-            3'd1: r1_data_final = r1_imm_val;
-            3'd2: r1_data_final = data_alu;
-            3'd3: r1_data_final = data_mul;
-            3'd4: r1_data_final = data_ld;
-            default: r1_data_final = r1_data;
-        endcase
-        case (src2)
-            3'd0: r2_data_final = r2_data;
-            3'd1: r2_data_final = r2_imm_val;
-            3'd2: r2_data_final = data_alu;
-            3'd3: r2_data_final = data_mul;
-            3'd4: r2_data_final = data_ld;
-            default: r2_data_final = r2_data;
-        endcase
+        if      (sel_v1 & we_alu & (idx_alu == sel_slot1)) r1_data_final = data_alu;
+        else if (sel_v1 & we_mul & (idx_mul == sel_slot1)) r1_data_final = data_mul;
+        else if (sel_v1 & we_ld  & (idx_ld  == sel_slot1)) r1_data_final = data_ld;
+        else if (r1_imm_sel)                               r1_data_final = r1_imm_val;
+        else                                               r1_data_final = r1_data;
+        if      (sel_v2 & we_alu & (idx_alu == sel_slot2)) r2_data_final = data_alu;
+        else if (sel_v2 & we_mul & (idx_mul == sel_slot2)) r2_data_final = data_mul;
+        else if (sel_v2 & we_ld  & (idx_ld  == sel_slot2)) r2_data_final = data_ld;
+        else if (r2_imm_sel)                               r2_data_final = r2_imm_val;
+        else                                               r2_data_final = r2_data;
     end
 
 endmodule

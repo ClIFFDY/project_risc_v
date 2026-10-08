@@ -36,20 +36,11 @@ module alu(
     input [2:0] csr_func3,
     input [31:0] aux_addr_in,
     input [31:0] r1_data, r2_data, cs_data,
-//前送命中判据（rob 槽扫描的【组合】输出）：在【结果寄存那一沿】把"我下一拍是不是在给下一条供值"
-//算好、与 result/idx_out 同沿同门控寄存 —— 那一沿消费者正好在 pre 级，槽扫描给出的就是它的期望槽号
-//⇒ forw 侧不必再比 idx，只剩一级 mux（比较器留在本级寄存沿上，有一整拍余量）。
-//★ 只覆盖"值刚上口"那一拍。mul/ld 的多拍保持期间命中位会掉、落回默认值 —— 那一拍消费者本来就被
-//  ls_use_hit / stall_mulu_haz 顶着（这两个检查点不动），放行那拍值已进写口/阵列。本模块结果口只一拍宽。
-    input [2:0]  fwd_slot1, fwd_slot2,
-    input        fwd_hit1,  fwd_hit2,
     (* max_fanout = 8 *) output reg [4:0] rd_out,
     (* max_fanout = 8 *) output reg [2:0] idx_out,
     output reg gen_out,
     (* max_fanout = 8 *) output reg [31:0] result, result_csr,
-    (* max_fanout = 8 *) output reg we,
-//本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 result 同沿同门控寄存，供 forw 直接选源
-    output reg hit1, hit2
+    (* max_fanout = 8 *) output reg we
     );
 
     localparam [3:0]
@@ -173,8 +164,6 @@ module alu(
             gen_out  <= 1'b0;
             result   <= 32'd0;
             we       <= 1'b0;
-            hit1     <= 1'b0;
-            hit2     <= 1'b0;
         end
         else if (flush_con_jump) begin
 //跳转冲刷：本级挂着的如果【不是发起者自己】那一笔，那就是判定拍溜进来的错路条
@@ -185,8 +174,6 @@ module alu(
             gen_out  <= gen_out;
             result   <= result;
             we       <= we;
-            hit1     <= hit1;
-            hit2     <= hit2;
         end
         else if (we_in) begin
             if ((flush_con_exc | flush_con_irq) |
@@ -196,8 +183,6 @@ module alu(
                 gen_out  <= gen_in;
                 result   <= result_nx;
                 we       <= we_nx;
-                hit1     <= fwd_hit1 & (idx_in == fwd_slot1);
-                hit2     <= fwd_hit2 & (idx_in == fwd_slot2);
             end
             else begin                               // 单元侧 stall 抬着：操作数还没定，结果连着 rd/idx/we 一起保持
                 rd_out   <= rd_out;
@@ -205,8 +190,6 @@ module alu(
                 gen_out  <= gen_out;
                 result   <= result;
                 we       <= we;
-                hit1     <= hit1;
-                hit2     <= hit2;
             end
         end
         else begin
@@ -215,8 +198,6 @@ module alu(
             gen_out  <= 1'b0;
             result   <= 32'd0;
             we       <= 1'b0;
-            hit1     <= 1'b0;
-            hit2     <= 1'b0;
         end
     end
 

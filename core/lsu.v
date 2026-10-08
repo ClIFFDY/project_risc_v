@@ -44,8 +44,6 @@ module lsu(
 //前送命中判据（消费者载荷里锁存的槽号/有效位，与 forw 当拍看到的同一份）：本模块结果口这一拍供的值是不是它的。
 //★ 本模块的"新值"（`ld_data_cur`）是组合的 ⇒ 命中位也走组合、与 `loaded`/`ld_idx` 同步给出，
 //  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
-    input [2:0]  sel_slot1, sel_slot2,
-    input        sel_v1,    sel_v2,
     input [6:0] opcode,
     input [9:0] func10,
     input [4:0] rd_in, r1_post, r2_post,
@@ -70,7 +68,6 @@ module lsu(
     (* max_fanout = 8 *) output reg [31:0] ld_data_out,
     (* max_fanout = 8 *) output reg loaded,
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 loaded/ld_idx 同拍给出，供 forw 直接选源
-    output reg hit1, hit2,
     output reg ld_we,
 //三条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_lsu_haz,
@@ -513,8 +510,6 @@ module lsu(
             ld_data_out = ld_wb_data;
             ld_idx = ld_wb_idx;
             ld_gen = ld_wb_gen;
-            hit1 = sel_v1 & (ld_wb_idx == sel_slot1);
-            hit2 = sel_v2 & (ld_wb_idx == sel_slot2);
         end
         else if (ld_hold) begin
             loaded = 1'b1;
@@ -523,8 +518,6 @@ module lsu(
             ld_data_out = ld_hold_data;
             ld_idx = idx_hold;
             ld_gen = gen_hold;
-            hit1 = sel_v1 & (idx_hold == sel_slot1);
-            hit2 = sel_v2 & (idx_hold == sel_slot2);
         end
         else begin
             loaded = 1'b0;
@@ -536,8 +529,6 @@ module lsu(
             ld_data_out = ld_wb_data;
             ld_idx = 3'd0;
             ld_gen = 1'b0;
-            hit1 = 1'b0;
-            hit2 = 1'b0;
         end
     end
 

@@ -36,8 +36,6 @@ module cpu_top(
     wire [31:0] r1_imm_val_w, r2_imm_val_w;
     wire        r1_imm_sel_w, r2_imm_sel_w;
 //三个单元各自算好的前送命中位（r1/r2 各一位）：forw 据此直接选源，本级不再比 idx
-    wire        hit1_alu_w, hit1_mul_w, hit1_ld_w;
-    wire        hit2_alu_w, hit2_mul_w, hit2_ld_w;
     wire [4:0] rd_3;
     wire [31:0] aux_addr_3, beq_off_q2, jalr_pred_addr_3;
     wire we_3, br_flag, br_pred_taken_3;
@@ -441,11 +439,7 @@ module cpu_top(
         .stall_lsu_haz(stall_lsu_haz_w),
         .stall_lsu_unload(stall_lsu_unload_w),
         .stall_lsu_full(stall_lsu_full_w),
-        .rd_load(rd_load),
-//命中位：与结果口同拍组合给出（载荷里锁存的槽号/有效位 ⇒ 与 forw 当拍看到的同一份消费者）
-        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
-        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
-        .hit1(hit1_ld_w), .hit2(hit2_ld_w)
+        .rd_load(rd_load)
     );
 //RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
     mulu u_mulu (
@@ -474,11 +468,7 @@ module cpu_top(
         .mul_idx(mul_idx_w),
         .mul_gen(mul_gen_w),
         .stall_mulu_haz(stall_mulu_haz_w),
-        .stall_mulu_div(stall_mulu_div_w),
-//命中位：与结果口同拍组合给出（载荷里锁存的槽号/有效位 ⇒ 与 forw 当拍看到的同一份消费者）
-        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
-        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
-        .hit1(hit1_mul_w), .hit2(hit2_mul_w)
+        .stall_mulu_div(stall_mulu_div_w)
     );
     bra_predict u_bra_predict (
         .clk(clk),
@@ -514,8 +504,10 @@ module cpu_top(
         .data_alu(result_4),
         .data_mul(mul_data_final),
         .data_ld(ld_data_final),
-        .hit1_alu(hit1_alu_w), .hit1_mul(hit1_mul_w), .hit1_ld(hit1_ld_w),
-        .hit2_alu(hit2_alu_w), .hit2_mul(hit2_mul_w), .hit2_ld(hit2_ld_w),
+        .we_alu(we_4), .we_mul(mul_we), .we_ld(loaded),
+        .idx_alu(alu_idx_w), .idx_mul(mul_idx_w), .idx_ld(ld_idx_w),
+        .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
+        .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
         .r1_data(r1_data), .r2_data(r2_data),
         .r1_imm_val(r1_imm_val_w), .r2_imm_val(r2_imm_val_w),
         .r1_imm_sel(r1_imm_sel_w), .r2_imm_sel(r2_imm_sel_w),
@@ -544,11 +536,7 @@ module cpu_top(
         .idx_out(alu_idx_w),
         .gen_out(alu_gen_w),
         .result(result_4),
-        .we(we_4),
-//命中位：与 result 同沿寄存（那一沿消费者在 pre 级 ⇒ 用当拍槽扫描）
-        .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
-        .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
-        .hit1(hit1_alu_w), .hit2(hit2_alu_w)
+        .we(we_4)
     );
 //tb 的事件探针按这两个名字抓"寄存器堆写口" ⇒ 让它们跟着写口级的两条口走（语义不变）
     assign wp_taken_mul = mul_we;
