@@ -182,7 +182,8 @@ module controller(
 //  ⇒ 资格 = 我这条是 mret、且没有被更老的冲刷压住。
 //  ★ 自冲刷项显式排掉：合法 mret 自己会拉 flush_con_irq（它靠这个冲掉影子），
 //    那一项不能反过来把它自己挡掉 —— 原式是用 ~exc_irq_ret 做豁免的。
-    always @(*) flush_w_other = flush_con_exc | flush_con_jump | exc_irq | exc_irq_act;
+    always @(*) flush_w_other = flush_bju_exc | flush_con_jump | exc_irq | exc_irq_act
+                              | exc_ecall_i | exc_illegal_i | exc_ldst_misalign_in;
     always @(*) exc_irq_ret_ok = exc_irq_ret_i & ~flush_w_other;
     reg [31:0] exc_pc_c;
 //★ 访存非对齐那条比载荷晚一拍到（它在 lsu 里寄存过），pc 载荷得跟着寄存一拍；
