@@ -31,6 +31,13 @@ module pc(
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
     input rob_empty,
+//取指队列满（fetch_fifo 的 full）：与 stall_pc_redir 同性质的前端停留 —— 队满时 pc 不许再走，
+//否则已经交给 icache 的那条会被丢弃
+    input fifo_full,
+//★ 就绪门（rob 按冻结生产者槽现算）：【原地等】必须整组同门 —— 前端也算在内。
+//  只停后端不停取指 ⇒ 队列被灌满、fifo_full 又把 pc 的推进门关掉，
+//  于是这一拍刚译出来的前端重定向（jal/br1）被静默丢掉（实测 divu-01 漏跳一个 jal、整程序重跑）。
+    input rdy1_in, rdy2_in,
     output reg [31:0] pc_addr, aux_addr,
 //停顿源：重定向排队中（等 ROB 排空）/ 落点后多压一拍（stall_pc_redir）；
 //冲刷源：本拍把 pc 落到新目标（flush_pc_redir，icache 用它挡掉陈旧交付）。
@@ -131,7 +138,7 @@ module pc(
                 pc_addr <= isr_ret_addr2;
                 aux_addr <= isr_ret_addr2;
             end
-            else if (!flush_w && !stall_w) begin
+            else if (!flush_w && !stall_w && !fifo_full && rdy1_in && rdy2_in) begin
 //jal/br1 的改向分两档（"差一拍"就在这儿）：命中的那一拍目标 inst 已由 bra_predict 的 btb
 //交付给 pre_decoder，所以 pc 落**目标的下一个地址**（T+4）；未命中的那一拍没有 inst 可交付，
 //pc 落**目标地址本身**（T），由 icache 下一拍去取目标 —— 比命中晚一拍。

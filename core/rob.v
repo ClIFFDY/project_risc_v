@@ -64,15 +64,26 @@ module rob(
     input        alloc_en,
     input        alloc_we,
     input [4:0]  alloc_rd,
-//前送槽扫描口：消费者（下一拍进载荷那条）的两个源寄存器号，用 mid 级的 rs1_2/rs2_2。
-//本模块按【程序序】分配（`alloc_en = payload_go`，与进载荷同沿）⇒ 扫描那一拍所有 `ent_v`
-//的槽**一格不多一格不少**全是比它老的指令 ⇒ "比我老"不需要任何比较，`ent_v[s]` 即等价；
-//"取最年轻的匹配" = 窗口里年龄最大的那个（年龄一律 4 位截断，见下面 red line）。
-    input [4:0]  scan_rs1, scan_rs2,
-//扫描的推进条件（= pre_decoder 本级的锁存条件）：为 1 才把这一拍的扫描结果打拍换新
-    input        scan_go,
+//入队扫描口：这一拍要入册的那一条（fetch_fifo 队头）的两个源寄存器号。
+//扫描只在 alloc 那一拍跑一次：在册的项全是比它老的（它自己还没进册）⇒ "比我老"不需要比较；
+//"取最年轻的匹配" = 窗口里年龄最大的那个（年龄一律 4 位截断，见下面扫描块）。
+//结果（ps/pg/h，每个源三位）随分配一起写进新项 —— 这就是"生产者槽入队冻结"。
+    input [4:0]  alloc_rs1, alloc_rs2,
+//两级索引：s_idx = 本级输出（S 级，读拍）那条的槽号；pay_idx = 载荷那条的槽号。
+//值一律按【冻结在项里的 ps】索引现读，不再每拍扫槽。
+    input [2:0]  s_idx, pay_idx,
     output reg [2:0] fwd_slot1, fwd_slot2,
     output reg       fwd_hit1,  fwd_hit2,
+//载荷那条的两个操作数"能不能开跑"：~hit（本来就无生产者）或"生产者已可取值"
+//（项已不在册 / 值已落项 / 值这一拍正在某个结果口上）⇒ 门住载荷与 S 级（原地等）。
+//★ 判据必须按【载荷】这一级算，不能按 S 级：S 级等的生产者往往就是载荷那条自己，
+//  而载荷那条要发得出去（lsu/mulu 的入口门）要求本拍 payload_go = 1 —— 按 S 级判就会
+//  把载荷那条永久按在门上、它永远等不到完成 ⇒ 整核死锁（实测 sra-01 CoreMark 都挂）。
+//  载荷那条的生产者一定比它老 ⇒ 一定已经发出去过 ⇒ 判据一定能收敛（归纳）。
+//载荷有效位（post_decoder 随载荷一起锁存）：冲刷后载荷被清空、索引停在旧值，
+//此时必须直接放行 —— 否则 rdy 拿着一个不相干的槽号把整组按死（实测挂死）。
+    input        pay_v,
+    output reg       rdy1, rdy2,
 //前送值读口①【正常读】：索引就是本模块当拍扫描出的 fwd_slot1/2（不外引、不经任何选择）
 //  ⇒ 这条路上没有任何 stall/flush 组合量，bju 的判定锥进不来。
     output reg [31:0] fwd_data1, fwd_data2,
@@ -166,22 +177,24 @@ reg        scan_c1 [0:DEPTH-1];
 reg        scan_c2 [0:DEPTH-1];
 reg        scan_g1 [0:DEPTH-1];
 reg        scan_g2 [0:DEPTH-1];
-//打拍后的扫描结果（读拍用）
-reg        scan_y1q [0:DEPTH-1];
-reg        scan_y2q [0:DEPTH-1];
-reg        scan_g1q [0:DEPTH-1];
-reg        scan_g2q [0:DEPTH-1];
-reg        hit_c1, hit_c2;
-reg [2:0]  slot_c1, slot_c2;
-//一位有效热码 + "这一项已算完"：读口把【热码 & 数据】直接 OR 起来，不走"先算槽号再 mux"
-reg        scan_w1 [0:DEPTH-1];
-reg        scan_w2 [0:DEPTH-1];
-reg        scan_v1 [0:DEPTH-1];
-reg        scan_v2 [0:DEPTH-1];
-reg        scan_m1 [0:DEPTH-1];
-reg        scan_m2 [0:DEPTH-1];
+//每槽两个源冻结下来的生产者槽号/世代/有无（入队扫描的产物）。
+//只在复位与分配两处写；退项/冲刷/换人都不必清 —— 判据里 `ent_v[ps]` 与世代比较会把陈旧引用挡掉：
+//生产者已退 ⇒ 值在阵列/提交口；槽已换人 ⇒ 世代不匹配 ⇒ 当作"没有生产者"。
+reg [2:0]  ent_ps1 [0:DEPTH-1];
+reg        ent_pg1 [0:DEPTH-1];
+reg        ent_h1  [0:DEPTH-1];
+reg [2:0]  ent_ps2 [0:DEPTH-1];
+reg        ent_pg2 [0:DEPTH-1];
+reg        ent_h2  [0:DEPTH-1];
+//扫描的工作量（只在 alloc 那一拍用）
 reg        scan_y1 [0:DEPTH-1];
 reg        scan_y2 [0:DEPTH-1];
+reg [2:0]  alloc_ps1, alloc_ps2;
+reg        alloc_pg1, alloc_pg2, alloc_h1, alloc_h2;
+//读口/就绪重算的中间量
+reg [2:0]  ps1, ps2, ps1p, ps2p;
+reg        pg1, pg2, pg1p, pg2p;
+reg        gone1, gone2, done1, done2, port1, port2;
 integer si, sj;
 
 reg [2:0]  tail_p;
@@ -323,12 +336,8 @@ always @(posedge clk) rst_q <= rst;
 //★★ 输入是【上一级】的 rs（pre_decoder 的 r1_pre/r2_pre：本拍正在进 pre_decoder 那条），
 //   结果打拍、下一拍用。为什么要提前：否则"8×8 比较 + 归约"这一段会串进读拍
 //   （`rs → 扫描 → 取数 → 旁路 → r1_data`），那正是读锥最深的一段。
-//★ 「同拍正在分配的那一项」必须一起进候选：扫描读的是【上一拍】的 ent_v，而紧邻那条指令
-//   正好在这一拍 alloc ⇒ 漏掉它 ⇒ hit=0 ⇒ 旁路取到阵列旧值。
-//★ 进候选要【三样都补】：scan_c（参与"更年轻的摁掉更老的"的掩码）、scan_y（胜出者，
-//   被归约成 hit 的那一份）、scan_g（世代）。第一版只补了 c 和 g —— scan_y 是循环开头由
-//   scan_c 定的，后来改 c 不会回写它 ⇒ 新分配那条永远进不了命中集（实测 add a1,a0,x0 假 0）。
-//★ 世代必须取【翻转后】的 alloc_gen：扫描在 alloc 那一拍，下一拍 ent_gen[tail_p] 就是它。
+//★ 入队点前移之后，被扫的那条【上一拍已经入册】了，同拍 alloc_en 分配的是比它更年轻的那条
+//   ⇒ 不能再把"同拍正在分配项"补进候选（会把年轻写者当成前送源，最年轻者胜会让它赢）。
     always @(*) begin
         for (si = 0; si < DEPTH; si = si + 1) begin
             scan_ag[si] = {1'b0, (si[2:0] - head_p)};
@@ -337,25 +346,14 @@ always @(posedge clk) rst_q <= rst;
 //★ 别再想"给 rs=0 预置一个永不匹配的比较值"—— ent_rd 的残留值覆盖 0..31，不存在这样的值。
 //  `scan_wv` 自带 `|ent_rd`，而写 x0 的项 ent_rd=0 ⇒ rs=0 时天然不会命中。
             scan_wv[si] = ent_v[si] & |ent_rd[si];
-            scan_c1[si] = scan_wv[si] & (ent_rd[si] == scan_rs1);
-            scan_c2[si] = scan_wv[si] & (ent_rd[si] == scan_rs2);
+            scan_c1[si] = scan_wv[si] & (ent_rd[si] == alloc_rs1);
+            scan_c2[si] = scan_wv[si] & (ent_rd[si] == alloc_rs2);
             scan_g1[si] = ent_gen[si];
             scan_g2[si] = ent_gen[si];
             scan_y1[si] = scan_c1[si];
             scan_y2[si] = scan_c2[si];
         end
-//同拍正在分配那一项：世代取【翻转后】的值（下一拍 ent_gen[tail_p] 就是它）
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1)) begin
-            scan_c1[tail_p] = 1'b1;
-            scan_y1[tail_p] = 1'b1;
-            scan_g1[tail_p] = alloc_gen;
-        end
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs2)) begin
-            scan_c2[tail_p] = 1'b1;
-            scan_y2[tail_p] = 1'b1;
-            scan_g2[tail_p] = alloc_gen;
-        end
-//"有人比你更年轻"就把你摁掉（用含分配项的候选掩码，保证热码唯一）
+//"有人比你更年轻"就把你摁掉（保证热码唯一）
         for (si = 0; si < DEPTH; si = si + 1) begin
             for (sj = 0; sj < DEPTH; sj = sj + 1) begin
                 if (scan_c1[sj] && (scan_ag[sj] > scan_ag[si]))
@@ -364,53 +362,22 @@ always @(posedge clk) rst_q <= rst;
                     scan_y2[si] = 1'b0;
             end
         end
-        hit_c1  = 1'b0;
-        hit_c2  = 1'b0;
-        slot_c1 = 3'd0;
-        slot_c2 = 3'd0;
+        alloc_h1  = 1'b0;
+        alloc_h2  = 1'b0;
+        alloc_ps1 = 3'd0;
+        alloc_ps2 = 3'd0;
+        alloc_pg1 = 1'b0;
+        alloc_pg2 = 1'b0;
         for (si = 0; si < DEPTH; si = si + 1) begin
             if (scan_y1[si]) begin
-                hit_c1  = 1'b1;
-                slot_c1 = si[2:0];
+                alloc_h1  = 1'b1;
+                alloc_ps1 = si[2:0];
+                alloc_pg1 = scan_g1[si];
             end
             if (scan_y2[si]) begin
-                hit_c2  = 1'b1;
-                slot_c2 = si[2:0];
-            end
-        end
-    end
-
-//扫描结果打拍：换新与否跟 pre_decoder 的锁存条件同形（同一条指令走到读口那一拍才换）。
-//★ 冲刷拍必须清：被冲掉的那条不会再走到读口。
-    always @(posedge clk) begin
-        if (rst_q || flush_any) begin
-            fwd_slot1 <= 3'd0;
-            fwd_slot2 <= 3'd0;
-            for (si = 0; si < DEPTH; si = si + 1) begin
-                scan_y1q[si] <= 1'b0;
-                scan_y2q[si] <= 1'b0;
-                scan_g1q[si] <= 1'b0;
-                scan_g2q[si] <= 1'b0;
-            end
-        end
-        else if (scan_go) begin
-            fwd_slot1 <= slot_c1;
-            fwd_slot2 <= slot_c2;
-            for (si = 0; si < DEPTH; si = si + 1) begin
-                scan_y1q[si] <= scan_y1[si];
-                scan_y2q[si] <= scan_y2[si];
-                scan_g1q[si] <= scan_g1[si];
-                scan_g2q[si] <= scan_g2[si];
-            end
-        end
-        else begin
-            fwd_slot1 <= fwd_slot1;
-            fwd_slot2 <= fwd_slot2;
-            for (si = 0; si < DEPTH; si = si + 1) begin
-                scan_y1q[si] <= scan_y1q[si];
-                scan_y2q[si] <= scan_y2q[si];
-                scan_g1q[si] <= scan_g1q[si];
-                scan_g2q[si] <= scan_g2q[si];
+                alloc_h2  = 1'b1;
+                alloc_ps2 = si[2:0];
+                alloc_pg2 = scan_g2[si];
             end
         end
     end
@@ -424,31 +391,43 @@ always @(posedge clk) rst_q <= rst;
 //     否则旁路会跳过"刚提交（阵列还没写）"那一档兜底，落到阵列的老值上（实测 store 数据为 0）。
 //  槽号 `fwd_slot` 仍打拍：世代守卫只在"这条指令的槽被复用"时落，槽号本身不参与选值。
     always @(*) begin
-        for (si = 0; si < DEPTH; si = si + 1) begin
-            scan_w1[si] = scan_y1q[si] & (ent_gen[si] == scan_g1q[si]) & ent_v[si];
-            scan_w2[si] = scan_y2q[si] & (ent_gen[si] == scan_g2q[si]) & ent_v[si];
-            scan_v1[si] = scan_w1[si] & ent_wr[si] & ~ent_ex[si];
-            scan_v2[si] = scan_w2[si] & ent_wr[si] & ~ent_ex[si];
-        end
-//★ 命中位必须与"算完了没"用【同一份当拍判据】：世代对不上（槽已换人）时命中位也要落，
-//  否则旁路会以为"有个还没算完的 ROB 源"而不回落到阵列读，取到的是新住户的脏值。
-        fwd_hit1  = 1'b0;
-        fwd_hit2  = 1'b0;
-        fwd_done1 = 1'b0;
-        fwd_done2 = 1'b0;
-        fwd_data1 = 32'd0;
-        fwd_data2 = 32'd0;
+//读拍那一级：槽号就是冻结在项里的 ps；世代守卫保留（槽换人 ⇒ 命中位落、回落阵列读）
+        ps1 = ent_ps1[s_idx];
+        ps2 = ent_ps2[s_idx];
+        pg1 = ent_pg1[s_idx];
+        pg2 = ent_pg2[s_idx];
+        fwd_slot1 = ps1;
+        fwd_slot2 = ps2;
+        fwd_hit1  = ent_h1[s_idx] & ent_v[ps1] & (ent_gen[ps1] == pg1);
+        fwd_hit2  = ent_h2[s_idx] & ent_v[ps2] & (ent_gen[ps2] == pg2);
+        fwd_done1 = fwd_hit1 & ent_wr[ps1] & ~ent_ex[ps1];
+        fwd_done2 = fwd_hit2 & ent_wr[ps2] & ~ent_ex[ps2];
+        fwd_data1 = fwd_done1 ? ent_data[ps1] : 32'd0;
+        fwd_data2 = fwd_done2 ? ent_data[ps2] : 32'd0;
+//载荷那一级的就绪：~hit（本来就无生产者）/ 生产者已不在册（值在阵列或提交口）/
+//值已落项 / 值这一拍正在某个结果口上（这一项保住 ALU-RAW 的"当拍前送、不停拍"）
+        ps1p = ent_ps1[pay_idx];
+        ps2p = ent_ps2[pay_idx];
+        pg1p = ent_pg1[pay_idx];
+        pg2p = ent_pg2[pay_idx];
+        gone1 = ~ent_v[ps1p] | (ent_gen[ps1p] != pg1p);
+        gone2 = ~ent_v[ps2p] | (ent_gen[ps2p] != pg2p);
+        done1 = ent_v[ps1p] & (ent_gen[ps1p] == pg1p) & ent_wr[ps1p] & ~ent_ex[ps1p];
+        done2 = ent_v[ps2p] & (ent_gen[ps2p] == pg2p) & ent_wr[ps2p] & ~ent_ex[ps2p];
+        port1 = (alu_done & (alu_idx == ps1p)) | (mul_done & (mul_idx == ps1p)) | (ld_done & (ld_idx == ps1p));
+        port2 = (alu_done & (alu_idx == ps2p)) | (mul_done & (mul_idx == ps2p)) | (ld_done & (ld_idx == ps2p));
+        rdy1 = ~pay_v | ~ent_h1[pay_idx] | gone1 | done1 | port1;
+        rdy2 = ~pay_v | ~ent_h2[pay_idx] | gone2 | done2 | port2;
+    end
+
+//前送值读口②【停顿重读】：索引是消费者读锁存时锁下的槽（s1_q/s2_q，由 regfile 给）——
+//这一支与"按冻结 ps 现读"没有相位差（锁存下来的就是当时的 ps）。保留原样。
+    always @(*) begin
         st_done1  = 1'b0;
         st_done2  = 1'b0;
         st_data1  = 32'd0;
         st_data2  = 32'd0;
         for (si = 0; si < DEPTH; si = si + 1) begin
-            fwd_hit1  = fwd_hit1  | scan_w1[si];
-            fwd_hit2  = fwd_hit2  | scan_w2[si];
-            fwd_done1 = fwd_done1 | scan_v1[si];
-            fwd_done2 = fwd_done2 | scan_v2[si];
-            fwd_data1 = fwd_data1 | (scan_v1[si] ? ent_data[si] : 32'd0);
-            fwd_data2 = fwd_data2 | (scan_v2[si] ? ent_data[si] : 32'd0);
             st_done1  = st_done1  | ((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
             st_done2  = st_done2  | ((st_slot2 == si[2:0]) & ent_wr[si] & ~ent_ex[si]);
             st_data1  = st_data1  | (((st_slot1 == si[2:0]) & ent_wr[si] & ~ent_ex[si]) ? ent_data[si] : 32'd0);
@@ -502,6 +481,12 @@ always @(posedge clk) rst_q <= rst;
                 ent_rd[ri] <= 5'd0;
                 ent_data[ri] <= 32'd0;
                 ent_gen[ri] <= 1'b0;
+                ent_ps1[ri] <= 3'd0;
+                ent_pg1[ri] <= 1'b0;
+                ent_h1[ri]  <= 1'b0;
+                ent_ps2[ri] <= 3'd0;
+                ent_pg2[ri] <= 1'b0;
+                ent_h2[ri]  <= 1'b0;
             end
         end
         else begin
@@ -529,6 +514,13 @@ always @(posedge clk) rst_q <= rst;
 //所以"报了写但其实不写"的只剩非法编码，不会造成"选中一个永不产值的槽"。
                 ent_rd[tail_p] <= (alloc_we && (alloc_rd != 5'd0)) ? alloc_rd : 5'd0;
                 ent_gen[tail_p] <= ~ent_gen[tail_p];
+//两个源的生产者冻结（入队扫描）：ps/pg/h 与内容同沿锁进去
+                ent_ps1[tail_p] <= alloc_ps1;
+                ent_pg1[tail_p] <= alloc_pg1;
+                ent_h1 [tail_p] <= alloc_h1;
+                ent_ps2[tail_p] <= alloc_ps2;
+                ent_pg2[tail_p] <= alloc_pg2;
+                ent_h2 [tail_p] <= alloc_h2;
             end
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验是必需的：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（ent_v 挡不住"新住户也 valid"）。

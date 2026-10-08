@@ -40,6 +40,12 @@ module icache(
     input [31:0] mem_data,
 //本拍 pc 落到重定向目标（pc.v 的 redir_go，源名 flush_pc_redir）：挡掉"跳转前那次取指"的陈旧交付
     input flush_pc_redir,
+//取指队列满（fetch_fifo 的 full）：本拍放不下，交付寄存器保持、不再推进
+    input fifo_full,
+//★ 就绪门（rob 按冻结生产者槽现算）：【原地等】必须整组同门 —— 前端也算在内。
+//  只停后端不停取指 ⇒ 队列被灌满、fifo_full 又把 pc 的推进门关掉，
+//  于是这一拍刚译出来的前端重定向（jal/br1）被静默丢掉（实测 divu-01 漏跳一个 jal、整个程序重跑）。
+    input rdy1_in, rdy2_in,
 
 //取指输出
     output reg [31:0] inst_out,
@@ -72,7 +78,8 @@ module icache(
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：**先把 flag_bus 各位还原成原名，再按名字做逻辑**
-//（模块内不直接用位号）；本模块的取指推进由八条 stall 位合出来的 req_valid 与回填状态自己把关。
+//（模块内不直接用位号）；本模块的取指推进由 req_valid（只含前端那几条）与回填状态自己把关，
+//后端停顿不再进这一位 —— 它们由 fetch_fifo 吸收，队满时拿 fifo_full 停本级。
     reg flush_con_exc, flush_con_irq, flush_con_jump;
     reg stall_rob_full, stall_pc_redir;
     reg stall_lsu_haz, stall_lsu_full;
@@ -92,8 +99,13 @@ module icache(
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
         flush_w   = flush_con_exc | flush_con_irq | flush_con_jump;
+//★ 取指门必须与 pc 的推进门【逐项同门】（pc: !flush && !stall && !fifo_full），再并上 fifo_full：
+//  本模块的交付是"pc 的下游流水线"（pc 停 ⇒ 同一拍重复交付同一条），
+//  若对后端停顿解耦（pc 停、本级照推）就会把重交付当成新指令推给 fetch_fifo ⇒ 重复条目（实测）。
+//  想吃后端停顿，得先把交付改成"事件式"（每推进一次交付一次），那时才能照双发射那样解耦。
         req_valid = ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                    | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold);
+                    | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold
+                    | fifo_full) & rdy1_in & rdy2_in;
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）

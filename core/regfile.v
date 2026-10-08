@@ -48,6 +48,9 @@ module regfile(
 //  还没被取走的笔 ⇒ 写口优先和结果口优先各有反例。槽号唯一 ⇒ 至多一个口命中，而且命中的必然
 //  是 rob 扫出来的那条"比我老里最年轻"的笔（这正是 forw 点① 原来的选法，搬过来一字不改）。
     input [2:0]  idx_alu, idx_mul, idx_ld,
+//载荷那两个源的就绪（rob 按冻结的生产者槽现算）：它和 stall_w 是【同一件事】——
+//都是"载荷这一拍的操作数还不是最终值，得按锁存的槽重读"。见下面读口的保持分支。
+    input        rdy1_in, rdy2_in,
     input [2:0]  fwd_slot1, fwd_slot2,
     input        fwd_hit1,  fwd_hit2,
 //ROB 值读口①【正常读】：索引是 rob 自己的扫描口（不外引）⇒ 这条路上没有 stall 组合量。
@@ -171,7 +174,10 @@ module regfile(
             h2_q <= 1'b0;
         end
         else if (exec) begin
-            if (stall_w) begin
+//★ 判据必须与上游各级（pre_decoder 的 adv / post_decoder 的 payload_go）逐项同门：
+//  rdy 只加在上游、不补进这里 ⇒ 暂停那一拍走"正常读"，用【下一条】的 rs 把载荷的操作数
+//  覆写成别人的值（实测：div/rem 一族签名不对、CoreMark 跑到 401 字符就断）。
+            if ((stall_w | ~rdy1_in | ~rdy2_in) & ~flush_w) begin
                 bp1 = bypass(r1_q, h1_q, st_done1, st_data1, s1_q);
                 bp2 = bypass(r2_q, h2_q, st_done2, st_data2, s2_q);
                 if (bp1[32])

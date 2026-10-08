@@ -49,6 +49,10 @@ module post_decoder(
 //与 idx_in 同生共死的世代位：载荷沿锁存、随持有期一起保持，交执行单元带回来做完成上报的身份校验
     input        alloc_gen_in,
     output reg   issue_gen,
+//载荷有效位：本级载荷里装的是一条【真指令】（指令字非 0）。冲刷拍载荷被清零、issue_idx 停在旧值，
+//此时 rob 的就绪判据必须直接放行 —— 否则它会拿着一个不相干的槽号把整组按死（实测挂死）。
+//判据就取载荷锁存那一刻的 inst_in，与 issue_idx 同生共死。
+    output reg   pay_v,
 //前送槽号（← rob 的扫描口）：本条指令的两个操作数该由【哪个 ROB 槽】供值。
 //★ 它是【载荷】：只在同一个 `payload_go` 沿锁存（与 `issue_idx` 同生共死）。
 //  冻结期间**绝不能重算** —— rob 的退项是沿生效、扫描是组合读 `ent_v`，重算会让扫描
@@ -57,6 +61,8 @@ module post_decoder(
     output reg [2:0] sel_slot1, sel_slot2,
     output reg       sel_v1,    sel_v2,
     input  [2:0] fwd_slot1_in, fwd_slot2_in,
+//本条载荷自己两个源的“能不能开跑”（rob 按冻结的生产者槽现算）：没就绪就原地等，不传染生产者
+    input        rdy1_in, rdy2_in,
     input        fwd_hit1_in,  fwd_hit2_in,
 //★ 三个执行单元（alu/lsu/mulu）的输入【级数对齐】：都吃这一级（decoder 载荷）。
 //  lsu/mulu 原来吃的是 mem_buf 的组合输出（比 alu 早一级），索引也得跟着差一拍；
@@ -299,7 +305,10 @@ module post_decoder(
     assign payload_go = exec & ~(flush_con_exc | flush_con_irq | flush_con_jump)
                       & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz
                         | stall_lsu_full | stall_mulu_haz | stall_mulu_div
- | stall_icache_miss | stall_bus_hold);
+ | stall_icache_miss | stall_bus_hold)
+//★ 本条自己的两个源没就绪 ⇒ 原地等（不传染生产者）。有这一项之后，被挡住的指令根本到不了
+//  各级入口 ⇒ lsu 入口门里那条“含 RAW 的 ~ls_use_hit”的历史包袱才可以去掉。
+                      & rdy1_in & rdy2_in;
 
     always @(posedge clk) begin
         if (rst_q)
@@ -338,6 +347,7 @@ module post_decoder(
             exc_illegal_out <= 1'b0;
             issue_idx <= 3'd0;
             issue_gen <= 1'b0;
+            pay_v <= 1'b0;
             sel_slot1 <= 3'd0;
             sel_slot2 <= 3'd0;
             sel_v1 <= 1'b0;
@@ -351,12 +361,13 @@ module post_decoder(
         end
         else if (exec) begin
 //在EXE状态下根据不同的opcode对指令进行二次解码
-            if (~(flush_con_exc | flush_con_irq | flush_con_jump)
-              & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz
-                 | stall_lsu_full | stall_mulu_haz | stall_mulu_div
- | stall_icache_miss | stall_bus_hold)) begin
+//★ 判据必须与 payload_go 【逐字同门】（这里直接写成 payload_go 本身）：它比下面那串
+//  停顿位多出 rdy 那一项，漏掉就出现"推进门按住了、装载这里照样装" ——
+//  pre_decoder 被按住的输出被当成新载荷又装一遍，同一条指令跑两次。
+            if (payload_go) begin
                 issue_idx <= idx_in;
                 issue_gen <= alloc_gen_in;
+                pay_v <= (inst_in != 32'd0);
                 sel_slot1 <= fwd_slot1_in;
                 sel_slot2 <= fwd_slot2_in;
                 sel_v1 <= fwd_hit1_in;
@@ -530,12 +541,13 @@ module post_decoder(
                 if (exc_illegal_now | ((inst_in[6:0] == OPCODE_JAL) & inst_in[21]))
                     we <= 1'b0;
             end
-            else if ((stall_rob_full | stall_pc_redir | stall_lsu_haz
-                    | stall_lsu_full | stall_mulu_haz | stall_mulu_div
- | stall_icache_miss | stall_bus_hold)
+//★ 保持分支同理：payload_go 为 0 且不是冲刷拍 ⇒ 一律保持（含 rdy 那一项），
+//  否则 rdy 一挡就落进下面的"清"分支、载荷当场被清掉。
+            else if (~payload_go
                    & ~(flush_con_exc | flush_con_irq | flush_con_jump)) begin
                 issue_idx <= issue_idx;
                 issue_gen <= issue_gen;
+                pay_v <= pay_v;
                 sel_slot1 <= sel_slot1;
                 sel_slot2 <= sel_slot2;
                 sel_v1 <= sel_v1;
@@ -574,6 +586,7 @@ module post_decoder(
             else begin
                     issue_idx <= 3'd0;
                     issue_gen <= 1'b0;
+                    pay_v <= 1'b0;
                     sel_slot1 <= 3'd0;
                     sel_slot2 <= 3'd0;
                     sel_v1 <= 1'b0;
