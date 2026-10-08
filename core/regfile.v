@@ -29,6 +29,16 @@ module regfile(
 //lane1 的两个读口：一个包的两条指令同拍要各自的操作数，所以口数从 2 变 4。
 //lane0 那两个口一行不动（它走的是原有通路），新增的两个只服务 lane1。
     input [4:0] r3, r4,
+//载荷 lane1 这一拍是否推进（= post_decoder 的 adv1）。口3/4 只在它=1 时才读"当拍地址"：
+//=0 时载荷 lane1 原地保持（还是原来那条），读口地址与扫槽必须用锁存的那一份。
+    input        adv1,
+//lane0 那一组同款：载荷 lane0 这一拍不推进（= adv0=0）时，口1/2 也走"停顿重读"
+    input        adv0,
+//★ 载荷 lane0 真正的推进门（= post_decoder 的 payload_go）：口1/2 的"停顿重读"要跟它同门。
+//  不能用 adv0（= payload_go & ~lane1_hold）：lane1 被按住那拍载荷 lane0 其实照走，
+//  用 ~adv0 会把口1/2 一起冻住 ⇒ 读成旧值。
+//  也不能用 stall_w（只含 flag_bus 那几位）：那就漏掉"载荷没推进"的其他情形。
+    input        payload_go_i,
 //两个物理写口的请求：由 ROB 的【提交口】驱动（口 A = head 更老、口 B = head+1 更年轻）。
 //阵列只在提交时被写 ⇒ 架构态永远精确，同 rd 的先后由结构保证。
     input we_a,
@@ -199,11 +209,30 @@ module regfile(
             h4_q <= 1'b0;
         end
         else if (exec) begin
-            if (stall_w) begin
+//★ 口3/4（lane1）的"停顿重读"条件是 `~adv1` —— 精确等于"载荷 lane1 这一拍不推进"：
+//  lane1 被 load-use 顶住时载荷 lane1 原地保持，而槽1 已经进到后面那条了 ——
+//  读口地址（pre 级 rs）与 rob 扫槽（同样取 pre 级 rs）都会漂到别人的操作数上，
+//  被顶住的那条于是读成阵列旧值（实测 CoreMark cyc≈162570：`add a5,a3,a0` 的 a0 读成 0x45
+//  而不是生产者 `li a0,1` 的 1，算出 0x4a 而应为 0x06）。
+//  口1/2 仍跟 `stall_w`：lane0 载荷与槽0 同门，地址一直跟着载荷那条走（实测无此问题）。
+//  hold 拍只读【锁存的地址 r?_q + 锁存的槽 s?_q】，且不更新锁存。
+            if (~payload_go_i) begin
                 bp1 = bypass(r1_q, h1_q, st_done1, st_data1, s1_q);
                 bp2 = bypass(r2_q, h2_q, st_done2, st_data2, s2_q);
+            end
+            else begin
+                bp1 = bypass(r1, fwd_hit1, fwd_done1, fwd_data1, fwd_slot1);
+                bp2 = bypass(r2, fwd_hit2, fwd_done2, fwd_data2, fwd_slot2);
+            end
+            if (~adv1) begin
                 bp3 = bypass(r3_q, h3_q, st_done3, st_data3, s3_q);
                 bp4 = bypass(r4_q, h4_q, st_done4, st_data4, s4_q);
+            end
+            else begin
+                bp3 = bypass(r3, fwd_hit3, fwd_done3, fwd_data3, fwd_slot3);
+                bp4 = bypass(r4, fwd_hit4, fwd_done4, fwd_data4, fwd_slot4);
+            end
+            if (~payload_go_i) begin
                 if (bp1[32])
                     r1_data <= bp1[31:0];
                 else
@@ -212,6 +241,18 @@ module regfile(
                     r2_data <= bp2[31:0];
                 else
                     r2_data <= r2_data;
+            end
+            else begin
+                r1_data <= bp1[31:0];
+                r2_data <= bp2[31:0];
+                r1_q <= r1;
+                r2_q <= r2;
+                s1_q <= fwd_slot1;
+                s2_q <= fwd_slot2;
+                h1_q <= fwd_hit1;
+                h2_q <= fwd_hit2;
+            end
+            if (~adv1) begin
                 if (bp3[32])
                     r3_data <= bp3[31:0];
                 else
@@ -222,24 +263,12 @@ module regfile(
                     r4_data <= r4_data;
             end
             else begin
-                bp1 = bypass(r1, fwd_hit1, fwd_done1, fwd_data1, fwd_slot1);
-                bp2 = bypass(r2, fwd_hit2, fwd_done2, fwd_data2, fwd_slot2);
-                bp3 = bypass(r3, fwd_hit3, fwd_done3, fwd_data3, fwd_slot3);
-                bp4 = bypass(r4, fwd_hit4, fwd_done4, fwd_data4, fwd_slot4);
-                r1_data <= bp1[31:0];
-                r2_data <= bp2[31:0];
                 r3_data <= bp3[31:0];
                 r4_data <= bp4[31:0];
-                r1_q <= r1;
-                r2_q <= r2;
                 r3_q <= r3;
                 r4_q <= r4;
-                s1_q <= fwd_slot1;
-                s2_q <= fwd_slot2;
                 s3_q <= fwd_slot3;
                 s4_q <= fwd_slot4;
-                h1_q <= fwd_hit1;
-                h2_q <= fwd_hit2;
                 h3_q <= fwd_hit3;
                 h4_q <= fwd_hit4;
             end

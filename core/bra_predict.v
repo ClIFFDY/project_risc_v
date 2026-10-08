@@ -206,7 +206,10 @@ module bra_predict(
         if (rst_q)
             bti_sel_q = 2'd0;
         else if (bti_pend)
-            bti_sel_q = bti_kind_q ? 2'd1 : 2'd2;
+            if (bti_kind_q)
+                bti_sel_q = 2'd1;
+            else
+                bti_sel_q = 2'd2;
         else
             bti_sel_q = 2'd0;
     end

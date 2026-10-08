@@ -200,6 +200,10 @@ module alu(
         else if (we_in) begin
             if ((flush_con_exc | flush_con_irq) |
                 ~(stall_lsu_haz | stall_lsu_full | stall_mulu_haz | stall_mulu_div)) begin
+//★ 2026-10-07 试过三种"防结果被覆盖"的写法，全部【更差】并已回退（regstream 首个分歧
+//  从 #28294 提前到 #28124 或直接卡死）：①"结果已属于这条就保持"；②rob 完成口"只认第一次
+//  回填"；③rob 出 fwd_nrdy（候选存在但没完成）让 unit 等。原因是"操作数晚到"那一段被一起冻住，
+//  这正是仓库笔记里「晚到/到过又走两条判据各管一半」的那一半。此处保持原样。
                 rd_out   <= rd_nx;
                 idx_out  <= idx_in;
                 gen_out  <= gen_in;

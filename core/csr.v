@@ -44,6 +44,9 @@ module csr(
 //  下一拍受理就把 mepc 锁成 −4、mret 跳到 0xfffffffc（实测 gpio 闭环：整段配置被重跑）。
 //  受理必须等队列里真有一条指令的那一拍。
     input       h0_v,
+//★ lane1 压着一条【更老】的没发出去。此刻 EXE 级(lane0)已经不是最老的没执行指令 ⇒
+//  按它锁 mepc 会把老那条整条跳掉。有更老的压着就不许受理，等它发出去再说。
+    input       lane1_hold,
     input jalr_fail, br2, br3,
     output reg [31:0] csr_data_out, isr_addr2, mcause, iret_addr2,
     output reg exc_irq_act, exc_irq_processing
@@ -67,7 +70,7 @@ module csr(
         stall    = flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
                  | flag_bus[2] | flag_bus[1] | flag_bus[0];
         flush_w  = flush_con_exc | flag_bus[10] | flag_bus[9];
-        exc_irq_gate = (ird_tmr != 2'd0) | ~h0_v;
+        exc_irq_gate = (ird_tmr != 2'd0) | ~h0_v | lane1_hold;
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
         retire   = !(flush_w | stall | mem_inflight);
     end

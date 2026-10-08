@@ -39,13 +39,38 @@ module cpu_top(
     wire [2:0]  rob_alloc_idx1_w;
     wire        alloc_gen1_w;
 //取指队列（icache 与 pre_decoder 之间的取指缓冲）：条目 = 原始指令字 + 携带量（见 fetch_fifo 模块头）
-    wire [31:0]  fifo_h0_inst_w, fifo_h1_inst_w, fifo_h0_addr_w;
-    wire         fifo_h0_brpred_w;
-    wire [31:0]  fifo_h0_jalr_w;
+    wire [31:0]  fifo_h0_inst_w, fifo_h1_inst_w, fifo_h0_addr_w, fifo_h1_addr_w;
+    wire         fifo_h0_brpred_w, fifo_h1_brpred_w;
+    wire [31:0]  fifo_h0_jalr_w, fifo_h1_jalr_w;
     wire         fifo_full_w, fifo_h0_v_w, fifo_h1_v_w;
-    wire         fifo_pop_v_w, fifo_pop2_w;
-//队头两条的 rs（条目里存好的字段）：rob 的扫槽吃它
+//★★ 出队两格（fetch_fifo 的出口寄存器）那套接线（2026-10-07）：
+//  队头那一组（组合）+ 出队两格的随行号/世代 + 给 fifo 的装载条件。
+//  ★ `fifo_h0_v_w/fifo_h1_v_w` 现在 = 出队两格的【有效位】（不再是队头的）；
+//    队头的有效位单独走 `fifo_nh0_v_w`（post_decoder 的幽灵项门、csr 的中断受理门照旧吃它）。
+    wire [31:0]  fifo_nh0_inst_w, fifo_nh1_inst_w;
+    wire [4:0]   fifo_nh0_r1_w, fifo_nh0_r2_w, fifo_nh1_r1_w, fifo_nh1_r2_w;
+    wire         fifo_nh0_v_w, fifo_nh1_v_w;
+    wire [2:0]   fifo_idx_out_w, fifo_idx1_out_w;
+    wire         fifo_gen_out_w, fifo_gen1_out_w;
+    wire         pre_cls1_0c_w, pre_lane1_v_in_w, pre_sl0_v_w;
+    wire [2:0]   pre_scan_cidx_w, pre_scan_cidx1_w;
+    wire         fifo_scan_v_w;
+//上压一格（本步先钉 0：必须逐位不变）
+    wire         lane1_lsu_blk_w, lane1_mulu_blk_w;
+//两条 lane 各自的换新门（post_decoder 出，pre_decoder 的两个发射槽吃）
+    wire         pd_adv0_w, pd_adv1_w;
+//ROB 分配口（前移到 pre_decoder：进槽那拍发号）
+    wire        pd_alloc_en0_w, pd_alloc_we0_w, pd_alloc_en1o_w, pd_alloc_we1o_w;
+    wire [4:0]  pd_alloc_rd0_w, pd_alloc_rd1o_w;
+    wire [1:0]  pd_need_pre_w;
+    wire [2:0]  pd_carry_idx_w, pd_carry_idx1_w;
+    wire        pd_carry_gen_w, pd_carry_gen1_w;
+    wire         pd_lane1_hold_w;
+    wire [1:0]   fifo_fill_n_w;
+//队头两条的 rs（条目里存好的字段）：给 pre_decoder
     wire [4:0]   fifo_h0_r1_w, fifo_h0_r2_w, fifo_h1_r1_w, fifo_h1_r2_w;
+//pre_decoder 本拍收进载荷的那两条的 rs：rob 的扫槽吃它
+    wire [4:0]   pd_f0_r1_w, pd_f0_r2_w, pd_f1_r1_w, pd_f1_r2_w;
 //ROB 的扫描口 3/4 与它们的结果；以及停顿重读口 3/4
     wire [2:0]  fwd_slot3_w, fwd_slot4_w, st_slot3_w, st_slot4_w;
     wire        fwd_hit3_w,  fwd_hit4_w;
@@ -75,7 +100,7 @@ module cpu_top(
 //mid_decoder 那一级的输出：译码字段由 pre 给出、本级纯寄存；载荷的操作数由 pd 组合装配后直送 forw
     wire [31:0] inst_2;
     wire [4:0] rs1_2, rs2_2;
-    wire [31:0] aux_addr_2;
+    wire [31:0] aux_addr_1_2_w, aux_addr_2;
     wire br_pred_taken_2;
     wire [31:0] jalr_pred_addr_2;
     wire [4:0]  rd_2;
@@ -112,6 +137,7 @@ module cpu_top(
 //  （从前它接 tag_w = 下一跳的号 ⇒ 老指令看起来比年轻指令还新，杀老写杀反）。
 //ROB（重排序缓冲）：分配口/完成口/退口。阶段 B-1 先只接线、退口暂不驱动寄存器堆（行为零变化）。
     wire [2:0]  rob_alloc_idx_w;
+    wire [4:0]  pd_rf_r1_w, pd_rf_r2_w, pd_rf_r3_w, pd_rf_r4_w;
 //前送槽扫描的打拍使能：pre_decoder 的输出推进条件（扫描提前读拍一拍）
     wire        pre_go_w;
     wire [2:0]  issue_idx_w;
@@ -120,7 +146,7 @@ module cpu_top(
     wire        fwd_hit1_w,  fwd_hit2_w;
     wire [2:0]  sel_slot1_w, sel_slot2_w;
     wire        sel_v1_w,    sel_v2_w;
-    wire        payload_go_w, payload_go_q_w;
+    wire        payload_go_w, payload_go_q_w, pd_alloc_en1_w;
     wire [2:0]  rob_head_w;
 //世代位：rob 分配时给出 → post_decoder 锁成载荷 → 执行单元随值带走 → 完成口带回 rob 校验
     wire        alloc_gen_w, issue_gen_w;
@@ -317,18 +343,32 @@ module cpu_top(
         .push_addr(aux_addr_0),
         .push_br_pred(br1),
         .push_jalr_pred(jalr_predict_offset),
-        .pop2(fifo_pop2_w),
+        .fill_n(fifo_fill_n_w),
         .h0_inst(fifo_h0_inst_w),
         .h1_inst(fifo_h1_inst_w),
         .h0_addr(fifo_h0_addr_w),
         .h0_br_pred(fifo_h0_brpred_w),
         .h0_jalr_pred(fifo_h0_jalr_w),
+        .h1_addr(fifo_h1_addr_w),
+        .h1_br_pred(fifo_h1_brpred_w),
+        .h1_jalr_pred(fifo_h1_jalr_w),
         .h0_v(fifo_h0_v_w),
         .h1_v(fifo_h1_v_w),
         .h0_r1(fifo_h0_r1_w), .h0_r2(fifo_h0_r2_w),
         .h1_r1(fifo_h1_r1_w), .h1_r2(fifo_h1_r2_w),
-        .pop_v(fifo_pop_v_w),
-        .pop2_v(),
+//出队两格的随行号/世代（与内容同门锁存）
+        .idx_out(fifo_idx_out_w), .idx1_out(fifo_idx1_out_w),
+        .gen_out(fifo_gen_out_w), .gen1_out(fifo_gen1_out_w),
+//队头那一组（组合）：配对判据/装载使能/发号 rd 吃它
+        .nh0_inst(fifo_nh0_inst_w), .nh1_inst(fifo_nh1_inst_w),
+        .nh0_r1(fifo_nh0_r1_w), .nh0_r2(fifo_nh0_r2_w),
+        .nh1_r1(fifo_nh1_r1_w), .nh1_r2(fifo_nh1_r2_w),
+        .nh0_v(fifo_nh0_v_w), .nh1_v(fifo_nh1_v_w),
+//装载条件：由 pre_decoder 按两条 lane 的 stall/配对现算（它解的就是这两格）
+        .adv0(pd_adv0_w), .adv1(pd_adv1_w),
+        .cls1_0c(pre_cls1_0c_w), .lane1_v_in(pre_lane1_v_in_w),
+        .rob_idx(rob_alloc_idx_w), .rob_idx1(rob_alloc_idx1_w),
+        .rob_gen(alloc_gen_w), .rob_gen1(alloc_gen1_w),
         .full(fifo_full_w),
 //取指侧预译码（原在 icache 里）：pc 的落点算术、bra_predict 的 br_en/jal、controller 的 ird_tmr 吃它
         .fch_br_en(br_en),
@@ -362,11 +402,26 @@ module cpu_top(
         .h1_v(fifo_h1_v_w),
         .h0_r1(fifo_h0_r1_w), .h0_r2(fifo_h0_r2_w),
         .h1_r1(fifo_h1_r1_w), .h1_r2(fifo_h1_r2_w),
+        .nh0_inst(fifo_nh0_inst_w), .nh1_inst(fifo_nh1_inst_w),
+        .nh0_r1(fifo_nh0_r1_w), .nh0_r2(fifo_nh0_r2_w),
+        .nh1_r1(fifo_nh1_r1_w), .nh1_r2(fifo_nh1_r2_w),
+        .nh0_v(fifo_nh0_v_w), .nh1_v(fifo_nh1_v_w),
+        .idx_stage(fifo_idx_out_w), .idx1_stage(fifo_idx1_out_w),
+        .gen_stage(fifo_gen_out_w), .gen1_stage(fifo_gen1_out_w),
+        .cls1_0c_out(pre_cls1_0c_w), .lane1_v_in_out(pre_lane1_v_in_w),
+        .scan_cidx(pre_scan_cidx_w), .scan_cidx1(pre_scan_cidx1_w),
+        .sl0_v_out(pre_sl0_v_w),
+        .h1_addr(fifo_h1_addr_w),
+        .h1_br_pred(fifo_h1_brpred_w),
+        .h1_jalr_pred(fifo_h1_jalr_w),
+        .adv0(pd_adv0_w),
+        .adv1(pd_adv1_w),
         .inst_out(inst_2),
         .rd_out(rd_2),
         .func10_out(func10_2),
         .imm_alu_out(imm_alu_2),
         .aux_addr_out(aux_addr_2),
+        .aux_addr_1_out(aux_addr_1_2_w),
         .br_pred_taken_out(br_pred_taken_2),
         .jalr_pred_addr_out(jalr_pred_addr_2),
         .r1_out(rs1_2),
@@ -379,7 +434,18 @@ module cpu_top(
         .r1_1_out(r1B_2),
         .r2_1_out(r2B_2),
         .lane1_v_out(laneB_v_2),
-        .pop2(fifo_pop2_w)
+        .fill_n(fifo_fill_n_w),
+//ROB 分配口前移到本级：进槽那一拍拿号，号随载荷走
+        .rob_idx(rob_alloc_idx_w), .rob_idx1(rob_alloc_idx1_w),
+        .rob_gen(alloc_gen_w), .rob_gen1(alloc_gen1_w),
+        .alloc_en0(pd_alloc_en0_w), .alloc_we0(pd_alloc_we0_w), .alloc_rd0(pd_alloc_rd0_w),
+        .alloc_en1o(pd_alloc_en1o_w), .alloc_we1o(pd_alloc_we1o_w), .alloc_rd1o(pd_alloc_rd1o_w),
+        .need_pre(pd_need_pre_w),
+        .idx_out(pd_carry_idx_w), .idx1_out(pd_carry_idx1_w),
+        .gen_out(pd_carry_gen_w), .gen1_out(pd_carry_gen1_w),
+        .scan_v(fifo_scan_v_w),
+        .f0_r1(pd_f0_r1_w), .f0_r2(pd_f0_r2_w),
+        .f1_r1(pd_f1_r1_w), .f1_r2(pd_f1_r2_w)
     );
     post_decoder u_post_decoder (
         .clk(clk),
@@ -399,6 +465,7 @@ module cpu_top(
 //  "mid 出拍 → 下一拍"那一拍延迟，与载荷同拍），非寄存器操作数在 pd 内组合覆盖，
 //  再作为 forw 点② 的默认值直送执行单元。
         .pc_operand_in(aux_addr_2),
+        .pc_operand_1_in(aux_addr_1_2_w),
         .offset_beq0_aux(imm_alu_2),
         .r1_imm_val(r1_imm_val_w), .r2_imm_val(r2_imm_val_w),
         .r1_imm_sel(r1_imm_sel_w), .r2_imm_sel(r2_imm_sel_w),
@@ -421,9 +488,9 @@ module cpu_top(
         .rd_out(rd_3),
         .issue_we(issue_we_w),
         .issue_rd(issue_rd_w),
-        .idx_in(rob_alloc_idx_w),
+        .idx_in(pd_carry_idx_w),
         .issue_idx(issue_idx_w),
-        .alloc_gen_in(alloc_gen_w),
+        .alloc_gen_in(pd_carry_gen_w),
         .issue_gen(issue_gen_w),
 //前送槽号：当拍由 rob 按槽序扫出，与 issue_idx 同一个 payload_go 沿锁存成载荷
         .fwd_slot1_in(fwd_slot1_w), .fwd_slot2_in(fwd_slot2_w),
@@ -432,6 +499,8 @@ module cpu_top(
         .sel_v1(sel_v1_w),       .sel_v2(sel_v2_w),
         .payload_go(payload_go_w),
         .payload_go_q(payload_go_q_w),
+        .alloc_en1out(pd_alloc_en1_w),
+        .rf_r1(pd_rf_r1_w), .rf_r2(pd_rf_r2_w), .rf_r3(pd_rf_r3_w), .rf_r4(pd_rf_r4_w),
         .opc_out(opc_3),
         .fn10_out(fn10_3),
         .fn10_ls_out(fn10_ls_3),
@@ -444,13 +513,19 @@ module cpu_top(
 //lane B：同一个包的第二条。它的槽扫描是 rob 的 3/4 号口（fwd_slot3/4），
 //索引/世代用 rob 的第二个分配口（alloc_idx1/alloc_gen1）。
         .lane1_v_in(laneB_v_2),
+        .lane1_lsu_blk(lane1_lsu_blk_w), .lane1_mulu_blk(lane1_mulu_blk_w),
+        .adv0(pd_adv0_w),
+        .adv1(pd_adv1_w),
+        .lane1_hold(pd_lane1_hold_w),
+        .fifo_h0_v(fifo_nh0_v_w),
+        .aux_addr_1_in(aux_addr_1_2_w),
         .inst1_in(instB_2),
         .rd1_in(rdB_2),
         .func10_1_in(f10B_2),
         .imm1_alu_in(immB_2),
         .rs1_1_in(r1B_2), .rs2_1_in(r2B_2),
-        .idx1_in(rob_alloc_idx1_w),
-        .alloc_gen1_in(alloc_gen1_w),
+        .idx1_in(pd_carry_idx1_w),
+        .alloc_gen1_in(pd_carry_gen1_w),
         .fwd_slot1_1_in(fwd_slot3_w), .fwd_slot2_1_in(fwd_slot4_w),
         .fwd_hit1_1_in(fwd_hit3_w),   .fwd_hit2_1_in(fwd_hit4_w),
         .lane1_v_out(laneB_v_3),
@@ -517,6 +592,9 @@ module cpu_top(
         .flag_bus(flag_bus),
         .flush_bju_pre(flush_bju_pre),
         .flush_idx(flush_idx_w),
+//★ 这里【只能】吃原始 payload_go：改吃 adv0（= payload_go & ~lane1_hold）实测直接卡死
+//  （regstream 到第 866 笔就停）—— lane1 按住时把 lane0 的访存也挡在门外，那条访存拿不到 ld_we
+//  ⇒ ROB 排不空 ⇒ 自锁。P17 那条"重复收编"嫌疑因此【未落实】，只记在案。
         .payload_go(payload_go_w),
 //★ 三个执行单元的输入级数对齐：lsu 也吃 decoder 载荷（原来吃 mem_buf 组合输出，早一级）
         .opcode(opc_3),
@@ -556,6 +634,7 @@ module cpu_top(
         .loaded(loaded),
         .ld_we(ld_we),
         .stall_lsu_haz(stall_lsu_haz_w),
+        .lane1_lsu_blk(lane1_lsu_blk_w),
         .stall_lsu_unload(stall_lsu_unload_w),
         .stall_lsu_full(stall_lsu_full_w),
         .rd_load(rd_load),
@@ -596,6 +675,7 @@ module cpu_top(
         .mul_idx(mul_idx_w),
         .mul_gen(mul_gen_w),
         .stall_mulu_haz(stall_mulu_haz_w),
+        .lane1_mulu_blk(lane1_mulu_blk_w),
         .stall_mulu_div(stall_mulu_div_w),
 //命中位：与结果口同拍组合给出（载荷里锁存的槽号/有效位 ⇒ 与 forw 当拍看到的同一份消费者）
         .sel_slot1(sel_slot1_w), .sel_slot2(sel_slot2_w),
@@ -738,7 +818,7 @@ module cpu_top(
 
     rob u_rob (
         .clk(clk), .rst(rst),
-        .alloc_en(payload_go_w), .alloc_idx(rob_alloc_idx_w), .full(stall_rob_full_w),
+        .alloc_en(pd_alloc_en0_w), .alloc_idx(rob_alloc_idx_w), .full(stall_rob_full_w),
         .alloc_gen(alloc_gen_w),
 //完成口 = 三个单元的结果口直连（值 + 索引 + 世代同拍同源）；ROB 按索引把 wr/data 一起写进那一项
         .alu_done(we_4),   .alu_idx(alu_idx_w), .alu_data(result_4),       .alu_gen(alu_gen_w),
@@ -753,10 +833,12 @@ module cpu_top(
 //提交口：驱动寄存器堆的两条写口（口 A = head、口 B = head+1）
         .cmt_we0(rob_rwe0_w), .cmt_rd0(rob_rrd0_w), .cmt_data0(rob_rdt0_w),
         .cmt_we1(rob_rwe1_w), .cmt_rd1(rob_rrd1_w), .cmt_data1(rob_rdt1_w),
-        .alloc_we(issue_we_w),
-        .alloc_rd(issue_rd_w),
-//lane1 的分配口：alloc_en1 = 本包有没有 lane1（绝不能用含 full 的量，见 rob.v 那条环）
-        .alloc_en1(laneB_v_2), .alloc_we1(issue_we1_w), .alloc_rd1(issue_rd1_w),
+        .alloc_we(pd_alloc_we0_w),
+        .alloc_rd(pd_alloc_rd0_w),
+//★ ROB 分配口前移到 pre_decoder（进槽那一拍发号）：见 pre_decoder 的端口注释。
+//  alloc_en 只表示"槽0 这一拍真的装了一条"，绝不含 payload_go；full 的判据吃 need_pre。
+        .need_pre(pd_need_pre_w),
+        .alloc_en1(pd_alloc_en1o_w), .alloc_we1(pd_alloc_we1o_w), .alloc_rd1(pd_alloc_rd1o_w),
         .alloc_idx1(rob_alloc_idx1_w), .alloc_gen1(alloc_gen1_w),
         .alu_done1(weB_4), .alu_idx1(alu_idxB_w), .alu_data1(resultB_4), .alu_gen1(alu_genB_w),
 //前送槽扫描：消费者是下一拍进载荷那条（本拍还在 pre 级）⇒ 用它的 rs1_1/rs2_1；
@@ -764,9 +846,10 @@ module cpu_top(
 //扫描吃【上一级】的 rs（pre_decoder 的组合版），结果在 rob 里打一拍 ⇒ 读拍只剩取数+选源
 //槽扫描吃【pre_decoder 的输出触发器】：读拍在 mid 那一级，所以扫描提前一拍、起点是普通触发器
 //（不是 icache 的 BRAM 输出寄存器 —— 那 2.45ns 的 clock-to-out 是白吃的）。
-        .scan_rs1(fifo_h0_r1_w), .scan_rs2(fifo_h0_r2_w),
-        .scan_go(fifo_pop_v_w),
-        .scan_rs1_1(fifo_h1_r1_w), .scan_rs2_1(fifo_h1_r2_w),
+        .scan_rs1(pd_f0_r1_w), .scan_rs2(pd_f0_r2_w),
+        .scan_cidx(pre_scan_cidx_w), .scan_cidx1(pre_scan_cidx1_w),
+        .scan_go(fifo_scan_v_w),
+        .scan_rs1_1(pd_f1_r1_w), .scan_rs2_1(pd_f1_r2_w),
         .fwd_slot1(fwd_slot1_w), .fwd_slot2(fwd_slot2_w),
         .fwd_hit1(fwd_hit1_w),   .fwd_hit2(fwd_hit2_w),
         .fwd_slot3(fwd_slot3_w), .fwd_slot4(fwd_slot4_w),
@@ -794,8 +877,8 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus),
 //读口地址由 mid_decoder 那一级给出（比 decoder 载荷早一拍），读值寄存后随载荷往下走
-        .r1(rs1_2),
-        .r2(rs2_2),
+        .r1(pd_rf_r1_w),
+        .r2(pd_rf_r2_w),
         .we_a(rob_rwe0_w),
         .rd_a(rob_rrd0_w),
         .data_a(rob_rdt0_w),
@@ -821,8 +904,11 @@ module cpu_top(
         .r1_data(r1_data),
         .r2_data(r2_data),
 //lane B 的两个读口：地址是 mid 那一级 lane1 的 rs（与 lane0 同拍），旁路/停顿重读逐项对应
-        .r3(r1B_2),
-        .r4(r2B_2),
+        .r3(pd_rf_r3_w),
+        .r4(pd_rf_r4_w),
+        .adv1(pd_adv1_w),
+        .adv0(pd_adv0_w),
+        .payload_go_i(payload_go_w),
         .fwd_data3(fwd_data3_w), .fwd_data4(fwd_data4_w),
         .fwd_done3(fwd_done3_w), .fwd_done4(fwd_done4_w),
         .st_slot3(st_slot3_w), .st_slot4(st_slot4_w),
@@ -879,6 +965,7 @@ module cpu_top(
     controller u_controller (
         .clk(clk),
         .rst(rst),
+        .lane1_hold(pd_lane1_hold_w),
         .br2(br2),
         .br3(br3),
         .jalr_fail(jalr_fail),
@@ -942,7 +1029,7 @@ module cpu_top(
 //中断的 mepc 取 pre_decoder 的 aux_addr_1（那条指令"地址+4"）：它是【正要进发射级、
 //还没被发出去】的那一条 = 中断返回点。取指 PC 在前端等 ROB 排空期间会漂，不能用。
         .pc_addr_in(aux_addr_2),
-        .fifo_h0_v(fifo_h0_v_w),
+        .fifo_h0_v(fifo_nh0_v_w),
         .csr_data_out(csr_data_rd),
         .isr_addr2(isr_addr2),
         .mcause(mcause),

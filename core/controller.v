@@ -61,6 +61,8 @@ module controller(
 //写序号（乱序写回用，逻辑就放在本模块内）：发射级要不要发号 + 三个单元的滞留兜底请求
     input jal, pre_jalr, btb_hit, br1,
     input csr_wr_en, exti, timi, softi,
+//lane1 压着更老那条：中断受理点要让开它
+    input lane1_hold,
     input [11:0] csr_addr,
 //csr 读口地址（c2 级），比 csr_addr 早一拍；读值寄存一拍后由 csr_data_out 给出
     input [11:0] csr_addr_pre,
@@ -281,6 +283,7 @@ module controller(
         .csr_data_in(csr_data_in),
         .pc_addr_in(pc_addr_in),
         .h0_v(fifo_h0_v),
+        .lane1_hold(lane1_hold),
         .ird_tmr(ird_tmr),
         .jalr_fail(jalr_fail),
         .br2(br2),

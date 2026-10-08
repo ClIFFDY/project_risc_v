@@ -80,6 +80,8 @@ module lsu(
     output reg ld_we,
 //三条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_lsu_haz,
+//★ lane1 的 load-use：只送给 post_decoder 当上压触发，不进 flag_bus
+    output reg lane1_lsu_blk,
     output reg stall_lsu_unload,
     output reg stall_lsu_full,
     output reg mem_inflight,
@@ -388,9 +390,10 @@ module lsu(
     end
 
     always @(*) begin
-        stall_lsu_haz    = ls_use_hit | ls_use_ans | ls_use_hit_1;
+        stall_lsu_haz    = ls_use_hit | ls_use_ans;
         stall_lsu_unload = s3_v & ~s3_done;
         stall_lsu_full   = full_stall;
+        lane1_lsu_blk    = ls_use_hit_1;
     end
 
 //===============================================================

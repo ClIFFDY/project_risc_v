@@ -90,7 +90,9 @@ module mulu(
     (* max_fanout = 8 *) output reg        mul_gen,
 //两条停顿源【逐条】对外：controller 原样过路进 flag_bus，或运算在消费者模块内做
     output reg stall_mulu_haz,
-    output reg stall_mulu_div
+    output reg stall_mulu_div,
+//★ lane1 那一项只送给 post_decoder 当上压触发，不进 flag_bus
+    output reg lane1_mulu_blk
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -489,6 +491,7 @@ module mulu(
 //  与 lane1 的读无关，混进去会让除法发起条件多一个无关项。
     always @(*) begin
         stall_mulu_haz = stall_mulu_haz_self | stall_mulu_haz_1;
+        lane1_mulu_blk = stall_mulu_haz_1;
     end
 
 //  口被 alu 占住时乘法让路是常态里的极少数（三笔同拍才轮到它让），量级可忽略。
@@ -496,7 +499,7 @@ module mulu(
 
 //本模块内部用的合流（不回压任何人，只用于 m_push 与 mstalled）：两条停顿源相或。
 //旧 wbu 的 hold_mul 端口与它对应的回压已随 ROB 取代 wbu 而作废，整条删除。
-    always @(*) stall = stall_mulu_haz | stall_mulu_div;
+    always @(*) stall = stall_mulu_haz_self | stall_mulu_haz_1 | stall_mulu_div;
 
 //组合输出：写回仲裁（乘法第二级与除法收尾共用，同一时刻只有一个在途结果）
     always @(*) begin

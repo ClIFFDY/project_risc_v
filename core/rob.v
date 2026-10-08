@@ -72,6 +72,9 @@ module rob(
     input        alloc_en1,
     input        alloc_we1,
     input [4:0]  alloc_rd1,
+//本拍最多能装几条（pre_decoder 按队头可用性给的保守上界）。★ 绝不含 payload_go：
+//`full` 吃它、`payload_go` 又吃 `full`，一旦这里含 payload_go 就是零延时组合环。
+    input [1:0]  need_pre,
 //前送槽扫描口：消费者（下一拍进载荷那条）的两个源寄存器号，用 mid 级的 rs1_2/rs2_2。
 //本模块按【程序序】分配（`alloc_en = payload_go`，与进载荷同沿）⇒ 扫描那一拍所有 `ent_v`
 //的槽**一格不多一格不少**全是比它老的指令 ⇒ "比我老"不需要任何比较，`ent_v[s]` 即等价；
@@ -79,6 +82,15 @@ module rob(
     input [4:0]  scan_rs1, scan_rs2,
 //lane1 的两个源（同一个包的第二条）。扫描口与 1/2 完全同形、同拍、同 scan_go。
     input [4:0]  scan_rs1_1, scan_rs2_1,
+//★★ 扫槽目标消费者自己的 ROB 号（= "下一拍进 S 的那条"的号，由 pre_decoder 给）。
+//  ★ 为什么必须有它：扫描的候选集是【全窗口】，靠"最年轻者胜"选源 —— 这条规则隐含
+//    "消费者自己还没进 ROB"（老前端只有一级出队寄存器时成立：扫的那条当拍才分配、
+//    `ent_v` 是打过一拍的、看不见它）。一旦前端多一级（fifo 出队两格 + pre_decoder 槽），
+//    被扫的那条【早一两拍就已经分配】⇒ 它自己会进候选集。实测 `mv sp,sp`（rd==rs1==x2）：
+//    扫描选中了消费者自己那一项 ⇒ `idx_in == fwd_slot` 判据失效 ⇒ 生产者 `auipc sp`
+//    的结果前送不出去 ⇒ 读出阵列旧值 0 ⇒ 启动第二笔写就错。
+//  ⇒ 把"比消费者更年轻的一律摁掉"补成显式判据（年龄一律 4 位截断，与 scan_ag 同口径）。
+    input [2:0]  scan_cidx, scan_cidx1,
 //扫描的推进条件（= pre_decoder 本级的锁存条件）：为 1 才把这一拍的扫描结果打拍换新
     input        scan_go,
     output reg [2:0] fwd_slot1, fwd_slot2,
@@ -189,6 +201,7 @@ reg        scan_wv [0:DEPTH-1];
 //候选掩码（含"同拍正在分配那一项"）与它对应的世代
 reg        scan_c1 [0:DEPTH-1];
 reg        scan_c2 [0:DEPTH-1];
+reg [3:0]  scan_cag0, scan_cag1;
 reg        scan_g1 [0:DEPTH-1];
 reg        scan_g2 [0:DEPTH-1];
 //打拍后的扫描结果（读拍用）
@@ -232,9 +245,7 @@ integer si, sj;
 
 reg [2:0]  tail_p;
 reg [3:0]  cnt;
-//本包要占几个槽：lane1 有效就 2，否则 1。满的判据必须按【整包】算 ——
-//只余 1 槽而成对时，整包等下一拍，绝不进一半（进一半就破了"一个包是一个单位"）。
-reg [2:0]  alloc_need;
+//满的判据用 pre_decoder 给的保守上界 need_pre（见端口注释）。
 
 reg [2:0]  head_nx;
 reg [2:0]  tail_nx;
@@ -307,11 +318,14 @@ always @(posedge clk) rst_q <= rst;
         flush_ok   = flush_con_rob && (flush_age < cnt) && ent_v[flush_idx];
         alloc_idx  = tail_p;
         alloc_gen  = ~ent_gen[tail_p];
-        alloc_idx1 = tail_p + 3'd1;
-        alloc_gen1 = ~ent_gen[tail_p + 3'd1];
+//lane1 的号 = tail_p + 【这一个槽也在装】（= take0）。槽0 不装时 lane1 自己拿 tail_p。
+        alloc_idx1 = alloc_en ? (tail_p + 3'd1) : tail_p;
+        alloc_gen1 = alloc_en ? ~ent_gen[tail_p + 3'd1] : ~ent_gen[tail_p];
         occupancy  = cnt;
         empty      = (cnt == 4'd0);
-        full       = ({1'b0, cnt} + {1'b0, alloc_need} > {1'b0, DEPTH});
+//（历史）★ +1：发号在【进槽那一拍】、建项在【进载荷那一拍】⇒ 有一个"只发了号、项还没建"的窗口；
+//  满的判据必须把这个窗口留出来，否则 tail 绕回来会把还挂在槽里的号重发给新指令（重号 ⇒ 完成落到别人的项）。
+        full       = ({1'b0, cnt} + {1'b0, need_pre} > {1'b0, DEPTH});
 //提交口：只有队头两项可退，且【写 rd 的项】才写寄存器堆。
 //★ `ent_rd != 0` 与 head_ok 里的 `!ent_ex` 是两道独立的门，缺一不可：
 //  post_decoder 的 issue_we 把 SYSTEM 保守算作会写 ⇒ 故障项的 ent_rd 可能非 0。
@@ -324,13 +338,7 @@ always @(posedge clk) rst_q <= rst;
 
     end
 
-//本包要占几个槽。lane1 有效就 2 —— 被 full 的判据与 tail 的推进两处共用。
-    always @(*) begin
-        if (alloc_en1)
-            alloc_need = 3'd2;
-        else
-            alloc_need = 3'd1;
-    end
+//本包要占几个槽：`full` 的判据吃【保守上界 need_pre】（不含 payload_go，环被切断）。
 
 //下一拍的指针与占用数：先算退掉的（0/1/2 笔），再算分配的，冲刷最后覆盖（与旧写法优先级一致）
     always @(*) begin
@@ -350,8 +358,12 @@ always @(posedge clk) rst_q <= rst;
             cnt_nx = cnt_nx - 4'd1;
         end
         if (alloc_en && !full) begin
-            tail_nx = tail_p + alloc_need;
-            cnt_nx  = cnt_nx + {1'b0, alloc_need};
+            tail_nx = tail_p + 3'd1;
+            cnt_nx  = cnt_nx + 4'd1;
+        end
+        if (alloc_en1 && !full) begin
+            tail_nx = tail_nx + 3'd1;
+            cnt_nx  = cnt_nx + 4'd1;
         end
 //★ 判据必须与时钟块那条【逐字一致】：边界项失效时走的是"全冲"，
 //  时钟块清项、这里也必须把 cnt/tail 一起归零 —— 漏了就是"项全清掉、计数还留着"，
@@ -389,6 +401,8 @@ always @(posedge clk) rst_q <= rst;
 //   scan_c 定的，后来改 c 不会回写它 ⇒ 新分配那条永远进不了命中集（实测 add a1,a0,x0 假 0）。
 //★ 世代必须取【翻转后】的 alloc_gen：扫描在 alloc 那一拍，下一拍 ent_gen[tail_p] 就是它。
     always @(*) begin
+        scan_cag0   = {1'b0, (scan_cidx  - head_p)};
+        scan_cag1   = {1'b0, (scan_cidx1 - head_p)};
         for (si = 0; si < DEPTH; si = si + 1) begin
             scan_ag[si] = {1'b0, (si[2:0] - head_p)};
 //候选判据压成一次 6 输入比较：`scan_wv` 只依赖触发器（与 rs 平行算好），剩下 5 个 XNOR + 这一次
@@ -396,10 +410,11 @@ always @(posedge clk) rst_q <= rst;
 //★ 别再想"给 rs=0 预置一个永不匹配的比较值"—— ent_rd 的残留值覆盖 0..31，不存在这样的值。
 //  `scan_wv` 自带 `|ent_rd`，而写 x0 的项 ent_rd=0 ⇒ rs=0 时天然不会命中。
             scan_wv[si] = ent_v[si] & |ent_rd[si];
-            scan_c1[si] = scan_wv[si] & (ent_rd[si] == scan_rs1);
-            scan_c2[si] = scan_wv[si] & (ent_rd[si] == scan_rs2);
-            scan_c3[si] = scan_wv[si] & (ent_rd[si] == scan_rs1_1);
-            scan_c4[si] = scan_wv[si] & (ent_rd[si] == scan_rs2_1);
+//年龄界（4 位截断，与 scan_ag 同一坐标）：比消费者更年轻的（ag >= cag）一律不是生产者。
+            scan_c1[si] = scan_wv[si] & (ent_rd[si] == scan_rs1)   & (scan_ag[si] < scan_cag0);
+            scan_c2[si] = scan_wv[si] & (ent_rd[si] == scan_rs2)   & (scan_ag[si] < scan_cag0);
+            scan_c3[si] = scan_wv[si] & (ent_rd[si] == scan_rs1_1) & (scan_ag[si] < scan_cag1);
+            scan_c4[si] = scan_wv[si] & (ent_rd[si] == scan_rs2_1) & (scan_ag[si] < scan_cag1);
             scan_g1[si] = ent_gen[si];
             scan_g2[si] = ent_gen[si];
             scan_g3[si] = ent_gen[si];
@@ -409,52 +424,9 @@ always @(posedge clk) rst_q <= rst;
             scan_y3[si] = scan_c3[si];
             scan_y4[si] = scan_c4[si];
         end
-//同拍正在分配那一项：世代取【翻转后】的值（下一拍 ent_gen[tail_p] 就是它）
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1)) begin
-            scan_c1[tail_p] = 1'b1;
-            scan_y1[tail_p] = 1'b1;
-            scan_g1[tail_p] = alloc_gen;
-        end
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs2)) begin
-            scan_c2[tail_p] = 1'b1;
-            scan_y2[tail_p] = 1'b1;
-            scan_g2[tail_p] = alloc_gen;
-        end
-//lane1 的两个源：这一拍正在分配的【两项】都要进候选（tail_p 是 lane0、tail_p+1 是 lane1）。
-//它俩都比"下一拍进载荷那个消费者"老，所以都是合法生产者。
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs1_1)) begin
-            scan_c3[tail_p] = 1'b1;
-            scan_y3[tail_p] = 1'b1;
-            scan_g3[tail_p] = alloc_gen;
-        end
-//★ 反向也要补：这一拍分配的 lane1 那项（tail_p+1）同样是"比消费者老"的生产者 ——
-//  漏了它，紧跟成对包之后的消费者就扫不到 lane1 刚写的那个 rd（实测 tightdep：
-//  a4 的项晚一拍进表，addi a5,a4,1 扫不到它、回落阵列读到旧值 0，a5 得 1 而不是 10）。
-        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs1)) begin
-            scan_c1[tail_p + 3'd1] = 1'b1;
-            scan_y1[tail_p + 3'd1] = 1'b1;
-            scan_g1[tail_p + 3'd1] = alloc_gen1;
-        end
-        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs2)) begin
-            scan_c2[tail_p + 3'd1] = 1'b1;
-            scan_y2[tail_p + 3'd1] = 1'b1;
-            scan_g2[tail_p + 3'd1] = alloc_gen1;
-        end
-        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs1_1)) begin
-            scan_c3[tail_p + 3'd1] = 1'b1;
-            scan_y3[tail_p + 3'd1] = 1'b1;
-            scan_g3[tail_p + 3'd1] = alloc_gen1;
-        end
-        if (alloc_en && (alloc_rd != 5'd0) && (alloc_rd == scan_rs2_1)) begin
-            scan_c4[tail_p] = 1'b1;
-            scan_y4[tail_p] = 1'b1;
-            scan_g4[tail_p] = alloc_gen;
-        end
-        if (alloc_en && alloc_en1 && (alloc_rd1 != 5'd0) && (alloc_rd1 == scan_rs2_1)) begin
-            scan_c4[tail_p + 3'd1] = 1'b1;
-            scan_y4[tail_p + 3'd1] = 1'b1;
-            scan_g4[tail_p + 3'd1] = alloc_gen1;
-        end
+//★ 这里原来还有一块"把本拍正在分配的那两项注入候选集"的补丁 —— 分配点前移到 pre_decoder
+//  （进槽那一拍写 ent_rd）之后，被扫的那条（= 队头）的前一条【上一拍就已经写进表了】
+//  ⇒ 候选集天然完整，注入不再需要；留着反而会把【被扫的消费者自己】当成生产者注入。
 //"有人比你更年轻"就把你摁掉（用含分配项的候选掩码，保证热码唯一）
         for (si = 0; si < DEPTH; si = si + 1) begin
             for (sj = 0; sj < DEPTH; sj = sj + 1) begin
@@ -684,14 +656,21 @@ always @(posedge clk) rst_q <= rst;
                 ent_rd[tail_p] <= (alloc_we && (alloc_rd != 5'd0)) ? alloc_rd : 5'd0;
                 ent_gen[tail_p] <= ~ent_gen[tail_p];
             end
-//lane1 那一项：与 lane0 同拍、同门控（full 已按整包算过，这里只要跟它一致就不会只进一半）。
-            if (alloc_en && alloc_en1 && !full) begin
-                ent_v[tail_p + 3'd1]  <= 1'b1;
-                ent_wr[tail_p + 3'd1] <= ~alloc_we1;
-                ent_ex[tail_p + 3'd1] <= 1'b0;
-                ent_rd[tail_p + 3'd1] <= (alloc_we1 && (alloc_rd1 != 5'd0)) ? alloc_rd1 : 5'd0;
-                ent_gen[tail_p + 3'd1] <= ~ent_gen[tail_p + 3'd1];
+//lane1 那一项：位置 = tail_p + 【槽0 也在装】（与 alloc_idx1 同式）。
+            if (alloc_en1 && !full) begin
+                ent_v[alloc_idx1]  <= 1'b1;
+                ent_wr[alloc_idx1] <= ~alloc_we1;
+                ent_ex[alloc_idx1] <= 1'b0;
+                ent_rd[alloc_idx1] <= (alloc_we1 && (alloc_rd1 != 5'd0)) ? alloc_rd1 : 5'd0;
+                ent_gen[alloc_idx1] <= alloc_gen1;
             end
+//★ 分配点前移到【进槽那一拍】之后，不写 rd 的项（store/br/x0 目的）比"发出去"早一拍可退
+//  ⇒ 异常/中断/mmio 的相位跟着挪一格（实测两条时序敏感的微测翻了）。这里把那一拍补回来：
+//  分配时先置 wr=0，下一拍由这一行统一置起（ent_rd=0 且已在册 ⇒ 它本来就不用等任何写口回报）。
+//  放在分配块【之后】：同沿对同一项的重复赋值，后面的赢 ⇒ 刚分配那一项这拍仍保持 wr=0。
+            for (ri = 0; ri < DEPTH; ri = ri + 1)
+                if (ent_v[ri] && !ent_wr[ri] && (ent_rd[ri] == 5'd0))
+                    ent_wr[ri] <= 1'b1;
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验是必需的：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（ent_v 挡不住"新住户也 valid"）。
             if (alu_done && ent_v[alu_idx] && (ent_gen[alu_idx] == alu_gen)) begin

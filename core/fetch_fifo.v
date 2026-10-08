@@ -17,12 +17,12 @@
 //     ② 让**成对发射完全由读侧决定** —— 看队头两条能不能配，能配就一次弹两条。
 //
 //   ★ 两个推进门必须分开：
-//       f_req = exec & ~flush_w & ~stall_pc_redir & ~stall_icache_miss   —— 取指侧
-//       adv   = exec & ~flush_w & ~stall_*（全部）                        —— 后端
+//       f_req  = exec & ~flush_w & ~stall_pc_redir & ~stall_icache_miss  —— 取指侧
+//       fill_n = pre_decoder 算的"本拍离开队列的条数"（后端停顿它全吃）  —— 读侧
 //     前端【不吃】rob_full / lsu / mulu / bus_hold 这些后端停顿：后端停顿时它继续往队里灌，
 //     灌到 full 再由 full 把前端按住；反过来队列不会被"后端停住"抽干
-//     （凡是能让队列变空的原因（冲刷/redir 排队/取指 miss）同时也在后端那一侧把 adv 拉低，
-//      所以"adv=1 而队列是空的"不会发生，不需要额外的空队列停顿）。
+//     （凡是能让队列变空的原因（冲刷/redir 排队/取指 miss）同时也在读侧把 fill_n 拉成 0，
+//      所以"读了 1 条而队列是空的"不会发生，不需要额外的空队列停顿）。
 //
 //   ★ 队头是【组合读 + 本拍写入旁路】：空队列时队头直接是本拍写进去的那条 ——
 //     冲刷后落点那条不用多压一拍，与"不插队列"同拍就能被读侧取用。
@@ -78,17 +78,44 @@ module fetch_fifo(
     input [31:0] push_addr,
     input        push_br_pred,
     input [31:0] push_jalr_pred,
-//读侧：本拍弹两条（判据在 pre_decoder 里，用队头两条现译出来算）
-    input        pop2,
-//队头两条（组合读，含本拍写入的旁路）
-    output reg [31:0] h0_inst, h1_inst, h0_addr,
+//读侧：本拍有几条【离开队列】（由 pre_decoder 按补空位算）
+    input [1:0]  fill_n,
+//★★ 选 lane / 装载条件（全部由 pre_decoder 组合给出，它解的就是本模块这两格）：
+//  adv0/adv1 = 载荷那一侧"这一拍换不换内容"（adv1=0 即 lane1 被 load-use 顶住）；
+//  cls1_0c   = "队头那条能不能当 lane1"（只有格1 换、格0 保持那一支要它）；
+//  lane1_v_in= 配成对时 lane1 的有效位；rob_idx/rob_gen = 这一拍发给这两条的 ROB 号（跟内容一起锁）。
+//  ★ 这几位都是【触发器 → 组合 → 触发器】，不构成组合环。
+    input        adv0, adv1,
+    input        cls1_0c, lane1_v_in,
+    input [2:0]  rob_idx, rob_idx1,
+    input        rob_gen, rob_gen1,
+//队头两条（组合读 + 本拍写入旁路）：给 pre_decoder 的配对/装载判据与 rob 扫槽用
+    output reg [31:0] nh0_inst, nh1_inst, nh0_addr, nh1_addr,
+    output reg        nh0_br_pred,
+    output reg        nh1_br_pred,
+    output reg [31:0] nh0_jalr_pred,
+    output reg [31:0] nh1_jalr_pred,
+//队头两条的两个源寄存器号（条目里存好的字段）
+    output reg [4:0]  nh0_r1, nh0_r2, nh1_r1, nh1_r2,
+    output reg        nh0_v, nh1_v,
+//★★★ 出队两格 = 【本模块的出口寄存器】（从 pre_decoder 的两个槽整体搬过来）：
+//  装哪一条由 adv0/adv1 + cls1_0c 现定 —— 这就是"按两条 lane 的 stall 选输出 lane"：
+//    格0 被取走（adv0）⇒ 下拍装队头；没取走 ⇒ 原地保持（**格内不搬数据**）。
+//    格1 被取走（adv1）⇒ adv0 时装队头下一条、~adv0 时【装队头】（换 lane 输出，格内仍不搬）；
+//                        adv1=0 ⇒ 原地保持。
+//  号与内容【同门】锁存（idx/gen 跟指令走，出去以后就是载荷的 issue_idx/issue_gen）。
+    output reg [31:0] h0_inst, h1_inst, h0_addr, h1_addr,
     output reg        h0_br_pred,
+    output reg        h1_br_pred,
     output reg [31:0] h0_jalr_pred,
-//队头两条的两个源寄存器号（条目里存好的字段）：rob 的扫槽吃它
+    output reg [31:0] h1_jalr_pred,
     output reg [4:0]  h0_r1, h0_r2, h1_r1, h1_r2,
     output reg        h0_v, h1_v,
-//本拍真的弹了 / 弹了两条（回给 rob 的扫槽使能与下游 lane1 使能）
-    output reg        pop_v, pop2_v,
+    output reg [2:0]  idx_out, idx1_out,
+    output reg        gen_out, gen1_out,
+//★ 原来这里回给 rob 的扫槽使能（pop_v/pop2_v）已搬去 pre_decoder 的 scan_v ——
+//  扫槽口的口径是"下一拍进载荷那条"，而"哪两条进载荷"现在由读侧的缓冲决定，
+//  队列自己只知道推了几条指针，不再知道那两条是谁。
 //取指侧预译码（原在 icache 里，2026-10-27 搬到本模块前端）：它们的消费者是 pc 的落点算术、
 //bra_predict 的 br_en/jal、controller 的 ird_tmr，以及 icache 自己的 jalr 类 NOP 门。
     output reg        fch_br_en, fch_jal, fch_jalr,
@@ -128,7 +155,7 @@ module fetch_fifo(
     reg stall_lsu_haz, stall_lsu_full;
     reg stall_mulu_haz, stall_mulu_div;
     reg stall_icache_miss, stall_bus_hold;
-    reg flush_w, f_req, f_adv, adv;
+    reg flush_w, f_req, f_adv;
     always @(*) begin
         flush_con_exc     = flag_bus[11];
         flush_con_irq     = flag_bus[10];
@@ -145,10 +172,6 @@ module fetch_fifo(
         flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
 //取指侧：只吃"冲刷 + 重定向排队 + 取指自己 miss"
         f_req = exec & ~flush_w & ~stall_pc_redir & ~stall_icache_miss;
-//后端：全吃（这一位只用来决定弹不弹）
-        adv   = exec & ~flush_w
-              & ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold);
         f_adv = f_req & ~full;
     end
 
@@ -157,6 +180,7 @@ module fetch_fifo(
     localparam OPCODE_JALR   = 7'b1100111;
     localparam OPCODE_BRANCH = 7'b1100011;
     localparam OPCODE_OP_IMM = 7'b0010011;
+    localparam OPCODE_LUI    = 7'b0110111;
     localparam OPCODE_OP     = 7'b0110011;
     localparam OPCODE_LOAD   = 7'b0000011;
     localparam OPCODE_STORE  = 7'b0100011;
@@ -191,8 +215,12 @@ module fetch_fifo(
             inst1_eff = 32'd0;
         end
         else begin
-            inst_eff  = inst_valid   ? inst_out  : 32'd0;
-            inst1_eff = inst_valid_b ? inst_next : 32'd0;
+            inst_eff  = 32'd0;
+            inst1_eff = 32'd0;
+            if (inst_valid)
+                inst_eff = inst_out;
+            if (inst_valid_b)
+                inst1_eff = inst_next;
         end
         inst1_eff_raw = inst1_eff;
 //★ lane1 jal 那一拍【必须空一拍】：pc 已经跳到 T1，下一拍交付的整对都是错路。
@@ -281,7 +309,10 @@ module fetch_fifo(
 
     always @(*) begin
         fch_ct_redir = lane0_redir | fch1_jal_r | fch1_br_r | fch1_jalr_r;
-        fch_ct_jalr  = lane0_redir ? (fch_jalr & btb_hit) : fch1_jalr_r;
+        if (lane0_redir)
+            fch_ct_jalr = fch_jalr & btb_hit;
+        else
+            fch_ct_jalr = fch1_jalr_r;
     end
 
 //命中档前提：本拍有改向、取指这一拍能推进（take 会武装 FSM）、且 BTIC 在 rd_key 上命中
@@ -303,12 +334,21 @@ module fetch_fifo(
 //  ★ "冲刷那拍 icache 出 NOP、BTIC 下一拍顶替"由本模块前端那个三态 mux 承担
 //    （bti_sel=2 出 NOP、=1 出注入对）⇒ 这里不需要任何"抑制/不推"的额外逻辑。
     always @(*) begin
-        fch_br_eff       = lane0_redir ? br1 : fch1_br_r;
-        fch_jal_eff      = lane0_redir ? fch_jal : fch1_jal_r;
-        fch_jalr_eff     = lane0_redir ? (fch_jalr & btb_hit) : fch1_jalr_r;
-        fch_off_beq_eff  = lane0_redir ? fch_off_beq : (fch1_off_beq + 32'd4);
-        fch_off_jal_eff  = lane0_redir ? fch_off_jal : (fch1_off_jal + 32'd4);
         fch_off_jalr_eff = push_jalr_pred;   // 两 lane 的 jalr 落点都来自当拍 btb 读（服务谁就是谁的）
+        if (lane0_redir) begin
+            fch_br_eff      = br1;
+            fch_jal_eff     = fch_jal;
+            fch_jalr_eff    = fch_jalr & btb_hit;
+            fch_off_beq_eff = fch_off_beq;
+            fch_off_jal_eff = fch_off_jal;
+        end
+        else begin
+            fch_br_eff      = fch1_br_r;
+            fch_jal_eff     = fch1_jal_r;
+            fch_jalr_eff    = fch1_jalr_r;
+            fch_off_beq_eff = fch1_off_beq + 32'd4;
+            fch_off_jal_eff = fch1_off_jal + 32'd4;
+        end
     end
 
 //写口这一拍两条各自的源寄存器号：只有真读这两个源的指令才填，别的留 0，免得在冒险比较里
@@ -378,6 +418,7 @@ module fetch_fifo(
     reg [106:0] push0_data, push1_data;
     reg [31:0] push_addr_l0;
     reg [106:0] h0_data, h1_data;
+    reg         hd0_v, hd1_v;
     reg        wr0, wr1, clr;
 
 //本拍要推几条：前端每拍至少一条（f_req 那一拍 —— 每拍都推，"错路那拍交付 NOP"也是推一条），
@@ -442,18 +483,6 @@ module fetch_fifo(
         wr1 = f_adv & push1_en;
     end
 
-//弹几条：读侧配对判据（pop2）在够两条时才成立
-    always @(*) begin
-        if (adv & h0_v) begin
-            pop_v  = 1'b1;
-            pop2_v = pop2 & h1_v;
-        end
-        else begin
-            pop_v  = 1'b0;
-            pop2_v = 1'b0;
-        end
-    end
-
 //写口：push0/push1 各写自己那一条语句（FF 阵列允许两个写译码器）
     always @(posedge clk) begin
         if (wr0) begin
@@ -477,7 +506,7 @@ module fetch_fifo(
         end
     end
 
-//读指针：清队时不动（那些条目由 wptr 作废）；正常按弹了几条走
+//读指针：清队时不动（那些条目由 wptr 作废）；正常按【本拍离开队列的条数】走
     always @(posedge clk) begin
         if (rst_q) begin
             rptr <= 4'd0;
@@ -485,15 +514,15 @@ module fetch_fifo(
         else if (clr) begin
             rptr <= rptr;
         end
-        else if (pop2_v) begin
+        else if (fill_n == 2'd2) begin
             rptr <= rptr + 4'd2;
         end
-        else if (pop_v) begin
+        else if (fill_n == 2'd1) begin
             rptr <= rptr + 4'd1;
         end
     end
 
-//队头：组合读 + 本拍写入旁路。
+//队头（组合读 + 本拍写入旁路）：**这是喂给出队寄存器的那一级**，不是交付口。
 //idx 上有条目 ⟺ 它落在 [rptr, wptr-1] 里（已有），或它就是本拍写入的位置。
     always @(*) begin
         idx0 = rptr;
@@ -502,41 +531,166 @@ module fetch_fifo(
 
     always @(*) begin
         h0_data = q_dat[idx0[2:0]];
-        h0_v    = (idx0 != wptr);
+        hd0_v    = (idx0 != wptr);
         if ((idx0 == wptr) & wr0) begin
             h0_data = push0_data;
-            h0_v    = 1'b1;
+            hd0_v    = 1'b1;
         end
         else if ((idx0 == wptr + 4'd1) & wr1) begin
             h0_data = push1_data;
-            h0_v    = 1'b1;
+            hd0_v    = 1'b1;
         end
         h1_data = q_dat[idx1[2:0]];
 //★ h1 在册的三种来源：它落在 [rptr, wptr-1] 里（已有条目）、或它正是本拍 push0 写的位置、
 //  或它正是本拍 push1 写的位置。写成 `(idx1 != wptr) | wr0` 会在【队空】时把 idx1=rptr+1
 //  判成"有条目"（那里其实还没写过）⇒ 拿垃圾当第二条去配对。
-        h1_v    = ((idx1 != wptr) & (idx1 != wptr + 4'd1))
+        hd1_v    = ((idx1 != wptr) & (idx1 != wptr + 4'd1))
                 | ((idx1 == wptr) & wr0)
                 | ((idx1 == wptr + 4'd1) & wr1);
         if ((idx1 == wptr) & wr0) begin
             h1_data = push0_data;
-            h1_v    = 1'b1;
+            hd1_v    = 1'b1;
         end
         else if ((idx1 == wptr + 4'd1) & wr1) begin
             h1_data = push1_data;
-            h1_v    = 1'b1;
+            hd1_v    = 1'b1;
         end
-//切给读侧。★ h1 不在册时把字压成 0：槽是没写过就是 X 的 FF 阵列，不让 X 走到译码/冒险比较里。
-        h0_inst      = h0_data[106:75];
-        h0_addr      = h0_data[74:43];
-        h0_br_pred   = h0_data[42];
-        h0_jalr_pred = h0_data[41:10];
-        h0_r1        = h0_data[9:5];
-        h0_r2        = h0_data[4:0];
-        h1_inst      = h1_v ? h1_data[106:75] : 32'd0;
-//★ 必须跟 h1_v 一起压 0（B6-1）：它们直通 pre_decoder → rob 的扫槽/冒险比较
-        h1_r1        = h1_v ? h1_data[9:5] : 5'd0;
-        h1_r2        = h1_v ? h1_data[4:0] : 5'd0;
+//切给读侧（纯按序出口）：队头 = 阵列里 rptr 那条，第二项 = rptr+1。
+//★ 第二项也带全字段（addr/br_pred/jalr_pred）：它在 pre_decoder 的缓冲里可能被挪成 lane0。
+//★ 不在册时把字压成 0：不让 X 走到译码/冒险比较里（B6-1 的口径）。
+        nh0_inst      = 32'd0;
+        nh0_addr      = h0_data[74:43];
+        nh0_br_pred   = h0_data[42];
+        nh0_jalr_pred = h0_data[41:10];
+        nh0_r1        = 5'd0;
+        nh0_r2        = 5'd0;
+        nh0_v         = hd0_v;
+        nh1_inst      = 32'd0;
+        nh1_addr      = h1_data[74:43];
+        nh1_br_pred   = h1_data[42];
+        nh1_jalr_pred = h1_data[41:10];
+        nh1_r1        = 5'd0;
+        nh1_r2        = 5'd0;
+        nh1_v         = hd1_v;
+        if (hd0_v) begin
+            nh0_inst = h0_data[106:75];
+            nh0_r1   = h0_data[9:5];
+            nh0_r2   = h0_data[4:0];
+        end
+        if (hd1_v) begin
+            nh1_inst = h1_data[106:75];
+            nh1_r1   = h1_data[9:5];
+            nh1_r2   = h1_data[4:0];
+        end
+    end
+
+
+//★★ 出队两格（发射槽）的装载：换新 / 保持 / 清 —— 与 pre_decoder 原来的两个槽块【逐字同形】。
+//★ 两个都换：格0 拿队头、格1 拿队头下一条。
+//★ 只有格1 换（格0 被按住）：**队头那条改落格1** —— 这就是"按 lane stall 换 lane 输出"，
+//  格0 原地保持、格1 也不搬格内数据，后面的指令按序从格1 走，不必陪格0 一起等。
+//★ 有效位：格1 = adv0 ? lane1_v_in : (队头在册 ∧ 队头能当 lane1)。
+//★ 清只跟 rst / flush_w / exec 走，与原来一致（停顿拍不动 —— 停顿时 adv0/adv1 已经是 0）。
+    always @(posedge clk) begin
+        if (rst_q) begin
+            h0_inst <= 32'd0;
+            h0_addr <= 32'd0;
+            h0_br_pred <= 1'b0;
+            h0_jalr_pred <= 32'd0;
+            h0_r1 <= 5'd0;
+            h0_r2 <= 5'd0;
+            h0_v <= 1'b0;
+            idx_out <= 3'd0;
+            gen_out <= 1'b0;
+            h1_inst <= 32'd0;
+            h1_addr <= 32'd0;
+            h1_br_pred <= 1'b0;
+            h1_jalr_pred <= 32'd0;
+            h1_r1 <= 5'd0;
+            h1_r2 <= 5'd0;
+            h1_v <= 1'b0;
+            idx1_out <= 3'd0;
+            gen1_out <= 1'b0;
+        end
+        else if (exec) begin
+            if (flush_w) begin
+                h0_inst <= 32'd0;
+                h0_addr <= 32'd0;
+                h0_br_pred <= 1'b0;
+                h0_jalr_pred <= 32'd0;
+                h0_r1 <= 5'd0;
+                h0_r2 <= 5'd0;
+                h0_v <= 1'b0;
+                idx_out <= 3'd0;
+                gen_out <= 1'b0;
+                h1_inst <= 32'd0;
+                h1_addr <= 32'd0;
+                h1_br_pred <= 1'b0;
+                h1_jalr_pred <= 32'd0;
+                h1_r1 <= 5'd0;
+                h1_r2 <= 5'd0;
+                h1_v <= 1'b0;
+                idx1_out <= 3'd0;
+                gen1_out <= 1'b0;
+            end
+            else begin
+                if (adv0) begin
+                    h0_inst <= nh0_inst;
+                    h0_addr <= nh0_addr;
+                    h0_br_pred <= nh0_br_pred;
+                    h0_jalr_pred <= nh0_jalr_pred;
+                    h0_r1 <= nh0_r1;
+                    h0_r2 <= nh0_r2;
+                    h0_v <= nh0_v;
+                    idx_out <= rob_idx;
+                    gen_out <= rob_gen;
+                end
+                else begin
+                    h0_inst <= h0_inst;
+                    h0_addr <= h0_addr;
+                    h0_br_pred <= h0_br_pred;
+                    h0_jalr_pred <= h0_jalr_pred;
+                    h0_r1 <= h0_r1;
+                    h0_r2 <= h0_r2;
+                    h0_v <= h0_v;
+                    idx_out <= idx_out;
+                    gen_out <= gen_out;
+                end
+                if (adv1) begin
+                    if (adv0) begin
+                        h1_inst <= nh1_inst;
+                        h1_addr <= nh1_addr;
+                        h1_br_pred <= nh1_br_pred;
+                        h1_jalr_pred <= nh1_jalr_pred;
+                        h1_r1 <= nh1_r1;
+                        h1_r2 <= nh1_r2;
+                        h1_v <= lane1_v_in;
+                    end
+                    else begin
+                        h1_inst <= nh0_inst;
+                        h1_addr <= nh0_addr;
+                        h1_br_pred <= nh0_br_pred;
+                        h1_jalr_pred <= nh0_jalr_pred;
+                        h1_r1 <= nh0_r1;
+                        h1_r2 <= nh0_r2;
+                        h1_v <= nh0_v & cls1_0c;
+                    end
+                    idx1_out <= rob_idx1;
+                    gen1_out <= rob_gen1;
+                end
+                else begin
+                    h1_inst <= h1_inst;
+                    h1_addr <= h1_addr;
+                    h1_br_pred <= h1_br_pred;
+                    h1_jalr_pred <= h1_jalr_pred;
+                    h1_r1 <= h1_r1;
+                    h1_r2 <= h1_r2;
+                    h1_v <= h1_v;
+                    idx1_out <= idx1_out;
+                    gen1_out <= gen1_out;
+                end
+            end
+        end
     end
 
 endmodule
