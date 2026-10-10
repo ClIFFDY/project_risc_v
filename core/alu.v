@@ -24,7 +24,7 @@
 
 module alu(
     input clk, rst,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
     input we_in, jal_flag, jalr_flag, cs_wr_en,
 //判定那条自己那一笔的 ROB 索引（bju 的 idx_q）：跳转冲刷拍用它区分"本级挂着的是不是发起者自己"
     input [4:0] rd_in,
@@ -68,25 +68,13 @@ module alu(
     reg [31:0] result_nx;
     reg        we_nx;
 
-//flag_bus 逐位翻译成原名：本模块内不起新的组合名，判定处直接写或运算
-    reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
-    reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_full;
-    reg stall_mulu_haz, stall_mulu_div;
-    reg stall_icache_miss, stall_bus_hold;
+//flag_bus 逐位翻译：本级只吃三条冲刷位 —— 停顿已经不进本级判定（数据相关改在保留站里等，
+//结构相关由前端各级自己挡），原来那组停顿译码连同"单元侧 stall 保持门"一起删掉了。
+    reg flush_con_exc, flush_con_irq, flush_con_jump;
     always @(*) begin
-        flush_con_exc     = flag_bus[11];
-        flush_con_irq     = flag_bus[10];
-        flush_con_jump    = flag_bus[9];
-        exec              = flag_bus[8];
-        stall_rob_full    = flag_bus[7];
-        stall_pc_redir    = flag_bus[6];
-        stall_lsu_haz     = flag_bus[5];
-        stall_lsu_full    = flag_bus[4];
-        stall_mulu_haz    = flag_bus[3];
-        stall_mulu_div    = flag_bus[2];
-        stall_icache_miss = flag_bus[1];
-        stall_bus_hold    = flag_bus[0];
+        flush_con_exc     = flag_bus[7];
+        flush_con_irq     = flag_bus[6];
+        flush_con_jump    = flag_bus[5];
     end
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -146,7 +134,7 @@ module alu(
 //★ 判据是本级的 we（指令站在 post_decoder 和 alu 之间时恒为 1）—— 不能用"载荷推进"当门：
 //  重定向排队（等 ROB 排空）会把流水线冻住，冻结期间若把结果寄存器清掉/不寄存，
 //  这条指令就永远不回报写口级 ⇒ ROB 排不空 ⇒ 等它排空的重定向永远等下去（自锁，实测四支程序全挂）。
-//★ 但【单元侧的 stall】（lsu 的在途 load / 车厢满、mulu 的乘除）抬着的那一拍必须不寄存：
+//★ 但【单元侧的 stall】（lsu 的在途 load / 车厢满、mdu 的乘除）抬着的那一拍必须不寄存：
 //  那一拍送进来的操作数还是旧的，寄存了下一拍写口级就会把它写进寄存器堆，
 //  而写口级在下一拍看不出这个值是哪一拍算出来的 ⇒ 只能在本级挡。
 //  单元侧那几条都是单元自己干完活就落、不看 ROB ⇒ 在这儿等它算完不成环。
@@ -176,21 +164,16 @@ module alu(
             we       <= we;
         end
         else if (we_in) begin
-            if ((flush_con_exc | flush_con_irq) |
-                ~(stall_lsu_haz | stall_lsu_full | stall_mulu_haz | stall_mulu_div)) begin
-                rd_out   <= rd_nx;
-                idx_out  <= idx_in;
-                gen_out  <= gen_in;
-                result   <= result_nx;
-                we       <= we_nx;
-            end
-            else begin                               // 单元侧 stall 抬着：操作数还没定，结果连着 rd/idx/we 一起保持
-                rd_out   <= rd_out;
-                idx_out  <= idx_out;
-                gen_out  <= gen_out;
-                result   <= result;
-                we       <= we;
-            end
+//★ 站式之后【不再有"单元侧 stall 冻住操作数"这一档】：本级的操作数由保留站的选中项寄存器驱动
+//  （选中项整拍不变），不是原来那个会被停顿冻住的载荷。原先那条 `~(stall_lsu_haz|lsu_full|
+//  mulu_haz|mulu_div)` 保持门已经变成 `~rs_full` —— 而站满恰恰是发射的常态 ⇒ 会把刚发出那条的
+//  结果丢掉（保持的是上一笔的 rd/idx/we），它那一项永远等不到完成口。故收结果无条件。
+//  跳转冲刷由上一条外层分支单独处理，异常/中断冲刷本来就走"登记但标永不落地"，都不需要这档。
+            rd_out   <= rd_nx;
+            idx_out  <= idx_in;
+            gen_out  <= gen_in;
+            result   <= result_nx;
+            we       <= we_nx;
         end
         else begin
             rd_out   <= 5'd0;

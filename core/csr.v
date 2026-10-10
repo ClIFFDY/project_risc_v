@@ -23,14 +23,20 @@
 module csr(
     input clk, rst,
     input csr_wr_en, exc_irq_ret, exti, timi, softi, exc_ecall, flush_bju_exc, flush_con_exc,
-//★ 资格版（controller 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
+    input exc_mark_in,
+//站里至少有一个有效项：中断的 mepc/冲刷边界都取"站里最老有效项"，站空时那个号是陈旧槽
+    input irq_head_v_in,
+//★ 真写使能（idu2 产）：csrrw/rs/rc 里只有"rs1 字段非 0"才真锁存（规范 §Zicsr 的
+//  "写"定义）。csr_wr_en 是【双重身份】—— alu 靠它判"这是条 CSR 指令"把读值选进 rd，
+//  所以 csrr 也必须为 1；真正锁不锁由本线决定。原来靠"把 csr_addr 清 0"来表达不写，
+//  但地址要同时供读口用，站式之后读口没有第二条地址通路了，必须把两件事拆成两根线。
+    input csr_wr_act,
+//★ 资格版（cont 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
 //  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
     input exc_irq_ret_ok,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
     input mem_inflight,
     input [11:0] csr_addr,
-//读口地址：提前到 c2 级，由 decoder 组合透传（与 csr_addr 同源同语义，非 SYSTEM 已清 0）
-    input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
 //异常【交付】口（来自 ROB 的 trap_fire）：故障项退到队头那一拍才拉，载荷是它自己那份。
@@ -40,7 +46,10 @@ module csr(
     input [31:0] exc_retire_pc, exc_retire_tval,
     input [1:0] ird_tmr,
     input jalr_fail, br2, br3,
-    output reg [31:0] csr_data_out, isr_addr2, mcause, iret_addr2,
+    output reg [31:0] isr_addr2, mcause, iret_addr2,
+//给 alu 的读值（组合、地址 = 本拍要发的 csr_addr）：站式之后 csr 指令在哪一拍发由站决定，
+//提前一拍读不再可能 ⇒ 改成"发的那一拍组合读出"。写锁存仍走时钟沿，故同拍读回的是【旧值】。
+    output reg [31:0] csr_data_comb,
     output reg exc_irq_act, exc_irq_processing
     );
 
@@ -52,9 +61,8 @@ module csr(
 //输入合流（按"上层不运算"下放至此）：停顿、中断闸门、指令退役
     reg stall, exc_irq_gate, retire, flush_w;
     always @(*) begin
-        stall    = flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
-                 | flag_bus[2] | flag_bus[1] | flag_bus[0];
-        flush_w  = flush_con_exc | flag_bus[10] | flag_bus[9];
+        stall    = flag_bus[3] | flag_bus[2] | flag_bus[0];
+        flush_w  = flush_con_exc | flag_bus[6] | flag_bus[5];
         exc_irq_gate = (ird_tmr != 2'd0);
 //指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
         retire   = !(flush_w | stall | mem_inflight);
@@ -102,7 +110,8 @@ module csr(
             exc_sirq_en <= exc_sirq_en;
             exc_irq_process <= exc_irq_process;
 //根据不同的csr写地址写入不同的csr寄存器
-            if (csr_wr_en && !stall) begin
+//★ 使能与地址由 alu 的寄存级给出（= 真的发出去过的那一组），故这里不再看停顿；只挡"发出后同拍被冲刷"。
+            if (csr_wr_act && !flush_w) begin
                 case (csr_addr)
 //全局使能设定
                 12'h300: begin
@@ -127,8 +136,8 @@ module csr(
                 end
 //isr返回目标设定
                 12'h341: begin
-                    iret_addr1 <= csr_data_in;
-                    iret_addr2 <= csr_data_in;
+                    iret_addr1 <= {csr_data_in[31:2], 2'b00};
+                    iret_addr2 <= {csr_data_in[31:2], 2'b00};
                 end
                 12'h342: begin
 //中断/异常原因寄存器
@@ -148,7 +157,7 @@ module csr(
 //★ 为什么不能在这里锁 mepc/mcause/mtval：先报出来的异常未必是最老的异常 —— 更老的指令可能
 //  还在 lsu 队列里没报（lsu 入口才判非对齐，队列里的那条要到下一拍才报）。检测拍就锁，会锁成
 //  "年轻的那条"，而 ROB 是按老的那条交付的 ⇒ 两个侧面对不上。改为按 ROB 的交付口锁，才精确。
-            if (flush_con_exc) begin
+            if (exc_mark_in) begin
                 exc_irq_en_post_reg <= exc_irq_en_reg;
                 exc_irq_en_reg <= 1'b0;
                 exc_irq_process <= 1'b1;
@@ -163,11 +172,11 @@ module csr(
                 if (exc_eirq_en && exc_eirq_pend) begin
                     mcause_reg <= 32'h8000000B;
                 end
-                else if (exc_tirq_en && exc_tirq_pend) begin
-                    mcause_reg <= 32'h80000007;
-                end
                 else if (exc_sirq_en && exc_sirq_pend) begin
                     mcause_reg <= 32'h80000003;
+                end
+                else if (exc_tirq_en && exc_tirq_pend) begin
+                    mcause_reg <= 32'h80000007;
                 end
                 exc_irq_en_post_reg <= exc_irq_en_reg;
                 exc_irq_en_reg <= 1'b0;
@@ -218,64 +227,36 @@ module csr(
             exc_tirq_pend = timi;
             exc_eirq_pend = exti;
             exc_global_pend = (exc_eirq_pend && exc_eirq_en) | (exc_tirq_pend && exc_tirq_en) | (exc_sirq_pend && exc_sirq_en);
-            exc_irq_act = exc_irq_en_reg && exc_global_pend && !exc_irq_process && !exc_irq_gate && !(exc_irq_ret | exc_ecall | flush_bju_exc | jalr_fail | br2 | br3);
+//★ 同拍只要有任何异常在交付路径上，中断一律让位：flush_con_exc 已经把
+//  ecall/ebreak/illegal（经 bju 输入级）与访存非对齐（经 lsu 寄存拍）全含进来，
+//  所以不必在这里逐个列 —— 靠 else-if 优先级兜正确性是脆的。
+            exc_irq_act = exc_irq_en_reg && exc_global_pend && !exc_irq_process && !exc_irq_gate &&
+                          !(exc_irq_ret | jalr_fail | br2 | br3) && !flush_con_exc && irq_head_v_in;
             exc_irq_processing = exc_irq_process;
             mcause = mcause_reg;
             isr_addr2 = isr_addr_reg2;
         end
     end
 
-//csr 读操作：地址取 c2 级的 csr_addr_pre（比 csr_addr 早一拍），结果寄存一拍后供 alu 当 cs_data。
-//原设计在 c3 级组合读出，读值要经 alu 直通再喂 forw 的 back1 旁路，于是
-//"csr mux → alu → forw → 判定比较"整条链落在同一拍里 —— 那正是全片最差路径的头（实测入口网 1.016ns）。
-//提前一拍读出并寄存后，cs_data 的源头变成触发器，链头整段消失；forw/decoder/流水线结构都不用动。
-//写后读旁路：本拍 c3 级正要写的 csr（csr_addr/csr_wr_en/csr_data_in）若与本级要读的地址相同，
-//直接前递写入值 —— 否则提前读会拿到写之前的老值。
-//两个地址都出自 decoder 且非 SYSTEM 已清 0，故不会因为"双方恰好都是 0"而误命中。
-    reg [31:0] csr_data_rd;
-//旁路资格：只有【真的会锁存】的地址才能前递"将要写入的值"。
-//否则"先把值写进一个不锁存的 CSR、紧接着读它"会读到那个被丢弃的写入值（实测 misa 读到写入值）。
-//本核不锁存的已实现地址：0x301 misa（只读常量）、0xB00/0xB02（只读计数器）。
-//可写地址都在 0x300~0x3FF（[11:8]==0011），只需再把 0x301 摘出去。
-    reg csr_latch_w;
+//给 alu 的组合读口：地址取本拍要发的 csr_addr（与写地址同源）。不做写后读旁路 ——
+//站式之后每条 csr 指令各占一个发射拍，前一条的写在前一沿就已落进寄存器，本条组合读到
+//的就是它，不需要旁路；没有旁路也顺带修掉"读只读常量表（misa）读到写入值"那类问题。
     always @(*) begin
-        csr_latch_w = 1'b0;
-        if (csr_addr[11:8] == 4'b0011)
-            csr_latch_w = 1'b1;
-        if (csr_addr == 12'h301)
-            csr_latch_w = 1'b0;
-    end
-    always@ (*) begin
-        if (csr_wr_en && csr_latch_w && (csr_addr == csr_addr_pre)) begin
-            csr_data_rd = csr_wr_val;
-        end
-        else begin
-            case (csr_addr_pre)
-            12'h300: csr_data_rd = {20'd0, exc_irq_en_post_reg, 3'd0, exc_irq_en_reg, 3'd0};
-//misa：MXL[31:30]=01（32 位）+ I[8] + M[12]，只读常量。
-//★ 读回 0 是不合规的（MXL=00 是保留编码），arch-test 的启动宏会读它。写被忽略（WARL）。
-            12'h301: csr_data_rd = 32'h40001100;
-            12'h304: csr_data_rd = {20'd0, exc_eirq_en, 3'd0, exc_tirq_en, 3'd0, exc_sirq_en, 3'd0};
-            12'h305: csr_data_rd = isr_addr_reg1;
-            12'h340: csr_data_rd = mscratch_reg;
-            12'h341: csr_data_rd = iret_addr1;
-            12'h342: csr_data_rd = mcause_reg;
-            12'h343: csr_data_rd = mtval_reg;
-            12'h344: csr_data_rd = {20'd0, exc_eirq_pend, 3'd0, exc_tirq_pend, 3'd0, exc_sirq_pend, 3'd0};
-            12'hB00: csr_data_rd = mcycle_reg;
-            12'hB02: csr_data_rd = minstret_reg;
-//mhartid：单 hart 恒 0，只读（地址 bit[11:10]==11 ⇒ post_decoder 会挡掉对它的写）
-            12'hF14: csr_data_rd = 32'd0;
-            default: csr_data_rd = 32'd0;
-            endcase
-        end
+        case (csr_addr)
+        12'h300: csr_data_comb = {19'd0, 2'b11, 3'd0, exc_irq_en_post_reg, 3'd0, exc_irq_en_reg, 3'd0};
+        12'h301: csr_data_comb = 32'h40001100;
+        12'h304: csr_data_comb = {20'd0, exc_eirq_en, 3'd0, exc_tirq_en, 3'd0, exc_sirq_en, 3'd0};
+        12'h305: csr_data_comb = isr_addr_reg1;
+        12'h340: csr_data_comb = mscratch_reg;
+        12'h341: csr_data_comb = iret_addr1;
+        12'h342: csr_data_comb = mcause_reg;
+        12'h343: csr_data_comb = mtval_reg;
+        12'h344: csr_data_comb = {20'd0, exc_eirq_pend, 3'd0, exc_tirq_pend, 3'd0, exc_sirq_pend, 3'd0};
+        12'hB00: csr_data_comb = mcycle_reg;
+        12'hB02: csr_data_comb = minstret_reg;
+        12'hF14: csr_data_comb = 32'd0;
+        default: csr_data_comb = 32'd0;
+        endcase
     end
 
-//读值寄存器：与上面同拍采样，故 cs_data 相对 c2 级地址晚一拍可用，正好落在该指令进 alu 的那一拍
-    always@ (posedge clk) begin
-        if (rst)
-            csr_data_out <= 32'd0;
-        else
-            csr_data_out <= csr_data_rd;
-    end
 endmodule 

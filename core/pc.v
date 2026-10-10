@@ -24,24 +24,20 @@ module pc(
     input clk, rst,
     input br1, exc_irq, exc_irq_ret, exc_mark,
     input jal, pre_jalr, btb_hit,
-//bra_predict 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 pre_decoder
+//bpu 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 idu1
 //⇒ pc 落 T+4；未命中 ⇒ pc 落 T，让 icache 下一拍自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
     input bti_hit,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
     input rob_empty,
-//取指队列满（fetch_fifo 的 full）：与 stall_pc_redir 同性质的前端停留 —— 队满时 pc 不许再走，
+//取指队列满（iffu 的 full）：与 stall_pc_redir 同性质的前端停留 —— 队满时 pc 不许再走，
 //否则已经交给 icache 的那条会被丢弃
     input fifo_full,
-//★ 就绪门（rob 按冻结生产者槽现算）：【原地等】必须整组同门 —— 前端也算在内。
-//  只停后端不停取指 ⇒ 队列被灌满、fifo_full 又把 pc 的推进门关掉，
-//  于是这一拍刚译出来的前端重定向（jal/br1）被静默丢掉（实测 divu-01 漏跳一个 jal、整程序重跑）。
-    input rdy1_in, rdy2_in,
     output reg [31:0] pc_addr, aux_addr,
 //停顿源：重定向排队中（等 ROB 排空）/ 落点后多压一拍（stall_pc_redir）；
 //冲刷源：本拍把 pc 落到新目标（flush_pc_redir，icache 用它挡掉陈旧交付）。
-//ROB 满原来单独接端口，现在吃 flag_bus[7]（源名 stall_rob_full），见下面的译码块。
+//ROB 满原来单独接端口，现在吃 flag_bus[3]（源名 stall_rob_full），见下面的译码块。
     output reg stall_pc_redir,
     output reg flush_pc_redir
     );
@@ -60,16 +56,15 @@ module pc(
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】；
-//或运算在本模块内做（源在 controller 里已逐条分开）。ROB 满原来单独接端口，现在吃 flag_bus[7]。
-    reg exec, flush_w, stall_w, flush_jump_w;
+//或运算在本模块内做（源在 cont 里已逐条分开）。ROB 满原来单独接端口，现在吃 flag_bus[3]。
+    reg exec, flush_w, flush_jump_w, stall_icache_miss;
     reg exc_w;
     always @(*) begin
-        exc_w        = flag_bus[11];
-        flush_jump_w = flag_bus[9] & ~exc_w;
-        flush_w      = exc_w | flag_bus[10] | flag_bus[9];
-        stall_w      = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
-                      | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec         = flag_bus[8];
+        exc_w        = flag_bus[7];
+        flush_jump_w = flag_bus[5] & ~exc_w;
+        flush_w      = exc_w | flag_bus[6] | flag_bus[5];
+        stall_icache_miss = flag_bus[1];
+        exec         = flag_bus[4];
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -138,9 +133,9 @@ module pc(
                 pc_addr <= isr_ret_addr2;
                 aux_addr <= isr_ret_addr2;
             end
-            else if (!flush_w && !stall_w && !fifo_full && rdy1_in && rdy2_in) begin
-//jal/br1 的改向分两档（"差一拍"就在这儿）：命中的那一拍目标 inst 已由 bra_predict 的 btb
-//交付给 pre_decoder，所以 pc 落**目标的下一个地址**（T+4）；未命中的那一拍没有 inst 可交付，
+            else if (!flush_w && !stall_pc_redir && !stall_icache_miss && !fifo_full) begin
+//jal/br1 的改向分两档（"差一拍"就在这儿）：命中的那一拍目标 inst 已由 bpu 的 btb
+//交付给 idu1，所以 pc 落**目标的下一个地址**（T+4）；未命中的那一拍没有 inst 可交付，
 //pc 落**目标地址本身**（T），由 icache 下一拍去取目标 —— 比命中晚一拍。
 //两个表达式都只落在 pc/aux 的 D 端（普通寄存器），不是 BRAM 地址脚 ⇒ 不进关键路径。
                 if (br1) begin

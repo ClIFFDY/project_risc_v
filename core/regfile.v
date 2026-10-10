@@ -22,7 +22,9 @@
 
 module regfile(
     input clk, rst,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
+//保留站的"满"【只喂前端】：读口要跟着上游一起停，值才不会被下一条覆写
+    input stall_rs_full,
 //读口地址 = pre 级那条（它下一拍就是 decoder 载荷那条）的 rs。读值在本模块寄存一拍、
 //正好与载荷同拍，所以这里就是把"本条指令要的操作数"从阵列+旁路里取出来的地方。
     input [4:0] r1, r2,
@@ -135,14 +137,13 @@ module regfile(
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】；
-//或运算在本模块内做（源在 controller 里已逐条分开）。
+//或运算在本模块内做（源在 cont 里已逐条分开）。
     reg exec, flush_w, stall_w, flush_con_exc;
     always @(*) begin
-        flush_con_exc     = flag_bus[11];
-        flush_w = flush_con_exc | flag_bus[10] | flag_bus[9];
-        stall_w = (flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4] | flag_bus[3]
-                 | flag_bus[2] | flag_bus[1] | flag_bus[0]) & ~flush_w;
-        exec    = flag_bus[8];
+        flush_con_exc     = flag_bus[7];
+        flush_w = flush_con_exc | flag_bus[6] | flag_bus[5];
+        stall_w = (flag_bus[3] | flag_bus[2] | stall_rs_full | flag_bus[0]) & ~flush_w;
+        exec    = flag_bus[4];
     end
 
 //停顿重读的索引：就是锁存下来的那两个槽（纯别名，不做任何选择 ——
@@ -153,7 +154,7 @@ module regfile(
         st_slot2 = s2_q;
     end
 
-//读数据进行 3 档旁路仲裁并输出。【时序读】：地址由 pre_decoder 那一级给出（比 decoder
+//读数据进行 3 档旁路仲裁并输出。【时序读】：地址由 idu1 那一级给出（比 decoder
 //载荷早一拍），值在这里寄存后随载荷往下走；前送级（decoder→执行单元之间）只在有更新结果时
 //覆盖它。★ 不要再退回"组合读"：那样阵列读会和旁路 mux、前送 mux 压进同一拍（关键路径变长），
 //而且 iverilog 不把存储器元素算进 `always @(*)` 的隐含敏感表 ⇒ 写阵列后读口不刷新（实测踩过）。
@@ -174,10 +175,10 @@ module regfile(
             h2_q <= 1'b0;
         end
         else if (exec) begin
-//★ 判据必须与上游各级（pre_decoder 的 adv / post_decoder 的 payload_go）逐项同门：
+//★ 判据必须与上游各级（idu1 的 adv / post_decoder 的 payload_go）逐项同门：
 //  rdy 只加在上游、不补进这里 ⇒ 暂停那一拍走"正常读"，用【下一条】的 rs 把载荷的操作数
 //  覆写成别人的值（实测：div/rem 一族签名不对、CoreMark 跑到 401 字符就断）。
-            if ((stall_w | ~rdy1_in | ~rdy2_in) & ~flush_w) begin
+            if (stall_w & ~flush_w) begin
                 bp1 = bypass(r1_q, h1_q, st_done1, st_data1, s1_q);
                 bp2 = bypass(r2_q, h2_q, st_done2, st_data2, s2_q);
                 if (bp1[32])

@@ -5,7 +5,7 @@
 //
 // Create Date: 2026/08/27 19:04:53
 // Design Name:
-// Module Name: controller
+// Module Name: cont
 // Project Name:
 // Target Devices:
 // Tool Versions:
@@ -20,13 +20,13 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module controller(
+module cont(
     input clk, rst, jalr_fail, br2, br3, exc_irq_ret, exc_ecall, flush_bju_exc,
 //异常仲裁源（原 trap_unit 并进本模块：它没有自己的流水级，按"模块按级划分"不该单独成文件）：
 //★【过 bju】ecall/ebreak/illegal/mret 四路信号不再直接吃 decoder 载荷，而是跟操作数/控制位
 //  一起进 bju 的【判定输入寄存级】、和 flush_bju_pre 同一拍出来（见 bju.v）。
 //  这样它们天生比载荷晚一拍，正好与【更老那条的寄存版冲刷】同拍 —— 本拍这边的
-//  flag_bus[9]/flush_bju_exc 描述的正是比它更老的那条 ⇒ 现成的 ~flush_older 就盖住了影子槽，
+//  flag_bus[5]/flush_bju_exc 描述的正是比它更老的那条 ⇒ 现成的 ~flush_older 就盖住了影子槽，
 //  本模块因此不再需要组合的 flush_bju_pre（它只剩 lsu 一个消费者）。
 //bju 名下那几种（分支/jalr/jal 非对齐）用【寄存版】：判定搬后一级之后，只有寄存版
 //与冲刷拍（flush_bju_exc）同拍有效；组合版在冲刷拍已经翻到下一条 ⇒ 载荷/mtval 全错位。
@@ -43,11 +43,14 @@ module controller(
 //三条冲刷各自的 ROB 边界：故障项自己的索引 / E4 载荷（中断边界）/ bju 判定那条自己的索引
     input [2:0]  exc_ldst_idx_in,
     input [2:0]  issue_idx_in,
+//站里最老有效项的号（中断边界与 csr 的 mepc 同源，见 idu2）
+    input [2:0]  irq_head_idx_in,
+//站里至少有一个有效项：中断的 mepc 与冲刷边界都取"站里最老有效项"，站空时它给不出地址
+    input        irq_head_v,
     input [2:0]  bju_idx_in,
-//停顿源（按"顶层不运算"从 cpu_top 下放至此）：逐源各占 flag_bus 一位，
+//停顿源（按"顶层不运算"从 cpu_top 下放至此）：逐源各占 flag_bus 一位。
+//★ 保留站的"满"【不在本总线上】：它只喂前端三级（cpu_top 直连），见 idu1 的端口说明。
 //本模块【不做任何或运算】—— 或/非一律下放到消费者模块内（见各家 stall_w/flush_w 的译码）。
-    input stall_lsu_haz, stall_lsu_full,
-    input stall_mulu_haz, stall_mulu_div,
     input stall_icache_miss, stall_bus_hold,
     input stall_rob_full, stall_pc_redir,
     input lsu_inflight,
@@ -58,20 +61,24 @@ module controller(
 //ROB 分支冲刷脉冲：误预测那条在 wb 拍，它的索引由 cpu_top 用载荷传（顶层只连线）
     output reg flush_con_rob,
     output reg [2:0] flush_idx,
+//杀集【含边界那条自己】：只给中断用（边界 = 站里最老那条还没执行的指令，要在 mret 之后重跑）
+    output reg flush_incl,
 //写序号（乱序写回用，逻辑就放在本模块内）：发射级要不要发号 + 三个单元的滞留兜底请求
     input jal, pre_jalr, btb_hit, br1,
     input csr_wr_en, exti, timi, softi,
+//真写使能（idu2 产）：csr_wr_en 只管"是条 CSR 指令"，锁不锁看这根
+    input csr_wr_act,
     input [11:0] csr_addr,
-//csr 读口地址（c2 级），比 csr_addr 早一拍；读值寄存一拍后由 csr_data_out 给出
-    input [11:0] csr_addr_pre,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
 //异常检测拍的载荷（cause/pc/tval）不再进 csr：csr 只在 ROB 交付那一拍锁上下文，
 //载荷由 ROB 按"队头那条故障指令自己那份"给出（见 csr 的 exc_retire 口）
-    output reg [31:0] csr_data_out, isr_addr2, mcause,
+    output reg [31:0] isr_addr2, mcause,
+//给 alu 的 csr 读值（组合、发那一拍）：站式后 csr 指令的发拍由站决定，提前一拍读不再可能
+    output reg [31:0] csr_data_comb,
     output reg exc_irq_act, exc_irq_processing, exc_irq,
     output reg [31:0] iret_addr2,
-    output reg [11:0] flag_bus,
+    output reg [7:0] flag_bus,
 //异常仲裁结果：flush_con_exc = 冲刷请求（寄存版判据）；exc_mark + cause/pc/tval = 给 ROB 的当拍标记
     output reg flush_con_exc,
     output reg exc_mark,
@@ -99,7 +106,7 @@ module controller(
 
     reg [1:0] ird_tmr;
     reg jalr_pred;
-    wire [31:0] csr_data_out_i, isr_addr2_i, mcause_i;
+    wire [31:0] isr_addr2_i, mcause_i, csr_data_comb_i;
     wire exc_irq_act_i, exc_irq_processing_i;
     wire [31:0] iret_addr2_i;
 
@@ -109,29 +116,30 @@ module controller(
     reg flush_w;
     always @(*) flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
 
-//预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）：pre_jalr 是 pre_decoder 的译码输出，
-//btb_hit 是 bra_predict 的命中输出，两者都是寄存器输出，此处相与不成环。
+//预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）：pre_jalr 是 idu1 的译码输出，
+//btb_hit 是 bpu 的命中输出，两者都是寄存器输出，此处相与不成环。
     always @(*) jalr_pred = pre_jalr & btb_hit;
 
 //各控制/停顿位各自成网：位与位之间不共享逻辑，综合时互不依赖
 //★ 上一轮为"剥开 pre"临时加的 [13]/[12] 已整体删除：异常源现在统一过 bju 的判定输入寄存级，
 //  exc_gated 里不再有任何与 pre 有关的项 ⇒ [11] 本身就是精确版 flush_con_exc，
 //  消费端直接取位，不需要再重组。
-//flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
-//            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
-//            stall_icache_miss, stall_bus_hold}
+//flag_bus[8:0] = {flush_con_exc, flush_con_irq, flush_con_jump, exec,   // [8:5]
+//                  stall_rob_full, stall_pc_redir,                     // [4:3]
+//                  stall_rs_full,                                      // [2] ★原 stall_lsu_haz 位
+//                  stall_icache_miss, stall_bus_hold}                  // [1:0]
+//★ 原来那三位 stall_lsu_full / stall_mulu_haz / stall_mulu_div 已【从总线上摘掉】：
+//  保留站之后它们恒为 0（cpu_top 直接接 1'b0），挂在总线上只是死线；数据相关现在只在站内等。
 //★ 每位只连一个源，本模块不在这里做或运算；消费端自己取自己要的位做或（冲刷优先于停顿）。
     always @(*) begin
 //★ mret 那一项用【资格版】：错路 mret 的冲刷会把正确路径刚取进来的指令冲掉
 //  （实测 wp_mret：分支落点后紧跟的 csrr/ sw 两条笔都不见了）。合法 mret 靠它的自冲刷清影子，必须留。
         flush_con_irq  = exc_irq || exc_irq_ret_ok || exc_irq_act;
         flush_con_jump = jalr_fail || br2 || br3;
+//只有"真中断受理"这一路把边界那条也杀掉。mret 的自冲刷不在此列：它的边界是它自己、它要退。
+        flush_incl     = exc_irq_act;
         flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
                     stall_rob_full, stall_pc_redir,
-                    stall_lsu_haz, stall_lsu_full,
-                    stall_mulu_haz, stall_mulu_div,
                     stall_icache_miss, stall_bus_hold};
 //ROB 冲刷口 + 边界：**三种冲刷都要作废比边界更年轻的项**。
 //★ 异常/中断也必须在【检测那一拍】就冲 ROB（不能只等队头交付）：冲刷拍会把流水线里那些
@@ -157,14 +165,15 @@ module controller(
 //★ 中断这一支也要分两种：真中断的边界 = 正进载荷那条自己（issue_idx_in）；
 //  而 mret 的自冲刷现在也从 bju 输入级出 ⇒ 边界是 mret 自己（bju_idx_i）。
         else if (flush_con_irq)
-            flush_idx = exc_irq_ret_ok ? bju_idx_i : issue_idx_in;
+            flush_idx = exc_irq_ret_ok ? bju_idx_i : irq_head_idx_in;
         else
             flush_idx = bju_idx_in;
 //复位期按原 stage = EXE / 无停顿 的口径给：只有 exec 抬、其余落下
         if (rst_q) begin
             flush_con_irq  = 1'b0;
             flush_con_jump = 1'b0;
-            flag_bus = {1'b0, 1'b0, 1'b0, 1'b1, 8'd0};
+            flush_incl     = 1'b0;
+            flag_bus = {1'b0, 1'b0, 1'b0, 1'b1, 4'd0};
         end
     end
 
@@ -183,7 +192,7 @@ module controller(
 //  ★ 自冲刷项显式排掉：合法 mret 自己会拉 flush_con_irq（它靠这个冲掉影子），
 //    那一项不能反过来把它自己挡掉 —— 原式是用 ~exc_irq_ret 做豁免的。
     always @(*) flush_w_other = flush_bju_exc | flush_con_jump | exc_irq | exc_irq_act
-                              | exc_ecall_i | exc_illegal_i | exc_ldst_misalign_in;
+                              | exc_ecall_i | exc_ebreak_i | exc_illegal_i | exc_ldst_misalign_in;
     always @(*) exc_irq_ret_ok = exc_irq_ret_i & ~flush_w_other;
     reg [31:0] exc_pc_c;
 //★ 访存非对齐那条比载荷晚一拍到（它在 lsu 里寄存过），pc 载荷得跟着寄存一拍；
@@ -196,14 +205,14 @@ module controller(
         else
             exc_pc_in_d1 <= exc_pc_in;
     end
-    always @(*) flush_older = flag_bus[10] | flag_bus[9];
+    always @(*) flush_older = flag_bus[6] | flag_bus[5];
 //更老的指令在本拍冲刷 ⇒ 这条是错路，它的操作数是垃圾，不能拿它报异常
 //★ 解码级那三条（ecall/ebreak/illegal）现在跟着 bju 的判定输入级走 ⇒ 本拍它们自己的标志
 //  与"更老那条的寄存版冲刷"同拍。寄存版 bju 冲刷有【两路】：[9]（br2/br3/jalr_fail）与
 //  flush_bju_exc（非对齐）—— "已预测跳、目标非对齐"那一支里 [9] 恰好为 0，
 //  所以解码级的判据必须把 flush_bju_exc 一并进来，否则影子 ecall 会在那一支漏抑制。
     always @(*) flush_older_dec = flush_older | flush_bju_exc;
-    always @(*) exc_dec      = (exc_ecall_i | exc_illegal_i) & ~flush_older_dec;
+    always @(*) exc_dec      = (exc_ecall_i | exc_ebreak_i | exc_illegal_i) & ~flush_older_dec;
 //★ 访存非对齐那条【保持不并 flush_bju_exc】：它是 lsu 自己寄存的一拍脉冲，与 bju 那条一般不同条；
 //  并进去会在"分支非对齐与访存非对齐被 stall 挤到同拍"时误吞合法访存异常。
 //  （本轮口径：先保持这处不对称落地，跑绿之后再单独合并。）
@@ -227,8 +236,8 @@ module controller(
                   :                        exc_pc_in_d1;
 //ROB 标记口的索引（三路 mux 原来在 cpu_top，按"顶层零逻辑"搬进来）：同样按相位选号
         exc_idx   = flush_bju_exc        ? bju_idx_in
-                  : (exc_ldst_misalign_in ? exc_ldst_idx_in
-                                          : bju_idx_i);
+                  : exc_dec              ? bju_idx_i
+                  :                        exc_ldst_idx_in;
         exc_tval  = 32'd0;
         if (flush_bju_exc) begin
             exc_cause = CAUSE_MISALIGN_INST;
@@ -262,6 +271,7 @@ module controller(
         .clk(clk),
         .rst(rst_q),
         .csr_wr_en(csr_wr_en),
+        .csr_wr_act(csr_wr_act),
         .flag_bus(flag_bus),
         .exc_irq_ret(exc_irq_ret),
         .exc_irq_ret_ok(exc_irq_ret_ok),
@@ -270,20 +280,21 @@ module controller(
         .softi(softi),
         .exc_ecall(exc_ecall),
         .flush_con_exc(flush_con_exc),
+        .exc_mark_in(exc_mark),
+        .irq_head_v_in(irq_head_v),
         .flush_bju_exc(flush_bju_exc),
         .exc_retire(rob_trap),
         .exc_retire_cause(rob_trap_cause),
         .exc_retire_pc(rob_trap_pc),
         .exc_retire_tval(rob_trap_tval),
         .csr_addr(csr_addr),
-        .csr_addr_pre(csr_addr_pre),
         .csr_data_in(csr_data_in),
         .pc_addr_in(pc_addr_in),
         .ird_tmr(ird_tmr),
         .jalr_fail(jalr_fail),
         .br2(br2),
         .br3(br3),
-        .csr_data_out(csr_data_out_i),
+        .csr_data_comb(csr_data_comb_i),
         .isr_addr2(isr_addr2_i),
         .mcause(mcause_i),
         .exc_irq_act(exc_irq_act_i),
@@ -292,7 +303,7 @@ module controller(
     );
 
     always @(*) begin
-        csr_data_out = csr_data_out_i;
+        csr_data_comb = csr_data_comb_i;
         isr_addr2 = isr_addr2_i;
         mcause = mcause_i;
         exc_irq_act = exc_irq_act_i;

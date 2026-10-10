@@ -5,7 +5,7 @@
 //
 // Create Date: 2026/08/29 20:12:36
 // Design Name:
-// Module Name: bra_predict
+// Module Name: bpu
 // Project Name:
 // Target Devices:
 // Tool Versions:
@@ -16,27 +16,32 @@
 // Revision:
 //   Revision 0.01 - File Created
 //   Revision 0.02 - 新增服务 br1/jal 的独立 bti（"br/jal 目标 inst 专用 itcm"）：
-//                   jal/br1 的落点地址只送 pc，目标那条指令由本表直送 pre_decoder，
+//                   jal/br1 的落点地址只送 pc，目标那条指令由本表直送 idu1，
 //                   于是 icache 的取指地址不再吃"当拍译码 + 加法器"那条 14.4ns 的链。
 // Additional Comments:
 //
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module bra_predict(
+module bpu(
     input clk, rst,
     input [31:0] pc_addr_in, jalr_target_q,
     input [5:0] br_pc_idx,
     input success, br_fail, br_en, jalr_flag, br_pred_taken_in,
-//新增：jal 译码信号（pre_decoder 当拍组合输出）、i-cache 当拍交付的指令与有效位（冷启动捕获用）、
+//新增：jal 译码信号（idu1 当拍组合输出）、i-cache 当拍交付的指令与有效位（冷启动捕获用）、
 //flag_bus（本模块自己译出 flush/stall，按"模块内先还原原名再做逻辑"的规矩）
     input jal,
     input [31:0] inst_in,
     input inst_valid,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
+//保留站的"满"【只喂前端取指推进】
+    input stall_rs_full,
+    input        fifo_full,
+//队列把本拍这条交付收下了：欠交付的目标 inst 只有被收下才算交掉（空泡也是收下）
+    input        take_en,
     output reg [31:0] jalr_predict_offset,
     output reg br1, br2, br3, jalr,
-//新增：命中标志（给 pc 选"落 T+4 / 落 T"）、交付给 pre_decoder 的目标指令与三态选择
+//新增：命中标志（给 pc 选"落 T+4 / 落 T"）、交付给 idu1 的目标指令与三态选择
     output reg bti_hit,
     output reg [31:0] bti_inst_q,
     output reg [1:0] bti_sel_q
@@ -49,30 +54,25 @@ module bra_predict(
     always @(posedge clk) rst_q <= rst;
 
 //flag_bus 译码（行为块，放本模块最前）：**先把各位还原成原名，再按名字做逻辑**（不用位号）。
-//adv 与 pc.v 那个 `!flush_w && !stall_w` 是同一个门，两边必须一致，否则"该改向却没交付"。
+//adv 与 pc.v 那个推进门逐项同门：两边必须一致，否则"该改向却没交付"或"目标 inst 丢了"。
+//这里的四条 = 前端真正会停的四条（后端停顿由取指队列吸收，不进这一位）。
     reg flush_con_exc, flush_con_irq, flush_con_jump;
     reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_full;
-    reg stall_mulu_haz, stall_mulu_div;
     reg stall_icache_miss, stall_bus_hold;
     reg exec_b, flush_w, stall_w, adv;
     always @(*) begin
-        flush_con_exc     = flag_bus[11];
-        flush_con_irq     = flag_bus[10];
-        flush_con_jump    = flag_bus[9];
-        exec_b            = flag_bus[8];
-        stall_rob_full    = flag_bus[7];
-        stall_pc_redir    = flag_bus[6];
-        stall_lsu_haz     = flag_bus[5];
-        stall_lsu_full    = flag_bus[4];
-        stall_mulu_haz    = flag_bus[3];
-        stall_mulu_div    = flag_bus[2];
+        flush_con_exc     = flag_bus[7];
+        flush_con_irq     = flag_bus[6];
+        flush_con_jump    = flag_bus[5];
+        exec_b            = flag_bus[4];
+        stall_rob_full    = flag_bus[3];
+        stall_pc_redir    = flag_bus[2];
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
         flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
-        stall_w = (stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                 | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold) & ~flush_w;
-        adv     = ~flush_w & ~stall_w;
+        stall_w = (stall_rob_full | stall_pc_redir | stall_rs_full
+                 | stall_icache_miss | stall_bus_hold) & ~flush_w;
+        adv     = ~flush_w & ~stall_pc_redir & ~stall_icache_miss & ~fifo_full;
     end
 
 //==================================================================================
@@ -103,7 +103,7 @@ module bra_predict(
 // 这条路根本不存在（那正是当前 14.4ns 关键路径的终点）。
 //
 // 索引/口径：读口用当拍 pc_addr_in；写口在 take 那一拍锁同一批位。预测发生在"这条指令被
-// pre_decoder 译码那一拍"（那时 pc 已是 指令地址+4），读写口看到同一个 pc 值，自洽。
+// idu1 译码那一拍"（那时 pc 已是 指令地址+4），读写口看到同一个 pc 值，自洽。
 // tag 22 位（pc[31:10]）与 8 位索引合起来覆盖 pc[31:2] 全部位 ⇒ 两条不同指令不可能同 tag
 // 同 index ⇒ **命中即条目属于这条指令**；jal/br 落点每地址恒定、无自修改代码 ⇒ 存下的 inst
 // 恒真，不需要校验（jalr 那套预测+校验是另一张表，别混）。
@@ -116,7 +116,7 @@ module bra_predict(
     reg [7:0]  bti_rd_idx;
     reg [21:0] bti_rd_tag;
     reg        take;
-//交付：take 那一拍记下"欠一次交付"，一直保持到 pre_decoder 真的把这条锁进流水线
+//交付：take 那一拍记下"欠一次交付"，一直保持到 idu1 真的把这条锁进流水线
 //（exec_b & adv），中途 stall 也不会丢 —— 交付位必须能粘住，不能是单拍脉冲。
     reg        bti_pend;
     reg        bti_kind_q;
@@ -160,7 +160,7 @@ module bra_predict(
 //  只靠 take 上的 ~flush_w 挡不住"已经欠下、随后才来冲刷"的情形（实测：分支预测跳、
 //  下一拍来了 br3 冲刷，欠下的目标 inst 在冲刷后仍被交付 ⇒ 多执行一条）。
 //  交付位必须能粘住（stall 不丢），但必须能被冲刷清掉。
-        else if (flush_w | (bti_pend && exec_b && adv)) begin
+        else if (flush_w | (bti_pend && take_en)) begin
             bti_pend    <= 1'b0;
         end
     end
@@ -176,7 +176,7 @@ module bra_predict(
     end
 
 //捕获通路的使能与 index/tag 跟着走两拍。
-//★ 停顿（stall_w）只能【冻结】窗口，不能作废：pc_addr 的推进条件就是 `!flush_w && !stall_w`
+//★ 停顿只能【冻结】窗口，不能作废：pc_addr 的推进条件就是上面 adv 那四条
 //  ⇒ 停顿期间取指侧（含 icache 的"这一拍读、下一拍出"）和这条窗口是【一起冻住】的，两拍的
 //  对齐关系不变。原来把 stall 也当"作废"清呢，一旦停顿相位相对取指移了一拍（删 mid_decoder
 //  就是），窗口几乎每次都被清掉 —— 实测 40 万拍里开闸 16521 次、只有 257 次走到待写（94% 是
@@ -197,7 +197,7 @@ module bra_predict(
             cap_idx_q2 <= cap_idx_q2;
             cap_tag_q2 <= cap_tag_q2;
         end
-        else if (stall_w) begin
+        else if (!adv) begin
             cap_q      <= cap_q;
             cap_idx_q1 <= cap_idx_q1;
             cap_tag_q1 <= cap_tag_q1;

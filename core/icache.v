@@ -33,31 +33,32 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_addr,
-    input br2, br3, pre_jalr, btb_hit, jalr_fail, exc_irq, exc_irq_ret, exc_ecall,
-    input [11:0] flag_bus,
+    input br2, br3, pre_jalr, btb_hit, jalr_fail, jal_in, br1_in, exc_irq, exc_irq_ret, exc_ecall,
+    input [7:0] flag_bus,
 //回填应答（接核内 itcm）
     input mem_valid,
     input [31:0] mem_data,
 //本拍 pc 落到重定向目标（pc.v 的 redir_go，源名 flush_pc_redir）：挡掉"跳转前那次取指"的陈旧交付
     input flush_pc_redir,
-//取指队列满（fetch_fifo 的 full）：本拍放不下，交付寄存器保持、不再推进
+//取指队列满（iffu 的 full）：本拍放不下，交付寄存器保持、不再推进
     input fifo_full,
-//★ 就绪门（rob 按冻结生产者槽现算）：【原地等】必须整组同门 —— 前端也算在内。
-//  只停后端不停取指 ⇒ 队列被灌满、fifo_full 又把 pc 的推进门关掉，
-//  于是这一拍刚译出来的前端重定向（jal/br1）被静默丢掉（实测 divu-01 漏跳一个 jal、整个程序重跑）。
-    input rdy1_in, rdy2_in,
 
 //取指输出
     output reg [31:0] inst_out,
 //inst_valid = "inst_out 里这条是可信的取指结果"，与 inst_out 同拍。
 //两种情况置 0：①常态读没命中（hit_sel 指向不存在的 way，读回来是未初始化值 / 板上垃圾）；
 //②回填期间来过冲刷（这条回填已经作废，交付拍送出的字不是 pc 现在要的那条）。
-//给 pre_decoder 当逐指令守卫：为 0 时它算不出 jal/br_en、也不会把这条锁进流水线。
+//给 idu1 当逐指令守卫：为 0 时它算不出 jal/br_en、也不会把这条锁进流水线。
 //必须是寄存器：终点是 inst_out 的下游，与取指同拍比较会把 tag 读→比较那条链引出去。
     output reg inst_valid,
-//busy = 本模块自己的停顿源（stall_icache_miss），也是给 pre_decoder 的垃圾指令守卫。
+//busy = 本模块自己的停顿源（stall_icache_miss），也是给 idu1 的垃圾指令守卫。
 //它是寄存器，不是组合输出：由 stage / fill_end / bts_run 自己说，不再从 cache_hit 现组合出来。
     output reg busy,
+//deliv_v = "inst_out 里有一条已交付、还没进取指队列"：交付给队列的**事件**。
+//不能用 rd_en（组合、推进时每拍都为高），也不能用 inst_valid（带保持的电平）。
+    output reg deliv_v,
+//队列把本条交付【收下】了（写进去、或空泡就地丢掉）：没被收下就把 deliv_v 挂住，不会丢
+    input take_en,
 //回填请求（接核内 itcm）
     output reg mem_req, mem_we,
     output reg [31:0] mem_addr, mem_wdata,
@@ -79,33 +80,23 @@ module icache(
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：**先把 flag_bus 各位还原成原名，再按名字做逻辑**
 //（模块内不直接用位号）；本模块的取指推进由 req_valid（只含前端那几条）与回填状态自己把关，
-//后端停顿不再进这一位 —— 它们由 fetch_fifo 吸收，队满时拿 fifo_full 停本级。
+//后端停顿不再进这一位 —— 它们由 iffu 吸收，队满时拿 fifo_full 停本级。
     reg flush_con_exc, flush_con_irq, flush_con_jump;
     reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_full;
-    reg stall_mulu_haz, stall_mulu_div;
+    reg stall_rs_full;
     reg stall_icache_miss, stall_bus_hold;
     reg flush_w, req_valid;
     always @(*) begin
-        flush_con_exc     = flag_bus[11];
-        flush_con_irq     = flag_bus[10];
-        flush_con_jump    = flag_bus[9];
-        stall_rob_full    = flag_bus[7];
-        stall_pc_redir    = flag_bus[6];
-        stall_lsu_haz     = flag_bus[5];
-        stall_lsu_full    = flag_bus[4];
-        stall_mulu_haz    = flag_bus[3];
-        stall_mulu_div    = flag_bus[2];
+        flush_con_exc     = flag_bus[7];
+        flush_con_irq     = flag_bus[6];
+        flush_con_jump    = flag_bus[5];
+        stall_rob_full    = flag_bus[3];
+        stall_pc_redir    = flag_bus[2];
+        stall_rs_full     = flag_bus[2];   // ★原 stall_lsu_haz 位：现在装的是"保留站满"
         stall_icache_miss = flag_bus[1];
         stall_bus_hold    = flag_bus[0];
         flush_w   = flush_con_exc | flush_con_irq | flush_con_jump;
-//★ 取指门必须与 pc 的推进门【逐项同门】（pc: !flush && !stall && !fifo_full），再并上 fifo_full：
-//  本模块的交付是"pc 的下游流水线"（pc 停 ⇒ 同一拍重复交付同一条），
-//  若对后端停顿解耦（pc 停、本级照推）就会把重交付当成新指令推给 fetch_fifo ⇒ 重复条目（实测）。
-//  想吃后端停顿，得先把交付改成"事件式"（每推进一次交付一次），那时才能照双发射那样解耦。
-        req_valid = ~(stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                    | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold
-                    | fifo_full) & rdy1_in & rdy2_in;
+        req_valid = ~(flush_w | stall_pc_redir | busy | fifo_full);
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -159,7 +150,7 @@ module icache(
 //===============================================================
 //取指地址：**只取 pc_addr >>> 2**，不吃 jal/br1，也没有那个 32 位加法器。
 //jalr 早就是"落点只送 pc"；现在 jal/br1 也一样 —— 它们的改向落点只进 pc，
-//而"目标那条指令"由 bra_predict 里那块独立的 btb 直接交付给 pre_decoder。
+//而"目标那条指令"由 bpu 里那块独立的 btb 直接交付给 idu1。
 //这样一来，"译码器 + 加法器 → 取指地址 → tag 阵列读 → 命中选择 → iram 地址口"
 //那条 13 级/14.4ns 的链整条消失。
     always @(*) begin
@@ -219,7 +210,7 @@ module icache(
             rd_addr = 14'd0;
         end
         else begin
-            rd_en   = req_valid;
+            rd_en   = req_valid & (~deliv_v | take_en);
             rd_addr = {hit_sel, idx, word};
         end
     end
@@ -243,6 +234,12 @@ module icache(
     end
 
     always @(posedge clk) begin
+        if (rst_q)                         deliv_v <= 1'b0;
+        else if (flush_w | flush_pc_redir) deliv_v <= 1'b0;
+        else                               deliv_v <= rd_en | (deliv_v & ~take_en);
+    end
+
+    always @(posedge clk) begin
         if (rst_q)                         fill_flushed <= 1'b0;
         else if (stage == 1'b0)            fill_flushed <= flush_w | flush_pc_redir;
         else if (flush_w | flush_pc_redir) fill_flushed <= 1'b1;
@@ -256,7 +253,7 @@ module icache(
 //跨度：缺失检测拍的下沿起、到交付拍落下（F+1），与 pc 的 "缺 6 拍加 4、回填期按住" 对位，
 //交付拍 pc_addr 恰为 miss 地址 +4，满足 inst_out(N)=instr(pc_addr(N)-4)。
 //复位值必须是 1：复位期间 bts_run=1 ⇒ busy 恒 1，取 0 会让复位后第一拍 stage 落到 EXE、
-//req_valid 抬起，icache 拿无效 hit_sel 去读 iram 并被 pre_decoder 锁进流水线。
+//req_valid 抬起，icache 拿无效 hit_sel 去读 iram 并被 idu1 锁进流水线。
     always @(posedge clk) begin
         if (rst_q)
             busy <= 1'b1;
@@ -268,11 +265,11 @@ module icache(
 
 //jalr 类改向当拍把取指输出刷成 NOP：icache 不再当拍跳目标，当拍读出来的那条是
 //跳转后的顺序指令（错路），必须挡掉；下一拍 pc 已在目标上，照常取到目标指令。
-//【必须写在这个触发器的 D 端，不能挪到"喂给 pre_decoder 的组合信号"上】：
-//jalr_pred = pre_jalr & btb_hit，而 pre_jalr 是 pre_decoder 从它的 inst_in 组合算出来的。
-//写在 D 端是 inst_out(Q)→pre_decoder→jalr_pred→inst_out(D)，触发器对触发器，合法；
-//若在 cpu_top 里对 icache_inst_w 过门再喂 pre_decoder，就闭成了
-//inst_g→pre_decoder→pre_jalr→jalr_pred→inst_g 的零延时组合环（xsim 实测 Iteration limit 10000）。
+//【必须写在这个触发器的 D 端，不能挪到"喂给 idu1 的组合信号"上】：
+//jalr_pred = pre_jalr & btb_hit，而 pre_jalr 是 idu1 从它的 inst_in 组合算出来的。
+//写在 D 端是 inst_out(Q)→idu1→jalr_pred→inst_out(D)，触发器对触发器，合法；
+//若在 cpu_top 里对 icache_inst_w 过门再喂 idu1，就闭成了
+//inst_g→idu1→pre_jalr→jalr_pred→inst_g 的零延时组合环（xsim 实测 Iteration limit 10000）。
 //与 req_valid 相与：停顿期间 req_valid=0，本来就没有新指令要挡，
 //而 pc 的 jalr 分支也在 stage==EXE 才生效，两边同步。
     always @(posedge clk) begin
@@ -280,7 +277,7 @@ module icache(
             inst_out <= 32'd0;
         else if (bts_run && (bts_line == BOOT_LINES) && bts_end)
             inst_out <= iram[rd_addr];
-        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | (jalr && req_valid))
+        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | ((jalr | jal_in | br1_in) && req_valid && (~deliv_v | take_en) && flag_bus[4] && ~stall_pc_redir && ~stall_icache_miss && ~fifo_full))
             inst_out <= 32'd0;
         else if (rd_en)
             inst_out <= iram[rd_addr];

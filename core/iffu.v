@@ -1,32 +1,38 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Module Name: fetch_fifo
+// Module Name: iffu
 // Description:
-//   夹在 icache 与 pre_decoder 之间的取指队列（单发射版）。
+//   夹在 icache 与 idu1 之间的取指队列（单发射版）。
 //
 //   条目只存"队列取消不了的携带量"：指令字 + 地址 + 分支预测位 + jalr 预测目标 +
 //   两个源寄存器号（107 位，深度 8）。rd / func10 / imm 是纯函数，一律不在队里存。
 //
 //   两个推进门分开：
-//     f_req = exec & ~flush_w & ~stall_w & rdy1_in & rdy2_in           （取指侧）
-//     adv                                                            （读侧，pre_decoder 给）
-//   ★ 取指门必须与 pc / icache 的推进门【逐项同门】：icache 的交付是"pc 的下游流水线"
-//     （pc 停住 ⇒ 随后几拍重复交付同一条），本级若对停调解耦，重交付会被当成新指令收下
-//     （实测同一条被分配 5 次 ⇒ 提交序列重复）。后端那八条停顿位、pc 的 fifo_full、
-//     以及 rob 的就绪门（rdy1/rdy2，见下面端口列表那两行的注释）一个都不能少 —— 少一个就是
-//     "队列被灌满 ⇒ full 关掉 pc 的推进门 ⇒ 这一拍刚译出的重定向被静默丢掉"。
+//     f_req = exec & deliv_v                                            （取指侧：交付事件）
+//     advance                                                               （读侧，idu1 给）
+//   ★ 取指侧收的是【事件】，不是"推进拍"：icache 的交付是"pc 的下游流水线"，
+//     pc 停住时它会连着几拍把同一条摆在输出上，照推进拍收就会把重交付当新指令收下
+//     （实测同一条被分配 5 次 ⇒ 提交序列重复）。deliv_v = "已交付、还没进队"。
+//   ★ 推力门 push_ok 只认真溢出（cnt<7），不看 full：冻门触发的那一拍，
+//     在飞的那条（含改向欠下的 bti 交付）仍要能进去。
 //
-//   队头是组合读 + 本拍写入旁路：空队列时队头直接是本拍写进去的那条，冲刷后落点那条
-//   不用多压一拍。出队格 h0 是本级的寄存器（承接原来 pre_decoder 那一级）。
+//   队头是组合读：空队列时压成空泡（不做"本拍写入旁路"），它只作出队格 h0 的 D 端。
+//   ★ 旁路"队空时队头直接是本拍写进去的那条"曾经在，实测是时序墙：它把
+//     icache 的 BRAM 输出一路组合送到 rob 的 ent_h2 D 端（11.0ns / 9 级 / 67% 布线），
+//     一去掉失败端点 293→6、WNS -1.175→-0.377，代价只有 +1.3% 拍数。
+//   出队格 h0 是本级的【唯一】输出寄存器：rob 的分配口/入队扫描口与 idu1 的译码输入
+//   都取它的 Q 端 —— 同一条指令的数据在一拍上同时发给 rob 与 idu1。ROB 号不再随本级的
+//   内容锁存（由 rob 直接发 idu1 的输出级），所以出队格里不存号、也无 nh0_* 那一组
+//   组合的队头输出。
 //
 //   取指侧的重定向译码（br_en / jal / jalr / offset_beq / offset_jal）在本模块前端，
-//   对刚交付的 inst_eff 组合解 —— 口径与原来 pre_decoder 的那一段一致。
+//   对刚交付的 inst_eff 组合解 —— 口径与原来 idu1 的那一段一致。
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module fetch_fifo(
+module iffu(
     input clk, rst,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
 //取指重定向（pc.v 的 redir_go 落地那拍）：整队作废
     input flush_pc_redir,
 //写口：icache 本拍交出的指令（三态在本模块前端合成）
@@ -38,34 +44,22 @@ module fetch_fifo(
     input [31:0] push_addr,
     input        push_br_pred,
     input [31:0] push_jalr_pred,
-//读侧：本拍出队格换不换内容（= 新 pre_decoder 的推进条件，与它逐字同形）
-    input        adv,
-//这一拍发给队头那条的 ROB 号（跟内容一起锁进出队格）
-    input [2:0]  rob_idx,
-    input        rob_gen,
-//队头（组合读 + 本拍写入旁路）：给 rob 的分配口与新 pre_decoder
-    output reg [31:0] nh0_inst, nh0_addr,
-    output reg        nh0_br_pred,
-    output reg [31:0] nh0_jalr_pred,
-    output reg [4:0]  nh0_r1, nh0_r2,
-    output reg        nh0_v,
-//出队格（本级的出口寄存器）
+//读侧：本拍出队格换不换内容（= 新 idu1 的推进条件，与它逐字同形）
+    input        advance,
+//出队格（本级的出口寄存器）：iffu 的唯一输出寄存器，rob 与 idu1 都在它的 Q 端取数
     output reg [31:0] h0_inst, h0_addr,
     output reg        h0_br_pred,
     output reg [31:0] h0_jalr_pred,
     output reg [4:0]  h0_r1, h0_r2,
-    output reg        h0_v,
-    output reg [2:0]  idx_out,
-    output reg        gen_out,
-//取指侧重定向译码（原 pre_decoder 的组合段）：消费者是 pc、bra_predict、icache 的 jalr 门
+//取指侧重定向译码（原 idu1 的组合段）：消费者是 pc、bpu、icache 的 jalr 门
     output reg        fch_br_en, fch_jal, fch_jalr,
     output reg [31:0] fch_off_beq, fch_off_jal,
 //取指侧停：本拍放不下。icache 与 pc 的推进被它按住
     output reg        full,
-//★ 就绪门（rob 按冻结生产者槽现算）：【原地等】必须整组同门 —— 前端也算在内。
-//  只停后端不停取指 ⇒ 队列被灌满、fifo_full 又把 pc 的推进门关掉，
-//  于是这一拍刚译出来的前端重定向（jal/br1）被静默丢掉（实测 divu-01 漏跳一个 jal、整个程序重跑）。
-    input             rdy1_in, rdy2_in
+//icache 的交付事件：有一条已交付、还没进队
+    input             deliv_v,
+//本条交付被【收下】了（写进去、或是空泡就地丢掉）——欠交付的两边都盯它，别盯"取指门开了"
+    output reg        take_en
     );
 
 //复位就地打一拍（与其它模块同款）
@@ -73,34 +67,21 @@ module fetch_fifo(
     always @(posedge clk) rst_q <= rst;
 
 //flag_bus 逐位还原（口径与各消费者一致：冲刷压停顿）
+//停顿位一位都不用了：后端停顿由本队列吸收，推力只看交付事件与空位。
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
-    reg stall_rob_full, stall_pc_redir;
-    reg stall_lsu_haz, stall_lsu_full;
-    reg stall_mulu_haz, stall_mulu_div;
-    reg stall_icache_miss, stall_bus_hold;
-    reg stall_w;
-    reg flush_w, f_req, f_adv;
+    reg flush_w, f_req, f_adv, f_nop, push_ok;
+//三态合成出来的"本拍这条"（下面给值）：推力判"是不是空泡"要在译码块里用它，故声明提前
+    reg [31:0] inst_eff;
     always @(*) begin
-        flush_con_exc     = flag_bus[11];
-        flush_con_irq     = flag_bus[10];
-        flush_con_jump    = flag_bus[9];
-        exec              = flag_bus[8];
-        stall_rob_full    = flag_bus[7];
-        stall_pc_redir    = flag_bus[6];
-        stall_lsu_haz     = flag_bus[5];
-        stall_lsu_full    = flag_bus[4];
-        stall_mulu_haz    = flag_bus[3];
-        stall_mulu_div    = flag_bus[2];
-        stall_icache_miss = flag_bus[1];
-        stall_bus_hold    = flag_bus[0];
+        flush_con_exc     = flag_bus[7];
+        flush_con_irq     = flag_bus[6];
+        flush_con_jump    = flag_bus[5];
+        exec              = flag_bus[4];
         flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
-        stall_w = (stall_rob_full | stall_pc_redir | stall_lsu_haz | stall_lsu_full
-                 | stall_mulu_haz | stall_mulu_div | stall_icache_miss | stall_bus_hold) & ~flush_w;
-//★ 推力门必须与 pc/icache 的推进门【逐项同门】：icache 的交付是"pc 的下游流水线"，
-//  pc 停住时它会在随后几拍重复交付同一条 ⇒ 若本模块照推，就会把重交付当新指令收下
-//  （实测：同一条指令被分配 5 次 ⇒ 提交序列重复 ⇒ 签名错）。
-        f_req = exec & ~flush_w & ~stall_w & rdy1_in & rdy2_in;
-        f_adv = f_req & ~full;
+        f_req = exec & (deliv_v | (bti_sel != 2'd0));
+        f_nop = ~|inst_eff;
+        f_adv = f_req & ~f_nop & push_ok;
+        take_en = f_req & (f_nop | push_ok);
     end
 
 //RV32I 里与源寄存器号/改向有关的 opcode
@@ -113,7 +94,7 @@ module fetch_fifo(
     localparam OPCODE_STORE  = 7'b0100011;
     localparam OPCODE_SYSTEM = 7'b1110011;
 
-//提取分支/跳转立即数的函数（口径与 pre_decoder 里那两条逐字一致）
+//提取分支/跳转立即数的函数（口径与 idu1 里那两条逐字一致）
     function [31:0] immB;
         input [31:0] inst;
         immB = {{19{inst[31]}}, inst[31], inst[7], inst[30:25], inst[11:8], 1'b0};
@@ -124,10 +105,9 @@ module fetch_fifo(
         immJ = {{12{inst[31]}}, inst[19:12], inst[20], inst[30:21], 1'b0};
     endfunction
 
-//指令来源三态（口径与原 pre_decoder 的 inst_effective 一致）：
+//指令来源三态（口径与原 idu1 的 inst_effective 一致）：
 //bti_sel=1 用 btb 直送的跳转目标那条；=2 交付 NOP（方向说跳但没缓存）；=0 用 icache 正常交付。
 //inst_valid=0 表示这一拍送来的是无效读数（缺失垃圾 / 那次回填已被冲刷作废），压成 0。
-    reg [31:0] inst_eff;
     always @(*) begin
         if (bti_sel == 2'd1)
             inst_eff = bti_inst;
@@ -137,7 +117,7 @@ module fetch_fifo(
             inst_eff = inst_valid ? inst_in : 32'd0;
     end
 
-//取指侧分支/跳转预译码（原 pre_decoder 末尾那块）：
+//取指侧分支/跳转预译码（原 idu1 末尾那块）：
 //jal / br_en / offset_* 不受 stage 门控（消费者里有取指地址那条环），只有 jalr 保留门控。
     always @(*) begin
         fch_br_en = 1'b0;
@@ -192,6 +172,9 @@ module fetch_fifo(
     reg [3:0]  idx0;
     reg [106:0] push0_data, h0_data;
     reg         hd0_v;
+    reg [31:0]  nx_inst, nx_addr, nx_jalr_pred;
+    reg         nx_br_pred;
+    reg [4:0]   nx_r1, nx_r2;
     reg        wr0, clr;
 
 //写入的那一条（布局见上）。addr 是"指令地址 + 4"口径的 aux_addr，原样存。
@@ -206,7 +189,8 @@ module fetch_fifo(
 //full 按"占用 ≥ 6 就报"（阈值），不是"放不下才报"：本拍要推的那条还在飞（写入在本拍结束），
 //按"放不下"判会让取指在满/不满之间来回。阈值 6 + 在飞 1 ⇒ 最高占用 7 < 8，不会写丢。
     always @(*) begin
-        full = f_req & (cnt_use >= 4'd6);
+        full    = (cnt_use >= 4'd6);
+        push_ok = (cnt_use < 4'd7);
     end
 
     always @(*) begin
@@ -245,43 +229,38 @@ module fetch_fifo(
         else if (clr) begin
             rptr <= rptr;
         end
-        else if (adv & nh0_v) begin
+        else if (advance & hd0_v) begin
             rptr <= rptr + 4'd1;
         end
     end
 
-//队头（组合读 + 本拍写入旁路）：喂给出队格的那一级
+//队头（组合读）：出队格的 D 端
     always @(*) begin
         idx0 = rptr;
     end
 
+//不在册时整条压 0：不让陈旧值/X 走到译码、冒险比较和下游载荷里
     always @(*) begin
         h0_data = q_dat[idx0[2:0]];
         hd0_v   = (idx0 != wptr);
-        if ((idx0 == wptr) & wr0) begin
-            h0_data = push0_data;
-            hd0_v   = 1'b1;
-        end
-//不在册时整条压 0：不让陈旧值/X 走到译码、冒险比较和下游载荷里
-        nh0_inst      = 32'd0;
-        nh0_addr      = 32'd0;
-        nh0_br_pred   = 1'b0;
-        nh0_jalr_pred = 32'd0;
-        nh0_r1        = 5'd0;
-        nh0_r2        = 5'd0;
-        nh0_v         = hd0_v;
+        nx_inst      = 32'd0;
+        nx_addr      = 32'd0;
+        nx_br_pred   = 1'b0;
+        nx_jalr_pred = 32'd0;
+        nx_r1        = 5'd0;
+        nx_r2        = 5'd0;
         if (hd0_v) begin
-            nh0_inst      = h0_data[106:75];
-            nh0_addr      = h0_data[74:43];
-            nh0_br_pred   = h0_data[42];
-            nh0_jalr_pred = h0_data[41:10];
-            nh0_r1        = h0_data[9:5];
-            nh0_r2        = h0_data[4:0];
+            nx_inst      = h0_data[106:75];
+            nx_addr      = h0_data[74:43];
+            nx_br_pred   = h0_data[42];
+            nx_jalr_pred = h0_data[41:10];
+            nx_r1        = h0_data[9:5];
+            nx_r2        = h0_data[4:0];
         end
     end
 
-//出队格的装载：换新 / 保持 / 清。保持条件与下一级的推进条件同门（adv 就是下一级给的）。
-//号与内容同门锁存（idx/gen 跟指令走，出去以后就是载荷的 issue_idx/issue_gen）。
+//出队格的装载：换新 / 保持 / 清。保持条件与下一级的推进条件同门（advance 就是下一级给的）。
+//装载源取本级组合读出的队头（不在册时已压成 0）。
     always @(posedge clk) begin
         if (rst_q) begin
             h0_inst <= 32'd0;
@@ -290,9 +269,6 @@ module fetch_fifo(
             h0_jalr_pred <= 32'd0;
             h0_r1 <= 5'd0;
             h0_r2 <= 5'd0;
-            h0_v <= 1'b0;
-            idx_out <= 3'd0;
-            gen_out <= 1'b0;
         end
         else if (exec) begin
             if (flush_w) begin
@@ -302,20 +278,14 @@ module fetch_fifo(
                 h0_jalr_pred <= 32'd0;
                 h0_r1 <= 5'd0;
                 h0_r2 <= 5'd0;
-                h0_v <= 1'b0;
-                idx_out <= 3'd0;
-                gen_out <= 1'b0;
             end
-            else if (adv) begin
-                h0_inst <= nh0_inst;
-                h0_addr <= nh0_addr;
-                h0_br_pred <= nh0_br_pred;
-                h0_jalr_pred <= nh0_jalr_pred;
-                h0_r1 <= nh0_r1;
-                h0_r2 <= nh0_r2;
-                h0_v <= nh0_v;
-                idx_out <= rob_idx;
-                gen_out <= rob_gen;
+            else if (advance) begin
+                h0_inst <= nx_inst;
+                h0_addr <= nx_addr;
+                h0_br_pred <= nx_br_pred;
+                h0_jalr_pred <= nx_jalr_pred;
+                h0_r1 <= nx_r1;
+                h0_r2 <= nx_r2;
             end
             else begin
                 h0_inst <= h0_inst;
@@ -324,9 +294,6 @@ module fetch_fifo(
                 h0_jalr_pred <= h0_jalr_pred;
                 h0_r1 <= h0_r1;
                 h0_r2 <= h0_r2;
-                h0_v <= h0_v;
-                idx_out <= idx_out;
-                gen_out <= gen_out;
             end
         end
     end

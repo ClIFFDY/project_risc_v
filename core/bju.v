@@ -13,7 +13,7 @@
 //              ① 判定输入寄存级 —— 操作数与控制位一起寄存（操作数来自 forw 的组合输出，
 //                 直接吃会让"计算单元→前送→操作数→比较/加法"串成一条全片最差链）；
 //              ② 判定级 —— 比较与加法，结果/落点/预测表限定信号在下一拍生效；
-//              另给出一条组合版前置冲刷 flush_bju_pre（判定级的当拍版本），只有 lsu/mulu 消费。
+//              另给出一条组合版前置冲刷 flush_bju_pre（判定级的当拍版本），只有 lsu/mdu 消费。
 //
 // Dependencies:
 //
@@ -25,7 +25,7 @@
 
 module bju(
     input clk, rst,
-    input [11:0] flag_bus,
+    input [7:0] flag_bus,
 //判定源：与 alu 的输入同源（decoder 本级的寄存器输出）
     input [31:0] r1_data_in, r2_data_in,
     input [3:0] alu_func4_in,
@@ -36,8 +36,11 @@ module bju(
     input [31:0] jal_target_in,
 //异常源（从 post_decoder 载荷进来）：与操作数/控制位【同沿】锁进判定输入寄存级。
 //这样它们天然比载荷晚一拍出，正好与"更老那条的寄存版冲刷"【同拍配对】——
-//  本拍出的是 X_m 的异常，本拍 flag_bus[9]/flush_bju_exc 出的是 X_{m-1} 的冲刷，
+//  本拍出的是 X_m 的异常，本拍 flag_bus[5]/flush_bju_exc 出的是 X_{m-1} 的冲刷，
 //  于是消费端用现成的 ~flush_older 就盖住了影子槽，不再需要组合的 pre。
+//判定输入级的装载门：保留站改造后由【站的出站脉冲】给（原来本模块自己从 flag_bus 拼）。
+//★ 每一条出站的指令都要过这一级（bju 是全核的判定 + 异常通道），所以它 = issue_v。
+    input adv_in,
     input exc_ecall_in, exc_ebreak_in, exc_illegal_in, exc_irq_ret_in,
 //判定结果与跳转落点（寄存一拍后有效）
     output reg success, br_fail, jalr_fail,
@@ -45,7 +48,10 @@ module bju(
 //ROB 的冲刷只作废【比它更年轻】的项，比它老、还在途的（load/mul）必须留下，
 //否则它们的写回/总线请求就被连同错路指令一起扔了（实测 CoreMark：两条在途 lw 的写回消失）。
     input [2:0]  idx_in,
+    input        gen_in,
     output reg [2:0] idx_q,
+    output reg       bju_judged,
+    output reg       bju_gen,
     output reg [31:0] jp_target, jalr_target_q2,
     output reg [5:0] br_pc_idx,
     output reg flush_bju_exc,
@@ -64,11 +70,11 @@ module bju(
     output reg exc_ecall_i, exc_ebreak_i, exc_illegal_i, exc_irq_ret_i,
 //同一条自己的 PC（= 输入级的 aux_q），给 mepc 用
     output reg [31:0] exc_pc_i,
-//F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[10]|flag_bus[9]）。
-//  寄存判定那一拍上 flag_bus[9] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
+//F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[6]|flag_bus[5]）。
+//  寄存判定那一拍上 flag_bus[5] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
 //  去门标记会自己掐掉自己（br 预测不跳+真跳+非对齐那一支的异常会静默丢失）。
     output reg older_q,
-//前置冲刷：同一判定的组合版本，早一拍，只喂 lsu/mulu
+//前置冲刷：同一判定的组合版本，早一拍，只喂 lsu/mdu
     output reg flush_bju_pre
     );
 
@@ -86,13 +92,12 @@ module bju(
 //控制位译码（行为块，放本模块最前）：判定延迟拍只关心"本拍是不是冲刷拍"。
 //★ flush_con_exc 已经是精确版（不再含 pre）⇒ 直接取 [11]。
     reg flush_w;
-    always @(*) flush_w = flag_bus[11] | flag_bus[10] | flag_bus[9];
+    always @(*) flush_w = flag_bus[7] | flag_bus[6] | flag_bus[5];
 
 //操作数装载门控：与边界推进（post_decoder 的 payload_go）同一组位 ——
 //stall 期间一位都不许动，能装进来的那一刻，源已经就绪。
     reg adv;
-    always @(*) adv = flag_bus[8] & ~(flag_bus[7] | flag_bus[6] | flag_bus[5] | flag_bus[4]
-                                    | flag_bus[3] | flag_bus[2] | flag_bus[1] | flag_bus[0]);
+    always @(*) adv = adv_in;
 
 //===============================================================
 // 判定输入寄存级（新增）：把"这一拍要判的那条指令"整个寄存一级
@@ -107,6 +112,7 @@ module bju(
     reg [31:0] r1_q, r2_q, aux_q, beq_q, jalr_pred_q, jal_tgt_q;
     reg [3:0]  func4_q;
     reg        brf_q, jalrf_q, pred_q, exc_jal_mis_q;
+    reg        gen_i, gen_q, adv_d;
 //异常源也进这一级（与操作数/控制位同生共死）—— 这是"过 bju"的核心：它们比载荷晚一拍出，
 //正好与【更老那条】的寄存版冲刷同拍。
     reg        ecall_q, ebreak_q, illegal_q, irq_ret_q;
@@ -128,6 +134,7 @@ module bju(
             illegal_q <= 1'b0;
             irq_ret_q <= 1'b0;
             idx_i <= 3'd0;
+            gen_i <= 1'b0;
         end
         else if (flush_w) begin
             r1_q <= 32'd0;
@@ -146,6 +153,7 @@ module bju(
             illegal_q <= 1'b0;
             irq_ret_q <= 1'b0;
             idx_i <= 3'd0;
+            gen_i <= 1'b0;
         end
         else if (adv) begin
             r1_q <= r1_data_in;
@@ -164,11 +172,12 @@ module bju(
             illegal_q <= exc_illegal_in;
             irq_ret_q <= exc_irq_ret_in;
             idx_i <= idx_in;
+            gen_i <= gen_in;
         end
     end
 
 //判定输入级那一条自己的异常 / PC（与 flush_bju_pre 同拍、描述同一条）。
-//组合给出即可（源是寄存器）：controller 在"更老那条的寄存版冲刷"那一拍拿到它们，
+//组合给出即可（源是寄存器）：cont 在"更老那条的寄存版冲刷"那一拍拿到它们，
 //用现成的 ~flush_older 就把影子槽盖住了。
     always @(*) begin
         exc_ecall_i   = ecall_q;
@@ -181,7 +190,7 @@ module bju(
 //F2 用：与"操作数被采样的那一拍"对齐的采样（判定级读当拍的 flush_older 会把自己掐掉）
     always @(posedge clk) begin
         if (rst_q) older_q <= 1'b0;
-        else       older_q <= flag_bus[10] | flag_bus[9];
+        else       older_q <= flag_bus[6] | flag_bus[5];
     end
 
 //判定组合逻辑用的寄存器
@@ -271,7 +280,7 @@ module bju(
 //  单铺一路载荷送进来（jal_target_in），同样是进这个落点寄存器、同样零额外寄存器。
 //flush_bju_pre 是同一判定的组合版本、早一拍：判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令
 //在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去动 FIFO 指针、
-//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu/mulu 因此在入口多挡一拍。
+//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu/mdu 因此在入口多挡一拍。
 //★ 进本级的操作数不受任何 stall 门控：装载那一拍 stall 位全 0（adv），拿到的就是最终值 ⇒
 //  判定、组合前置冲刷、当拍异常标记一律照常出，不再挂 hazard 门。
 
@@ -295,6 +304,11 @@ module bju(
     end
 
 //===============================================================
+    always @(posedge clk) begin
+        if (rst_q || flush_w) adv_d <= 1'b0;
+        else                  adv_d <= adv;
+    end
+
 // 判定延迟拍（下一拍生效）
 //===============================================================
 //判定延迟拍：判定结果、跳转落点、以及预测表回写要用的索引与限定信号统一寄存一拍。
@@ -303,6 +317,8 @@ module bju(
     always @(posedge clk) begin
         if (rst_q) begin
             success <= 1'b0;
+            bju_judged <= 1'b0;
+            bju_gen <= 1'b0;
             br_fail <= 1'b0;
             jalr_fail <= 1'b0;
             flush_bju_exc <= 1'b0;
@@ -317,6 +333,8 @@ module bju(
         end
         else if (flush_w) begin
             success <= 1'b0;
+            bju_judged <= 1'b0;
+            bju_gen <= 1'b0;
             br_fail <= 1'b0;
             jalr_fail <= 1'b0;
             flush_bju_exc <= 1'b0;
@@ -339,6 +357,8 @@ module bju(
             jalr_flag_q <= jalrf_q & ~exc_jalr_misalign;
             br_pred_taken_q <= pred_q;
             idx_q <= idx_i;
+            bju_gen <= gen_i;
+            bju_judged <= adv_d;
         end
     end
 endmodule
