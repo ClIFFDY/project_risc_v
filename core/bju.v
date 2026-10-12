@@ -13,7 +13,6 @@
 //              ① 判定输入寄存级 —— 操作数与控制位一起寄存（操作数来自 forw 的组合输出，
 //                 直接吃会让"计算单元→前送→操作数→比较/加法"串成一条全片最差链）；
 //              ② 判定级 —— 比较与加法，结果/落点/预测表限定信号在下一拍生效；
-//              另给出一条组合版前置冲刷 flush_bju_pre（判定级的当拍版本），只有 lsu/mdu 消费。
 //
 // Dependencies:
 //
@@ -64,7 +63,7 @@ module bju(
 //判定输入级那一条自己的 ROB 号（与 exc_bju 同拍）：wport 用它认"本级挂的是不是它"
     output reg [2:0] idx_i,
     output reg [31:0] exc_pc_q,
-//判定【输入级】那一条自己带的异常（与 flush_bju_pre 同拍、描述同一条）：ecall/ebreak/illegal/mret。
+//判定【输入级】那一条自己带的异常（与 idu2 的 bju_in_flight 同拍、描述同一条）：ecall/ebreak/illegal/mret。
 //★ 必须从【输入寄存级】出、不能从延迟寄存级出：从延迟级出就与"更老那条的寄存版冲刷"错开两拍，
 //  消费端的 ~flush_older 盖不住影子槽（那正是当初要 pre 的原因）。
     output reg exc_ecall_i, exc_ebreak_i, exc_illegal_i, exc_irq_ret_i,
@@ -73,9 +72,7 @@ module bju(
 //F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[6]|flag_bus[5]）。
 //  寄存判定那一拍上 flag_bus[5] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
 //  去门标记会自己掐掉自己（br 预测不跳+真跳+非对齐那一支的异常会静默丢失）。
-    output reg older_q,
-//前置冲刷：同一判定的组合版本，早一拍，只喂 lsu/mdu
-    output reg flush_bju_pre
+    output reg older_q
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -176,7 +173,7 @@ module bju(
         end
     end
 
-//判定输入级那一条自己的异常 / PC（与 flush_bju_pre 同拍、描述同一条）。
+//判定输入级那一条自己的异常 / PC（与 idu2 的 bju_in_flight 同拍、描述同一条）。
 //组合给出即可（源是寄存器）：cont 在"更老那条的寄存版冲刷"那一拍拿到它们，
 //用现成的 ~flush_older 就把影子槽盖住了。
     always @(*) begin
@@ -278,11 +275,11 @@ module bju(
 //  非对齐拍 exc 会压掉 jump 重定向（pc.v 的 flush_jump_w = bit6 & ~bit9）⇒ 那一拍它只被 mtval 消费。
 //  jal 的目标【不在流水里】（mid_decoder 不为 JAL 置 imm_c）⇒ 由 post_decoder 就地解 immJ 算好后
 //  单铺一路载荷送进来（jal_target_in），同样是进这个落点寄存器、同样零额外寄存器。
-//flush_bju_pre 是同一判定的组合版本、早一拍：判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令
+//早一拍的那道遮挡不由本模块给：判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令
 //在 c2 上会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去动 FIFO 指针、
-//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu/mdu 因此在入口多挡一拍。
+//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu 因此在入口多挡一拍，挡位由 idu2 的 bju_in_flight 给。
 //★ 进本级的操作数不受任何 stall 门控：装载那一拍 stall 位全 0（adv），拿到的就是最终值 ⇒
-//  判定、组合前置冲刷、当拍异常标记一律照常出，不再挂 hazard 门。
+//  判定、当拍异常标记一律照常出，不再挂 hazard 门。
 
     always @(*) begin
         exc_br_misalign = success_now & beq_q[1];
@@ -290,7 +287,6 @@ module bju(
         exc_bju = exc_br_misalign | exc_jalr_misalign | exc_jal_mis_q;
         br2_now = success_now & ~pred_q;
         br3_now = br_fail_now & pred_q;
-        flush_bju_pre = br2_now | br3_now | jalr_fail_now | exc_br_misalign | exc_jalr_misalign;
         if (br2_now | exc_br_misalign)
             jp_target_now = aux_q + beq_q;
         else if (br3_now)
@@ -312,8 +308,11 @@ module bju(
 // 判定延迟拍（下一拍生效）
 //===============================================================
 //判定延迟拍：判定结果、跳转落点、以及预测表回写要用的索引与限定信号统一寄存一拍。
-//冲刷拍必须清（否则同一笔判定会连拉两拍）；停顿拍不清：操作数被冻住时判定值不变，
-//与旧设计把 success/br_fail 放在 decoder 主块里自保持的行为一致。
+//冲刷拍清【判定结果】与落点（否则同一笔判定会连拉两拍），但【判定回报】（idx_q/bju_gen/
+//bju_judged）照 adv_d 出：中断/异常的冲刷边界比判定在途那条更年轻，那条活着却再也等不到
+//回报 ⇒ ROB 里 ent_wr=1/ent_jmp=1/ent_jdg=0 的项卡在队头 ⇒ 等 rob_empty 的重定向自锁。
+//回报是 1 拍脉冲，被杀集作废的项由 ROB 的 ent_v/ent_gen 过滤，不会误伤。
+//停顿拍不清：操作数被冻住时判定值不变，与旧设计把 success/br_fail 放在 decoder 主块里自保持的行为一致。
     always @(posedge clk) begin
         if (rst_q) begin
             success <= 1'b0;
@@ -333,8 +332,6 @@ module bju(
         end
         else if (flush_w) begin
             success <= 1'b0;
-            bju_judged <= 1'b0;
-            bju_gen <= 1'b0;
             br_fail <= 1'b0;
             jalr_fail <= 1'b0;
             flush_bju_exc <= 1'b0;
@@ -344,6 +341,9 @@ module bju(
             jalr_flag_q <= 1'b0;
             br_pred_taken_q <= 1'b0;
             exc_pc_q <= 32'd0;
+            idx_q <= idx_i;
+            bju_gen <= gen_i;
+            bju_judged <= adv_d;
         end
         else begin
             success <= success_now;

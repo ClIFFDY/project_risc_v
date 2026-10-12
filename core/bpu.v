@@ -243,7 +243,12 @@ module bpu(
                 btb_v[br_pc_idx] <= (jalr_target_q != 32'd0);
             end
 //冷启动捕获：这一拍 icache 交付的就是目标 inst（pc 已于 take 那拍落 T）
-            if (cap_q[1] & inst_valid) begin
+//★ 写口必须自己再带 ~flush_w：cap_q 是"到沿才清"，冲刷那一拍 cap_q[1] 还是 1，
+//  而 inst_valid 也还是上一拍的（电平信号、到沿才被冲刷压掉）⇒ 会把冲掉的错路交付
+//  （实测是 0）当目标 inst 连同 bti_v=1 一起写进表 ⇒ 该分支此后命中到一条空指令、
+//  "pc 落 T+4 + bti 交付 T"这一对里 T 永远没人交付（静默丢一条）。
+//  表里 0 只可能是空泡（真指令不会是 0）⇒ 这一条不改学习能力、也不改命中率。
+            if (cap_q[1] & inst_valid & ~flush_w) begin
                 bti_inst[cap_idx_q2] <= inst_in;
                 bti_tag[cap_idx_q2]  <= cap_tag_q2;
                 bti_v[cap_idx_q2]    <= 1'b1;

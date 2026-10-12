@@ -36,10 +36,32 @@ module cpu_top(
     wire [4:0] rs1_idu1, rs2_idu1;
     wire [31:0] aux_addr_idu1;
     wire br_pred_taken_idu1;
-    wire [31:0] jalr_pred_addr_idu1;
-    wire [4:0]  rd_idu1;
-    wire [9:0]  func10_idu1;
-    wire [31:0] imm_alu_idu1;
+//idu1 S 级寄存的全译码字段（送 idu2 的入站）
+    wire [1:0]  dec_class_idu1;
+    wire        dec_we_idu1;
+    wire [4:0]  dec_rd_idu1;
+    wire        dec_is_st_idu1;
+    wire [2:0]  dec_mulop_idu1;
+    wire [2:0]  dec_lsf3_idu1;
+    wire [3:0]  dec_func4_idu1;
+    wire [2:0]  dec_csrf3_idu1;
+    wire        dec_csrw_en_idu1;
+    wire        dec_csrw_armed_idu1;
+    wire        dec_csrw_wr_idu1;
+    wire [11:0] dec_csra_idu1;
+    wire [31:0] dec_jval_idu1;
+    wire        dec_brf_idu1;
+    wire        dec_jalf_idu1;
+    wire        dec_jalfr_idu1;
+    wire        dec_exc_illegal_idu1;
+    wire        dec_exc_jmis_idu1;
+    wire        dec_exc_ecall_idu1;
+    wire        dec_exc_ebreak_idu1;
+    wire        dec_exc_irq_ret_idu1;
+    wire        dec_r1_imm_idu1;
+    wire        dec_r2_imm_idu1;
+    wire [31:0] dec_r1_immv_idu1;
+    wire [31:0] dec_r2_immv_idu1;
 //非寄存器操作数的载荷（装配已并进 forw）
 //三个单元各自算好的前送命中位（r1/r2 各一位）：forw 据此直接选源，本级不再比 idx
     wire [4:0] rd_idu2;
@@ -77,11 +99,6 @@ module cpu_top(
     wire [2:0]  pay_idx_out_idu2;
 //rob 前送值读口两组：① 正常读（索引 = rob 自己的扫描槽）② 停顿重读（索引 = regfile 的锁存槽）
 //  ★ 分成两组是为了把 stall 那条组合量从【正常读】的数据路上拿掉（见 regfile/rob 的注释）
-    wire [31:0] fwd_data1_rob, fwd_data2_rob;
-    wire        fwd_done1_rob, fwd_done2_rob;
-    wire [2:0]  st_slot1_regfile, st_slot2_regfile;
-    wire [31:0] st_data1_rob, st_data2_rob;
-    wire        st_done1_rob, st_done2_rob;
 //mdu 的结果口被 ROB 按索引直接采走 ⇒ 结果口恒"当场被取走"，不再需要写口级的放行握手
     wire        empty_rob;
     wire [3:0]  trap_cause_rob;
@@ -119,7 +136,7 @@ module cpu_top(
     wire br_fail_bju, success_bju, jalr_fail_bju, jal_flag_idu2, jalr_flag_idu2, jalr_flag_q_bju, br_pred_taken_q_bju, exc_irq_ret_idu2, exc_ecall_idu2, exc_ebreak_idu2;
     wire exc_irq_ret_ok_cont;
     wire flush_bju_exc_bju, exc_jal_misalign_out_idu2, exc_illegal_out_idu2, exc_ldst_misalign_out_lsu, exc_ldst_st_out_lsu;
-//bju 判定输入级出来的异常（与 flush_bju_pre_bju 同拍、描述同一条）：喂 cont 的异常仲裁
+//bju 判定输入级出来的异常（与 idu2 的 bju_in_flight_idu2 同拍、描述同一条）：喂 cont 的异常仲裁
     wire exc_ecall_bju, exc_ebreak_bju, exc_illegal_bju, exc_irq_ret_bju;
     wire [31:0] exc_pc_i_bju;
 //cont 输出的 ROB 标记索引（三路 mux 已搬进 cont）
@@ -131,12 +148,12 @@ module cpu_top(
     wire flush_con_exc_cont;
     wire [3:0] exc_cause_cont;
     wire [31:0] exc_pc_cont, exc_tval_cont;
-//前置冲刷（早一拍）：由 bju 的组合判定给出，直连 lsu/mdu（不进 flag_bus_cont，见 cont.v）
-    wire flush_bju_pre_bju;
+//前置冲刷（早一拍）：由 idu2 的 bju 在途位给出，直连 lsu（不进 flag_bus_cont，见 cont.v）
+    wire bju_in_flight_idu2;
 //停顿源（逐条，一位一源）：lsu 三条 / mdu 两条 / dcache / icache / bus / rob / pc
     wire stall_lsu_haz_lsu, stall_lsu_unload_lsu, stall_lsu_full_lsu;
     wire car_free_lsu;
-    wire loaded_lsu, we_lsu, inflight_lsu;
+    wire loaded_lsu, we_lsu;
     wire stall_rob_full_rob, stall_pc_redir_pc;
     wire flush_con_rob_cont, flush_incl_cont, flush_pc_redir_pc;
     wire [2:0] flush_idx_cont;
@@ -193,8 +210,10 @@ module cpu_top(
 //  冲刷，不再单独进 pc；ROB 满改吃 flag_bus_cont[3]（stall_rob_full），端口已删。
         .exc_irq(exc_irq_cont),
 //★ 这两根都换成【交付资格】同源的版本（理由见 pc.v 排队那一块）：武装不能再用裸译码/裸载荷。
+//  trap_fire 是"标记装进来的排队项够不够格发射"的判据（错路标记会被老分支冲刷连项灭掉）。
         .exc_irq_ret(exc_irq_ret_ok_cont),
         .exc_mark(exc_mark_cont),
+        .trap_fire(flush_rob_trap_rob),
         .rob_empty(empty_rob),
         .fifo_full(full_iffu),
         .stall_pc_redir(stall_pc_redir_pc),
@@ -295,12 +314,8 @@ module cpu_top(
         .rdy1_in(rdy1_rob), .rdy2_in(rdy2_rob),
         .advance(advance_idu1),
         .inst_out(inst_idu1),
-        .rd_out(rd_idu1),
-        .func10_out(func10_idu1),
-        .imm_alu_out(imm_alu_idu1),
         .aux_addr_out(aux_addr_idu1),
         .br_pred_taken_out(br_pred_taken_idu1),
-        .jalr_pred_addr_out(jalr_pred_addr_idu1),
         .r1_out(rs1_idu1),
         .r2_out(rs2_idu1),
         .idx_out(pay_idx_idu1),
@@ -309,9 +324,34 @@ module cpu_top(
         .alloc_we(alloc_we_idu1),
         .alloc_rd(alloc_rd_idu1),
         .alloc_jmp(alloc_jmp_idu1),
-        .alloc_pend(alloc_pend_idu1)
+        .alloc_pend(alloc_pend_idu1),
+        .dec_class(dec_class_idu1),
+        .dec_we(dec_we_idu1),
+        .dec_rd(dec_rd_idu1),
+        .dec_is_st(dec_is_st_idu1),
+        .dec_mulop(dec_mulop_idu1),
+        .dec_lsf3(dec_lsf3_idu1),
+        .dec_func4(dec_func4_idu1),
+        .dec_csrf3(dec_csrf3_idu1),
+        .dec_csrw_en(dec_csrw_en_idu1),
+        .dec_csrw_armed(dec_csrw_armed_idu1),
+        .dec_csrw_wr(dec_csrw_wr_idu1),
+        .dec_csra(dec_csra_idu1),
+        .dec_jval(dec_jval_idu1),
+        .dec_brf(dec_brf_idu1),
+        .dec_jalf(dec_jalf_idu1),
+        .dec_jalfr(dec_jalfr_idu1),
+        .dec_exc_illegal(dec_exc_illegal_idu1),
+        .dec_exc_jmis(dec_exc_jmis_idu1),
+        .dec_exc_ecall(dec_exc_ecall_idu1),
+        .dec_exc_ebreak(dec_exc_ebreak_idu1),
+        .dec_exc_irq_ret(dec_exc_irq_ret_idu1),
+        .dec_r1_imm(dec_r1_imm_idu1),
+        .dec_r2_imm(dec_r2_imm_idu1),
+        .dec_r1_immv(dec_r1_immv_idu1),
+        .dec_r2_immv(dec_r2_immv_idu1)
     );
-//发射单元（issue unit）：组合译码 + 四类统一保留站（深度 4）。由 post_decoder 改造而来。
+//发射单元（issue unit）：入站取值 + 四类统一保留站（深度 6）。由 post_decoder 改造而来。
 //★ 出站同时驱动 alu / bju（bju 是每条指令都要过的判定+异常通道），lsu/mdu 由各自的
 //  mem_op / is_mul 判据过滤 —— 与原来"载荷同时喂四个单元"同形。
     idu2 u_idu2 (
@@ -319,19 +359,39 @@ module cpu_top(
         .rst(rst),
         .flag_bus(flag_bus_cont),
         .s_advance(advance_idu1),
-        .func10(func10_idu1),
-        .rd_in(rd_idu1),
         .rs1_in(rs1_idu1),
         .rs2_in(rs2_idu1),
-        .imm_alu_in(imm_alu_idu1),
         .inst_in(inst_idu1),
-        .offset_beq0_aux(imm_alu_idu1),
         .pc_operand_in(aux_addr_idu1),
         .aux_addr_in(aux_addr_idu1),
         .br_pred_taken_in(br_pred_taken_idu1),
-        .jalr_pred_addr_in(jalr_pred_addr_idu1),
         .idx_in(pay_idx_idu1),
         .alloc_gen_in(pay_gen_idu1),
+        .dec_class(dec_class_idu1),
+        .dec_we(dec_we_idu1),
+        .dec_rd(dec_rd_idu1),
+        .dec_is_st(dec_is_st_idu1),
+        .dec_mulop(dec_mulop_idu1),
+        .dec_lsf3(dec_lsf3_idu1),
+        .dec_func4(dec_func4_idu1),
+        .dec_csrf3(dec_csrf3_idu1),
+        .dec_csrw_en(dec_csrw_en_idu1),
+        .dec_csrw_armed(dec_csrw_armed_idu1),
+        .dec_csrw_wr(dec_csrw_wr_idu1),
+        .dec_csra(dec_csra_idu1),
+        .dec_jval(dec_jval_idu1),
+        .dec_brf(dec_brf_idu1),
+        .dec_jalf(dec_jalf_idu1),
+        .dec_jalfr(dec_jalfr_idu1),
+        .dec_exc_illegal(dec_exc_illegal_idu1),
+        .dec_exc_jmis(dec_exc_jmis_idu1),
+        .dec_exc_ecall(dec_exc_ecall_idu1),
+        .dec_exc_ebreak(dec_exc_ebreak_idu1),
+        .dec_exc_irq_ret(dec_exc_irq_ret_idu1),
+        .dec_r1_imm(dec_r1_imm_idu1),
+        .dec_r2_imm(dec_r2_imm_idu1),
+        .dec_r1_immv(dec_r1_immv_idu1),
+        .dec_r2_immv(dec_r2_immv_idu1),
 //操作数底值 = regfile 的寄存读（与入站同拍）；非寄存器操作数在站内入站当拍覆盖
         .r1_data(r1_data_regfile), .r2_data(r2_data_regfile),
 //rob 的扫描口：槽号/命中/【生产者世代】（站项入站时把世代一起冻下来做唤醒校验）
@@ -345,13 +405,16 @@ module cpu_top(
         .we_alu(we_alu),   .idx_alu(idx_alu), .gen_alu(gen_alu), .data_alu(result_alu),
         .we_mul(we_mdu), .idx_mul(idx_mdu), .gen_mul(gen_mdu), .data_mul(data_final_mdu),
         .we_ld(loaded_lsu),  .idx_ld(idx_lsu),   .gen_ld(gen_lsu),   .data_ld(data_final_lsu),
+//提交口：读口旁路的最后一档（刚落进写口、阵列还没写那一笔）
+        .we_a(rwe0_rob), .rd_a(rrd0_rob), .data_a(rdt0_rob),
+        .we_b(rwe1_rob), .rd_b(rrd1_rob), .data_b(rdt1_rob),
         .flush_con_rob(flush_con_rob_cont),
         .rob_flush_part(flush_part_rob),
         .flush_incl(flush_incl_cont),
         .flush_idx(flush_idx_cont),
         .trap_fire(flush_rob_trap_rob),
         .head_ptr(head_rob),
-        .flush_bju_pre(flush_bju_pre_bju),
+        .bju_in_flight(bju_in_flight_idu2),
         .lsu_full_in(~car_free_lsu),
         .mul_ready_in(mul_ready_mdu), .div_ready_in(div_ready_mdu),
         .alloc_rob_in(alloc_en_idu1),
@@ -395,7 +458,7 @@ module cpu_top(
         .occupancy()
     );
 //分支/跳转判定单元：判定源与 alu 的输入同源（前送后的操作数 / func4_idu2），
-//比较与加法在本拍做，结果、落点在下一拍生效；flush_bju_pre_bju 是同一判定的组合版本、早一拍
+//比较与加法在本拍做，结果、落点在下一拍生效；早一拍的那道遮挡改由 idu2 的 bju_in_flight 给
     bju u_bju (
         .clk(clk),
         .rst(rst),
@@ -439,14 +502,13 @@ module cpu_top(
         .exc_ebreak_i(exc_ebreak_bju),
         .exc_illegal_i(exc_illegal_bju),
         .exc_irq_ret_i(exc_irq_ret_bju),
-        .exc_pc_i(exc_pc_i_bju),
-        .flush_bju_pre(flush_bju_pre_bju)
+        .exc_pc_i(exc_pc_i_bju)
     );
     lsu u_lsu (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus_cont),
-        .flush_bju_pre(flush_bju_pre_bju),
+        .bju_in_flight(bju_in_flight_idu2),
         .payload_go(payload_go_idu2),
 //★ 三个执行单元的输入级数对齐：lsu 也吃 decoder 载荷（原来吃 mem_buf 组合输出，早一级）
         .opcode(opc_idu2),
@@ -463,7 +525,6 @@ module cpu_top(
         .bus_data_tim(data_out_tim_in),
         .ready_dcache(ld_ready_dcache),
         .dcache_hold(hold_dcache),
-        .mem_inflight(inflight_lsu),
         .ready_tim(ready_tim_in),
         .ready_ext(bus_loaded_in),
         .bus_addr_out(bus_addr_out_lsu),
@@ -601,11 +662,6 @@ module cpu_top(
 //发出口：不写 rd 的项靠这一拍置"可退"（站式之后"执行早于退役"不再隐含）
         .issue_en(payload_go_idu2), .issue_idx(issue_idx_idu2), .issue_gen(issue_gen_idu2),
 //前送值读口①（正常读，索引 = 本模块扫描出的槽）与②（停顿重读，索引 = regfile 的锁存槽）
-        .fwd_data1(fwd_data1_rob), .fwd_data2(fwd_data2_rob),
-        .fwd_done1(fwd_done1_rob), .fwd_done2(fwd_done2_rob),
-        .st_slot1(st_slot1_regfile),  .st_slot2(st_slot2_regfile),
-        .st_data1(st_data1_rob), .st_data2(st_data2_rob),
-        .st_done1(st_done1_rob), .st_done2(st_done2_rob),
 //提交口：驱动寄存器堆的两条写口（口 A = head、口 B = head+1）
         .commit_we0(rwe0_rob), .commit_rd0(rrd0_rob), .commit_data0(rdt0_rob),
         .commit_we1(rwe1_rob), .commit_rd1(rrd1_rob), .commit_data1(rdt1_rob),
@@ -642,33 +698,18 @@ module cpu_top(
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus_cont),
-//读口地址由 idu1 那一级给出（比载荷早一拍），读值寄存后随载荷往下走
+//读口地址由 iffu 的【出队格】给出（它下一拍就是 idu1 输出级那条），读值寄存后正好与那条同拍
+//★ 早一拍是为了让"入站那一拍"就能取值压站（到达→出站 1 拍）；id 侧要的相位与之天然对齐，
+//  因为 rob 的扫描/入队也是吃出队格的 rs（见 rob 的扫描口）。
         .stall_rs_full(stall_rs_full_idu2),
-        .r1(rs1_idu1),
-        .r2(rs2_idu1),
+        .r1(h0_r1_iffu),
+        .r2(h0_r2_iffu),
         .we_a(rwe0_rob),
         .rd_a(rrd0_rob),
         .data_a(rdt0_rob),
         .we_b(rwe1_rob),
         .rd_b(rrd1_rob),
         .data_b(rdt1_rob),
-//★ 读侧旁路也吃三个单元结果口（共 5 源）：结果离开单元口那一拍还没落进阵列，
-//  而消费者的操作数取自"读锁存沿" ⇒ 那一格只有这里补得住（原来由 forw 点① 承担）。
-//  选源用 rob 的槽扫描（与 payload 的 sel_slot 同源、取当拍组合版）：扫描口读的就是本模块的
-//  读口地址 rs1_idu1/rs2_idu1，同一条指令（扫描早一拍），所以当拍就能用。
-        .we_alu(we_alu), .data_alu(result_alu),
-        .we_mul(loaded_mdu), .data_mul(data_final_mdu),
-        .we_ld(loaded_lsu), .data_ld(data_final_lsu),
-        .idx_alu(idx_alu), .idx_mul(idx_mdu), .idx_ld(idx_lsu),
-//载荷操作数的就绪（rob 现算）：与 stall_w 一起决定读口是"正常读"还是"按锁存槽重读"
-        .rdy1_in(rdy1_rob), .rdy2_in(rdy2_rob),
-        .fwd_data1(fwd_data1_rob), .fwd_data2(fwd_data2_rob),
-        .fwd_done1(fwd_done1_rob), .fwd_done2(fwd_done2_rob),
-        .st_slot1(st_slot1_regfile), .st_slot2(st_slot2_regfile),
-        .st_data1(st_data1_rob), .st_data2(st_data2_rob),
-        .st_done1(st_done1_rob), .st_done2(st_done2_rob),
-        .fwd_slot1(fwd_slot1_rob), .fwd_slot2(fwd_slot2_rob),
-        .fwd_hit1(fwd_hit1_rob),   .fwd_hit2(fwd_hit2_rob),
         .r1_data(r1_data_regfile),
         .r2_data(r2_data_regfile)
     );
@@ -733,7 +774,7 @@ module cpu_top(
         .exc_irq_ret_ok(exc_irq_ret_ok_cont),
         .bju_tgt_in(jp_target_bju),
         .bju_older_in(older_bju),
-//★ 不再有 flush_bju_pre_bju：ecall/ebreak/illegal/mret 改吃 bju 的【判定输入级】输出（同拍配对）
+//★ cont 不吃前置冲刷：ecall/ebreak/illegal/mret 改吃 bju 的【判定输入级】输出（同拍配对）
         .exc_ecall_i(exc_ecall_bju),
         .exc_ebreak_i(exc_ebreak_bju),
         .exc_illegal_i(exc_illegal_bju),
@@ -771,7 +812,7 @@ module cpu_top(
         .stall_bus_hold(bus_hold_in),
         .stall_rob_full(stall_rob_full_rob),
         .stall_pc_redir(stall_pc_redir_pc),
-        .lsu_inflight(inflight_lsu),
+        .rob_head_ptr(head_rob),
         .csr_wr_en(csr_wr_en_idu2),
         .csr_wr_act(csr_wr_act_idu2),
         .exti(exti),

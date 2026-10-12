@@ -27,12 +27,12 @@
 module lsu(
     input clk, rst,
     input [7:0] flag_bus,
-//前置冲刷（早一拍），由 bju 的组合判定直接给出（源名 flush_bju_pre）：
+//前置冲刷（早一拍），由 idu2 的 bju 在途位给出（源名 bju_in_flight）：
 //判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令在 c2 上会停留两拍
 //（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
 //动 FIFO 指针、拉总线（store 也在这条路上），等寄存器清已经收不回来，故入口要多挡一拍。
-//不进 flag_bus：绕 cont 一圈会把这条晚到的组合信号挂上全片广播网（实测多花 0.45ns）。
-    input flush_bju_pre,
+//不进 flag_bus：绕 cont 一圈会把这根信号挂上全片广播网（实测多花 0.45ns）。
+    input bju_in_flight,
 //入口门（每条指令只收一次）：decoder 载荷【这一拍就要推进】才允许收。
 //★ 必须用"本拍推进"而不是"上一拍推进过"：车厢满（stall_lsu_full）时前端会被冻住、
 //  payload_go 当拍就是 0，用上一拍那种"事后脉冲"会让这一条在新车厢里被静默丢掉
@@ -101,12 +101,12 @@ module lsu(
 //            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷优先于停顿；exec 即本模块的停开机使能。
-//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 flush_bju_pre，那是 bju 判定的组合版、早一拍）：
+//本模块的冲刷窗口比别的模块【宽一拍】（多 OR 一个 bju_in_flight，那是 bju 出站的下一拍）：
 //入队门控与总线选通都挂在这同一个 flush_w 上，多一项即可覆盖两拍，模块内部逻辑一行不用动。
     reg exec, flush_w, flush_con_exc;
     always @(*) begin
         flush_con_exc = flag_bus[7];
-        flush_w = flush_con_exc | flag_bus[6] | flag_bus[5] | flush_bju_pre;
+        flush_w = flush_con_exc | flag_bus[6] | flag_bus[5] | bju_in_flight;
         exec    = flag_bus[4];
     end
 

@@ -35,7 +35,8 @@ module csr(
 //  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
     input exc_irq_ret_ok,
     input [7:0] flag_bus,
-    input mem_inflight,
+//ROB 队头指针：minstret 的真口径 —— 它这一拍推进了几格就是退休了几条（一拍最多 2 条）
+    input [2:0] head_ptr_in,
     input [11:0] csr_addr,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
@@ -58,14 +59,11 @@ module csr(
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_reg, mcycle_reg, minstret_reg, mscratch_reg, mtval_reg;
     reg [31:0] iret_addr1;
 
-//输入合流（按"上层不运算"下放至此）：停顿、中断闸门、指令退役
-    reg stall, exc_irq_gate, retire, flush_w;
+//输入合流（按"上层不运算"下放至此）：冲刷闸门（指令写用）、中断闸门
+    reg exc_irq_gate, flush_w;
     always @(*) begin
-        stall    = flag_bus[3] | flag_bus[2] | flag_bus[0];
         flush_w  = flush_con_exc | flag_bus[6] | flag_bus[5];
         exc_irq_gate = (ird_tmr != 2'd0);
-//指令退役：取旧 stage==EXE 的口径 = 本拍既未冲刷也未停顿，供 minstret 计数用
-        retire   = !(flush_w | stall | mem_inflight);
     end
 
 //即将锁存的写入值（与"意图写入值" csr_data_in 区分开）：
@@ -200,15 +198,23 @@ module csr(
     end
 
 //指令退役逻辑，主要用于调试和性能测试
+//★ minstret 数的必须是【真退休条数】：原来拿"本拍既未冲刷也未停顿"当退休、每拍最多 +1 ⇒
+//  它数的是"没停顿的拍数"，与条数无关（实测 CoreMark：653614 拍读出 472257，看着像 IPC 0.722，
+//  其实是非停顿拍占比；真退休只有 330916 条 ⇒ IPC 0.455）。ROB 一拍最多退 2 条，
+//  唯一的真口径是【队头指针这一拍推进了几格】。
+    reg [2:0] head_q;
+    reg [1:0] ret_cnt;
+    always @(*) ret_cnt = head_ptr_in - head_q;
     always @(posedge clk) begin
         if (rst) begin
             mcycle_reg <= 32'd0;
             minstret_reg <= 32'd0;
+            head_q <= 3'd0;
         end
         else begin
             mcycle_reg <= mcycle_reg + 32'd1;
-            if (retire)
-                minstret_reg <= minstret_reg + 32'd1;
+            minstret_reg <= minstret_reg + {30'd0, ret_cnt};
+            head_q <= head_ptr_in;
         end
     end
 

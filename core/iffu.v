@@ -117,6 +117,22 @@ module iffu(
             inst_eff = inst_valid ? inst_in : 32'd0;
     end
 
+    reg [31:0] inst_lat;
+    reg [31:0] pc_lat;
+    always @(posedge clk) begin
+        if (rst_q | flush_w) begin
+            inst_lat <= 32'd0;
+            pc_lat   <= 32'd0;
+        end
+        else if (f_req) begin
+            inst_lat <= inst_eff;
+            pc_lat   <= push_addr;
+        end
+    end
+
+    reg [31:0] inst_cur;
+    always @(*) inst_cur = (f_req | (push_addr != pc_lat)) ? inst_eff : inst_lat;
+
 //取指侧分支/跳转预译码（原 idu1 末尾那块）：
 //jal / br_en / offset_* 不受 stage 门控（消费者里有取指地址那条环），只有 jalr 保留门控。
     always @(*) begin
@@ -126,9 +142,9 @@ module iffu(
         fch_jal = 1'b0;
         fch_jalr = 1'b0;
         if (!rst_q) begin
-            case (inst_eff[6:0])
+            case (inst_cur[6:0])
                 OPCODE_JAL: begin
-                    fch_off_jal = $signed(immJ(inst_eff));
+                    fch_off_jal = $signed(immJ(inst_cur));
                     fch_jal = 1'b1;
                 end
                 OPCODE_JALR: begin
@@ -136,7 +152,7 @@ module iffu(
                         fch_jalr = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    fch_off_beq = $signed(immB(inst_eff));
+                    fch_off_beq = $signed(immB(inst_cur));
                     fch_br_en = 1'b1;
                 end
             endcase

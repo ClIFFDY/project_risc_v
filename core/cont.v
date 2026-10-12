@@ -53,7 +53,8 @@ module cont(
 //本模块【不做任何或运算】—— 或/非一律下放到消费者模块内（见各家 stall_w/flush_w 的译码）。
     input stall_icache_miss, stall_bus_hold,
     input stall_rob_full, stall_pc_redir,
-    input lsu_inflight,
+//ROB 队头指针（透传给 csr，作 minstret 的真退休口径）
+    input [2:0]  rob_head_ptr,
 //异常交付口（ROB 的 trap_fire + 载荷）：透传给 csr，由它在【队头那一拍】锁 mepc/mcause/mtval
     input rob_trap,
     input [3:0]  rob_trap_cause,
@@ -267,7 +268,7 @@ module cont(
 
 //csr异常/中断寄存器
     csr u_csr (
-        .mem_inflight(lsu_inflight),
+        .head_ptr_in(rob_head_ptr),
         .clk(clk),
         .rst(rst_q),
         .csr_wr_en(csr_wr_en),

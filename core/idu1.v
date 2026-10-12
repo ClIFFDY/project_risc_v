@@ -5,10 +5,11 @@
 //   取指队列与载荷之间的寄存器级（= 原 mid_decoder 的位置），并入 rd / func10 / imm 的译码。
 //
 //   输入是 iffu 的出队格（F 级，原样指令字 + 随行号），输出是本级的寄存器（S 级）：
-//   载荷字段由 S 级的指令字【组合】解出（不再多寄存一份译码结果）。
+//   全译码（入站分类 / 各单元字段 / 异常标记 / 非寄存器操作数覆盖）由 S 级的指令字
+//   【组合】解出、并随载荷同沿寄存进 S 级（原来这一份解在 idu2 的入站拍上）。
 //
 //   ★ 两套译码源不同、用途不同：
-//     - 载荷面（rd/func10/imm）解在 S 级的 inst 上，给 post_decoder；
+//     - 载荷面（rd/func10/imm）与全译码解在 S 级的 inst 上，给 idu2 的入站；
 //     - rob 分配口只判"这一类写不写 rd"，解在 **fifo 队头**（nh0）上 —— 入队发生在
 //       "队头进 出队格"那一拍，rob 要的是那一条的 rd，不能裸取 inst[11:7]
 //       （BRANCH/STORE 会变出幽灵写者）。
@@ -39,12 +40,8 @@ module idu1(
     output reg   advance,
 //给 post_decoder 的载荷（原 mid_decoder 的输出集合 + 随行号）
     output reg [31:0] inst_out,
-    output reg [4:0]  rd_out,
-    output reg [9:0]  func10_out,
-    output reg [31:0] imm_alu_out,
     output reg [31:0] aux_addr_out,
     output reg        br_pred_taken_out,
-    output reg [31:0] jalr_pred_addr_out,
     output reg [4:0]  r1_out, r2_out,
     output reg [2:0]  idx_out,
     output reg        gen_out,
@@ -56,7 +53,33 @@ module idu1(
 //它们即使不写 rd（rd=x0），单元照样会报一笔完成口 ⇒ 不能当"没人会回报"提前置可退；
 //否则它立刻退休、槽被回收，而它的完成口（除法 30+ 拍）晚回来时会撞上槽的新住户。
     output reg        alloc_pend,
-    output reg [4:0]  alloc_rd
+    output reg [4:0]  alloc_rd,
+//全译码（随 S 级寄存器送 idu2 的入站：分类 / 各单元字段 / 异常标记 / 非寄存器操作数覆盖）
+    output reg [1:0]  dec_class,
+    output reg        dec_we,
+    output reg [4:0]  dec_rd,
+    output reg        dec_is_st,
+    output reg [2:0]  dec_mulop,
+    output reg [2:0]  dec_lsf3,
+    output reg [3:0]  dec_func4,
+    output reg [2:0]  dec_csrf3,
+    output reg        dec_csrw_en,
+    output reg        dec_csrw_armed,
+    output reg        dec_csrw_wr,
+    output reg [11:0] dec_csra,
+    output reg [31:0] dec_jval,
+    output reg        dec_brf,
+    output reg        dec_jalf,
+    output reg        dec_jalfr,
+    output reg        dec_exc_illegal,
+    output reg        dec_exc_jmis,
+    output reg        dec_exc_ecall,
+    output reg        dec_exc_ebreak,
+    output reg        dec_exc_irq_ret,
+    output reg        dec_r1_imm,
+    output reg        dec_r2_imm,
+    output reg [31:0] dec_r1_immv,
+    output reg [31:0] dec_r2_immv
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核，工具只能在布局阶段自己复制。每个模块各自打一拍，
@@ -72,9 +95,12 @@ module idu1(
     localparam OPCODE_BRANCH = 7'b1100011;
     localparam OPCODE_LOAD   = 7'b0000011;
     localparam OPCODE_STORE  = 7'b0100011;
+    localparam OPCODE_MISC_MEM = 7'b0001111;
     localparam OPCODE_AUIPC  = 7'b0010111;
     localparam OPCODE_LUI    = 7'b0110111;
     localparam OPCODE_SYSTEM = 7'b1110011;
+
+    localparam CLS_ALU = 2'd0, CLS_MUL = 2'd1, CLS_LSU = 2'd2, CLS_BJU = 2'd3;
 
 //提取不同类型指令立即数的函数块
     function [31:0] immB;
@@ -95,6 +121,11 @@ module idu1(
     function [31:0] immU;
         input [31:0] inst;
         immU = {inst[31:12], 12'd0};
+    endfunction
+
+    function [31:0] immJ;
+        input [31:0] inst;
+        immJ = {{12{inst[31]}}, inst[19:12], inst[20], inst[30:21], 1'b0};
     endfunction
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
@@ -170,6 +201,248 @@ module idu1(
         endcase
     end
 
+    reg csr_is_access_dec, csr_exists_dec, csr_ro_dec, csr_wr_dec;
+    always @(*) begin
+        csr_is_access_dec = (inst_in[14:12] != 3'b000) && (inst_in[14:12] != 3'b100);
+//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
+//  这一根同时决定"真写使能"和"对只读 CSR 的写要不要报非法"，两者是同一个判据。
+        csr_wr_dec        = (inst_in[14:12] == 3'b001) | (inst_in[14:12] == 3'b101) |
+                            (inst_in[19:15] != 5'd0);
+        csr_ro_dec        = (inst_in[31:30] == 2'b11);
+        csr_exists_dec    = 1'b0;
+        case (inst_in[31:20])
+            12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
+            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14: csr_exists_dec = 1'b1;
+            default: csr_exists_dec = 1'b0;
+        endcase
+    end
+
+    reg exc_illegal_dec, exc_jmis_dec;
+    always @(*) begin
+        exc_illegal_dec = 1'b0;
+        exc_jmis_dec    = (inst_in[6:0] == OPCODE_JAL) & inst_in[21];
+        if (inst_in != 32'd0) begin
+            case (inst_in[6:0])
+                OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec = 1'b0;
+                OPCODE_LOAD: begin
+                    if (inst_in[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b110) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b111) exc_illegal_dec = 1'b1;
+                end
+                OPCODE_STORE: begin
+                    if (inst_in[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b100) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b101) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b110) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b111) exc_illegal_dec = 1'b1;
+                end
+                OPCODE_JALR: begin
+                    if (inst_in[14:12] != 3'b000) exc_illegal_dec = 1'b1;
+                end
+                OPCODE_BRANCH: begin
+                    if (inst_in[14:12] == 3'b010) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                end
+                OPCODE_OP_IMM: begin
+                    if (inst_in[14:12] == 3'b001) begin
+                        if (inst_in[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                    end
+                    if (inst_in[14:12] == 3'b101) begin
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_dec = 1'b1;
+                    end
+                end
+                OPCODE_OP: begin
+                    if (inst_in[31:25] == 7'b0000001) exc_illegal_dec = 1'b0;
+                    else if (inst_in[14:12] == 3'b000) begin
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_dec = 1'b1;
+                    end
+                    else if (inst_in[14:12] == 3'b001) begin
+                        if (inst_in[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                    end
+                    else if (inst_in[14:12] == 3'b101) begin
+                        if ((inst_in[31:25] != 7'd0) && (inst_in[31:25] != 7'b0100000))
+                            exc_illegal_dec = 1'b1;
+                    end
+                    else begin
+                        if (inst_in[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                    end
+                end
+                OPCODE_MISC_MEM: begin
+                    if (inst_in[14:12] == 3'b010) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                end
+                OPCODE_SYSTEM: begin
+                    if (inst_in[14:12] == 3'b100) exc_illegal_dec = 1'b1;
+                    if (inst_in[14:12] == 3'b000) begin
+                        case (inst_in[31:20])
+                            12'h000, 12'h001, 12'h302, 12'h105: ;   // ecall / ebreak / mret / wfi（wfi 当 NOP）
+                            default: exc_illegal_dec = 1'b1;
+                        endcase
+                    end
+                    if (csr_is_access_dec) begin
+                        if (!csr_exists_dec) exc_illegal_dec = 1'b1;
+                        if (csr_ro_dec) begin
+                            if (csr_wr_dec) exc_illegal_dec = 1'b1;
+                        end
+                    end
+                end
+                default: exc_illegal_dec = 1'b1;
+            endcase
+        end
+    end
+
+//入站分类 + 各类字段装配
+    reg [1:0]  class_dec;
+    reg        we_dec, csrw_en_dec, csrw_armed_dec, csrw_wr_dec;
+    reg [4:0]  rd_pick_dec;
+    reg        is_st_dec;
+    reg [2:0]  mulop_dec, lsf3_dec, csrf3_dec;
+    reg [3:0]  func4_dec;
+    reg [11:0] csra_dec;
+    reg [31:0] jval_dec;
+    reg        brf_dec, jalf_dec, jalfr_dec;
+
+    always @(*) begin
+        class_dec      = CLS_ALU;
+        we_dec         = 1'b0;
+        csrw_en_dec    = 1'b0;
+        csrw_armed_dec = 1'b0;
+        csrw_wr_dec    = 1'b0;
+        rd_pick_dec    = 5'd0;
+        is_st_dec      = 1'b0;
+        mulop_dec      = 3'd0;
+        lsf3_dec       = 3'd0;
+        csrf3_dec      = 3'd0;
+        func4_dec      = 4'd0;
+        csra_dec       = 12'd0;
+        jval_dec       = 32'd0;
+        brf_dec        = 1'b0;
+        jalf_dec       = 1'b0;
+        jalfr_dec      = 1'b0;
+
+        case (inst_in[6:0])
+            OPCODE_OP: begin
+                if (inst_in[31:25] == 7'b0000001) begin
+                    class_dec = CLS_MUL;
+                    mulop_dec = inst_in[14:12];
+                end
+                else begin
+                    func4_dec   = {func10_dec[8], func10_dec[2:0]};
+                    rd_pick_dec = rd_dec;
+                    we_dec      = 1'b1;
+                end
+            end
+            OPCODE_OP_IMM: begin
+                func4_dec   = {func10_dec[8], func10_dec[2:0]};
+                rd_pick_dec = rd_dec;
+                we_dec      = 1'b1;
+            end
+            OPCODE_JAL: begin
+                class_dec   = CLS_BJU;
+                jalf_dec    = 1'b1;
+                rd_pick_dec = rd_dec;
+                we_dec      = 1'b1;
+            end
+            OPCODE_JALR: begin
+                class_dec   = CLS_BJU;
+                jalfr_dec   = 1'b1;
+                rd_pick_dec = rd_dec;
+                we_dec      = 1'b1;
+                jval_dec    = jalr_pred_in;
+            end
+            OPCODE_BRANCH: begin
+                class_dec   = CLS_BJU;
+                brf_dec     = 1'b1;
+                func4_dec   = {1'b0, inst_in[14:12]};
+                jval_dec    = imm_dec - 32'd4;
+            end
+            OPCODE_LUI: begin
+                rd_pick_dec = rd_dec;
+                we_dec      = 1'b1;
+            end
+            OPCODE_AUIPC: begin
+                rd_pick_dec = rd_dec;
+                we_dec      = 1'b1;
+            end
+            OPCODE_LOAD: begin
+                class_dec   = CLS_LSU;
+                lsf3_dec    = inst_in[14:12];
+                rd_pick_dec = rd_dec;
+                jval_dec    = imm_dec;
+            end
+            OPCODE_STORE: begin
+                class_dec   = CLS_LSU;
+                is_st_dec   = 1'b1;
+                lsf3_dec    = inst_in[14:12];
+                jval_dec    = imm_dec;
+            end
+            OPCODE_SYSTEM: begin
+                class_dec   = CLS_BJU;
+                csrf3_dec   = inst_in[14:12];
+                rd_pick_dec = rd_dec;
+                case (inst_in[14:12])
+                    3'b001, 3'b010, 3'b011, 3'b101, 3'b110, 3'b111: begin
+                        we_dec         = 1'b1;
+                        csrw_en_dec    = 1'b1;
+                        csrw_armed_dec = 1'b1;
+                        csrw_wr_dec    = csr_wr_dec;
+                    end
+                    default: begin
+                        we_dec      = 1'b0;
+                        csrw_en_dec = 1'b0;
+                    end
+                endcase
+//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
+//  `csrr rd, csr` 若被清成地址 0 就会读回 0（实测：启动宏读 mtvec 读回 0 ⇒ 误判没写进去）。
+                csra_dec = (inst_in[14:12] != 3'b000) ? inst_in[31:20] : 12'd0;
+            end
+            default: ;
+        endcase
+        if (exc_illegal_dec | exc_jmis_dec) begin
+            we_dec         = 1'b0;
+            csrw_en_dec    = 1'b0;
+            csrw_armed_dec = 1'b0;
+            csrw_wr_dec    = 1'b0;
+        end
+    end
+
+//非寄存器操作数的覆盖（立即数在这里并进操作数）
+    reg r1_imm_dec, r2_imm_dec;
+    reg [31:0] r1_immv_dec, r2_immv_dec;
+    always @(*) begin
+        r1_imm_dec  = 1'b0;
+        r2_imm_dec  = 1'b0;
+        r1_immv_dec = 32'd0;
+        r2_immv_dec = 32'd0;
+        case (inst_in[6:0])
+            OPCODE_OP_IMM: begin r2_imm_dec = 1'b1; r2_immv_dec = imm_dec; end
+            OPCODE_JALR:   begin r2_imm_dec = 1'b1; r2_immv_dec = imm_dec; end
+            OPCODE_LUI:    begin r2_imm_dec = 1'b1; r2_immv_dec = imm_dec; end
+            OPCODE_AUIPC:  begin
+                r1_imm_dec  = 1'b1; r1_immv_dec = addr_in;
+                r2_imm_dec  = 1'b1; r2_immv_dec = imm_dec;
+            end
+            OPCODE_SYSTEM: begin
+                if ((inst_in[14:12] == 3'b101) | (inst_in[14:12] == 3'b110) | (inst_in[14:12] == 3'b111)) begin
+                    r1_imm_dec  = 1'b1;
+                    r1_immv_dec = {27'd0, inst_in[19:15]};
+                end
+            end
+            default: ;
+        endcase
+    end
+
+//异常标记（ecall/ebreak/mret）
+    reg exc_ecall_dec, exc_ebreak_dec, exc_irq_ret_dec;
+    always @(*) begin
+        exc_ecall_dec   = (inst_in[6:0] == OPCODE_SYSTEM) && (inst_in[31:20] == 12'h000);
+        exc_ebreak_dec  = (inst_in[6:0] == OPCODE_SYSTEM) && (inst_in[31:20] == 12'h001);
+        exc_irq_ret_dec = (inst_in[6:0] == OPCODE_SYSTEM) && (inst_in[14:12] == 3'b000)
+                        && (inst_in[31:20] == 12'h302);
+    end
+
 //rob 分配口：分配发生在"出队格 h0 换新"那一拍，吃的就是本级的译码输入（= h0 的 Q 端），
 //与 idu1 自己的译码同源 —— 不再另解一份队头。rd 直接复用主译码的 rd_dec（按 opcode 分类
 //填过，不裸取 inst[11:7]）。
@@ -189,58 +462,142 @@ module idu1(
     always @(posedge clk) begin
         if (rst_q) begin
             inst_out <= 32'd0;
-            rd_out <= 5'd0;
-            func10_out <= 10'd0;
-            imm_alu_out <= 32'd0;
             aux_addr_out <= 32'd0;
             br_pred_taken_out <= 1'b0;
-            jalr_pred_addr_out <= 32'd0;
             r1_out <= 5'd0;
             r2_out <= 5'd0;
             idx_out <= 3'd0;
             gen_out <= 1'b0;
+            dec_class <= 2'd0;
+            dec_we <= 1'b0;
+            dec_rd <= 5'd0;
+            dec_is_st <= 1'b0;
+            dec_mulop <= 3'd0;
+            dec_lsf3 <= 3'd0;
+            dec_func4 <= 4'd0;
+            dec_csrf3 <= 3'd0;
+            dec_csrw_en <= 1'b0;
+            dec_csrw_armed <= 1'b0;
+            dec_csrw_wr <= 1'b0;
+            dec_csra <= 12'd0;
+            dec_jval <= 32'd0;
+            dec_brf <= 1'b0;
+            dec_jalf <= 1'b0;
+            dec_jalfr <= 1'b0;
+            dec_exc_illegal <= 1'b0;
+            dec_exc_jmis <= 1'b0;
+            dec_exc_ecall <= 1'b0;
+            dec_exc_ebreak <= 1'b0;
+            dec_exc_irq_ret <= 1'b0;
+            dec_r1_imm <= 1'b0;
+            dec_r2_imm <= 1'b0;
+            dec_r1_immv <= 32'd0;
+            dec_r2_immv <= 32'd0;
         end
         else if (exec) begin
             if (advance) begin
                 inst_out <= inst_in;
-                rd_out <= rd_dec;
-                func10_out <= func10_dec;
-                imm_alu_out <= imm_dec;
                 aux_addr_out <= addr_in;
                 br_pred_taken_out <= br_pred_in;
-                jalr_pred_addr_out <= jalr_pred_in;
                 r1_out <= r1_in;
                 r2_out <= r2_in;
                 idx_out <= idx_in;
                 gen_out <= gen_in;
+                dec_class <= class_dec;
+                dec_we <= we_dec;
+                dec_rd <= rd_pick_dec;
+                dec_is_st <= is_st_dec;
+                dec_mulop <= mulop_dec;
+                dec_lsf3 <= lsf3_dec;
+                dec_func4 <= func4_dec;
+                dec_csrf3 <= csrf3_dec;
+                dec_csrw_en <= csrw_en_dec;
+                dec_csrw_armed <= csrw_armed_dec;
+                dec_csrw_wr <= csrw_wr_dec;
+                dec_csra <= csra_dec;
+                dec_jval <= jval_dec;
+                dec_brf <= brf_dec;
+                dec_jalf <= jalf_dec;
+                dec_jalfr <= jalfr_dec;
+                dec_exc_illegal <= exc_illegal_dec;
+                dec_exc_jmis <= exc_jmis_dec;
+                dec_exc_ecall <= exc_ecall_dec;
+                dec_exc_ebreak <= exc_ebreak_dec;
+                dec_exc_irq_ret <= exc_irq_ret_dec;
+                dec_r1_imm <= r1_imm_dec;
+                dec_r2_imm <= r2_imm_dec;
+                dec_r1_immv <= r1_immv_dec;
+                dec_r2_immv <= r2_immv_dec;
             end
 //★ 保持判据必须与 advance 逐项同门：advance 比 stall 多出 rdy 那一项，不把它补进这里，
 //  暂停那一拍就掉进下面的"清"分支 —— S 级被清零，那条指令永远进不了载荷。
             else if ((stall | ~rdy1_in | ~rdy2_in) & ~flush_w) begin
                 inst_out <= inst_out;
-                rd_out <= rd_out;
-                func10_out <= func10_out;
-                imm_alu_out <= imm_alu_out;
                 aux_addr_out <= aux_addr_out;
                 br_pred_taken_out <= br_pred_taken_out;
-                jalr_pred_addr_out <= jalr_pred_addr_out;
                 r1_out <= r1_out;
                 r2_out <= r2_out;
                 idx_out <= idx_out;
                 gen_out <= gen_out;
+                dec_class <= dec_class;
+                dec_we <= dec_we;
+                dec_rd <= dec_rd;
+                dec_is_st <= dec_is_st;
+                dec_mulop <= dec_mulop;
+                dec_lsf3 <= dec_lsf3;
+                dec_func4 <= dec_func4;
+                dec_csrf3 <= dec_csrf3;
+                dec_csrw_en <= dec_csrw_en;
+                dec_csrw_armed <= dec_csrw_armed;
+                dec_csrw_wr <= dec_csrw_wr;
+                dec_csra <= dec_csra;
+                dec_jval <= dec_jval;
+                dec_brf <= dec_brf;
+                dec_jalf <= dec_jalf;
+                dec_jalfr <= dec_jalfr;
+                dec_exc_illegal <= dec_exc_illegal;
+                dec_exc_jmis <= dec_exc_jmis;
+                dec_exc_ecall <= dec_exc_ecall;
+                dec_exc_ebreak <= dec_exc_ebreak;
+                dec_exc_irq_ret <= dec_exc_irq_ret;
+                dec_r1_imm <= dec_r1_imm;
+                dec_r2_imm <= dec_r2_imm;
+                dec_r1_immv <= dec_r1_immv;
+                dec_r2_immv <= dec_r2_immv;
             end
             else begin
                 inst_out <= 32'd0;
-                rd_out <= 5'd0;
-                func10_out <= 10'd0;
-                imm_alu_out <= 32'd0;
                 aux_addr_out <= 32'd0;
                 br_pred_taken_out <= 1'b0;
-                jalr_pred_addr_out <= 32'd0;
                 r1_out <= 5'd0;
                 r2_out <= 5'd0;
                 idx_out <= 3'd0;
                 gen_out <= 1'b0;
+                dec_class <= 2'd0;
+                dec_we <= 1'b0;
+                dec_rd <= 5'd0;
+                dec_is_st <= 1'b0;
+                dec_mulop <= 3'd0;
+                dec_lsf3 <= 3'd0;
+                dec_func4 <= 4'd0;
+                dec_csrf3 <= 3'd0;
+                dec_csrw_en <= 1'b0;
+                dec_csrw_armed <= 1'b0;
+                dec_csrw_wr <= 1'b0;
+                dec_csra <= 12'd0;
+                dec_jval <= 32'd0;
+                dec_brf <= 1'b0;
+                dec_jalf <= 1'b0;
+                dec_jalfr <= 1'b0;
+                dec_exc_illegal <= 1'b0;
+                dec_exc_jmis <= 1'b0;
+                dec_exc_ecall <= 1'b0;
+                dec_exc_ebreak <= 1'b0;
+                dec_exc_irq_ret <= 1'b0;
+                dec_r1_imm <= 1'b0;
+                dec_r2_imm <= 1'b0;
+                dec_r1_immv <= 32'd0;
+                dec_r2_immv <= 32'd0;
             end
         end
     end
