@@ -364,12 +364,16 @@ module idu2(
     reg bju_pending;
     reg       sel_go;
     reg       res_ok_q;
+    reg       sel_go_irqret;
+    reg       issue_v_irqret;
     reg       bju_issuing_now;
     always @(*) begin
         sel_go          = sel_vld_q & exec & ~flush_w;
         res_ok_q        = 1'b1;
         if (ent_class[sel_slot_q] == CLS_LSU) res_ok_q = ~lsu_full_in;
         if (ent_class[sel_slot_q] == CLS_MUL) res_ok_q = ent_is_div[sel_slot_q] ? div_ready_in : mul_ready_in;
+        sel_go_irqret   = sel_vld_q & exec & ~flush_con_exc & ~flush_con_jump;
+        issue_v_irqret  = sel_go_irqret & res_ok_q;
         bju_issuing_now = sel_go & (ent_class[sel_slot_q] == CLS_BJU);
         bju_pending     = bju_shift[0] | bju_shift[1] | bju_issuing_now;
     end
@@ -503,7 +507,7 @@ module idu2(
         exc_illegal_out   = ent_exc_illegal[sel_slot_q];
         exc_ecall         = ent_exc_ecall[sel_slot_q];
         exc_ebreak        = ent_exc_ebreak[sel_slot_q];
-        exc_irq_ret       = ent_exc_irq_ret[sel_slot_q];
+        exc_irq_ret       = ent_exc_irq_ret[sel_slot_q] & issue_v_irqret;
         exc_jal_misalign_out = ent_exc_jal_misalign[sel_slot_q];
         rs1_out       = 5'd0;
         rs2_out       = 5'd0;
@@ -534,7 +538,7 @@ module idu2(
             alu_func4 = 4'd0; csr_func3 = 3'd0; aux_addr_out = 32'd0; off_mem_out = 32'd0;
             br_flag = 1'b0; jal_flag = 1'b0; jalr_flag = 1'b0; br_pred_taken_out = 1'b0;
             exc_illegal_out = 1'b0; exc_ecall = 1'b0; exc_ebreak = 1'b0;
-            exc_irq_ret = 1'b0; exc_jal_misalign_out = 1'b0;
+            exc_jal_misalign_out = 1'b0;
             rs1_out = 5'd0; rs2_out = 5'd0; opc_out = 7'd0;
             fn10_out = 10'd0; fn10_ls_out = 10'd0;
             beq_off_q2 = 32'd0; jalr_pred_addr_out = 32'd0; jal_target_out = 32'd0;
@@ -552,7 +556,6 @@ module idu2(
 //==============================================================================
     always @(posedge clk) begin
         if (rst_q) begin
-            occupancy      <= 4'd0;
             pending_cnt  <= 3'd0;
             bju_shift   <= 2'd0;
             for (i = 0; i < DEPTH; i = i + 1) begin

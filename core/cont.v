@@ -190,9 +190,10 @@ module cont(
 //★ mret 与其它异常源走同一套：它现在也过 bju 的判定输入级 ⇒ 本拍它自己的标志（exc_irq_ret_i）
 //  与"更老那条的寄存版冲刷"同拍。[11]（含 flush_bju_exc）与 [9]（br2/br3/jalr_fail）必来自更老的指令。
 //  ⇒ 资格 = 我这条是 mret、且没有被更老的冲刷压住。
-//  ★ 自冲刷项显式排掉：合法 mret 自己会拉 flush_con_irq（它靠这个冲掉影子），
-//    那一项不能反过来把它自己挡掉 —— 原式是用 ~exc_irq_ret 做豁免的。
-    always @(*) flush_w_other = flush_bju_exc | flush_con_jump | exc_irq | exc_irq_act
+//  ★ 中断受理那一路（exc_irq_act → flush_con_irq）【不在本式里】：它由本模块的 flush_con_irq
+//    经 flag_bus[6] 反喂回来，收进来就成零延时环（synth 8-295，工具靠 set_disable_timing 硬剪
+//    ⇒ 硅上行为与 RTL 仿真不一致）。mret 的自冲刷项因此天然不在此列，无需再显式豁免。
+    always @(*) flush_w_other = flush_bju_exc | flush_con_jump
                               | exc_ecall_i | exc_ebreak_i | exc_illegal_i | exc_ldst_misalign_in;
     always @(*) exc_irq_ret_ok = exc_irq_ret_i & ~flush_w_other;
     reg [31:0] exc_pc_c;
@@ -206,7 +207,7 @@ module cont(
         else
             exc_pc_in_d1 <= exc_pc_in;
     end
-    always @(*) flush_older = flag_bus[6] | flag_bus[5];
+    always @(*) flush_older = exc_irq_ret_ok | flush_con_jump;
 //更老的指令在本拍冲刷 ⇒ 这条是错路，它的操作数是垃圾，不能拿它报异常
 //★ 解码级那三条（ecall/ebreak/illegal）现在跟着 bju 的判定输入级走 ⇒ 本拍它们自己的标志
 //  与"更老那条的寄存版冲刷"同拍。寄存版 bju 冲刷有【两路】：[9]（br2/br3/jalr_fail）与

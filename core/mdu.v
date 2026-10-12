@@ -458,6 +458,7 @@ module mdu(
         else begin
             mul_loaded   = 1'b0;
             rd_mul       = 5'd0;
+            mul_idx      = 3'd0;
             mul_gen      = 1'b0;
             mul_data_out = 32'd0;
         end
