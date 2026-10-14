@@ -44,19 +44,23 @@ module icache(
     input fifo_full,
 
 //取指输出
-    output reg [31:0] inst_out,
+    output reg [31:0] inst_out, inst_next,
 //inst_valid = "inst_out 里这条是可信的取指结果"，与 inst_out 同拍。
 //两种情况置 0：①常态读没命中（hit_sel 指向不存在的 way，读回来是未初始化值 / 板上垃圾）；
 //②回填期间来过冲刷（这条回填已经作废，交付拍送出的字不是 pc 现在要的那条）。
 //给 idu1 当逐指令守卫：为 0 时它算不出 jal/br_en、也不会把这条锁进流水线。
 //必须是寄存器：终点是 inst_out 的下游，与取指同拍比较会把 tag 读→比较那条链引出去。
     output reg inst_valid,
+    output reg inst_valid_n,
 //busy = 本模块自己的停顿源（stall_icache_miss），也是给 idu1 的垃圾指令守卫。
 //它是寄存器，不是组合输出：由 stage / fill_end / bts_run 自己说，不再从 cache_hit 现组合出来。
     output reg busy,
 //deliv_v = "inst_out 里有一条已交付、还没进取指队列"：交付给队列的**事件**。
 //不能用 rd_en（组合、推进时每拍都为高），也不能用 inst_valid（带保持的电平）。
     output reg deliv_v,
+    output reg deliv_n,
+    output reg pair_fetch_ok,
+    output reg pair_ok,
 //队列把本条交付【收下】了（写进去、或空泡就地丢掉）：没被收下就把 deliv_v 挂住，不会丢
     input take_en,
 //回填请求（接核内 itcm）
@@ -75,28 +79,23 @@ module icache(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：**先把 flag_bus 各位还原成原名，再按名字做逻辑**
 //（模块内不直接用位号）；本模块的取指推进由 req_valid（只含前端那几条）与回填状态自己把关，
 //后端停顿不再进这一位 —— 它们由 iffu 吸收，队满时拿 fifo_full 停本级。
     reg flush_con_exc, flush_con_irq, flush_con_jump;
-    reg stall_rob_full, stall_pc_redir;
-    reg stall_rs_full;
-    reg stall_icache_miss, stall_bus_hold;
-    reg flush_w, req_valid;
+    reg stall_pc_redir, stall_icache_miss, exec;
+    reg flush_w, req_valid, rd_go;
     always @(*) begin
         flush_con_exc     = flag_bus[7];
         flush_con_irq     = flag_bus[6];
         flush_con_jump    = flag_bus[5];
-        stall_rob_full    = flag_bus[3];
+        exec              = flag_bus[4];
         stall_pc_redir    = flag_bus[2];
-        stall_rs_full     = flag_bus[2];   // ★原 stall_lsu_haz 位：现在装的是"保留站满"
         stall_icache_miss = flag_bus[1];
-        stall_bus_hold    = flag_bus[0];
         flush_w   = flush_con_exc | flush_con_irq | flush_con_jump;
         req_valid = ~(flush_w | stall_pc_redir | busy | fifo_full);
+        rd_go     = ~(flush_w | stall_pc_redir | fifo_full | (deliv_v & ~take_en) | jal_in | br1_in | (pre_jalr & btb_hit));
     end
 
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
@@ -106,16 +105,18 @@ module icache(
 //寄存器（按级分组）
 //第 0 级：本拍组合
     (* max_fanout = 32 *) reg [31:0] fetch_addr;
-    reg cache_hit;
     (* max_fanout = 32 *) reg [18:0] tag;
     (* max_fanout = 32 *) reg [6:0] idx;
     (* max_fanout = 32 *) reg [4:0] word;
     reg [2:0] hit_way;
     reg [1:0] hit_sel;
-    (* max_fanout = 32 *) reg [13:0] rd_addr;
+    (* max_fanout = 32 *) reg [13:0] rd_addr, rd_addr1;
     reg rd_en, fill_ok;
+    reg cache_hit;
+    reg rd_l1;
     reg wr_en;
     reg [13:0] wr_addr;
+    reg [13:0] portb_addr;
 //本次回填期间来过冲刷：起回填的那一拍（stage==0）清成当拍有没有冲刷，回填期间来一个就置起来。
 //回填期 pc 被 stall 按住，唯一能让它走的就是冲刷（flush_w / flush_pc_redir），
 //所以这一位就等价于"这次回填已经不是 pc 现在要的那条了"。
@@ -185,6 +186,7 @@ module icache(
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         hit_way[2] = valid2[idx] && (tag2[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1] || hit_way[2];
+        pair_ok   = cache_hit & (word != 5'd0) & (word != 5'd31);
         hit_sel = hit_way[0] ? 2'd0 : (hit_way[1] ? 2'd1 : 2'd2);
         mem_req = bts_run ? ~bts_end : (stage == 1'b1 && !fill_end);
         mem_addr = bts_run ? {bts_line, 7'd0} : (fill_addr + (fill_cnt << 2));
@@ -204,15 +206,33 @@ module icache(
         if (fill_end & fill_ok) begin
             rd_en   = 1'b1;
             rd_addr = {fill_way, fill_idx, miss_word};
+            rd_l1   = 1'b0;
         end
         else if (bts_run && (bts_line == BOOT_LINES) && bts_end) begin
             rd_en   = 1'b1;
             rd_addr = 14'd0;
+            rd_l1   = 1'b0;
         end
         else begin
             rd_en   = req_valid & (~deliv_v | take_en);
             rd_addr = {hit_sel, idx, word};
+            rd_l1   = rd_en & pair_ok;
         end
+    end
+
+//lane1 取指地址：与 lane0 同 way、同组，只 +1 个字（成对只在同一 icache 行内成立，word==31 时不成对）。
+    always @(*) begin
+        rd_addr1 = {hit_sel, idx, word + 5'd1};
+    end
+
+//口 B 地址二选一：回填/自举写，或 lane1 取指读。BRAM 一个口只有【一根地址总线】，读写是它的时分复用，
+//两个来源的地址必须先显式合成这一根，再进阵列；否则综合器数出三个地址会判 Infeasible ram_style，
+//把整个 48KB 阵列掉进 LUTRAM（且不中断流程）。写与 lane1 读不共拍（写 ⟹ stage==1/自举 ⟹ busy ⟹ 取指停）。
+    always @(*) begin
+        if (wr_en)
+            portb_addr = wr_addr;
+        else
+            portb_addr = rd_addr1;
     end
 
 //打一拍：它是给"此刻躺在 inst_out 里那条"用的。
@@ -234,9 +254,24 @@ module icache(
     end
 
     always @(posedge clk) begin
+        if (rst_q)
+            inst_valid_n <= 1'b0;
+        else if (rd_en)
+            inst_valid_n <= rd_l1 & ~flush_w;
+        else
+            inst_valid_n <= inst_valid_n;
+    end
+
+    always @(posedge clk) begin
         if (rst_q)                         deliv_v <= 1'b0;
         else if (flush_w | flush_pc_redir) deliv_v <= 1'b0;
         else                               deliv_v <= rd_en | (deliv_v & ~take_en);
+    end
+
+    always @(posedge clk) begin
+        if (rst_q)                         deliv_n <= 1'b0;
+        else if (flush_w | flush_pc_redir) deliv_n <= 1'b0;
+        else                               deliv_n <= rd_l1 | (deliv_n & ~take_en);
     end
 
     always @(posedge clk) begin
@@ -260,7 +295,16 @@ module icache(
         else
             busy <= bts_run
                   | (stage == 1'b1 & ~fill_end)
-                  | (stage == 1'b0 & ~cache_hit);
+                  | (stage == 1'b0 & ~cache_hit & rd_go);
+    end
+
+//pair_fetch_ok：本拍这一行能不能一次取到两个字（lane1 = word+1 仍在同一行内、且命中、且不在缺失/自举）。
+//寄存一拍、与 inst_out 同拍出（给 pc 的 +8 判据挡锥备用；本步无消费者）。
+    always @(posedge clk) begin
+        if (rst_q)
+            pair_fetch_ok <= 1'b0;
+        else
+            pair_fetch_ok <= (word != 5'd31) & cache_hit & ~busy;
     end
 
 //jalr 类改向当拍把取指输出刷成 NOP：icache 不再当拍跳目标，当拍读出来的那条是
@@ -277,20 +321,29 @@ module icache(
             inst_out <= 32'd0;
         else if (bts_run && (bts_line == BOOT_LINES) && bts_end)
             inst_out <= iram[rd_addr];
-        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | ((jalr | jal_in | br1_in) && req_valid && (~deliv_v | take_en) && flag_bus[4] && ~stall_pc_redir && ~stall_icache_miss && ~fifo_full))
+        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | ((jalr | jal_in | br1_in) && req_valid && (~deliv_v | take_en) && exec && ~stall_pc_redir && ~stall_icache_miss && ~fifo_full))
             inst_out <= 32'd0;
         else if (rd_en)
             inst_out <= iram[rd_addr];
     end
 
 //===============================================================
-// 自举与回填状态机（iram 写口）
+// 自举与回填状态机（iram 口 B：回填/自举写 / lane1 取指读 二选一）
 //===============================================================
-//iram 单写口：地址在自举与回填之间选。
+//iram 口 B 只有一根地址总线（portb_addr）读写时分复用：写那拍填 mem_data；不写那拍读 lane1 的字进 inst_next。
 //自举的 way 是常量 2'd0（way0 只有自举写得进去），回填的 fill_way 恒 ∈ {1,2} —— way0 的写通路物理取消。
+//inst_next 与 inst_out 同三分支形状（读使能推进 / 冲刷浇零 / 停顿保持）。
     always @(posedge clk) begin
         if (wr_en)
-            iram[wr_addr] <= mem_data;
+            iram[portb_addr] <= mem_data;
+        else if (rst_q)
+            inst_next <= 32'd0;
+        else if ((jalr_fail | br2 | br3 | exc_irq | exc_irq_ret | exc_ecall | flush_con_exc | flush_pc_redir) | ((jalr | jal_in | br1_in) && req_valid && (~deliv_v | take_en) && exec && ~stall_pc_redir && ~stall_icache_miss && ~fifo_full))
+            inst_next <= 32'd0;
+        else if (rd_en)
+            inst_next <= iram[portb_addr];
+        else
+            inst_next <= inst_next;
     end
 
 //自举序列：复位释放后逐行填充前 16KB（128 行 × 32 字），固定写 way0。
@@ -344,7 +397,7 @@ module icache(
                     lru[idx] <= 1'b1;
                 else if (hit_way[2])
                     lru[idx] <= 1'b0;
-                if (!cache_hit) begin
+                if (!cache_hit && rd_go) begin
                     stage <= 1'b1;
                     miss_word <= word;
                     fill_cnt <= 5'd0;

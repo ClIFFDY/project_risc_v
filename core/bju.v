@@ -46,13 +46,13 @@ module bju(
 //本拍被判那条指令的 ROB 索引（判定打一拍 ⇒ 冲刷边界必须用【寄存后的】这个号）：
 //ROB 的冲刷只作废【比它更年轻】的项，比它老、还在途的（load/mul）必须留下，
 //否则它们的写回/总线请求就被连同错路指令一起扔了（实测 CoreMark：两条在途 lw 的写回消失）。
-    input [2:0]  idx_in,
+    input [3:0]  idx_in,
     input        gen_in,
-    output reg [2:0] idx_q,
+    output reg [3:0] idx_q,
     output reg       bju_judged,
     output reg       bju_gen,
     output reg [31:0] jp_target, jalr_target_q2,
-    output reg [5:0] br_pc_idx,
+    output reg [8:0] br_pc_idx,
     output reg flush_bju_exc,
     output reg jalr_flag_q, br_pred_taken_q,
 //F1：被判那条自己的地址（"地址+4"）—— 必须与 jp_target **同块同清**地寄存一份。
@@ -61,7 +61,7 @@ module bju(
 //  的写口登记就发生在这一拍，任何寄存版都晚一拍、撤不掉。
     output reg exc_bju,
 //判定输入级那一条自己的 ROB 号（与 exc_bju 同拍）：wport 用它认"本级挂的是不是它"
-    output reg [2:0] idx_i,
+    output reg [3:0] idx_i,
     output reg [31:0] exc_pc_q,
 //判定【输入级】那一条自己带的异常（与 idu2 的 bju_in_flight 同拍、描述同一条）：ecall/ebreak/illegal/mret。
 //★ 必须从【输入寄存级】出、不能从延迟寄存级出：从延迟级出就与"更老那条的寄存版冲刷"错开两拍，
@@ -83,11 +83,9 @@ module bju(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：判定延迟拍只关心"本拍是不是冲刷拍"。
-//★ flush_con_exc 已经是精确版（不再含 pre）⇒ 直接取 [11]。
+//★ flush_con_exc 已经是精确版（不再含 pre）⇒ 直接取 [7]。
     reg flush_w;
     always @(*) flush_w = flag_bus[7] | flag_bus[6] | flag_bus[5];
 
@@ -263,7 +261,7 @@ module bju(
     always @(*) begin
         jalr_low2 = 2'd0;
         if (jalrf_q) begin
-            jalr_low2 = r1_q[1:0] + r2_q[1:0];
+            jalr_low2 = (r1_q[1:0] + r2_q[1:0]) & 2'd2;
         end
     end
 
@@ -324,7 +322,7 @@ module bju(
             jp_target <= 32'd0;
             jalr_target_q2 <= 32'd0;
             idx_q <= 3'd0;
-            br_pc_idx <= 6'd0;
+            br_pc_idx <= 9'd0;
             jalr_flag_q <= 1'b0;
             br_pred_taken_q <= 1'b0;
             idx_q <= 3'd0;
@@ -337,7 +335,7 @@ module bju(
             flush_bju_exc <= 1'b0;
             jp_target <= 32'd0;
             jalr_target_q2 <= 32'd0;
-            br_pc_idx <= 6'd0;
+            br_pc_idx <= 9'd0;
             jalr_flag_q <= 1'b0;
             br_pred_taken_q <= 1'b0;
             exc_pc_q <= 32'd0;
@@ -353,7 +351,7 @@ module bju(
             jp_target <= jp_target_now;
             exc_pc_q <= aux_q;
             jalr_target_q2 <= jalr_target_now;
-            br_pc_idx <= aux_q[8:3];
+            br_pc_idx <= aux_q[11:3];
             jalr_flag_q <= jalrf_q & ~exc_jalr_misalign;
             br_pred_taken_q <= pred_q;
             idx_q <= idx_i;

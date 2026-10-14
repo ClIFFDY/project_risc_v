@@ -25,12 +25,14 @@
 
 module bpu(
     input clk, rst,
-    input [31:0] pc_addr_in, jalr_target_q,
-    input [5:0] br_pc_idx,
+    input [31:0] pc_addr_in, aux_addr_in, jalr_target_q,
+    input [8:0] br_pc_idx,
     input success, br_fail, br_en, jalr_flag, br_pred_taken_in,
 //新增：jal 译码信号（idu1 当拍组合输出）、i-cache 当拍交付的指令与有效位（冷启动捕获用）、
 //flag_bus（本模块自己译出 flush/stall，按"模块内先还原原名再做逻辑"的规矩）
     input jal,
+    input fch_jal_l1,
+    input br_en_l1,
     input [31:0] inst_in,
     input inst_valid,
     input [7:0] flag_bus,
@@ -39,8 +41,9 @@ module bpu(
     input        fifo_full,
 //队列把本拍这条交付收下了：欠交付的目标 inst 只有被收下才算交掉（空泡也是收下）
     input        take_en,
-    output reg [31:0] jalr_predict_offset,
-    output reg br1, br2, br3, jalr,
+    output reg [31:0] jalr_predict_offset, jalr_predict_offset_l1,
+    output reg br1, br2, br3, jalr, jalr_l1,
+    output reg br1_l1,
 //新增：命中标志（给 pc 选"落 T+4 / 落 T"）、交付给 idu1 的目标指令与三态选择
     output reg bti_hit,
     output reg [31:0] bti_inst_q,
@@ -78,21 +81,25 @@ module bpu(
 //==================================================================================
 // 老的一组：BHT（方向）+ 服务 jalr 的 btb（预测落点地址）。本次一行不改。
 //==================================================================================
-    reg [1:0] bht [0:63];
+    reg [1:0] bht [0:511];
     reg [31:0] btb [0:63];
 //BTB 有效表：把命中判定从"目标 != 0"（32 位或归约）换成 1 位查表。
 //写口与 btb 同拍按 (jalr_target_q != 0) 更新，复位和非命中项都是 0，
 //所以 btb_v[i] 恒等于原来的 (btb[i] != 0)，逐位等价。
     reg btb_v [0:63];
-    reg predict_en;
+    reg predict_en, predict_en_l1;
     integer i;
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
-        if (rst_q)
+        if (rst_q) begin
             predict_en = 1'b0;
-        else
-            predict_en = (bht[pc_addr_in[8:3]] > 2'd1);
+            predict_en_l1 = 1'b0;
+        end
+        else begin
+            predict_en    = (bht[aux_addr_in[11:3]] > 2'd1);
+            predict_en_l1 = (bht[pc_addr_in[11:3]] > 2'd1);
+        end
     end
 
 //==================================================================================
@@ -113,9 +120,19 @@ module bpu(
     (* ram_style = "distributed" *) reg [21:0] bti_tag  [0:255];
     (* ram_style = "distributed" *) reg        bti_v    [0:255];
 
-    reg [7:0]  bti_rd_idx;
-    reg [21:0] bti_rd_tag;
+    reg [7:0]  bti_rd_idx0, bti_rd_idx1;
+    reg [21:0] bti_rd_tag0, bti_rd_tag1;
+    reg [7:0]  bti_sel_idx;
+    reg [21:0] bti_sel_tag;
     reg        take;
+    always @(*) begin
+        bti_rd_idx0 = aux_addr_in[9:2];
+        bti_rd_tag0 = aux_addr_in[31:10];
+        bti_rd_idx1 = pc_addr_in[9:2];
+        bti_rd_tag1 = pc_addr_in[31:10];
+        bti_sel_idx = fch_jal_l1 ? bti_rd_idx1 : bti_rd_idx0;
+        bti_sel_tag = fch_jal_l1 ? bti_rd_tag1 : bti_rd_tag0;
+    end
 //交付：take 那一拍记下"欠一次交付"，一直保持到 idu1 真的把这条锁进流水线
 //（exec_b & adv），中途 stall 也不会丢 —— 交付位必须能粘住，不能是单拍脉冲。
     reg        bti_pend;
@@ -129,18 +146,19 @@ module bpu(
 //新 bti 的查表/命中判定 + take（与 pc.v 同一个门）：
 //take=1 且命中 ⇒ 这一拍记下交付目标 inst；take=1 且未命中 ⇒ 这一拍记下交付 NOP，
 //由 pc 落 T 让 icache 自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
+    reg bti_hit0, bti_hit1;
     always @(*) begin
         if (rst_q) begin
-            bti_rd_idx = 8'd0;
-            bti_rd_tag = 22'd0;
-            bti_hit    = 1'b0;
-            take       = 1'b0;
+            bti_hit0 = 1'b0;
+            bti_hit1 = 1'b0;
+            bti_hit  = 1'b0;
+            take     = 1'b0;
         end
         else begin
-            bti_rd_idx = pc_addr_in[9:2];
-            bti_rd_tag = pc_addr_in[31:10];
-            bti_hit    = bti_v[bti_rd_idx] & (bti_tag[bti_rd_idx] == bti_rd_tag);
-            take       = (jal | br1) & adv;
+            bti_hit0 = bti_v[bti_rd_idx0] & (bti_tag[bti_rd_idx0] == bti_rd_tag0);
+            bti_hit1 = bti_v[bti_rd_idx1] & (bti_tag[bti_rd_idx1] == bti_rd_tag1);
+            bti_hit  = fch_jal_l1 ? bti_hit1 : bti_hit0;
+            take     = (jal | br1) & adv;
         end
     end
 
@@ -154,7 +172,7 @@ module bpu(
         else if (take) begin
             bti_pend    <= 1'b1;
             bti_kind_q  <= bti_hit;
-            bti_inst_q  <= bti_inst[bti_rd_idx];
+            bti_inst_q  <= fch_jal_l1 ? bti_inst[bti_rd_idx1] : bti_inst[bti_rd_idx0];
         end
 //★ 冲刷必须**作废**欠着的这次交付：欠交付的那条分支一定比冲刷源更年轻 ⇒ 是错路。
 //  只靠 take 上的 ~flush_w 挡不住"已经欠下、随后才来冲刷"的情形（实测：分支预测跳、
@@ -206,8 +224,8 @@ module bpu(
         end
         else begin
             cap_q      <= {cap_q[0], take & ~bti_hit};
-            cap_idx_q1 <= pc_addr_in[9:2];
-            cap_tag_q1 <= pc_addr_in[31:10];
+            cap_idx_q1 <= bti_sel_idx;
+            cap_tag_q1 <= bti_sel_tag;
             cap_idx_q2 <= cap_idx_q1;
             cap_tag_q2 <= cap_tag_q1;
         end
@@ -218,7 +236,7 @@ module bpu(
     always @(posedge clk) begin
         if (rst_q) begin
 //初始BHT回到弱不跳转
-            for (i = 0; i < 64; i = i + 1)
+            for (i = 0; i < 512; i = i + 1)
                 bht[i] <= 2'd1;
             for (i = 0; i < 64; i = i + 1)
                 btb[i] <= 32'd0;
@@ -239,8 +257,8 @@ module bpu(
             end
 //jalr实际目标在EX期解析：按随指令流水的载荷PC回写BTB
             if (jalr_flag) begin
-                btb[br_pc_idx] <= jalr_target_q;
-                btb_v[br_pc_idx] <= (jalr_target_q != 32'd0);
+                btb[br_pc_idx[5:0]] <= jalr_target_q;
+                btb_v[br_pc_idx[5:0]] <= (jalr_target_q != 32'd0);
             end
 //冷启动捕获：这一拍 icache 交付的就是目标 inst（pc 已于 take 那拍落 T）
 //★ 写口必须自己再带 ~flush_w：cap_q 是"到沿才清"，冲刷那一拍 cap_q[1] 还是 1，
@@ -260,17 +278,23 @@ module bpu(
     always @(*) begin
         if (rst_q) begin
             br1 = 1'b0;
+            br1_l1 = 1'b0;
             br2 = 1'b0;
             br3 = 1'b0;
             jalr = 1'b0;
+            jalr_l1 = 1'b0;
             jalr_predict_offset = 32'd0;
+            jalr_predict_offset_l1 = 32'd0;
         end
         else begin
             br1 = br_en & predict_en;
+            br1_l1 = br_en_l1 & predict_en_l1;
             br2 = success & !br_pred_taken_in;
             br3 = br_fail & br_pred_taken_in;
-            jalr_predict_offset = btb[pc_addr_in[8:3]];
-            jalr = btb_v[pc_addr_in[8:3]];
+            jalr_predict_offset = btb[aux_addr_in[8:3]];
+            jalr_l1 = btb_v[pc_addr_in[8:3]];
+            jalr_predict_offset_l1 = btb[pc_addr_in[8:3]];
+            jalr = btb_v[aux_addr_in[8:3]];
         end
     end
 

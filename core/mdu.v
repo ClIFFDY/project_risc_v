@@ -56,8 +56,8 @@ module mdu(
     input [7:0] flag_bus,
 //本次冲刷的边界（cont 的 flush_idx：三种冲刷各取自己那条的号）：
 //入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
-    input [2:0]  flush_idx,
-    input [2:0]  head_ptr,
+    input [3:0]  flush_idx,
+    input [3:0]  head_ptr,
     input        flush_part,
 //两条接收通道（乘法口 / 除法口）：站一拍只出一条 ⇒ 两套载荷同源，只有 valid 不同。
 //★ 站侧门控用的就是本模块导出的 mul_ready / div_ready，两边逐字同一表达式 ⇒
@@ -65,13 +65,13 @@ module mdu(
     input        mul_go,
     input [9:0]  mul_func10,
     input [4:0]  mul_rd,
-    input [2:0]  mul_idx_in,
+    input [3:0]  mul_idx_in,
     input        mul_gen_in,
     input [31:0] mul_r1, mul_r2,
     input        div_go,
     input [9:0]  div_func10,
     input [4:0]  div_rd,
-    input [2:0]  div_idx_in,
+    input [3:0]  div_idx_in,
     input        div_gen_in,
     input [31:0] div_r1, div_r2,
     (* max_fanout = 8 *) output reg [31:0] mul_data_out,
@@ -79,7 +79,7 @@ module mdu(
 //本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 mul_idx 逐支同步，供 forw 直接选源
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
-    output reg [2:0]  mul_idx,
+    output reg [3:0]  mul_idx,
     (* max_fanout = 8 *) output reg        mul_gen,
 //两条 ready 回站：只由本模块寄存器状态决定（不含对方通道、不含被选指令）⇒ 不闭零延时环。
 //站侧按站项自己的算子门控（乘法项看 mul_ready、除法项看 div_ready），门控式与本模块的接收式逐字相同。
@@ -97,8 +97,6 @@ module mdu(
 //控制位译码（与流水级无关，放本模块最前）
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
 //不用流水线使能，故只取三条冲刷位。
@@ -106,7 +104,7 @@ module mdu(
 //flush_w 上。
 //乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w, flush_con_exc;
-    reg [3:0] d_age, flush_age;
+    reg [4:0] d_age, flush_age;
     reg       d_kill;
     always @(*) begin
         flush_con_exc = flag_bus[7];
@@ -117,30 +115,30 @@ module mdu(
 //  bus_hold   = 总线不可用（外部 hold）
 //  pipe_stall = 总线保持 / 取指缺失 / lsu 那三条（排掉自己的 haz/div 两位）
 //★ dcache 忙(2) 已撤出全核广播：乘法与 dcache 无关，本模块不再吃它（它只在 lsu 内部生效）。
-//★ 不要并进 stall_rob_full(9) / stall_pc_redir(8)：ROB 排空要靠队头那条乘法完成，
+//★ 不要并进 stall_rob_full(3) / stall_pc_redir(2)：ROB 排空要靠队头那条乘法完成，
 //  而乘法正被它挡在 mdu 门外 ⇒ ROB 永不排空 ⇒ 死锁（与 lsu 入口门同一个坑）。
     reg pipe_stall, bus_hold;
     always @(*) begin
         bus_hold   = flag_bus[0];
-//★ 只留总线占用。【不能再带 flag_bus[2]（= 保留站满）】：站式之后站满恰恰是发射常态，
+//★ 只留总线占用。【不能再并进"保留站满"】：站式之后站满恰恰是发射常态，
 //  而保留站对指令只【摆一拍】——那一拍门关着，这条乘/除就永远不发起，它的 ROB 项再也等不到
 //  完成口 ⇒ 队头卡死、整核死等（实测 div-01：一条 div 在 pc 走到 0x160 处发出后凭空消失）。
 //  原设计没有这个问题，是因为载荷会一直摆在门口等门开。
-        pipe_stall = flag_bus[0];   // [2]=保留站满（原 stall_lsu_haz 位）、[0]=总线占用
+        pipe_stall = flag_bus[0];   // [0]=总线占用
     end
 
 //寄存器声明（按级分组）
 //乘法：第一级锁操作数 / 第二级锁乘积
     reg [31:0] m_a, m_b;
     reg [4:0]  m_rd;
-    reg [2:0]  m_idx;
+    reg [3:0]  m_idx;
     reg        m_gen;
     reg [2:0]  m_op;
     reg        m_v;
 
     reg [63:0] m_p;
     reg [4:0]  m_rd_q;
-    reg [2:0]  m_idx_q;
+    reg [3:0]  m_idx_q;
     reg        m_gen_q;
     reg [2:0]  m_op_q;
     (* max_fanout = 8 *)
@@ -156,7 +154,7 @@ module mdu(
     reg        d_ovf;             // INT_MIN / -1
     reg        d_sign_b;
     reg [4:0]  d_rd;
-    reg [2:0]  d_idx;
+    reg [3:0]  d_idx;
     reg        d_gen;
     reg [4:0]  d_cnt;
     reg        d_busy;
@@ -174,13 +172,13 @@ module mdu(
 //按 c2 → c3 → c4 → 写口 的级数对齐，除法写口落在 d_done+3。
     reg [2:0]  d_cmt_q;
     reg [4:0]  d_cmt_rd;
-    reg [2:0]  d_cmt_idx;
+    reg [3:0]  d_cmt_idx;
     reg        d_cmt_gen;
     reg [31:0] d_cmt_data;
 
 //输出保持
     reg [4:0]  hold_rd;
-    reg [2:0]  idx_hold;
+    reg [3:0]  idx_hold;
     reg        gen_hold;
     reg [31:0] hold_data;
     reg        hold;

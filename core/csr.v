@@ -36,7 +36,7 @@ module csr(
     input exc_irq_ret_ok,
     input [7:0] flag_bus,
 //ROB 队头指针：minstret 的真口径 —— 它这一拍推进了几格就是退休了几条（一拍最多 2 条）
-    input [2:0] head_ptr_in,
+    input [3:0] head_ptr_in,
     input [11:0] csr_addr,
     input [31:0] csr_data_in,
     input [31:0] pc_addr_in,
@@ -202,7 +202,7 @@ module csr(
 //  它数的是"没停顿的拍数"，与条数无关（实测 CoreMark：653614 拍读出 472257，看着像 IPC 0.722，
 //  其实是非停顿拍占比；真退休只有 330916 条 ⇒ IPC 0.455）。ROB 一拍最多退 2 条，
 //  唯一的真口径是【队头指针这一拍推进了几格】。
-    reg [2:0] head_q;
+    reg [3:0] head_q;
     reg [1:0] ret_cnt;
     always @(*) ret_cnt = head_ptr_in - head_q;
     always @(posedge clk) begin

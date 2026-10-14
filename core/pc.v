@@ -23,17 +23,21 @@
 module pc(
     input clk, rst,
     input br1, exc_irq, exc_irq_ret, exc_mark, trap_fire,
-    input jal, pre_jalr, btb_hit,
+    input jal, pre_jalr, pre_jalr_l1, btb_hit, btb_hit_l1,
+    input br1_l1,
 //bpu 那块服务 br1/jal 的 btb 命中：命中 ⇒ 目标 inst 当拍由 btb 交付给 idu1
 //⇒ pc 落 T+4；未命中 ⇒ pc 落 T，让 icache 下一拍自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
     input bti_hit,
     input [7:0] flag_bus,
     input [31:0] jp_target, offset_jal2, offset_jalr2,
     input [31:0] offset_beq2, isr_addr2, isr_ret_addr2,
+    input [31:0] offset_beq_l1, offset_jalr_l1,
     input rob_empty,
 //取指队列满（iffu 的 full）：与 stall_pc_redir 同性质的前端停留 —— 队满时 pc 不许再走，
 //否则已经交给 icache 的那条会被丢弃
     input fifo_full,
+    input pair_ok,
+    input fch_jal_l1,
     output reg [31:0] pc_addr, aux_addr,
 //停顿源：重定向排队中（等 ROB 排空）/ 落点后多压一拍（stall_pc_redir）；
 //冲刷源：本拍把 pc 落到新目标（flush_pc_redir，icache 用它挡掉陈旧交付）。
@@ -52,8 +56,6 @@ module pc(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】；
 //或运算在本模块内做（源在 cont 里已逐条分开）。ROB 满原来单独接端口，现在吃 flag_bus[3]。
@@ -67,9 +69,19 @@ module pc(
         exec         = flag_bus[4];
     end
 
+
+    reg [31:0] jal_base;
+    always @(*) begin
+        jal_base = fch_jal_l1 ? pc_addr : aux_addr;
+    end
+
 //预测跳转成立（按"顶层不运算"从 cpu_top 下放至此）
-    reg jalr;
+    reg jalr, jalr_l1;
     always @(*) jalr = pre_jalr & btb_hit;
+    always @(*) jalr_l1 = pre_jalr_l1 & btb_hit_l1;
+
+    reg [31:0] br1_l1_base;
+    always @(*) br1_l1_base = aux_addr + 32'd4;
 
 //程序计数器，传递取指地址
 //重定向排队：判定那一拍照旧【先冲刷更年轻的】，但真正的跳转要等 ROB 排空 —— 这样
@@ -166,31 +178,45 @@ module pc(
 //两个表达式都只落在 pc/aux 的 D 端（普通寄存器），不是 BRAM 地址脚 ⇒ 不进关键路径。
                 if (br1) begin
                     if (bti_hit) begin
-                        pc_addr <= pc_addr + offset_beq2;
+                        pc_addr <= aux_addr + offset_beq2;
                         aux_addr <= aux_addr + offset_beq2;
                     end
                     else begin
-                        pc_addr <= pc_addr + offset_beq2 - 32'd4;
-                        aux_addr <= aux_addr + offset_beq2 - 32'd4;
+                        pc_addr <= aux_addr + offset_beq2 - 32'd4;
+                        aux_addr <= aux_addr + offset_beq2;
                     end
                 end
                 else if (jal) begin
                     if (bti_hit) begin
-                        pc_addr <= pc_addr + offset_jal2;
-                        aux_addr <= pc_addr + offset_jal2;
+                        pc_addr <= jal_base + offset_jal2;
+                        aux_addr <= jal_base + offset_jal2;
                     end
                     else begin
-                        pc_addr <= pc_addr + offset_jal2 - 32'd4;
-                        aux_addr <= pc_addr + offset_jal2 - 32'd4;
+                        pc_addr <= jal_base + offset_jal2 - 32'd4;
+                        aux_addr <= jal_base + offset_jal2;
                     end
                 end
                 else if (jalr) begin
                     pc_addr <= offset_jalr2;
-                    aux_addr <= offset_jalr2;
+                    aux_addr <= offset_jalr2 + 32'd4;
+                end
+                else if (br1_l1) begin
+                    pc_addr <= br1_l1_base + offset_beq_l1 - 32'd4;
+                    aux_addr <= br1_l1_base + offset_beq_l1;
+                end
+                else if (jalr_l1) begin
+                    pc_addr <= offset_jalr_l1;
+                    aux_addr <= offset_jalr_l1 + 32'd4;
                 end
                 else begin
-                    pc_addr <= pc_addr + 4'd4;
-                    aux_addr <= pc_addr + 4'd4;
+                    if (pair_ok) begin
+                        pc_addr <= pc_addr + 32'd8;
+                        aux_addr <= pc_addr + 32'd4;
+                    end
+                    else begin
+                        pc_addr <= pc_addr + 4'd4;
+                        aux_addr <= pc_addr + 4'd4;
+                    end
                 end
             end
             else if (flush_w) begin

@@ -38,11 +38,16 @@ module iffu(
 //写口：icache 本拍交出的指令（三态在本模块前端合成）
     input [31:0] inst_in,
     input        inst_valid,
+    input [31:0] inst_in1,
+    input        inst_valid1,
+    input        deliv_n,
     input [1:0]  bti_sel,
     input [31:0] bti_inst,
+    input        btb_hit,
 //本拍这一条的携带量：地址（pc 的 aux_addr 口径，原样存）、分支预测"跳"位、jalr 预测目标
     input [31:0] push_addr,
     input        push_br_pred,
+    input        br1_l1,
     input [31:0] push_jalr_pred,
 //读侧：本拍出队格换不换内容（= 新 idu1 的推进条件，与它逐字同形）
     input        advance,
@@ -51,9 +56,16 @@ module iffu(
     output reg        h0_br_pred,
     output reg [31:0] h0_jalr_pred,
     output reg [4:0]  h0_r1, h0_r2,
+    output reg [31:0] h1_inst, h1_addr,
+    output reg        h1_br_pred,
+    output reg [31:0] h1_jalr_pred,
+    output reg [4:0]  h1_r1, h1_r2,
 //取指侧重定向译码（原 idu1 的组合段）：消费者是 pc、bpu、icache 的 jalr 门
     output reg        fch_br_en, fch_jal, fch_jalr,
+    output reg        fch_jal_l1,
+    output reg        fch_br_en_l1, fch_jalr_l1,
     output reg [31:0] fch_off_beq, fch_off_jal,
+    output reg [31:0] fch_off_beq_l1,
 //取指侧停：本拍放不下。icache 与 pc 的推进被它按住
     output reg        full,
 //icache 的交付事件：有一条已交付、还没进队
@@ -69,9 +81,11 @@ module iffu(
 //flag_bus 逐位还原（口径与各消费者一致：冲刷压停顿）
 //停顿位一位都不用了：后端停顿由本队列吸收，推力只看交付事件与空位。
     reg flush_con_exc, flush_con_irq, flush_con_jump, exec;
-    reg flush_w, f_req, f_adv, f_nop, push_ok;
-//三态合成出来的"本拍这条"（下面给值）：推力判"是不是空泡"要在译码块里用它，故声明提前
-    reg [31:0] inst_eff;
+    reg flush_w, f_req, push_ok0, push_ok1;
+    reg f_nop0, f_nop1, f_pair, push_l0, push_l1, lane0_redir;
+    reg lane1_go, lane1_jal, lane1_br, lane1_jalr;
+    reg lane0_jal, lane0_jalr, lane0_br;
+    reg [31:0] inst_eff, inst_eff1;
     always @(*) begin
         flush_con_exc     = flag_bus[7];
         flush_con_irq     = flag_bus[6];
@@ -79,9 +93,16 @@ module iffu(
         exec              = flag_bus[4];
         flush_w = flush_con_exc | flush_con_irq | flush_con_jump;
         f_req = exec & (deliv_v | (bti_sel != 2'd0));
-        f_nop = ~|inst_eff;
-        f_adv = f_req & ~f_nop & push_ok;
-        take_en = f_req & (f_nop | push_ok);
+    end
+
+    always @(*) begin
+        f_nop0 = ~|inst_eff;
+        f_nop1 = ~|inst_eff1;
+        f_pair = (bti_sel == 2'd0) & deliv_v & deliv_n & inst_valid1 & ~lane0_redir;
+        push_l0 = f_req & ~f_nop0;
+        push_l1 = f_req & f_pair & ~f_nop1;
+        take_en = f_req & ( (push_l0 & push_l1) ? push_ok1 :
+                            ((push_l0 | push_l1) ? push_ok0 : 1'b1) );
     end
 
 //RV32I 里与源寄存器号/改向有关的 opcode
@@ -115,6 +136,8 @@ module iffu(
             inst_eff = 32'd0;
         else
             inst_eff = inst_valid ? inst_in : 32'd0;
+        inst_eff1 = inst_valid1 ? inst_in1 : 32'd0;
+        //
     end
 
     reg [31:0] inst_lat;
@@ -136,35 +159,38 @@ module iffu(
 //取指侧分支/跳转预译码（原 idu1 末尾那块）：
 //jal / br_en / offset_* 不受 stage 门控（消费者里有取指地址那条环），只有 jalr 保留门控。
     always @(*) begin
-        fch_br_en = 1'b0;
-        fch_off_beq = 32'd0;
-        fch_off_jal = 32'd0;
-        fch_jal = 1'b0;
-        fch_jalr = 1'b0;
-        if (!rst_q) begin
-            case (inst_cur[6:0])
-                OPCODE_JAL: begin
-                    fch_off_jal = $signed(immJ(inst_cur));
-                    fch_jal = 1'b1;
-                end
-                OPCODE_JALR: begin
-                    if (!flush_w)
-                        fch_jalr = 1'b1;
-                end
-                OPCODE_BRANCH: begin
-                    fch_off_beq = $signed(immB(inst_cur));
-                    fch_br_en = 1'b1;
-                end
-            endcase
-        end
+        lane0_jal  = (inst_cur[6:0] == OPCODE_JAL);
+        lane0_jalr = (inst_cur[6:0] == OPCODE_JALR);
+        lane0_br   = (inst_cur[6:0] == OPCODE_BRANCH);
+        lane1_go   = ~rst_q & ~flush_w & inst_valid1 & deliv_v & (bti_sel == 2'd0) & ~lane0_redir;
+        lane1_jal  = lane1_go & (inst_in1[6:0] == OPCODE_JAL);
+        lane1_br   = lane1_go & (inst_in1[6:0] == OPCODE_BRANCH);
+        lane1_jalr = lane1_go & (inst_in1[6:0] == OPCODE_JALR);
+    end
+
+    always @(*) begin
+        fch_jal        = (lane0_jal & ~rst_q) | lane1_jal;
+        fch_jalr       = lane0_jalr & ~rst_q & ~flush_w;
+        fch_br_en      = lane0_br & ~rst_q;
+        fch_jal_l1     = lane1_jal;
+        fch_br_en_l1   = lane1_br;
+        fch_jalr_l1    = lane1_jalr;
+        fch_off_beq    = $signed(immB(inst_cur));
+        fch_off_jal    = lane1_jal ? $signed(immJ(inst_in1)) : $signed(immJ(inst_cur));
+        fch_off_beq_l1 = $signed(immB(inst_in1));
+        lane0_redir    = ((inst_cur[6:0] == OPCODE_BRANCH) & push_br_pred)
+                       | (lane0_jal & ~rst_q)
+                       | (fch_jalr & btb_hit);
     end
 
 //写口这一条的源寄存器号：只有真读这两个源的指令才填，别的留 0，免得在冒险比较里误命中。
 //csrrwi/si/ci 的 [19:15] 是 zimm、不是寄存器号：只对 rs1 形（funct3=001/010/011）填。
-    reg [4:0] w0_r1, w0_r2;
+    reg [4:0] w0_r1, w0_r2, w1_r1, w1_r2;
     always @(*) begin
         w0_r1 = 5'd0;
         w0_r2 = 5'd0;
+        w1_r1 = 5'd0;
+        w1_r2 = 5'd0;
         case (inst_eff[6:0])
             OPCODE_OP, OPCODE_OP_IMM, OPCODE_JALR, OPCODE_BRANCH,
             OPCODE_LOAD, OPCODE_STORE: w0_r1 = inst_eff[19:15];
@@ -177,6 +203,18 @@ module iffu(
         case (inst_eff[6:0])
             OPCODE_OP, OPCODE_BRANCH, OPCODE_STORE: w0_r2 = inst_eff[24:20];
         endcase
+        case (inst_eff1[6:0])
+            OPCODE_OP, OPCODE_OP_IMM, OPCODE_JALR, OPCODE_BRANCH,
+            OPCODE_LOAD, OPCODE_STORE: w1_r1 = inst_eff1[19:15];
+        endcase
+        if ((inst_eff1[6:0] == OPCODE_SYSTEM)
+         && (inst_eff1[14:12] != 3'b101)
+         && (inst_eff1[14:12] != 3'b110)
+         && (inst_eff1[14:12] != 3'b111))
+            w1_r1 = inst_eff1[19:15];
+        case (inst_eff1[6:0])
+            OPCODE_OP, OPCODE_BRANCH, OPCODE_STORE: w1_r2 = inst_eff1[24:20];
+        endcase
     end
 
     localparam [3:0] DEPTH = 4'd8;
@@ -185,28 +223,31 @@ module iffu(
     reg [106:0] q_dat [0:7];
     reg [3:0]  wptr, rptr;
     reg [3:0]  cnt_use;
-    reg [3:0]  idx0;
-    reg [106:0] push0_data, h0_data;
-    reg         hd0_v;
+    reg [3:0]  idx0, idx1;
+    reg [106:0] push0_data, push1_data, h0_data, h1_data;
+    reg         hd0_v, hd1_v;
     reg [31:0]  nx_inst, nx_addr, nx_jalr_pred;
-    reg         nx_br_pred;
-    reg [4:0]   nx_r1, nx_r2;
-    reg        wr0, clr;
+    reg [31:0]  nx1_inst, nx1_addr, nx1_jalr_pred;
+    reg         nx_br_pred, nx1_br_pred;
+    reg [4:0]   nx_r1, nx_r2, nx1_r1, nx1_r2;
+    reg        wr0, wr1, clr;
 
 //写入的那一条（布局见上）。addr 是"指令地址 + 4"口径的 aux_addr，原样存。
     always @(*) begin
         push0_data = {inst_eff, push_addr, push_br_pred, push_jalr_pred, w0_r1, w0_r2};
+        push1_data = {inst_eff1, push_addr + 32'd4, br1_l1, push_jalr_pred, w1_r1, w1_r2};
     end
 
     always @(*) begin
         cnt_use  = wptr - rptr;
+        push_ok0 = (cnt_use < 4'd7);
+        push_ok1 = (cnt_use < 4'd6);
     end
 
 //full 按"占用 ≥ 6 就报"（阈值），不是"放不下才报"：本拍要推的那条还在飞（写入在本拍结束），
 //按"放不下"判会让取指在满/不满之间来回。阈值 6 + 在飞 1 ⇒ 最高占用 7 < 8，不会写丢。
     always @(*) begin
         full    = (cnt_use >= 4'd6);
-        push_ok = (cnt_use < 4'd7);
     end
 
     always @(*) begin
@@ -214,14 +255,18 @@ module iffu(
     end
 
     always @(*) begin
-        wr0 = f_adv;
+        wr0 = take_en & push_l0;
+        wr1 = take_en & push_l1;
     end
 
 //写口
     always @(posedge clk) begin
-        if (wr0) begin
+        if (wr0)
             q_dat[wptr[2:0]] <= push0_data;
-        end
+        else if (wr1)
+            q_dat[wptr[2:0]] <= push1_data;
+        if (wr0 & wr1)
+            q_dat[wptr[2:0] + 3'd1] <= push1_data;
     end
 
 //写指针
@@ -233,6 +278,9 @@ module iffu(
             wptr <= rptr;
         end
         else if (wr0) begin
+            wptr <= wptr + (wr1 ? 4'd2 : 4'd1);
+        end
+        else if (wr1) begin
             wptr <= wptr + 4'd1;
         end
     end
@@ -246,13 +294,18 @@ module iffu(
             rptr <= rptr;
         end
         else if (advance & hd0_v) begin
-            rptr <= rptr + 4'd1;
+            rptr <= rptr + (hd1_v ? 4'd2 : 4'd1);
         end
     end
 
 //队头（组合读）：出队格的 D 端
     always @(*) begin
         idx0 = rptr;
+    end
+
+//第二个出队格（lane1）的队头：与 h0 同一套，位置 +1
+    always @(*) begin
+        idx1 = rptr + 4'd1;
     end
 
 //不在册时整条压 0：不让陈旧值/X 走到译码、冒险比较和下游载荷里
@@ -272,6 +325,25 @@ module iffu(
             nx_jalr_pred = h0_data[41:10];
             nx_r1        = h0_data[9:5];
             nx_r2        = h0_data[4:0];
+        end
+    end
+
+    always @(*) begin
+        h1_data = q_dat[idx1[2:0]];
+        hd1_v   = (idx0 != wptr) & (idx1 != wptr);
+        nx1_inst      = 32'd0;
+        nx1_addr      = 32'd0;
+        nx1_br_pred   = 1'b0;
+        nx1_jalr_pred = 32'd0;
+        nx1_r1        = 5'd0;
+        nx1_r2        = 5'd0;
+        if (hd1_v) begin
+            nx1_inst      = h1_data[106:75];
+            nx1_addr      = h1_data[74:43];
+            nx1_br_pred   = h1_data[42];
+            nx1_jalr_pred = h1_data[41:10];
+            nx1_r1        = h1_data[9:5];
+            nx1_r2        = h1_data[4:0];
         end
     end
 
@@ -310,6 +382,43 @@ module iffu(
                 h0_jalr_pred <= h0_jalr_pred;
                 h0_r1 <= h0_r1;
                 h0_r2 <= h0_r2;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            h1_inst <= 32'd0;
+            h1_addr <= 32'd0;
+            h1_br_pred <= 1'b0;
+            h1_jalr_pred <= 32'd0;
+            h1_r1 <= 5'd0;
+            h1_r2 <= 5'd0;
+        end
+        else if (exec) begin
+            if (flush_w) begin
+                h1_inst <= 32'd0;
+                h1_addr <= 32'd0;
+                h1_br_pred <= 1'b0;
+                h1_jalr_pred <= 32'd0;
+                h1_r1 <= 5'd0;
+                h1_r2 <= 5'd0;
+            end
+            else if (advance) begin
+                h1_inst <= nx1_inst;
+                h1_addr <= nx1_addr;
+                h1_br_pred <= nx1_br_pred;
+                h1_jalr_pred <= nx1_jalr_pred;
+                h1_r1 <= nx1_r1;
+                h1_r2 <= nx1_r2;
+            end
+            else begin
+                h1_inst <= h1_inst;
+                h1_addr <= h1_addr;
+                h1_br_pred <= h1_br_pred;
+                h1_jalr_pred <= h1_jalr_pred;
+                h1_r1 <= h1_r1;
+                h1_r2 <= h1_r2;
             end
         end
     end

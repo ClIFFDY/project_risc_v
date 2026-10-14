@@ -27,7 +27,7 @@ module regfile(
     input stall_rs_full,
 //读口地址 = iffu 的出队格那条的 rs。它下一拍就是 idu1 输出级那条 ⇒ 读值寄存一拍后正好与那条同拍，
 //所以这里就是把"本条指令要的操作数"从阵列里取出来的地方。
-    input [4:0] r1, r2,
+    input [4:0] r1, r2, r3, r4,
 //两个物理写口的请求：由 ROB 的【提交口】驱动（口 A = head 更老、口 B = head+1 更年轻）。
 //阵列只在提交时被写 ⇒ 架构态永远精确，同 rd 的先后由结构保证。
     input we_a,
@@ -37,7 +37,7 @@ module regfile(
     input [4:0] rd_b,
     input [31:0] data_b,
 //读数据
-    output reg [31:0] r1_data, r2_data
+    output reg [31:0] r1_data, r2_data, r3_data, r4_data
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -95,19 +95,52 @@ module regfile(
 //★ 保持判据必须与 idu1 的 advance 逐项同门（`~advance` 就是 flush_w | stall_w，exec 那一项由外层给）：
 //  上游那一拍没推进 ⇒ 出队格与 idu1 输出级一起冻住 ⇒ 本条要的操作数还是【上一条】的，只能保持。
 //  差一项就会按新地址去读下一条的 rs，把载荷的操作数覆写成别人的值（实测：div/rem 一族签名不对）。
+    reg [4:0] r1_addr_q, r2_addr_q, r3_addr_q, r4_addr_q;
     always @(posedge clk) begin
         if (rst_q) begin
             r1_data <= 32'd0;
             r2_data <= 32'd0;
+            r3_data <= 32'd0;
+            r4_data <= 32'd0;
+            r1_addr_q <= 5'd0;
+            r2_addr_q <= 5'd0;
+            r3_addr_q <= 5'd0;
+            r4_addr_q <= 5'd0;
         end
         else if (exec) begin
-            if (flush_w | stall_w) begin
+            if (flush_w) begin
                 r1_data <= r1_data;
                 r2_data <= r2_data;
+                r3_data <= r3_data;
+                r4_data <= r4_data;
+                r1_addr_q <= r1_addr_q;
+                r2_addr_q <= r2_addr_q;
+                r3_addr_q <= r3_addr_q;
+                r4_addr_q <= r4_addr_q;
+            end
+            else if (stall_w) begin
+                r1_addr_q <= r1_addr_q;
+                r2_addr_q <= r2_addr_q;
+                r3_addr_q <= r3_addr_q;
+                r4_addr_q <= r4_addr_q;
+                r1_data <= (we_b & (rd_b == r1_addr_q)) ? data_b :
+                           (we_a & (rd_a == r1_addr_q)) ? data_a : r1_data;
+                r2_data <= (we_b & (rd_b == r2_addr_q)) ? data_b :
+                           (we_a & (rd_a == r2_addr_q)) ? data_a : r2_data;
+                r3_data <= (we_b & (rd_b == r3_addr_q)) ? data_b :
+                           (we_a & (rd_a == r3_addr_q)) ? data_a : r3_data;
+                r4_data <= (we_b & (rd_b == r4_addr_q)) ? data_b :
+                           (we_a & (rd_a == r4_addr_q)) ? data_a : r4_data;
             end
             else begin
                 r1_data <= bypass(r1);
                 r2_data <= bypass(r2);
+                r3_data <= bypass(r3);
+                r4_data <= bypass(r4);
+                r1_addr_q <= r1;
+                r2_addr_q <= r2;
+                r3_addr_q <= r3;
+                r4_addr_q <= r4;
             end
         end
     end

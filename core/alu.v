@@ -29,7 +29,7 @@ module alu(
 //判定那条自己那一笔的 ROB 索引（bju 的 idx_q）：跳转冲刷拍用它区分"本级挂着的是不是发起者自己"
     input [4:0] rd_in,
 //ROB 索引：与结果同沿寄存（结果晚一拍，索引必须一起晚一拍，否则完成口会回填到错项）
-    input [2:0] idx_in,
+    input [3:0] idx_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
     input       gen_in,
     input [3:0] alu_func4,
@@ -37,7 +37,7 @@ module alu(
     input [31:0] aux_addr_in,
     input [31:0] r1_data, r2_data, cs_data,
     (* max_fanout = 8 *) output reg [4:0] rd_out,
-    (* max_fanout = 8 *) output reg [2:0] idx_out,
+    (* max_fanout = 8 *) output reg [3:0] idx_out,
     output reg gen_out,
     (* max_fanout = 8 *) output reg [31:0] result, result_csr,
     (* max_fanout = 8 *) output reg we

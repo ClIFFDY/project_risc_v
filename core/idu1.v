@@ -31,11 +31,19 @@ module idu1(
     input        br_pred_in,
     input [31:0] jalr_pred_in,
     input [4:0]  r1_in, r2_in,
-    input [2:0]  idx_in,
+    input [3:0]  idx_in,
     input        gen_in,
 //载荷那条的就绪（rob 按冻结生产者槽现算）：本来只在 post_decoder 门 payload_go，
 //但"原地等"必须【整组一起停】—— 否则本级照推会把 S 级内容原地覆盖掉、那条永远进不了载荷。
     input        rdy1_in, rdy2_in,
+    input [31:0] inst_in1,
+    input [31:0] addr_in1,
+    input        br_pred_in1,
+    input [31:0] jalr_pred_in1,
+    input [4:0]  r1_in1, r2_in1,
+    input [3:0]  idx_in1,
+    input        gen_in1,
+    input        rdy1_in1, rdy2_in1,
 //给 fifo 的推进条件（与出队格的"换新"同门）
     output reg   advance,
 //给 post_decoder 的载荷（原 mid_decoder 的输出集合 + 随行号）
@@ -43,10 +51,11 @@ module idu1(
     output reg [31:0] aux_addr_out,
     output reg        br_pred_taken_out,
     output reg [4:0]  r1_out, r2_out,
-    output reg [2:0]  idx_out,
+    output reg [3:0]  idx_out,
     output reg        gen_out,
+    output reg        pay_v_out,
 //rob 分配口（在队头上按 opcode 分类解）
-    output reg        alloc_en,
+    output reg        alloc_en0,
     output reg        alloc_we,
     output reg        alloc_jmp,
 //这一条会不会报完成口（给 rob 的"发出即置可退"用）：M 类（funct7==1 的 OP）与 LOAD。
@@ -79,7 +88,45 @@ module idu1(
     output reg        dec_r1_imm,
     output reg        dec_r2_imm,
     output reg [31:0] dec_r1_immv,
-    output reg [31:0] dec_r2_immv
+    output reg [31:0] dec_r2_immv,
+    output reg [31:0] inst_out1,
+    output reg [31:0] aux_addr_out1,
+    output reg        br_pred_taken_out1,
+    output reg [4:0]  r1_out1, r2_out1,
+    output reg [3:0]  idx_out1,
+    output reg        gen_out1,
+    output reg        pay_v_out1,
+    output reg        advance1,
+    output reg        alloc_en1,
+    output reg        alloc_we1,
+    output reg        alloc_jmp1,
+    output reg        alloc_pend1,
+    output reg [4:0]  alloc_rd1,
+    output reg [1:0]  dec_class1,
+    output reg        dec_we1,
+    output reg [4:0]  dec_rd1,
+    output reg        dec_is_st1,
+    output reg [2:0]  dec_mulop1,
+    output reg [2:0]  dec_lsf31,
+    output reg [3:0]  dec_func41,
+    output reg [2:0]  dec_csrf31,
+    output reg        dec_csrw_en1,
+    output reg        dec_csrw_armed1,
+    output reg        dec_csrw_wr1,
+    output reg [11:0] dec_csra1,
+    output reg [31:0] dec_jval1,
+    output reg        dec_brf1,
+    output reg        dec_jalf1,
+    output reg        dec_jalfr1,
+    output reg        dec_exc_illegal1,
+    output reg        dec_exc_jmis1,
+    output reg        dec_exc_ecall1,
+    output reg        dec_exc_ebreak1,
+    output reg        dec_exc_irq_ret1,
+    output reg        dec_r1_imm1,
+    output reg        dec_r2_imm1,
+    output reg [31:0] dec_r1_immv1,
+    output reg [31:0] dec_r2_immv1
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核，工具只能在布局阶段自己复制。每个模块各自打一拍，
@@ -130,8 +177,6 @@ module idu1(
 
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
-//            stall_lsu_haz, stall_lsu_full,
-//            stall_mulu_haz, stall_mulu_div,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】。
     reg exec, flush_w, stall;
@@ -449,12 +494,311 @@ module idu1(
 //★ 发号拍 = 本级每一个推进拍（不按出队格有效与否区分）：空泡也要占一项 ——
 //  载荷的 rob 号与“冻结的生产者槽”都按项索引取，空泡没有项就会取到别人那一项。
     always @(*) begin
-        alloc_en   = advance;
+        alloc_en0  = advance;
         alloc_rd   = rd_dec;
         alloc_we   = (rd_dec != 5'd0);
         alloc_jmp  = jmp_dec;
         alloc_pend = (inst_in[6:0] == OPCODE_LOAD) |
                      ((inst_in[6:0] == OPCODE_OP) && (inst_in[31:25] == 7'b0000001));
+    end
+
+//lane1 的译码（与 lane0 一模，源换成 inst_in1 / addr_in1 / jalr_pred_in1）
+    reg [4:0]  rd_dec1;
+    reg [9:0]  func10_dec1;
+    reg [31:0] imm_dec1;
+    reg        jmp_dec1;
+    always @(*) begin
+        rd_dec1 = 5'd0;
+        func10_dec1 = 10'd0;
+        imm_dec1 = 32'd0;
+        jmp_dec1 = 1'b0;
+        case (inst_in1[6:0])
+            OPCODE_OP: begin
+                rd_dec1 = inst_in1[11:7];
+                func10_dec1 = {inst_in1[31:25], inst_in1[14:12]};
+            end
+            OPCODE_OP_IMM: begin
+                imm_dec1 = immI(inst_in1);
+                rd_dec1 = inst_in1[11:7];
+                func10_dec1 = {(inst_in1[14:12] == 3'b001 || inst_in1[14:12] == 3'b101) ? inst_in1[31:25] : 7'd0,
+                            inst_in1[14:12]};
+            end
+            OPCODE_JAL: begin
+                rd_dec1 = inst_in1[11:7];
+                jmp_dec1 = 1'b1;
+            end
+            OPCODE_JALR: begin
+                rd_dec1 = inst_in1[11:7];
+                imm_dec1 = immI(inst_in1);
+                jmp_dec1 = 1'b1;
+            end
+            OPCODE_BRANCH: begin
+                imm_dec1 = immB(inst_in1);
+                func10_dec1 = {7'd0, inst_in1[14:12]};
+                jmp_dec1 = 1'b1;
+            end
+            OPCODE_LOAD: begin
+                imm_dec1 = immI(inst_in1);
+                rd_dec1 = inst_in1[11:7];
+            end
+            OPCODE_STORE: begin
+                imm_dec1 = immS(inst_in1);
+            end
+            OPCODE_LUI: begin
+                imm_dec1 = immU(inst_in1);
+                rd_dec1 = inst_in1[11:7];
+            end
+            OPCODE_AUIPC: begin
+                imm_dec1 = immU(inst_in1) - 4'd4;
+                rd_dec1 = inst_in1[11:7];
+            end
+            OPCODE_SYSTEM: begin
+                rd_dec1 = inst_in1[11:7];
+                func10_dec1 = {7'd0, inst_in1[14:12]};
+            end
+        endcase
+    end
+
+    reg csr_is_access_dec1, csr_exists_dec1, csr_ro_dec1, csr_wr_dec1;
+    always @(*) begin
+        csr_is_access_dec1 = (inst_in1[14:12] != 3'b000) && (inst_in1[14:12] != 3'b100);
+        csr_wr_dec1        = (inst_in1[14:12] == 3'b001) | (inst_in1[14:12] == 3'b101) |
+                            (inst_in1[19:15] != 5'd0);
+        csr_ro_dec1        = (inst_in1[31:30] == 2'b11);
+        csr_exists_dec1    = 1'b0;
+        case (inst_in1[31:20])
+            12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
+            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14: csr_exists_dec1 = 1'b1;
+            default: csr_exists_dec1 = 1'b0;
+        endcase
+    end
+
+    reg exc_illegal_dec1, exc_jmis_dec1;
+    always @(*) begin
+        exc_illegal_dec1 = 1'b0;
+        exc_jmis_dec1    = (inst_in1[6:0] == OPCODE_JAL) & inst_in1[21];
+        if (inst_in1 != 32'd0) begin
+            case (inst_in1[6:0])
+                OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec1 = 1'b0;
+                OPCODE_LOAD: begin
+                    if (inst_in1[14:12] == 3'b011) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b110) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b111) exc_illegal_dec1 = 1'b1;
+                end
+                OPCODE_STORE: begin
+                    if (inst_in1[14:12] == 3'b011) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b100) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b101) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b110) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b111) exc_illegal_dec1 = 1'b1;
+                end
+                OPCODE_JALR: begin
+                    if (inst_in1[14:12] != 3'b000) exc_illegal_dec1 = 1'b1;
+                end
+                OPCODE_BRANCH: begin
+                    if (inst_in1[14:12] == 3'b010) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b011) exc_illegal_dec1 = 1'b1;
+                end
+                OPCODE_OP_IMM: begin
+                    if (inst_in1[14:12] == 3'b001) begin
+                        if (inst_in1[31:25] != 7'd0) exc_illegal_dec1 = 1'b1;
+                    end
+                    if (inst_in1[14:12] == 3'b101) begin
+                        if ((inst_in1[31:25] != 7'd0) && (inst_in1[31:25] != 7'b0100000))
+                            exc_illegal_dec1 = 1'b1;
+                    end
+                end
+                OPCODE_OP: begin
+                    if (inst_in1[31:25] == 7'b0000001) exc_illegal_dec1 = 1'b0;
+                    else if (inst_in1[14:12] == 3'b000) begin
+                        if ((inst_in1[31:25] != 7'd0) && (inst_in1[31:25] != 7'b0100000))
+                            exc_illegal_dec1 = 1'b1;
+                    end
+                    else if (inst_in1[14:12] == 3'b001) begin
+                        if (inst_in1[31:25] != 7'd0) exc_illegal_dec1 = 1'b1;
+                    end
+                    else if (inst_in1[14:12] == 3'b101) begin
+                        if ((inst_in1[31:25] != 7'd0) && (inst_in1[31:25] != 7'b0100000))
+                            exc_illegal_dec1 = 1'b1;
+                    end
+                    else begin
+                        if (inst_in1[31:25] != 7'd0) exc_illegal_dec1 = 1'b1;
+                    end
+                end
+                OPCODE_MISC_MEM: begin
+                    if (inst_in1[14:12] == 3'b010) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b011) exc_illegal_dec1 = 1'b1;
+                end
+                OPCODE_SYSTEM: begin
+                    if (inst_in1[14:12] == 3'b100) exc_illegal_dec1 = 1'b1;
+                    if (inst_in1[14:12] == 3'b000) begin
+                        case (inst_in1[31:20])
+                            12'h000, 12'h001, 12'h302, 12'h105: ;
+                            default: exc_illegal_dec1 = 1'b1;
+                        endcase
+                    end
+                    if (csr_is_access_dec1) begin
+                        if (!csr_exists_dec1) exc_illegal_dec1 = 1'b1;
+                        if (csr_ro_dec1) begin
+                            if (csr_wr_dec1) exc_illegal_dec1 = 1'b1;
+                        end
+                    end
+                end
+                default: exc_illegal_dec1 = 1'b1;
+            endcase
+        end
+    end
+
+    reg [1:0]  class_dec1;
+    reg        we_dec1, csrw_en_dec1, csrw_armed_dec1, csrw_wr_dec1;
+    reg [4:0]  rd_pick_dec1;
+    reg        is_st_dec1;
+    reg [2:0]  mulop_dec1, lsf3_dec1, csrf3_dec1;
+    reg [3:0]  func4_dec1;
+    reg [11:0] csra_dec1;
+    reg [31:0] jval_dec1;
+    reg        brf_dec1, jalf_dec1, jalfr_dec1;
+    always @(*) begin
+        class_dec1      = CLS_ALU;
+        we_dec1         = 1'b0;
+        csrw_en_dec1    = 1'b0;
+        csrw_armed_dec1 = 1'b0;
+        csrw_wr_dec1    = 1'b0;
+        rd_pick_dec1    = 5'd0;
+        is_st_dec1      = 1'b0;
+        mulop_dec1      = 3'd0;
+        lsf3_dec1       = 3'd0;
+        csrf3_dec1      = 3'd0;
+        func4_dec1      = 4'd0;
+        csra_dec1       = 12'd0;
+        jval_dec1       = 32'd0;
+        brf_dec1        = 1'b0;
+        jalf_dec1       = 1'b0;
+        jalfr_dec1      = 1'b0;
+        case (inst_in1[6:0])
+            OPCODE_OP: begin
+                if (inst_in1[31:25] == 7'b0000001) begin
+                    class_dec1 = CLS_MUL;
+                    mulop_dec1 = inst_in1[14:12];
+                end
+                else begin
+                    func4_dec1   = {func10_dec1[8], func10_dec1[2:0]};
+                    rd_pick_dec1 = rd_dec1;
+                    we_dec1      = 1'b1;
+                end
+            end
+            OPCODE_OP_IMM: begin
+                func4_dec1   = {func10_dec1[8], func10_dec1[2:0]};
+                rd_pick_dec1 = rd_dec1;
+                we_dec1      = 1'b1;
+            end
+            OPCODE_JAL: begin
+                class_dec1   = CLS_BJU;
+                jalf_dec1    = 1'b1;
+                rd_pick_dec1 = rd_dec1;
+                we_dec1      = 1'b1;
+            end
+            OPCODE_JALR: begin
+                class_dec1   = CLS_BJU;
+                jalfr_dec1   = 1'b1;
+                rd_pick_dec1 = rd_dec1;
+                we_dec1      = 1'b1;
+                jval_dec1    = jalr_pred_in1;
+            end
+            OPCODE_BRANCH: begin
+                class_dec1   = CLS_BJU;
+                brf_dec1     = 1'b1;
+                func4_dec1   = {1'b0, inst_in1[14:12]};
+                jval_dec1    = imm_dec1 - 32'd4;
+            end
+            OPCODE_LUI: begin
+                rd_pick_dec1 = rd_dec1;
+                we_dec1      = 1'b1;
+            end
+            OPCODE_AUIPC: begin
+                rd_pick_dec1 = rd_dec1;
+                we_dec1      = 1'b1;
+            end
+            OPCODE_LOAD: begin
+                class_dec1   = CLS_LSU;
+                lsf3_dec1    = inst_in1[14:12];
+                rd_pick_dec1 = rd_dec1;
+                jval_dec1    = imm_dec1;
+            end
+            OPCODE_STORE: begin
+                class_dec1   = CLS_LSU;
+                is_st_dec1   = 1'b1;
+                lsf3_dec1    = inst_in1[14:12];
+                jval_dec1    = imm_dec1;
+            end
+            OPCODE_SYSTEM: begin
+                class_dec1   = CLS_BJU;
+                csrf3_dec1   = inst_in1[14:12];
+                rd_pick_dec1 = rd_dec1;
+                case (inst_in1[14:12])
+                    3'b001, 3'b010, 3'b011, 3'b101, 3'b110, 3'b111: begin
+                        we_dec1         = 1'b1;
+                        csrw_en_dec1    = 1'b1;
+                        csrw_armed_dec1 = 1'b1;
+                        csrw_wr_dec1    = csr_wr_dec1;
+                    end
+                    default: begin
+                        we_dec1      = 1'b0;
+                        csrw_en_dec1 = 1'b0;
+                    end
+                endcase
+                csra_dec1 = (inst_in1[14:12] != 3'b000) ? inst_in1[31:20] : 12'd0;
+            end
+            default: ;
+        endcase
+        if (exc_illegal_dec1 | exc_jmis_dec1) begin
+            we_dec1         = 1'b0;
+            csrw_en_dec1    = 1'b0;
+            csrw_armed_dec1 = 1'b0;
+            csrw_wr_dec1    = 1'b0;
+        end
+    end
+
+    reg r1_imm_dec1, r2_imm_dec1;
+    reg [31:0] r1_immv_dec1, r2_immv_dec1;
+    always @(*) begin
+        r1_imm_dec1  = 1'b0;
+        r2_imm_dec1  = 1'b0;
+        r1_immv_dec1 = 32'd0;
+        r2_immv_dec1 = 32'd0;
+        case (inst_in1[6:0])
+            OPCODE_OP_IMM: begin r2_imm_dec1 = 1'b1; r2_immv_dec1 = imm_dec1; end
+            OPCODE_JALR:   begin r2_imm_dec1 = 1'b1; r2_immv_dec1 = imm_dec1; end
+            OPCODE_LUI:    begin r2_imm_dec1 = 1'b1; r2_immv_dec1 = imm_dec1; end
+            OPCODE_AUIPC:  begin
+                r1_imm_dec1  = 1'b1; r1_immv_dec1 = addr_in1;
+                r2_imm_dec1  = 1'b1; r2_immv_dec1 = imm_dec1;
+            end
+            OPCODE_SYSTEM: begin
+                if ((inst_in1[14:12] == 3'b101) | (inst_in1[14:12] == 3'b110) | (inst_in1[14:12] == 3'b111)) begin
+                    r1_imm_dec1  = 1'b1;
+                    r1_immv_dec1 = {27'd0, inst_in1[19:15]};
+                end
+            end
+            default: ;
+        endcase
+    end
+
+    reg exc_ecall_dec1, exc_ebreak_dec1, exc_irq_ret_dec1;
+    always @(*) begin
+        exc_ecall_dec1   = (inst_in1[6:0] == OPCODE_SYSTEM) && (inst_in1[31:20] == 12'h000);
+        exc_ebreak_dec1  = (inst_in1[6:0] == OPCODE_SYSTEM) && (inst_in1[31:20] == 12'h001);
+        exc_irq_ret_dec1 = (inst_in1[6:0] == OPCODE_SYSTEM) && (inst_in1[14:12] == 3'b000)
+                        && (inst_in1[31:20] == 12'h302);
+    end
+
+    always @(*) begin
+        alloc_en1   = advance & (inst_in1 != 32'd0);
+        alloc_rd1   = rd_dec1;
+        alloc_we1   = (rd_dec1 != 5'd0);
+        alloc_jmp1  = jmp_dec1;
+        alloc_pend1 = (inst_in1[6:0] == OPCODE_LOAD) |
+                     ((inst_in1[6:0] == OPCODE_OP) && (inst_in1[31:25] == 7'b0000001));
     end
 
 //推进/保持/清：与 fifo 出队格的"换新/保持/清"【逐字同形】。
@@ -468,6 +812,7 @@ module idu1(
             r2_out <= 5'd0;
             idx_out <= 3'd0;
             gen_out <= 1'b0;
+            pay_v_out <= 1'b0;
             dec_class <= 2'd0;
             dec_we <= 1'b0;
             dec_rd <= 5'd0;
@@ -503,6 +848,7 @@ module idu1(
                 r2_out <= r2_in;
                 idx_out <= idx_in;
                 gen_out <= gen_in;
+                pay_v_out <= (addr_in != 32'd0);
                 dec_class <= class_dec;
                 dec_we <= we_dec;
                 dec_rd <= rd_pick_dec;
@@ -539,6 +885,7 @@ module idu1(
                 r2_out <= r2_out;
                 idx_out <= idx_out;
                 gen_out <= gen_out;
+                pay_v_out <= pay_v_out;
                 dec_class <= dec_class;
                 dec_we <= dec_we;
                 dec_rd <= dec_rd;
@@ -573,6 +920,7 @@ module idu1(
                 r2_out <= 5'd0;
                 idx_out <= 3'd0;
                 gen_out <= 1'b0;
+                pay_v_out <= 1'b0;
                 dec_class <= 2'd0;
                 dec_we <= 1'b0;
                 dec_rd <= 5'd0;
@@ -598,6 +946,155 @@ module idu1(
                 dec_r2_imm <= 1'b0;
                 dec_r1_immv <= 32'd0;
                 dec_r2_immv <= 32'd0;
+            end
+        end
+    end
+
+    always @(*) begin
+        advance1 = advance & pay_v_out1;
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            inst_out1 <= 32'd0;
+            aux_addr_out1 <= 32'd0;
+            br_pred_taken_out1 <= 1'b0;
+            r1_out1 <= 5'd0;
+            r2_out1 <= 5'd0;
+            idx_out1 <= 3'd0;
+            gen_out1 <= 1'b0;
+            pay_v_out1 <= 1'b0;
+            dec_class1 <= 2'd0;
+            dec_we1 <= 1'b0;
+            dec_rd1 <= 5'd0;
+            dec_is_st1 <= 1'b0;
+            dec_mulop1 <= 3'd0;
+            dec_lsf31 <= 3'd0;
+            dec_func41 <= 4'd0;
+            dec_csrf31 <= 3'd0;
+            dec_csrw_en1 <= 1'b0;
+            dec_csrw_armed1 <= 1'b0;
+            dec_csrw_wr1 <= 1'b0;
+            dec_csra1 <= 12'd0;
+            dec_jval1 <= 32'd0;
+            dec_brf1 <= 1'b0;
+            dec_jalf1 <= 1'b0;
+            dec_jalfr1 <= 1'b0;
+            dec_exc_illegal1 <= 1'b0;
+            dec_exc_jmis1 <= 1'b0;
+            dec_exc_ecall1 <= 1'b0;
+            dec_exc_ebreak1 <= 1'b0;
+            dec_exc_irq_ret1 <= 1'b0;
+            dec_r1_imm1 <= 1'b0;
+            dec_r2_imm1 <= 1'b0;
+            dec_r1_immv1 <= 32'd0;
+            dec_r2_immv1 <= 32'd0;
+        end
+        else if (exec) begin
+            if (advance) begin
+                inst_out1 <= inst_in1;
+                aux_addr_out1 <= addr_in1;
+                br_pred_taken_out1 <= br_pred_in1;
+                r1_out1 <= r1_in1;
+                r2_out1 <= r2_in1;
+                idx_out1 <= idx_in1;
+                gen_out1 <= gen_in1;
+                pay_v_out1 <= (addr_in1 != 32'd0);
+                dec_class1 <= class_dec1;
+                dec_we1 <= we_dec1;
+                dec_rd1 <= rd_pick_dec1;
+                dec_is_st1 <= is_st_dec1;
+                dec_mulop1 <= mulop_dec1;
+                dec_lsf31 <= lsf3_dec1;
+                dec_func41 <= func4_dec1;
+                dec_csrf31 <= csrf3_dec1;
+                dec_csrw_en1 <= csrw_en_dec1;
+                dec_csrw_armed1 <= csrw_armed_dec1;
+                dec_csrw_wr1 <= csrw_wr_dec1;
+                dec_csra1 <= csra_dec1;
+                dec_jval1 <= jval_dec1;
+                dec_brf1 <= brf_dec1;
+                dec_jalf1 <= jalf_dec1;
+                dec_jalfr1 <= jalfr_dec1;
+                dec_exc_illegal1 <= exc_illegal_dec1;
+                dec_exc_jmis1 <= exc_jmis_dec1;
+                dec_exc_ecall1 <= exc_ecall_dec1;
+                dec_exc_ebreak1 <= exc_ebreak_dec1;
+                dec_exc_irq_ret1 <= exc_irq_ret_dec1;
+                dec_r1_imm1 <= r1_imm_dec1;
+                dec_r2_imm1 <= r2_imm_dec1;
+                dec_r1_immv1 <= r1_immv_dec1;
+                dec_r2_immv1 <= r2_immv_dec1;
+            end
+            else if ((stall | ~rdy1_in1 | ~rdy2_in1) & ~flush_w) begin
+                inst_out1 <= inst_out1;
+                aux_addr_out1 <= aux_addr_out1;
+                br_pred_taken_out1 <= br_pred_taken_out1;
+                r1_out1 <= r1_out1;
+                r2_out1 <= r2_out1;
+                idx_out1 <= idx_out1;
+                gen_out1 <= gen_out1;
+                pay_v_out1 <= pay_v_out1;
+                dec_class1 <= dec_class1;
+                dec_we1 <= dec_we1;
+                dec_rd1 <= dec_rd1;
+                dec_is_st1 <= dec_is_st1;
+                dec_mulop1 <= dec_mulop1;
+                dec_lsf31 <= dec_lsf31;
+                dec_func41 <= dec_func41;
+                dec_csrf31 <= dec_csrf31;
+                dec_csrw_en1 <= dec_csrw_en1;
+                dec_csrw_armed1 <= dec_csrw_armed1;
+                dec_csrw_wr1 <= dec_csrw_wr1;
+                dec_csra1 <= dec_csra1;
+                dec_jval1 <= dec_jval1;
+                dec_brf1 <= dec_brf1;
+                dec_jalf1 <= dec_jalf1;
+                dec_jalfr1 <= dec_jalfr1;
+                dec_exc_illegal1 <= dec_exc_illegal1;
+                dec_exc_jmis1 <= dec_exc_jmis1;
+                dec_exc_ecall1 <= dec_exc_ecall1;
+                dec_exc_ebreak1 <= dec_exc_ebreak1;
+                dec_exc_irq_ret1 <= dec_exc_irq_ret1;
+                dec_r1_imm1 <= dec_r1_imm1;
+                dec_r2_imm1 <= dec_r2_imm1;
+                dec_r1_immv1 <= dec_r1_immv1;
+                dec_r2_immv1 <= dec_r2_immv1;
+            end
+            else begin
+                inst_out1 <= 32'd0;
+                aux_addr_out1 <= 32'd0;
+                br_pred_taken_out1 <= 1'b0;
+                r1_out1 <= 5'd0;
+                r2_out1 <= 5'd0;
+                idx_out1 <= 3'd0;
+                gen_out1 <= 1'b0;
+                pay_v_out1 <= 1'b0;
+                dec_class1 <= 2'd0;
+                dec_we1 <= 1'b0;
+                dec_rd1 <= 5'd0;
+                dec_is_st1 <= 1'b0;
+                dec_mulop1 <= 3'd0;
+                dec_lsf31 <= 3'd0;
+                dec_func41 <= 4'd0;
+                dec_csrf31 <= 3'd0;
+                dec_csrw_en1 <= 1'b0;
+                dec_csrw_armed1 <= 1'b0;
+                dec_csrw_wr1 <= 1'b0;
+                dec_csra1 <= 12'd0;
+                dec_jval1 <= 32'd0;
+                dec_brf1 <= 1'b0;
+                dec_jalf1 <= 1'b0;
+                dec_jalfr1 <= 1'b0;
+                dec_exc_illegal1 <= 1'b0;
+                dec_exc_jmis1 <= 1'b0;
+                dec_exc_ecall1 <= 1'b0;
+                dec_exc_ebreak1 <= 1'b0;
+                dec_exc_irq_ret1 <= 1'b0;
+                dec_r1_imm1 <= 1'b0;
+                dec_r2_imm1 <= 1'b0;
+                dec_r1_immv1 <= 32'd0;
+                dec_r2_immv1 <= 32'd0;
             end
         end
     end
