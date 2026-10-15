@@ -871,6 +871,16 @@ module idu2(
         end
     end
 
+    reg [DEPTH-1:0] bpa1, bpa2, bpb1, bpb2;
+    always @(*) begin
+        for (i = 0; i < DEPTH; i = i + 1) begin
+            bpa1[i] = we  & (pt_is0 == ent_ps1[i]);
+            bpa2[i] = we  & (pt_is0 == ent_ps2[i]);
+            bpb1[i] = we1 & (pt_is1 == ent_ps1[i]);
+            bpb2[i] = we1 & (pt_is1 == ent_ps2[i]);
+        end
+    end
+
     always @(posedge clk) begin
         if (rst_q) begin
             sel_slot_q  <= 3'd0;
@@ -880,10 +890,10 @@ module idu2(
             byp1_q <= 2'd0;  byp2_q <= 2'd0;  byp3_q <= 2'd0;  byp4_q <= 2'd0;
         end
         else begin
-            byp1_q <= ~have_sel ? 2'd0 : (we  & (pt_is0 == ent_ps1[sel_slot])) ? 2'd1 : (we1 & (pt_is1 == ent_ps1[sel_slot])) ? 2'd2 : 2'd0;
-            byp2_q <= ~have_sel ? 2'd0 : (we  & (pt_is0 == ent_ps2[sel_slot])) ? 2'd1 : (we1 & (pt_is1 == ent_ps2[sel_slot])) ? 2'd2 : 2'd0;
-            byp3_q <= ~have_sel1 ? 2'd0 : (we  & (pt_is0 == ent_ps1[sel_slot1])) ? 2'd1 : (we1 & (pt_is1 == ent_ps1[sel_slot1])) ? 2'd2 : 2'd0;
-            byp4_q <= ~have_sel1 ? 2'd0 : (we  & (pt_is0 == ent_ps2[sel_slot1])) ? 2'd1 : (we1 & (pt_is1 == ent_ps2[sel_slot1])) ? 2'd2 : 2'd0;
+            byp1_q <= ~have_sel ? 2'd0 : bpa1[sel_slot] ? 2'd1 : bpb1[sel_slot] ? 2'd2 : 2'd0;
+            byp2_q <= ~have_sel ? 2'd0 : bpa2[sel_slot] ? 2'd1 : bpb2[sel_slot] ? 2'd2 : 2'd0;
+            byp3_q <= ~have_sel1 ? 2'd0 : bpa1[sel_slot1] ? 2'd1 : bpb1[sel_slot1] ? 2'd2 : 2'd0;
+            byp4_q <= ~have_sel1 ? 2'd0 : bpa2[sel_slot1] ? 2'd1 : bpb2[sel_slot1] ? 2'd2 : 2'd0;
             sel_slot_q  <= sel_slot  - ({2'd0,(issue_v & (sel_slot_q  < sel_slot))}  + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot))});
             sel_slot1_q <= sel_slot1 - ({2'd0,(issue_v & (sel_slot_q  < sel_slot1))} + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot1))});
             sel_vld_q   <= have_sel & exec & ~flush_w;
