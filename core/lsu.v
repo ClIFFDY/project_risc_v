@@ -376,7 +376,7 @@ module lsu(
     end
 
     always @(*) begin
-        s3_v_nx    = s3_kill ? 1'b0 : (s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v));
+        s3_v_nx    = s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v);
         s3_kind_nx = s2_move ? s2_kind : s3_kind;
     end
 
