@@ -56,6 +56,7 @@ module lsu(
 //  miss 当拍不摆总线、等它落下的拍才发送；本模块的入口也照旧不看它（车厢占满由 full 顶住）。
 //  原先它是经 cont 绕一圈、经全核广播回来再给本模块用的，现在由 dcache 直连过来。
     input dcache_hold,
+    input ld_ready_nx,
     input        has_older_bju_in,
     input [3:0]  flush_idx_in,
     input [3:0]  head_ptr_in,
@@ -79,6 +80,9 @@ module lsu(
 //  （sel → opc_out → mem_op → full_stall → 站候选 → sel）。这里取 s2_ok & s3_ok，不含 opcode。
     output reg  car_free,
     output reg mem_inflight,
+    output reg        ld_wb_nx,
+    output reg [3:0]  ld_nx_idx,
+    output reg        ld_nx_gen,
     (* max_fanout = 8 *) output reg [4:0] rd_load,
 //本条写回记录带的 ROB 索引（跟着数据走）
     (* max_fanout = 8 *) output reg [3:0]  ld_idx,
@@ -159,6 +163,7 @@ module lsu(
     reg mem_op, is_st, new_in, new_in_pre, new_go, full_stall, bus_go;
     reg s2_noncache, new_noncache, s2_hold, new_hold;
     reg s3_done, s3_ok, s2_move, s2_ok, s2_put_go;
+    reg s3_v_nx, s3_kind_nx;
     reg ld_out, blank_bus, s2_put, new_put;
     reg ls_use_hit, miss;
     reg ls_use_ans;
@@ -270,7 +275,7 @@ module lsu(
 //在途读 = 级3 里那笔读，或级2 里刚摆上、下一拍才进级3 的那笔读（后一项不能省：快慢设备
 //混跑时先回来的应答会串到前一条头上 —— 实测 ls_mix2 两条读结果互换）。
 //dcache 1 拍应答 ⇒ 该摆下一笔的那拍 ready_in 正好是 1 ⇒ blank 为 0 ⇒ 快路径一拍不减速。
-        ld_out     = (s2_v & ~s2_kind & s2_sent) | (s3_v & ~s3_kind);
+        ld_out     = (s2_v & ~s2_kind & s2_sent & s2_noncache) | (s3_v & ~s3_kind);
         blank_bus  = miss | (ld_out & ~ready_in);
         s2_noncache  = ~((s2_addr[31:24]  == 8'd0) & (s2_addr[23:13]  == 11'h100));
         new_noncache = ~((cur_addr[31:24] == 8'd0) & (cur_addr[23:13] == 11'h100));
@@ -368,6 +373,17 @@ module lsu(
         fl_age = {1'b0, (flush_idx_in - head_ptr_in)};
         s2_kill = s2_v & s2_oldbj & flush_commit & (s2_age > fl_age);
         s3_kill = s3_v & s3_oldbj & flush_commit & (s3_age > fl_age);
+    end
+
+    always @(*) begin
+        s3_v_nx    = s3_kill ? 1'b0 : (s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v));
+        s3_kind_nx = s2_move ? s2_kind : s3_kind;
+    end
+
+    always @(*) begin
+        ld_wb_nx  = s3_v_nx & ~s3_kind_nx & ld_ready_nx;
+        ld_nx_idx = s2_move ? s2_idx : s3_idx;
+        ld_nx_gen = s2_move ? s2_gen : s3_gen;
     end
 //===============================================================
 // 时序：两级推进

@@ -299,7 +299,8 @@ module bju(
 
 //===============================================================
     always @(posedge clk) begin
-        if (rst_q || flush_w) adv_d <= 1'b0;
+        if (rst_q)            adv_d <= 1'b0;
+        else if (flush_w)     adv_d <= 1'b0;
         else                  adv_d <= adv;
     end
 

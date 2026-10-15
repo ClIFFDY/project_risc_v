@@ -84,7 +84,10 @@ module mdu(
 //两条 ready 回站：只由本模块寄存器状态决定（不含对方通道、不含被选指令）⇒ 不闭零延时环。
 //站侧按站项自己的算子门控（乘法项看 mul_ready、除法项看 div_ready），门控式与本模块的接收式逐字相同。
     output reg mul_ready,
-    output reg div_ready
+    output reg div_ready,
+    output reg        mul_wb_nx,
+    output reg [3:0]  mul_nx_idx,
+    output reg        mul_nx_gen
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -376,7 +379,11 @@ module mdu(
 
 //完成脉冲（比最后一次迭代晚一拍）
     always @(posedge clk) begin
-        if (rst_q || d_kill) begin
+        if (rst_q) begin
+            d_done   <= 1'b0;
+            d_done_q <= 1'b0;
+        end
+        else if (d_kill) begin
             d_done   <= 1'b0;
             d_done_q <= 1'b0;
         end
@@ -459,6 +466,19 @@ module mdu(
             mul_idx      = 3'd0;
             mul_gen      = 1'b0;
             mul_data_out = 32'd0;
+        end
+    end
+
+    always @(*) begin
+        if (pipe_stall | wb_conflict) begin
+            mul_wb_nx  = m_pv & ~d_cmt_q[1];
+            mul_nx_idx = m_idx_q;
+            mul_nx_gen = m_gen_q;
+        end
+        else begin
+            mul_wb_nx  = m_v & ~d_cmt_q[1];
+            mul_nx_idx = m_idx;
+            mul_nx_gen = m_gen;
         end
     end
 

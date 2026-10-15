@@ -92,14 +92,8 @@ module bpu(
 
 //BHT查当前取指PC，饱和计数>1则预测跳转
     always @(*) begin
-        if (rst_q) begin
-            predict_en = 1'b0;
-            predict_en_l1 = 1'b0;
-        end
-        else begin
-            predict_en    = (bht[aux_addr_in[11:3]] > 2'd1);
-            predict_en_l1 = (bht[pc_addr_in[11:3]] > 2'd1);
-        end
+        predict_en    = (bht[aux_addr_in[11:3]] > 2'd1);
+        predict_en_l1 = (bht[pc_addr_in[11:3]] > 2'd1);
     end
 
 //==================================================================================
@@ -148,18 +142,10 @@ module bpu(
 //由 pc 落 T 让 icache 自己去取目标（差一拍，只有 jal 冷启动吃这一拍）。
     reg bti_hit0, bti_hit1;
     always @(*) begin
-        if (rst_q) begin
-            bti_hit0 = 1'b0;
-            bti_hit1 = 1'b0;
-            bti_hit  = 1'b0;
-            take     = 1'b0;
-        end
-        else begin
-            bti_hit0 = bti_v[bti_rd_idx0] & (bti_tag[bti_rd_idx0] == bti_rd_tag0);
-            bti_hit1 = bti_v[bti_rd_idx1] & (bti_tag[bti_rd_idx1] == bti_rd_tag1);
-            bti_hit  = fch_jal_l1 ? bti_hit1 : bti_hit0;
-            take     = (jal | br1) & adv;
-        end
+        bti_hit0 = bti_v[bti_rd_idx0] & (bti_tag[bti_rd_idx0] == bti_rd_tag0);
+        bti_hit1 = bti_v[bti_rd_idx1] & (bti_tag[bti_rd_idx1] == bti_rd_tag1);
+        bti_hit  = fch_jal_l1 ? bti_hit1 : bti_hit0;
+        take     = (jal | br1) & adv;
     end
 
 //欠交付状态机
@@ -185,9 +171,7 @@ module bpu(
 
 //交付三态：0 = 用 icache 正常交付；1 = 用 bti 的目标 inst；2 = 交付 NOP
     always @(*) begin
-        if (rst_q)
-            bti_sel_q = 2'd0;
-        else if (bti_pend)
+        if (bti_pend)
             bti_sel_q = bti_kind_q ? 2'd1 : 2'd2;
         else
             bti_sel_q = 2'd0;
@@ -276,26 +260,14 @@ module bpu(
 
 //组合输出：当前取指PC的预测结果 + 载荷的预测判定
     always @(*) begin
-        if (rst_q) begin
-            br1 = 1'b0;
-            br1_l1 = 1'b0;
-            br2 = 1'b0;
-            br3 = 1'b0;
-            jalr = 1'b0;
-            jalr_l1 = 1'b0;
-            jalr_predict_offset = 32'd0;
-            jalr_predict_offset_l1 = 32'd0;
-        end
-        else begin
-            br1 = br_en & predict_en;
-            br1_l1 = br_en_l1 & predict_en_l1;
-            br2 = success & !br_pred_taken_in;
-            br3 = br_fail & br_pred_taken_in;
-            jalr_predict_offset = btb[aux_addr_in[8:3]];
-            jalr_l1 = btb_v[pc_addr_in[8:3]];
-            jalr_predict_offset_l1 = btb[pc_addr_in[8:3]];
-            jalr = btb_v[aux_addr_in[8:3]];
-        end
+        br1 = br_en & predict_en;
+        br1_l1 = br_en_l1 & predict_en_l1;
+        br2 = success & !br_pred_taken_in;
+        br3 = br_fail & br_pred_taken_in;
+        jalr_predict_offset = btb[aux_addr_in[8:3]];
+        jalr_l1 = btb_v[pc_addr_in[8:3]];
+        jalr_predict_offset_l1 = btb[pc_addr_in[8:3]];
+        jalr = btb_v[aux_addr_in[8:3]];
     end
 
 endmodule

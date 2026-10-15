@@ -143,7 +143,11 @@ module iffu(
     reg [31:0] inst_lat;
     reg [31:0] pc_lat;
     always @(posedge clk) begin
-        if (rst_q | flush_w) begin
+        if (rst_q) begin
+            inst_lat <= 32'd0;
+            pc_lat   <= 32'd0;
+        end
+        else if (flush_w) begin
             inst_lat <= 32'd0;
             pc_lat   <= 32'd0;
         end
@@ -162,16 +166,16 @@ module iffu(
         lane0_jal  = (inst_cur[6:0] == OPCODE_JAL);
         lane0_jalr = (inst_cur[6:0] == OPCODE_JALR);
         lane0_br   = (inst_cur[6:0] == OPCODE_BRANCH);
-        lane1_go   = ~rst_q & ~flush_w & inst_valid1 & deliv_v & (bti_sel == 2'd0) & ~lane0_redir;
+        lane1_go   = ~flush_w & inst_valid1 & deliv_v & (bti_sel == 2'd0) & ~lane0_redir;
         lane1_jal  = lane1_go & (inst_in1[6:0] == OPCODE_JAL);
         lane1_br   = lane1_go & (inst_in1[6:0] == OPCODE_BRANCH);
         lane1_jalr = lane1_go & (inst_in1[6:0] == OPCODE_JALR);
     end
 
     always @(*) begin
-        fch_jal        = (lane0_jal & ~rst_q) | lane1_jal;
-        fch_jalr       = lane0_jalr & ~rst_q & ~flush_w;
-        fch_br_en      = lane0_br & ~rst_q;
+        fch_jal        = lane0_jal | lane1_jal;
+        fch_jalr       = lane0_jalr & ~flush_w;
+        fch_br_en      = lane0_br;
         fch_jal_l1     = lane1_jal;
         fch_br_en_l1   = lane1_br;
         fch_jalr_l1    = lane1_jalr;
@@ -179,7 +183,7 @@ module iffu(
         fch_off_jal    = lane1_jal ? $signed(immJ(inst_in1)) : $signed(immJ(inst_cur));
         fch_off_beq_l1 = $signed(immB(inst_in1));
         lane0_redir    = ((inst_cur[6:0] == OPCODE_BRANCH) & push_br_pred)
-                       | (lane0_jal & ~rst_q)
+                       | lane0_jal
                        | (fch_jalr & btb_hit);
     end
 

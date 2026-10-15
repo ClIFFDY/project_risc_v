@@ -155,10 +155,7 @@ module icache(
 //这样一来，"译码器 + 加法器 → 取指地址 → tag 阵列读 → 命中选择 → iram 地址口"
 //那条 13 级/14.4ns 的链整条消失。
     always @(*) begin
-        if (rst_q)
-            fetch_addr = 32'd0;
-        else
-            fetch_addr = pc_addr >>> 2;
+        fetch_addr = pc_addr >>> 2;
     end
 
 //写口：自举与回填共用【同一条写语句、同一个地址表达式】。写成两条写语句（两个地址表达式），

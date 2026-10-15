@@ -223,7 +223,8 @@ module cpu_top(
     wire bju_in_flight_idu2;
 //停顿源（逐条，一位一源）
     wire car_free_lsu;
-    wire loaded_lsu, we_lsu;
+    wire loaded_lsu, we_lsu, ld_wb_nx_lsu, ld_nx_gen_lsu;
+    wire [3:0] ld_nx_idx_lsu;
     wire stall_rob_full_rob, stall_pc_redir_pc;
     wire flush_con_rob_cont, flush_incl_cont, flush_pc_redir_pc;
     wire [3:0] flush_idx_cont;
@@ -243,7 +244,7 @@ module cpu_top(
     wire ready_tim_in;
     wire [31:0] data_dcache, mem_addr_dcache, mem_wdata_dcache, mem_data_dtcm;
     wire [3:0] mem_be_dcache;
-    wire busy_dcache, ld_ready_dcache, mem_req_dcache, mem_we_dcache, mem_valid_dtcm;
+    wire busy_dcache, ld_ready_dcache, ld_ready_nx_dcache, mem_req_dcache, mem_we_dcache, mem_valid_dtcm;
 //dcache 的停顿（busy 的延拓拍，原来在顶层合成 d_hold_int，现在由 dcache 自己输出）。
 //★ 它【只给 lsu】：不进 flag_bus_cont 的全核广播 —— "dcache 忙"与"前端该不该冻"是两件事，
 //  交给 lsu 之后，dcache 回填期间前端照常推进。
@@ -253,6 +254,8 @@ module cpu_top(
     wire loaded_mdu, we_mdu;
 //mdu 两条 ready（回站的门控）与两条接收口的 valid
     wire mul_ready_mdu, div_ready_mdu, mul_go_idu2, div_go_idu2;
+    wire mul_wb_nx_mdu, mul_nx_gen_mdu;
+    wire [3:0] mul_nx_idx_mdu;
     wire [4:0] rd_mul_mdu;
 //总线层次块
     wire [31:0] bus_addr_out_lsu, bus_data_out_lsu;
@@ -603,6 +606,8 @@ module cpu_top(
         .bju_in_flight(bju_in_flight_idu2),
         .lsu_full_in(~car_free_lsu),
         .mul_ready_in(mul_ready_mdu), .div_ready_in(div_ready_mdu),
+        .mul_wb_nx(mul_wb_nx_mdu), .mul_nx_idx(mul_nx_idx_mdu), .mul_nx_gen(mul_nx_gen_mdu),
+        .ld_wb_nx(ld_wb_nx_lsu), .ld_nx_idx(ld_nx_idx_lsu), .ld_nx_gen(ld_nx_gen_lsu),
         .alloc_rob_in(alloc_en_idu1),
         .alloc_rob_in1(alloc_en1_idu1),
         .alloc_en(rs_alloc_en_idu2),
@@ -724,6 +729,7 @@ module cpu_top(
         .bus_data_dcache(data_dcache),
         .bus_data_tim(data_out_tim_in),
         .ready_dcache(ld_ready_dcache),
+        .ld_ready_nx(ld_ready_nx_dcache),
         .dcache_hold(hold_dcache),
         .has_older_bju_in(has_older_bju_sel_idu2),
         .flush_idx_in(flush_idx_cont),
@@ -747,6 +753,9 @@ module cpu_top(
         .ld_data_out(data_final_lsu),
         .loaded(loaded_lsu),
         .ld_we(we_lsu),
+        .ld_wb_nx(ld_wb_nx_lsu),
+        .ld_nx_idx(ld_nx_idx_lsu),
+        .ld_nx_gen(ld_nx_gen_lsu),
         .car_free(car_free_lsu)
     );
 //RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
@@ -782,7 +791,10 @@ module cpu_top(
         .mul_gen(gen_mdu),
 //两条 ready 回站：站侧按站项算子分别门控
         .mul_ready(mul_ready_mdu),
-        .div_ready(div_ready_mdu)
+        .div_ready(div_ready_mdu),
+        .mul_wb_nx(mul_wb_nx_mdu),
+        .mul_nx_idx(mul_nx_idx_mdu),
+        .mul_nx_gen(mul_nx_gen_mdu)
     );
     bpu u_bpu (
         .clk(clk),
@@ -984,6 +996,7 @@ module cpu_top(
         .bus_we_in(bus_we_out_lsu),
         .bus_data_out(data_dcache),
         .ld_ready(ld_ready_dcache),
+        .ld_ready_nx(ld_ready_nx_dcache),
         .busy(busy_dcache),
         .hold(hold_dcache),
         .mem_req(mem_req_dcache),

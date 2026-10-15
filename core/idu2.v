@@ -154,6 +154,12 @@ module idu2(
     input        lsu_full_in,
 //mdu 的两条 ready：乘法项看 mul_ready_in、除法项看 div_ready_in（按站项自己的算子门控）
     input        mul_ready_in, div_ready_in,
+    input        mul_wb_nx,
+    input [3:0]  mul_nx_idx,
+    input        mul_nx_gen,
+    input        ld_wb_nx,
+    input [3:0]  ld_nx_idx,
+    input        ld_nx_gen,
 
 //---- 给 rob 的入站（分配）使能 ----
     output       alloc_en,
@@ -236,6 +242,8 @@ module idu2(
     reg [2:0] sel_class_q;
     reg       sel_is_div_q;
     reg       sel_irq_ret_q;
+    reg [5:0]  sel_ps1_q, sel_ps2_q, sel_ps1b_q, sel_ps2b_q;
+    reg [31:0] sel_aux_q;
     reg [2:0] sel_slot1_q;
     reg       sel_vld1_q;
     wire       issue_v0 = issue_v;
@@ -302,7 +310,7 @@ module idu2(
 //★ push_en ≡ src_en（= idu1 的 advance）：这一条压不下去就必须把 advance 挡掉，
 //  否则它既没进站、又被 idu1 的输出覆盖 = 丢条。
     reg [3:0] occ_live;
-    always @(*) occ_live = occupancy - (issue_v ? 4'd1 : 4'd0) - (issue_v1 ? 4'd1 : 4'd0);
+    always @(*) occ_live = occupancy;
     always @(*) begin
         src_en0 = s_advance;
         src_en1 = s_advance1;
@@ -367,6 +375,8 @@ module idu2(
     wire [5:0] pt_alu2 = {1'b1, idx_alu2, gen_alu2};
     wire [5:0] pt_mul  = {1'b1, idx_mul,  gen_mul};
     wire [5:0] pt_ld   = {1'b1, idx_ld,   gen_ld};
+    wire [5:0] pt_mulnx = {1'b1, mul_nx_idx, mul_nx_gen};
+    wire [5:0] pt_ldnx  = {1'b1, ld_nx_idx,  ld_nx_gen};
     wire [5:0] pt_is0  = {1'b1, issue_idx,  issue_gen};
     wire [5:0] pt_is1  = {1'b1, issue_idx1, issue_gen1};
 
@@ -401,7 +411,7 @@ module idu2(
     end
 
 //---- 唤醒（组合）：结果口广播按 idx+gen 双匹配 ----
-    reg [DEPTH-1:0] wake1, wake2;
+    reg [DEPTH-1:0] wake1, wake2, wake1p, wake2p;
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
             wake1[i] = ent_wait1[i] & ((we_alu  & (pt_alu  == ent_ps1[i])) |
@@ -412,6 +422,10 @@ module idu2(
                                (we_alu2 & (pt_alu2 == ent_ps2[i])) |
                                (we_mul  & (pt_mul  == ent_ps2[i])) |
                                (we_ld   & (pt_ld   == ent_ps2[i])));
+            wake1p[i] = ent_wait1[i] & ((mul_wb_nx & (pt_mulnx == ent_ps1[i])) |
+                               (ld_wb_nx  & (pt_ldnx  == ent_ps1[i])));
+            wake2p[i] = ent_wait2[i] & ((mul_wb_nx & (pt_mulnx == ent_ps2[i])) |
+                               (ld_wb_nx  & (pt_ldnx  == ent_ps2[i])));
         end
     end
 
@@ -421,9 +435,9 @@ module idu2(
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
             nx_wait1[i]= ent_wait1[i];
-            if (wake1[i]) nx_wait1[i] = 1'b0;
+            if (wake1[i] | wake1p[i]) nx_wait1[i] = 1'b0;
             nx_wait2[i]= ent_wait2[i];
-            if (wake2[i]) nx_wait2[i] = 1'b0;
+            if (wake2[i] | wake2p[i]) nx_wait2[i] = 1'b0;
         end
     end
 
@@ -467,7 +481,7 @@ module idu2(
         if (sel_class_q == CLS_LSU) res_ok_q = ~lsu_full_in;
         if (sel_class_q == CLS_MUL) res_ok_q = sel_is_div_q ? div_ready_in : mul_ready_in;
         sel_go_irqret   = sel_vld_q & exec & ~flush_con_exc & ~flush_con_jump;
-        issue_v_irqret  = sel_go_irqret & res_ok_q;
+        issue_v_irqret  = sel_go_irqret;
         bju_issuing_now = sel_go & (sel_class_q == CLS_BJU);
         bju_pending     = bju_shift[0] | bju_shift[1] | bju_issuing_now;
     end
@@ -485,8 +499,8 @@ module idu2(
 //★ 早唤醒：本拍发射的那条（we/we1，下一拍必出结果、结果写进 prf[它的 tag]）本拍就能唤醒消费者。
 //★ 这两路是【单操作数的就绪项】，必须并进各自那一项里 —— 整项 OR 会让"只有一个操作数到"的项也发出去。
             ent_issuable[i] = ent_valid[i]
-                & (~ent_wait1[i] | wake1[i] | (we & (pt_is0 == ent_ps1[i])) | (we1 & (pt_is1 == ent_ps1[i])))
-                & (~ent_wait2[i] | wake2[i] | (we & (pt_is0 == ent_ps2[i])) | (we1 & (pt_is1 == ent_ps2[i])));
+                & (~ent_wait1[i] | wake1[i] | wake1p[i] | (we & (pt_is0 == ent_ps1[i])) | (we1 & (pt_is1 == ent_ps1[i])))
+                & (~ent_wait2[i] | wake2[i] | wake2p[i] | (we & (pt_is0 == ent_ps2[i])) | (we1 & (pt_is1 == ent_ps2[i])));
             if (ent_class[i] == CLS_LSU)
                 ent_issuable[i] = ent_issuable[i]
                          & (ent_is_store[i] ? (~ent_has_older_lsu[i] & ~ent_has_older_bju[i])
@@ -561,42 +575,72 @@ module idu2(
         for (i = DEPTH-1; i >= 0; i = i - 1)
             if (ent_issuable1[i]) begin sel_slot1 = i[2:0]; have_sel1 = 1'b1; end
     end
-    assign issue_v1 = sel_vld1_q & exec & ~flush_w;
+    reg [2:0] byp1_q, byp2_q, byp3_q, byp4_q;
+    reg       byp_ok, byp_ok1;
+    always @(*) begin
+        byp_ok  = 1'b1;
+        byp_ok1 = 1'b1;
+        if ((byp1_q == 3'd3) & ~(we_mul & (pt_mul == sel_ps1_q)))
+            byp_ok = 1'b0;
+        if ((byp2_q == 3'd3) & ~(we_mul & (pt_mul == sel_ps2_q)))
+            byp_ok = 1'b0;
+        if ((byp1_q == 3'd4) & ~(we_ld & (pt_ld == sel_ps1_q)))
+            byp_ok = 1'b0;
+        if ((byp2_q == 3'd4) & ~(we_ld & (pt_ld == sel_ps2_q)))
+            byp_ok = 1'b0;
+        if ((byp3_q == 3'd3) & ~(we_mul & (pt_mul == sel_ps1b_q)))
+            byp_ok1 = 1'b0;
+        if ((byp4_q == 3'd3) & ~(we_mul & (pt_mul == sel_ps2b_q)))
+            byp_ok1 = 1'b0;
+        if ((byp3_q == 3'd4) & ~(we_ld & (pt_ld == sel_ps1b_q)))
+            byp_ok1 = 1'b0;
+        if ((byp4_q == 3'd4) & ~(we_ld & (pt_ld == sel_ps2b_q)))
+            byp_ok1 = 1'b0;
+    end
 
-    assign issue_v = sel_go & res_ok_q;
+    assign issue_v1 = sel_vld1_q & exec & ~flush_w & byp_ok1;
+    assign issue_v = sel_go & res_ok_q & byp_ok;
+
 //mdu 两条接收口：一拍至多一条（类别与算子家族都取被选中那一项）
     assign mul_go = issue_v & (sel_class_q == CLS_MUL) & ~sel_is_div_q;
     assign div_go = issue_v & (sel_class_q == CLS_MUL) &  sel_is_div_q;
 
 //出站操作数：立即数走项里的常数；否则取 prf 的寄存读（地址 = 选优拍那一条的 ps）；
 //发射拍结果口上电且 tag 命中 ⇒ 用口上值（早唤醒/当拍唤醒的旁路，省 1 拍）
-    reg [1:0] byp1_q, byp2_q, byp3_q, byp4_q;
     reg [31:0] out_op1, out_op2;
     always @(*) begin
         out_op1 = ent_imm1[sel_slot_q] ? ent_op1[sel_slot_q] :
-                  (byp1_q == 2'd1) ? data_alu :
-                  (byp1_q == 2'd2) ? data_alu2 : rdata1_in;
+                  (byp1_q == 3'd1) ? data_alu :
+                  (byp1_q == 3'd2) ? data_alu2 :
+                  (byp1_q == 3'd3) ? data_mul :
+                  (byp1_q == 3'd4) ? data_ld : rdata1_in;
         out_op2 = ent_imm2[sel_slot_q] ? ent_op2[sel_slot_q] :
-                  (byp2_q == 2'd1) ? data_alu :
-                  (byp2_q == 2'd2) ? data_alu2 : rdata2_in;
+                  (byp2_q == 3'd1) ? data_alu :
+                  (byp2_q == 3'd2) ? data_alu2 :
+                  (byp2_q == 3'd3) ? data_mul :
+                  (byp2_q == 3'd4) ? data_ld : rdata2_in;
     end
 //给 prf 的读口地址（发射拍，用已寄存的选优结果 ⇒ 读口不挂在选优锥尾巴上）
-    assign raddr1_out = ent_ps1[sel_slot_q];
-    assign raddr2_out = ent_ps2[sel_slot_q];
+    assign raddr1_out = sel_ps1_q;
+    assign raddr2_out = sel_ps2_q;
     assign r1_final_out = out_op1;
     assign r2_final_out = out_op2;
 
     reg [31:0] out_op1_1, out_op2_1;
     always @(*) begin
         out_op1_1 = ent_imm1[sel_slot1_q] ? ent_op1[sel_slot1_q] :
-                  (byp3_q == 2'd1) ? data_alu :
-                  (byp3_q == 2'd2) ? data_alu2 : rdata3_in;
+                  (byp3_q == 3'd1) ? data_alu :
+                  (byp3_q == 3'd2) ? data_alu2 :
+                  (byp3_q == 3'd3) ? data_mul :
+                  (byp3_q == 3'd4) ? data_ld : rdata3_in;
         out_op2_1 = ent_imm2[sel_slot1_q] ? ent_op2[sel_slot1_q] :
-                  (byp4_q == 2'd1) ? data_alu :
-                  (byp4_q == 2'd2) ? data_alu2 : rdata4_in;
+                  (byp4_q == 3'd1) ? data_alu :
+                  (byp4_q == 3'd2) ? data_alu2 :
+                  (byp4_q == 3'd3) ? data_mul :
+                  (byp4_q == 3'd4) ? data_ld : rdata4_in;
     end
-    assign raddr3_out = ent_ps1[sel_slot1_q];
-    assign raddr4_out = ent_ps2[sel_slot1_q];
+    assign raddr3_out = sel_ps1b_q;
+    assign raddr4_out = sel_ps2b_q;
     assign r1_final_out1 = out_op1_1;
     assign r2_final_out1 = out_op2_1;
 
@@ -611,7 +655,7 @@ module idu2(
         csr_wr_en     = ent_csr_wr_en[sel_slot_q];
         csr_wr_act    = ent_csr_wr_act[sel_slot_q];
         csr_addr      = ent_csr_addr[sel_slot_q];
-        aux_addr_out  = ent_aux_addr[sel_slot_q];
+        aux_addr_out  = sel_aux_q;
         off_mem_out   = ent_jmp_val[sel_slot_q];
         br_flag       = ent_br_flag[sel_slot_q];
         jal_flag      = ent_jal_flag[sel_slot_q];
@@ -871,13 +915,17 @@ module idu2(
         end
     end
 
-    reg [DEPTH-1:0] bpa1, bpa2, bpb1, bpb2;
+    reg [DEPTH-1:0] bpa1, bpa2, bpb1, bpb2, bpm1, bpm2, bpl1, bpl2;
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
             bpa1[i] = we  & (pt_is0 == ent_ps1[i]);
             bpa2[i] = we  & (pt_is0 == ent_ps2[i]);
             bpb1[i] = we1 & (pt_is1 == ent_ps1[i]);
             bpb2[i] = we1 & (pt_is1 == ent_ps2[i]);
+            bpm1[i] = mul_wb_nx & (pt_mulnx == ent_ps1[i]);
+            bpm2[i] = mul_wb_nx & (pt_mulnx == ent_ps2[i]);
+            bpl1[i] = ld_wb_nx & (pt_ldnx == ent_ps1[i]);
+            bpl2[i] = ld_wb_nx & (pt_ldnx == ent_ps2[i]);
         end
     end
 
@@ -887,13 +935,15 @@ module idu2(
             sel_vld_q   <= 1'b0;
             sel_slot1_q <= 3'd0;
             sel_vld1_q  <= 1'b0;
-            byp1_q <= 2'd0;  byp2_q <= 2'd0;  byp3_q <= 2'd0;  byp4_q <= 2'd0;
+            sel_ps1_q <= 6'd0;  sel_ps2_q <= 6'd0;  sel_aux_q <= 32'd0;
+            sel_ps1b_q <= 6'd0; sel_ps2b_q <= 6'd0;
+            byp1_q <= 3'd0;  byp2_q <= 3'd0;  byp3_q <= 3'd0;  byp4_q <= 3'd0;
         end
         else begin
-            byp1_q <= ~have_sel ? 2'd0 : bpa1[sel_slot] ? 2'd1 : bpb1[sel_slot] ? 2'd2 : 2'd0;
-            byp2_q <= ~have_sel ? 2'd0 : bpa2[sel_slot] ? 2'd1 : bpb2[sel_slot] ? 2'd2 : 2'd0;
-            byp3_q <= ~have_sel1 ? 2'd0 : bpa1[sel_slot1] ? 2'd1 : bpb1[sel_slot1] ? 2'd2 : 2'd0;
-            byp4_q <= ~have_sel1 ? 2'd0 : bpa2[sel_slot1] ? 2'd1 : bpb2[sel_slot1] ? 2'd2 : 2'd0;
+            byp1_q <= ~have_sel ? 3'd0 : bpl1[sel_slot] ? 3'd4 : bpm1[sel_slot] ? 3'd3 : bpa1[sel_slot] ? 3'd1 : bpb1[sel_slot] ? 3'd2 : 3'd0;
+            byp2_q <= ~have_sel ? 3'd0 : bpl2[sel_slot] ? 3'd4 : bpm2[sel_slot] ? 3'd3 : bpa2[sel_slot] ? 3'd1 : bpb2[sel_slot] ? 3'd2 : 3'd0;
+            byp3_q <= ~have_sel1 ? 3'd0 : bpl1[sel_slot1] ? 3'd4 : bpm1[sel_slot1] ? 3'd3 : bpa1[sel_slot1] ? 3'd1 : bpb1[sel_slot1] ? 3'd2 : 3'd0;
+            byp4_q <= ~have_sel1 ? 3'd0 : bpl2[sel_slot1] ? 3'd4 : bpm2[sel_slot1] ? 3'd3 : bpa2[sel_slot1] ? 3'd1 : bpb2[sel_slot1] ? 3'd2 : 3'd0;
             sel_slot_q  <= sel_slot  - ({2'd0,(issue_v & (sel_slot_q  < sel_slot))}  + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot))});
             sel_slot1_q <= sel_slot1 - ({2'd0,(issue_v & (sel_slot_q  < sel_slot1))} + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot1))});
             sel_vld_q   <= have_sel & exec & ~flush_w;
@@ -901,6 +951,11 @@ module idu2(
             sel_class_q   <= ent_class[sel_slot];
             sel_is_div_q  <= ent_is_div[sel_slot];
             sel_irq_ret_q <= ent_exc_irq_ret[sel_slot];
+            sel_ps1_q  <= ent_ps1[sel_slot];
+            sel_ps2_q  <= ent_ps2[sel_slot];
+            sel_aux_q  <= ent_aux_addr[sel_slot];
+            sel_ps1b_q <= ent_ps1[sel_slot1];
+            sel_ps2b_q <= ent_ps2[sel_slot1];
         end
     end
 

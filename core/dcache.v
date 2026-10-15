@@ -32,7 +32,7 @@ module dcache(
 
 //总线接口
     output reg [31:0] bus_data_out,
-    output reg ld_ready, busy, hold,
+    output reg ld_ready, busy, hold, ld_ready_nx,
 //后端存储接口
     output reg mem_req, mem_we,
     output reg [31:0] mem_addr, mem_wdata,
@@ -110,8 +110,8 @@ module dcache(
         hit_way[1] = valid1[idx] && (tag1[idx] == tag);
         cache_hit = hit_way[0] || hit_way[1];
 
-        rd_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
-        wr_req = !rst_q && (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
+        rd_req = (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && !bus_we_in;
+        wr_req = (stage == 1'b0) && (bus_addr_in[31:24] == 8'd0) && (bus_addr_in[23:13] == 11'h100) && bus_we_in && !wr_pend;
 //store 命中即行内就地更新，一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
@@ -127,9 +127,9 @@ module dcache(
         wr_drive = wr_pend || wr_req;
         rd_drive = (stage == 1'b1) && !fill_end;
 
-        busy = !rst_q && ((stage == 1'b1 && !fill_end) || (rd_req && !cache_hit) ||
+        busy = ((stage == 1'b1 && !fill_end) || (rd_req && !cache_hit) ||
                         (wr_pend && !mem_ready));
-        mem_req = !rst_q && (wr_drive || rd_drive);
+        mem_req = (wr_drive || rd_drive);
         mem_we = wr_drive;
         if (wr_pend) begin
             mem_addr = wr_addr;
@@ -148,6 +148,7 @@ module dcache(
 //读口：hit 与 fill_end 合成一个地址/一个使能/一个数据选择（每个 data 只有一个读口）
         rd_en  = fill_end || (rd_req && cache_hit);
         rd_addr = fill_end ? {fill_way, fill_idx, miss_word} : {hit_way[1], idx, word};
+        ld_ready_nx = (rd_req & cache_hit) | fill_end;
     end
 
 //写口：单写口 + 字节使能，三个写源合成【一个】写表达式，仍能推成 BRAM ——
