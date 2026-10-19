@@ -22,9 +22,9 @@
 module idu1(
     input clk, rst,
     input [7:0] flag_bus,
-//保留站的"满"【只喂这一段】：取指队头 → 保留站。它不进全核广播 ——
-//站满恰恰是发射常态，广播出去会让执行单元（乘法发起、CSR 写）误以为自己该停。
-    input stall_rs_full,
+    input [1:0]  st_pop,
+    input [3:0]  st_flush_pop,
+    output       credit_stall_o,
 //来自 iffu 出队格（F 级）
     input [31:0] inst_in,
     input [31:0] addr_in,
@@ -179,15 +179,28 @@ module idu1(
 //            stall_rob_full, stall_pc_redir,
 //            stall_icache_miss, stall_bus_hold}
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】。
-    reg exec, flush_w, stall;
+    reg [3:0] credit;
+    reg [5:0] credit_nx;
+    reg exec, flush_w, stall, credit_ok;
     always @(*) begin
         flush_w = flag_bus[7] | flag_bus[6] | flag_bus[5];
-        stall = (flag_bus[3] | flag_bus[2] | stall_rs_full | flag_bus[0]) & ~flush_w;
+        credit_ok = (credit + {2'd0, st_pop} + {2'd0, st_flush_pop} > {3'd0, pay_v_out1});
+        stall = ((flag_bus[3] | flag_bus[2] | flag_bus[0]) & ~flush_w) | ~credit_ok;
         exec    = flag_bus[4];
 //★ 保留站改造：`rdy1_in & rdy2_in` 已从本级摘掉 —— 操作数等待由 idu2 的站项承担，
 //  S 级不再为它停（否则"原地等"还在，站的解耦白做）。入站就绪只用来决定"锁值还是锁标签"。
         advance     = exec & ~flush_w & ~stall;
     end
+
+    always @(*) credit_nx = {2'd0, credit} - {5'd0, advance} - {5'd0, advance1}
+                          + {4'd0, st_pop} + {2'd0, st_flush_pop};
+    always @(posedge clk) begin
+        if (rst_q) credit <= 4'd8;
+        else if (credit_nx[5]) credit <= 4'd0;
+        else if (credit_nx > 6'd8) credit <= 4'd8;
+        else credit <= credit_nx[3:0];
+    end
+    assign credit_stall_o = ~credit_ok;
 
 //译码字段的组合解算：源是本级的输入（F 级的指令字），口径与原来那一段逐条一致。
     reg [4:0]  rd_dec;

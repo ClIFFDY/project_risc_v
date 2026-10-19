@@ -85,10 +85,18 @@ module mdu(
 //站侧按站项自己的算子门控（乘法项看 mul_ready、除法项看 div_ready），门控式与本模块的接收式逐字相同。
     output reg mul_ready,
     output reg div_ready,
-    output reg        mul_wb_nx,
-    output reg [3:0]  mul_nx_idx,
-    output reg        mul_nx_gen
+    output reg        mul_wake_q,
+    output reg [3:0]  mul_wake_idx_q,
+    output reg        mul_wake_gen_q,
+    output reg        mul_nack_q,
+    output reg [3:0]  mul_nack_idx_q,
+    output reg        mul_nack_gen_q,
+    output accept_mul,
+    output accept_div
     );
+
+    assign accept_mul = mul_ready;
+    assign accept_div = div_ready;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -469,16 +477,24 @@ module mdu(
         end
     end
 
-    always @(*) begin
-        if (pipe_stall | wb_conflict) begin
-            mul_wb_nx  = m_pv & ~d_cmt_q[1];
-            mul_nx_idx = m_idx_q;
-            mul_nx_gen = m_gen_q;
+    always @(posedge clk) begin
+        if (rst_q) begin
+            mul_wake_q <= 1'b0;
+            mul_wake_idx_q <= 4'd0;
+            mul_wake_gen_q <= 1'b0;
+            mul_nack_q <= 1'b0;
+            mul_nack_idx_q <= 4'd0;
+            mul_nack_gen_q <= 1'b0;
         end
         else begin
-            mul_wb_nx  = m_v & ~d_cmt_q[1];
-            mul_nx_idx = m_idx;
-            mul_nx_gen = m_gen;
+            mul_wake_q <= m_push & ~d_cmt_q[0];
+            if (m_push) begin
+                mul_wake_idx_q <= mul_idx_in;
+                mul_wake_gen_q <= mul_gen_in;
+            end
+            mul_nack_q <= mul_wake_q & (pipe_stall | wb_conflict);
+            mul_nack_idx_q <= mul_wake_idx_q;
+            mul_nack_gen_q <= mul_wake_gen_q;
         end
     end
 

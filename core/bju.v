@@ -72,8 +72,11 @@ module bju(
 //F2：判定输入拍采到的"更老指令正在冲刷"（flag_bus[6]|flag_bus[5]）。
 //  寄存判定那一拍上 flag_bus[5] 就是【这条指令自己】的跳转冲刷 ⇒ 拿当拍的 flush_older
 //  去门标记会自己掐掉自己（br 预测不跳+真跳+非对齐那一支的异常会静默丢失）。
-    output reg older_q
+    output reg older_q,
+    output accept
     );
+
+    assign accept = 1'b1;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，

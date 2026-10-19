@@ -40,8 +40,11 @@ module alu(
     (* max_fanout = 8 *) output reg [3:0] idx_out,
     output reg gen_out,
     (* max_fanout = 8 *) output reg [31:0] result, result_csr,
-    (* max_fanout = 8 *) output reg we
+    (* max_fanout = 8 *) output reg we,
+    output accept
     );
+
+    assign accept = 1'b1;
 
     localparam [3:0]
         ADD  = 4'b0000,

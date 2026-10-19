@@ -165,6 +165,10 @@ module rob(
     output reg        commit_we1,
     output reg [4:0]  commit_rd1,
     output reg [31:0] commit_data1,
+    output reg [3:0]  commit_slot0,
+    output reg [3:0]  commit_slot1,
+    output reg        commit_gen0,
+    output reg        commit_gen1,
 //队头索引：写口级与各单元算年龄的基准（年龄 = {1'b0,(idx - head_ptr)}）
 //年龄基准：全核 4 个模块（`forw`/`wport`/`lsu`/`mdu`）共 21 个负载点都在拿它做减法基准，
 //是个纯广播网。
@@ -252,6 +256,8 @@ reg [4:0]  ent_cnt_nx;
 reg        commit_we0_comb, commit_we1_comb;
 reg [4:0]  commit_rd0_comb, commit_rd1_comb;
 reg [31:0] commit_data0_comb, commit_data1_comb;
+reg [3:0]  commit_slot0_comb, commit_slot1_comb;
+reg        commit_gen0_comb, commit_gen1_comb;
 reg [3:0]  head1_ptr;
 reg        flush_any;
 reg        head_ok;
@@ -337,6 +343,10 @@ always @(posedge clk) rst_q <= rst;
         commit_we1_comb   = head1_ok && (ent_rd[head1_ptr] != 5'd0);
         commit_rd1_comb   = ent_rd[head1_ptr];
         commit_data1_comb = ent_data[head1_ptr];
+        commit_slot0_comb = head_ptr;
+        commit_gen0_comb  = ent_gen[head_ptr];
+        commit_slot1_comb = head1_ptr;
+        commit_gen1_comb  = ent_gen[head1_ptr];
 
     end
 
@@ -557,6 +567,10 @@ always @(posedge clk) rst_q <= rst;
             commit_we1   <= 1'b0;
             commit_rd1   <= 5'd0;
             commit_data1 <= 32'd0;
+            commit_slot0 <= 4'd0;
+            commit_slot1 <= 4'd0;
+            commit_gen0  <= 1'b0;
+            commit_gen1  <= 1'b0;
         end
         else begin
             commit_we0   <= commit_we0_comb;
@@ -565,6 +579,10 @@ always @(posedge clk) rst_q <= rst;
             commit_we1   <= commit_we1_comb;
             commit_rd1   <= commit_rd1_comb;
             commit_data1 <= commit_data1_comb;
+            commit_slot0 <= commit_slot0_comb;
+            commit_slot1 <= commit_slot1_comb;
+            commit_gen0  <= commit_gen0_comb;
+            commit_gen1  <= commit_gen1_comb;
         end
     end
 

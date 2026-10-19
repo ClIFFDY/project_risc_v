@@ -158,7 +158,11 @@ module cpu_top(
     wire        flush_part_rob;
     wire [31:0] r1_final_out_idu2, r2_final_out_idu2;
     wire        stall_rs_full_idu2;
-    wire        rs_alloc_en_idu2;
+    wire [1:0]  station_pop_idu2;
+    wire [3:0]  station_flush_pop_idu2;
+    wire [5:0]  fu_ready_idu2;
+    reg         mul_ready_q, div_ready_q, lsu_ready_q;
+    wire rs_alloc_en_idu2;
     wire [3:0]  pay_idx_out_idu2;
 //rob 前送值读口两组：① 正常读（索引 = rob 自己的扫描槽）② 停顿重读（索引 = regfile 的锁存槽）
 //  ★ 分成两组是为了把 stall 那条组合量从【正常读】的数据路上拿掉（见 regfile/rob 的注释）
@@ -187,6 +191,8 @@ module cpu_top(
     wire        rwe0_rob, rwe1_rob;
     wire [4:0]  rrd0_rob, rrd1_rob;
     wire [31:0] rdt0_rob, rdt1_rob;
+    wire [3:0]  commit_slot0_rob, commit_slot1_rob;
+    wire        commit_gen0_rob, commit_gen1_rob;
 //写序号（cont 内生成）：跟着每条写一路走；以及落地广播、滞留兜底
     wire [3:0]  idx_lsu, idx_mdu;
 //非流水线层次块（核内控制信号和其他信号）：按信号首生产者所在模块的代码位置排序
@@ -223,8 +229,8 @@ module cpu_top(
     wire bju_in_flight_idu2;
 //停顿源（逐条，一位一源）
     wire car_free_lsu;
-    wire loaded_lsu, we_lsu, ld_wb_nx_lsu, ld_nx_gen_lsu;
-    wire [3:0] ld_nx_idx_lsu;
+    wire loaded_lsu, we_lsu, ld_wake_q_lsu, ld_wake_gen_q_lsu, ld_nack_q_lsu, ld_nack_gen_q_lsu;
+    wire [3:0] ld_wake_idx_q_lsu, ld_nack_idx_q_lsu;
     wire stall_rob_full_rob, stall_pc_redir_pc;
     wire flush_con_rob_cont, flush_incl_cont, flush_pc_redir_pc;
     wire [3:0] flush_idx_cont;
@@ -254,8 +260,11 @@ module cpu_top(
     wire loaded_mdu, we_mdu;
 //mdu 两条 ready（回站的门控）与两条接收口的 valid
     wire mul_ready_mdu, div_ready_mdu, mul_go_idu2, div_go_idu2;
-    wire mul_wb_nx_mdu, mul_nx_gen_mdu;
-    wire [3:0] mul_nx_idx_mdu;
+    wire accept_alu, accept_alu2, accept_bju, accept_lsu, accept_mul, accept_div;
+    wire [5:0] unit_accept_w;
+    assign unit_accept_w = {accept_bju, accept_lsu, accept_div, accept_mul, accept_alu2, accept_alu};
+    wire mul_wake_q_mdu, mul_wake_gen_q_mdu, mul_nack_q_mdu, mul_nack_gen_q_mdu;
+    wire [3:0] mul_wake_idx_q_mdu, mul_nack_idx_q_mdu;
     wire [4:0] rd_mul_mdu;
 //总线层次块
     wire [31:0] bus_addr_out_lsu, bus_data_out_lsu;
@@ -405,7 +414,9 @@ module cpu_top(
         .addr_in(h0_addr_iffu),
         .br_pred_in(h0_br_pred_iffu),
         .jalr_pred_in(h0_jalr_pred_iffu),
-        .stall_rs_full(stall_rs_full_idu2),
+        .st_pop(station_pop_idu2),
+        .st_flush_pop(station_flush_pop_idu2),
+        .credit_stall_o(stall_rs_full_idu2),
         .r1_in(h0_r1_iffu),
         .r2_in(h0_r2_iffu),
         .idx_in(alloc_idx_rob),
@@ -501,6 +512,58 @@ module cpu_top(
 //发射单元（issue unit）：入站取值 + 四类统一保留站（深度 6）。由 post_decoder 改造而来。
 //★ 出站同时驱动 alu / bju（bju 是每条指令都要过的判定+异常通道），lsu/mdu 由各自的
 //  mem_op / is_mul 判据过滤 —— 与原来"载荷同时喂四个单元"同形。
+    wire [1:0]  sel_class1_idu2;
+    wire [6:0]  opc1_idu2;
+    wire [9:0]  fn10_1_idu2, fn10_ls_1_idu2;
+    wire [31:0] off_mem1_idu2, aux_addr1_idu2, beq_off1_idu2, jalr_pred_addr1_idu2, jal_target1_idu2;
+    wire        br_flag1_idu2, jal_flag1_idu2, jalr_flag1_idu2, br_pred_taken1_idu2;
+    wire        exc_jal_misalign1_idu2, exc_ecall1_idu2, exc_ebreak1_idu2, exc_irq_ret1_idu2;
+    wire        has_older_bju1_idu2;
+    wire        mul_go1_idu2, div_go1_idu2;
+    localparam CLS_ALU_T = 2'd0, CLS_MUL_T = 2'd1, CLS_LSU_T = 2'd2, CLS_BJU_T = 2'd3;
+    wire lane1_lsu = issue_v1_idu2 & (sel_class1_idu2 == CLS_LSU_T);
+    wire lane1_bju = issue_v1_idu2 & (sel_class1_idu2 == CLS_BJU_T);
+    wire lane1_mul = issue_v1_idu2 & (sel_class1_idu2 == CLS_MUL_T);
+    wire lane0_exc = exc_illegal_out_idu2 | exc_ecall_idu2 | exc_ebreak_idu2
+                   | exc_irq_ret_idu2 | exc_jal_misalign_out_idu2;
+    wire bju_from1 = lane1_bju & ~lane0_exc;
+    wire        bju_adv    = payload_go_idu2 | lane1_bju;
+    wire [31:0] bju_r1     = bju_from1 ? r1_final_out1_idu2 : r1_final_out_idu2;
+    wire [3:0]  bju_idx    = bju_from1 ? issue_idx1_idu2 : issue_idx_idu2;
+    wire [31:0] bju_r2     = bju_from1 ? r2_final_out1_idu2 : r2_final_out_idu2;
+    wire [3:0]  bju_func4  = bju_from1 ? alu_func4_1_idu2 : func4_idu2;
+    wire        bju_brf    = bju_from1 ? br_flag1_idu2 : br_flag_idu2;
+    wire        bju_jalrf  = bju_from1 ? jalr_flag1_idu2 : jalr_flag_idu2;
+    wire [31:0] bju_aux    = bju_from1 ? aux_addr1_idu2 : aux_addr_idu2;
+    wire [31:0] bju_beq    = bju_from1 ? beq_off1_idu2 : beq_off_idu2;
+    wire [31:0] bju_jalrp  = bju_from1 ? jalr_pred_addr1_idu2 : jalr_pred_addr_idu2;
+    wire        bju_pred   = bju_from1 ? br_pred_taken1_idu2 : br_pred_taken_idu2;
+    wire        bju_gen    = bju_from1 ? issue_gen1_idu2 : issue_gen_idu2;
+    wire        bju_jalmis = bju_from1 ? exc_jal_misalign1_idu2 : exc_jal_misalign_out_idu2;
+    wire [31:0] bju_jaltgt = bju_from1 ? jal_target1_idu2 : jal_target_idu2;
+    wire        bju_ecall  = bju_from1 ? exc_ecall1_idu2 : exc_ecall_idu2;
+    wire        bju_ebreak = bju_from1 ? exc_ebreak1_idu2 : exc_ebreak_idu2;
+    wire        bju_illegal= bju_from1 ? 1'b0 : exc_illegal_out_idu2;
+    wire        bju_irqret = bju_from1 ? exc_irq_ret1_idu2 : exc_irq_ret_idu2;
+    wire        lsu_go     = lane1_lsu ? issue_v1_idu2 : payload_go_idu2;
+    wire [6:0]  lsu_opc    = lane1_lsu ? opc1_idu2 : opc_idu2;
+    wire [9:0]  lsu_fn10   = lane1_lsu ? fn10_ls_1_idu2 : fn10_ls_idu2;
+    wire [4:0]  lsu_rd     = lane1_lsu ? rd_out1_idu2 : rd_idu2;
+    wire [31:0] lsu_r1     = lane1_lsu ? r1_final_out1_idu2 : r1_final_out_idu2;
+    wire [31:0] lsu_r2     = lane1_lsu ? r2_final_out1_idu2 : r2_final_out_idu2;
+    wire [31:0] lsu_off    = lane1_lsu ? off_mem1_idu2 : off_mem_idu2;
+    wire [3:0]  lsu_idx    = lane1_lsu ? issue_idx1_idu2 : issue_idx_idu2;
+    wire        lsu_gen    = lane1_lsu ? issue_gen1_idu2 : issue_gen_idu2;
+    wire        lsu_oldbju = lane1_lsu ? has_older_bju1_idu2 : has_older_bju_sel_idu2;
+    wire        mul_go_m   = mul_go_idu2 | mul_go1_idu2;
+    wire        div_go_m   = div_go_idu2 | div_go1_idu2;
+    wire [9:0]  mdu_fn10   = lane1_mul ? fn10_1_idu2 : fn10_idu2;
+    wire [4:0]  mdu_rd     = lane1_mul ? rd_out1_idu2 : rd_idu2;
+    wire [3:0]  mdu_idx    = lane1_mul ? issue_idx1_idu2 : issue_idx_idu2;
+    wire        mdu_gen    = lane1_mul ? issue_gen1_idu2 : issue_gen_idu2;
+    wire [31:0] mdu_r1     = lane1_mul ? r1_final_out1_idu2 : r1_final_out_idu2;
+    wire [31:0] mdu_r2     = lane1_mul ? r2_final_out1_idu2 : r2_final_out_idu2;
+    wire [31:0] exc_pc_in_mux = lane1_lsu ? aux_addr1_idu2 : aux_addr_idu2;
     idu2 u_idu2 (
         .clk(clk),
         .rst(rst),
@@ -597,6 +660,8 @@ module cpu_top(
 //提交口：读口旁路的最后一档（刚落进写口、阵列还没写那一笔）
         .we_a(rwe0_rob), .rd_a(rrd0_rob), .data_a(rdt0_rob),
         .we_b(rwe1_rob), .rd_b(rrd1_rob), .data_b(rdt1_rob),
+        .commit_slot0(commit_slot0_rob), .commit_slot1(commit_slot1_rob),
+        .commit_gen0(commit_gen0_rob), .commit_gen1(commit_gen1_rob),
         .flush_con_rob(flush_con_rob_cont),
         .rob_flush_part(flush_part_rob),
         .flush_incl(flush_incl_cont),
@@ -604,10 +669,12 @@ module cpu_top(
         .trap_fire(flush_rob_trap_rob),
         .head_ptr(head_rob),
         .bju_in_flight(bju_in_flight_idu2),
-        .lsu_full_in(~car_free_lsu),
-        .mul_ready_in(mul_ready_mdu), .div_ready_in(div_ready_mdu),
-        .mul_wb_nx(mul_wb_nx_mdu), .mul_nx_idx(mul_nx_idx_mdu), .mul_nx_gen(mul_nx_gen_mdu),
-        .ld_wb_nx(ld_wb_nx_lsu), .ld_nx_idx(ld_nx_idx_lsu), .ld_nx_gen(ld_nx_gen_lsu),
+        .fu_ready(fu_ready_idu2),
+        .unit_accept(unit_accept_w),
+        .mul_wake_q(mul_wake_q_mdu), .mul_wake_idx_q(mul_wake_idx_q_mdu), .mul_wake_gen_q(mul_wake_gen_q_mdu),
+        .mul_nack_q(mul_nack_q_mdu), .mul_nack_idx_q(mul_nack_idx_q_mdu), .mul_nack_gen_q(mul_nack_gen_q_mdu),
+        .ld_wake_q(ld_wake_q_lsu), .ld_wake_idx_q(ld_wake_idx_q_lsu), .ld_wake_gen_q(ld_wake_gen_q_lsu),
+        .ld_nack_q(ld_nack_q_lsu), .ld_nack_idx_q(ld_nack_idx_q_lsu), .ld_nack_gen_q(ld_nack_gen_q_lsu),
         .alloc_rob_in(alloc_en_idu1),
         .alloc_rob_in1(alloc_en1_idu1),
         .alloc_en(rs_alloc_en_idu2),
@@ -627,6 +694,21 @@ module cpu_top(
         .issue_gen1(issue_gen1_idu2),
         .alu_func4_1(alu_func4_1_idu2),
         .we1(we1_idu2),
+        .sel_class1_o(sel_class1_idu2),
+        .opc1(opc1_idu2),
+        .fn10_1(fn10_1_idu2),
+        .fn10_ls_1(fn10_ls_1_idu2),
+        .off_mem1(off_mem1_idu2),
+        .aux_addr1(aux_addr1_idu2),
+        .beq_off1(beq_off1_idu2),
+        .jalr_pred_addr1(jalr_pred_addr1_idu2),
+        .jal_target1(jal_target1_idu2),
+        .br_flag1(br_flag1_idu2), .jal_flag1(jal_flag1_idu2),
+        .jalr_flag1(jalr_flag1_idu2), .br_pred_taken1(br_pred_taken1_idu2),
+        .exc_jal_misalign1(exc_jal_misalign1_idu2), .exc_ecall1(exc_ecall1_idu2),
+        .exc_ebreak1(exc_ebreak1_idu2), .exc_irq_ret1(exc_irq_ret1_idu2),
+        .has_older_bju1(has_older_bju1_idu2),
+        .mul_go1(mul_go1_idu2), .div_go1(div_go1_idu2),
         .rd_out(rd_idu2),
         .issue_idx(issue_idx_idu2),
         .issue_gen(issue_gen_idu2),
@@ -654,31 +736,37 @@ module cpu_top(
         .exc_ebreak(exc_ebreak_idu2),
         .exc_jal_misalign_out(exc_jal_misalign_out_idu2),
         .exc_illegal_out(exc_illegal_out_idu2),
-        .rs_full(stall_rs_full_idu2),
-        .occupancy(),
+        .station_pop(station_pop_idu2),
+        .station_flush_pop(station_flush_pop_idu2),
 //prf：读口（地址 = 选优拍；数据 = 发射拍，含写穿）
         .rdata1_in(rdata1_prf), .rdata2_in(rdata2_prf),
         .rdata3_in(rdata3_prf), .rdata4_in(rdata4_prf),
         .raddr1_out(raddr1_idu2), .raddr2_out(raddr2_idu2),
         .raddr3_out(raddr3_idu2), .raddr4_out(raddr4_idu2)
     );
+    always @(posedge clk) begin
+        mul_ready_q <= mul_ready_mdu;
+        div_ready_q <= div_ready_mdu;
+        lsu_ready_q <= car_free_lsu;
+    end
+    assign fu_ready_idu2 = {1'b1, lsu_ready_q, div_ready_q, mul_ready_q, 1'b1, 1'b1};
 //分支/跳转判定单元：判定源与 alu 的输入同源（前送后的操作数 / func4_idu2），
 //比较与加法在本拍做，结果、落点在下一拍生效；早一拍的那道遮挡改由 idu2 的 bju_in_flight 给
     bju u_bju (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus_cont),
-        .adv_in(payload_go_idu2),
-        .r1_data_in(r1_final_out_idu2),
-        .idx_in(issue_idx_idu2),
-        .r2_data_in(r2_final_out_idu2),
-        .alu_func4_in(func4_idu2),
-        .br_flag_in(br_flag_idu2),
-        .jalr_flag_in(jalr_flag_idu2),
-        .aux_addr_in(aux_addr_idu2),
-        .beq_off_in(beq_off_idu2),
-        .jalr_pred_addr_in(jalr_pred_addr_idu2),
-        .br_pred_taken_in(br_pred_taken_idu2),
+        .adv_in(bju_adv),
+        .r1_data_in(bju_r1),
+        .idx_in(bju_idx),
+        .r2_data_in(bju_r2),
+        .alu_func4_in(bju_func4),
+        .br_flag_in(bju_brf),
+        .jalr_flag_in(bju_jalrf),
+        .aux_addr_in(bju_aux),
+        .beq_off_in(bju_beq),
+        .jalr_pred_addr_in(bju_jalrp),
+        .br_pred_taken_in(bju_pred),
         .success(success_bju),
         .br_fail(br_fail_bju),
         .jalr_fail(jalr_fail_bju),
@@ -692,46 +780,47 @@ module cpu_top(
         .idx_q(idx_q_bju),
         .bju_judged(judged_bju),
         .bju_gen(gen_bju),
-        .gen_in(issue_gen_idu2),
+        .gen_in(bju_gen),
         .br_pc_idx(br_pc_idx_bju),
         .jalr_flag_q(jalr_flag_q_bju),
         .br_pred_taken_q(br_pred_taken_q_bju),
-        .exc_jal_misalign_in(exc_jal_misalign_out_idu2),
-        .jal_target_in(jal_target_idu2),
+        .exc_jal_misalign_in(bju_jalmis),
+        .jal_target_in(bju_jaltgt),
 //异常源进判定输入寄存级（与操作数/控制位同沿）
-        .exc_ecall_in(exc_ecall_idu2),
-        .exc_ebreak_in(exc_ebreak_idu2),
-        .exc_illegal_in(exc_illegal_out_idu2),
-        .exc_irq_ret_in(exc_irq_ret_idu2),
+        .exc_ecall_in(bju_ecall),
+        .exc_ebreak_in(bju_ebreak),
+        .exc_illegal_in(bju_illegal),
+        .exc_irq_ret_in(bju_irqret),
         .exc_ecall_i(exc_ecall_bju),
         .exc_ebreak_i(exc_ebreak_bju),
         .exc_illegal_i(exc_illegal_bju),
         .exc_irq_ret_i(exc_irq_ret_bju),
-        .exc_pc_i(exc_pc_i_bju)
+        .exc_pc_i(exc_pc_i_bju),
+        .accept(accept_bju)
     );
     lsu u_lsu (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus_cont),
         .bju_in_flight(bju_in_flight_idu2),
-        .payload_go(payload_go_idu2),
+        .payload_go(lsu_go),
 //★ 三个执行单元的输入级数对齐：lsu 也吃 decoder 载荷（原来吃 mem_buf 组合输出，早一级）
-        .opcode(opc_idu2),
-        .func10(fn10_ls_idu2),
-        .rd_in(rd_idu2),
+        .opcode(lsu_opc),
+        .func10(lsu_fn10),
+        .rd_in(lsu_rd),
         .r1_post(rs1_idu2),
         .r2_post(rs2_idu2),
-        .r1_data_final(r1_final_out_idu2),
-        .r2_data_final(r2_final_out_idu2),
-        .offset_load0(off_mem_idu2),
-        .offset_store0(off_mem_idu2),
+        .r1_data_final(lsu_r1),
+        .r2_data_final(lsu_r2),
+        .offset_load0(lsu_off),
+        .offset_store0(lsu_off),
         .bus_data_ext(bus_data_in_ext),
         .bus_data_dcache(data_dcache),
         .bus_data_tim(data_out_tim_in),
         .ready_dcache(ld_ready_dcache),
         .ld_ready_nx(ld_ready_nx_dcache),
         .dcache_hold(hold_dcache),
-        .has_older_bju_in(has_older_bju_sel_idu2),
+        .has_older_bju_in(lsu_oldbju),
         .flush_idx_in(flush_idx_cont),
         .head_ptr_in(head_rob),
         .ready_tim(ready_tim_in),
@@ -745,18 +834,22 @@ module cpu_top(
         .exc_ldst_st_out(exc_ldst_st_out_lsu),
         .exc_ldst_idx_out(exc_ldst_idx_out_lsu),
 //索引与操作数同源：既然吃的是 decoder 载荷，索引就是它自己的 issue_idx（三者统一）
-        .idx_in(issue_idx_idu2),
-        .gen_in(issue_gen_idu2),
+        .idx_in(lsu_idx),
+        .gen_in(lsu_gen),
         .ld_idx(idx_lsu),
         .ld_gen(gen_lsu),
         .exc_ldst_addr_out(exc_ldst_addr_out_lsu),
         .ld_data_out(data_final_lsu),
         .loaded(loaded_lsu),
         .ld_we(we_lsu),
-        .ld_wb_nx(ld_wb_nx_lsu),
-        .ld_nx_idx(ld_nx_idx_lsu),
-        .ld_nx_gen(ld_nx_gen_lsu),
-        .car_free(car_free_lsu)
+        .ld_wake_q(ld_wake_q_lsu),
+        .ld_wake_idx_q(ld_wake_idx_q_lsu),
+        .ld_wake_gen_q(ld_wake_gen_q_lsu),
+        .ld_nack_q(ld_nack_q_lsu),
+        .ld_nack_idx_q(ld_nack_idx_q_lsu),
+        .ld_nack_gen_q(ld_nack_gen_q_lsu),
+        .car_free(car_free_lsu),
+        .accept(accept_lsu)
     );
 //RV32M：与 lsu 同拍取 mem_buf 输出，自己从 opcode/func10 判 M（不用额外派发标志）
     mdu u_mdu (
@@ -768,20 +861,20 @@ module cpu_top(
         .flush_part(flush_part_rob),
 //两条接收口（乘法 / 除法）：站一拍只出一条，所以两套载荷同源、只有 valid 不同。
 //操作数用站里算好的终值；r1_post/r2_post 那对只服务已废的 mul-use 冒险，随之外退场。
-        .mul_go(mul_go_idu2),
-        .mul_func10(fn10_idu2),
-        .mul_rd(rd_idu2),
-        .mul_idx_in(issue_idx_idu2),
-        .mul_gen_in(issue_gen_idu2),
-        .mul_r1(r1_final_out_idu2),
-        .mul_r2(r2_final_out_idu2),
-        .div_go(div_go_idu2),
-        .div_func10(fn10_idu2),
-        .div_rd(rd_idu2),
-        .div_idx_in(issue_idx_idu2),
-        .div_gen_in(issue_gen_idu2),
-        .div_r1(r1_final_out_idu2),
-        .div_r2(r2_final_out_idu2),
+        .mul_go(mul_go_m),
+        .mul_func10(mdu_fn10),
+        .mul_rd(mdu_rd),
+        .mul_idx_in(mdu_idx),
+        .mul_gen_in(mdu_gen),
+        .mul_r1(mdu_r1),
+        .mul_r2(mdu_r2),
+        .div_go(div_go_m),
+        .div_func10(mdu_fn10),
+        .div_rd(mdu_rd),
+        .div_idx_in(mdu_idx),
+        .div_gen_in(mdu_gen),
+        .div_r1(mdu_r1),
+        .div_r2(mdu_r2),
 //结果口（乘除共用一条；站式之后两者可同时在途 ⇒ 仲裁在 mdu 内做"除法优先"）
         .mul_data_out(data_final_mdu),
         .mul_loaded(loaded_mdu),
@@ -792,9 +885,14 @@ module cpu_top(
 //两条 ready 回站：站侧按站项算子分别门控
         .mul_ready(mul_ready_mdu),
         .div_ready(div_ready_mdu),
-        .mul_wb_nx(mul_wb_nx_mdu),
-        .mul_nx_idx(mul_nx_idx_mdu),
-        .mul_nx_gen(mul_nx_gen_mdu)
+        .mul_wake_q(mul_wake_q_mdu),
+        .mul_wake_idx_q(mul_wake_idx_q_mdu),
+        .mul_wake_gen_q(mul_wake_gen_q_mdu),
+        .mul_nack_q(mul_nack_q_mdu),
+        .mul_nack_idx_q(mul_nack_idx_q_mdu),
+        .mul_nack_gen_q(mul_nack_gen_q_mdu),
+        .accept_mul(accept_mul),
+        .accept_div(accept_div)
     );
     bpu u_bpu (
         .clk(clk),
@@ -859,22 +957,23 @@ module cpu_top(
         .idx_out(idx_alu),
         .gen_out(gen_alu),
         .result(result_alu),
-        .we(we_alu)
+        .we(we_alu),
+        .accept(accept_alu)
     );
     alu u_alu2 (
         .clk(clk),
         .rst(rst),
         .flag_bus(flag_bus_cont),
         .we_in(we1_idu2),
-        .jal_flag(1'b0),
-        .jalr_flag(1'b0),
+        .jal_flag(jal_flag1_idu2),
+        .jalr_flag(jalr_flag1_idu2),
         .cs_wr_en(1'b0),
         .rd_in(rd_out1_idu2),
         .idx_in(issue_idx1_idu2),
         .gen_in(issue_gen1_idu2),
         .alu_func4(alu_func4_1_idu2),
         .csr_func3(3'd0),
-        .aux_addr_in(32'd0),
+        .aux_addr_in(aux_addr1_idu2),
         .r1_data(r1_final_out1_idu2),
         .r2_data(r2_final_out1_idu2),
         .cs_data(32'd0),
@@ -883,7 +982,8 @@ module cpu_top(
         .idx_out(idx_alu2),
         .gen_out(gen_alu2),
         .result(result_alu2),
-        .we(we_alu2)
+        .we(we_alu2),
+        .accept(accept_alu2)
     );
 //tb 的事件探针按这两个名字抓"寄存器堆写口" ⇒ 让它们跟着写口级的两条口走（语义不变）
 
@@ -910,6 +1010,8 @@ module cpu_top(
 //前送值读口①（正常读，索引 = 本模块扫描出的槽）与②（停顿重读，索引 = regfile 的锁存槽）
 //提交口：驱动寄存器堆的两条写口（口 A = head、口 B = head+1）
         .commit_we0(rwe0_rob), .commit_rd0(rrd0_rob), .commit_data0(rdt0_rob),
+        .commit_slot0(commit_slot0_rob), .commit_slot1(commit_slot1_rob),
+        .commit_gen0(commit_gen0_rob), .commit_gen1(commit_gen1_rob),
         .commit_we1(rwe1_rob), .commit_rd1(rrd1_rob), .commit_data1(rdt1_rob),
         .alloc_we(alloc_we_idu1),
         .alloc_we1(alloc_we1_idu1),
@@ -1059,7 +1161,7 @@ module cpu_top(
         .exc_ldst_misalign_in(exc_ldst_misalign_out_lsu),
         .exc_ldst_st_in(exc_ldst_st_out_lsu),
         .exc_ldst_addr_in(exc_ldst_addr_out_lsu),
-        .exc_pc_in(aux_addr_idu2),
+        .exc_pc_in(exc_pc_in_mux),
 //ROB 冲刷边界：故障项自己的索引 / E4 载荷（中断边界）/ bju 判定那条
         .exc_ldst_idx_in(exc_ldst_idx_out_lsu),
         .issue_idx_in(issue_idx_idu2),

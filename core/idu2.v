@@ -143,6 +143,8 @@ module idu2(
 //---- 提交口（读口旁路的最后一档：刚落进写口、阵列还没写那一笔）----
     input        we_a, input [4:0] rd_a, input [31:0] data_a,
     input        we_b, input [4:0] rd_b, input [31:0] data_b,
+    input [3:0]  commit_slot0, commit_slot1,
+    input        commit_gen0,  commit_gen1,
 
 //---- 冲刷 / 陷阱 / 顺序 ----
     input        flush_con_rob,
@@ -151,15 +153,20 @@ module idu2(
     input [3:0]  flush_idx,
     input        trap_fire,
     input [3:0]  head_ptr,
-    input        lsu_full_in,
-//mdu 的两条 ready：乘法项看 mul_ready_in、除法项看 div_ready_in（按站项自己的算子门控）
-    input        mul_ready_in, div_ready_in,
-    input        mul_wb_nx,
-    input [3:0]  mul_nx_idx,
-    input        mul_nx_gen,
-    input        ld_wb_nx,
-    input [3:0]  ld_nx_idx,
-    input        ld_nx_gen,
+    input [5:0]  fu_ready,
+    input [5:0]  unit_accept,
+    input        mul_wake_q,
+    input [3:0]  mul_wake_idx_q,
+    input        mul_wake_gen_q,
+    input        mul_nack_q,
+    input [3:0]  mul_nack_idx_q,
+    input        mul_nack_gen_q,
+    input        ld_wake_q,
+    input [3:0]  ld_wake_idx_q,
+    input        ld_wake_gen_q,
+    input        ld_nack_q,
+    input [3:0]  ld_nack_idx_q,
+    input        ld_nack_gen_q,
 
 //---- 给 rob 的入站（分配）使能 ----
     output       alloc_en,
@@ -183,6 +190,19 @@ module idu2(
     output reg        issue_gen1,
     output reg [3:0]  alu_func4_1,
     output reg        we1,
+    output [1:0]  sel_class1_o,
+    output reg [6:0]  opc1,
+    output reg [9:0]  fn10_1,
+    output reg [9:0]  fn10_ls_1,
+    output reg [31:0] off_mem1,
+    output reg [31:0] aux_addr1,
+    output reg [31:0] beq_off1,
+    output reg [31:0] jalr_pred_addr1,
+    output reg [31:0] jal_target1,
+    output reg        br_flag1, jal_flag1, jalr_flag1, br_pred_taken1,
+    output reg        exc_jal_misalign1, exc_ecall1, exc_ebreak1, exc_irq_ret1,
+    output       has_older_bju1,
+    output       mul_go1, div_go1,
     output       bju_in_flight,
     output reg [4:0]  rd_out,
     output reg [3:0]  issue_idx,
@@ -209,8 +229,8 @@ module idu2(
     output [5:0]  raddr1_out, raddr2_out, raddr3_out, raddr4_out,
 
 //---- 状态 / 组合译码 ----
-    output reg        rs_full,
-    output reg [3:0]  occupancy
+    output reg [1:0]  station_pop,
+    output reg [3:0]  station_flush_pop
     );
 
 //==============================================================================
@@ -235,6 +255,8 @@ module idu2(
 
     localparam CLS_ALU = 2'd0, CLS_MUL = 2'd1, CLS_LSU = 2'd2, CLS_BJU = 2'd3;
 
+    localparam FU_ALU = 3'd0, FU_ALU2 = 3'd1, FU_MUL = 3'd2, FU_DIV = 3'd3, FU_LSU = 3'd4, FU_BJU = 3'd5;
+
     localparam DEPTH = 8;
 
     reg [2:0] sel_slot_q;
@@ -246,6 +268,10 @@ module idu2(
     reg [31:0] sel_aux_q;
     reg [2:0] sel_slot1_q;
     reg       sel_vld1_q;
+    reg [1:0] sel_class1_q;
+    reg       sel_is_div1_q;
+    reg       sel_irq_ret1_q;
+    reg [31:0] sel_aux1_q;
     wire       issue_v0 = issue_v;
     wire [2:0] sel_slot0_q = sel_slot_q;
 
@@ -299,29 +325,17 @@ module idu2(
     assign pay_idx_out = idx_in;
 
     reg        src_en0, src_en1, push_ok0, push_ok1, push_en0, push_en1;
-    reg [2:0]  pending_cnt;
     reg [3:0]  free_slot0, free_slot1;
-    reg        have_free_slot, have_free_slot_2;
     reg [4:0]  flush_part_age;
     always @(*) flush_part_age = {1'b0, (flush_idx - head_ptr)};
 
-//★ 背压只由【寄存器】决定（不许出 advance ← rs_full ← push_en ← advance 这条环）：
-//  站真满 / 没有空槽 / 已分配未入站在途数 —— 三项都不是 push_en 自己的函数。
-//★ push_en ≡ src_en（= idu1 的 advance）：这一条压不下去就必须把 advance 挡掉，
-//  否则它既没进站、又被 idu1 的输出覆盖 = 丢条。
-    reg [3:0] occ_live;
-    always @(*) occ_live = occupancy;
+    reg [3:0] occupancy;
+    reg [3:0] flush_kill_cnt;
     always @(*) begin
         src_en0 = s_advance;
         src_en1 = s_advance1;
-        rs_full = ((occ_live + {1'b0, pending_cnt} + (pay_v1_in ? 4'd1 : 4'd0) + 4'd1) > 4'd8)
-                  | ~have_free_slot | (pay_v1_in & ~have_free_slot_2);
-        push_ok0 = src_en0 & exec & ~flush_w
-                  & ~((occ_live + {1'b0, pending_cnt} + (pay_v1_in ? 4'd1 : 4'd0) + 4'd1) > 4'd8)
-                  & have_free_slot;
-        push_ok1 = src_en1 & exec & ~flush_w
-                  & ~((occ_live + {1'b0, pending_cnt} + (pay_v1_in ? 4'd1 : 4'd0) + 4'd1) > 4'd8)
-                  & have_free_slot_2;
+        push_ok0 = src_en0 & exec & ~flush_w;
+        push_ok1 = src_en1 & exec & ~flush_w;
         push_en0 = push_ok0;
         push_en1 = push_ok1;
     end
@@ -370,13 +384,16 @@ module idu2(
     reg [5:0]  ent_ps2  [0:DEPTH-1];
     reg        ent_imm1 [0:DEPTH-1];
     reg        ent_imm2 [0:DEPTH-1];
+    reg        ent_issued[0:DEPTH-1];
 //结果口 / 发射拍的身份 tag：bit5=1（在飞物理寄存器），低 5 位 = {ROB 槽号, 世代}
     wire [5:0] pt_alu  = {1'b1, idx_alu,  gen_alu};
     wire [5:0] pt_alu2 = {1'b1, idx_alu2, gen_alu2};
     wire [5:0] pt_mul  = {1'b1, idx_mul,  gen_mul};
     wire [5:0] pt_ld   = {1'b1, idx_ld,   gen_ld};
-    wire [5:0] pt_mulnx = {1'b1, mul_nx_idx, mul_nx_gen};
-    wire [5:0] pt_ldnx  = {1'b1, ld_nx_idx,  ld_nx_gen};
+    wire [5:0] pt_mulwq = {1'b1, mul_wake_idx_q, mul_wake_gen_q};
+    wire [5:0] pt_ldwq  = {1'b1, ld_wake_idx_q,  ld_wake_gen_q};
+    wire [5:0] pt_mulnack = {1'b1, mul_nack_idx_q, mul_nack_gen_q};
+    wire [5:0] pt_ldnack  = {1'b1, ld_nack_idx_q,  ld_nack_gen_q};
     wire [5:0] pt_is0  = {1'b1, issue_idx,  issue_gen};
     wire [5:0] pt_is1  = {1'b1, issue_idx1, issue_gen1};
 
@@ -390,28 +407,10 @@ module idu2(
     always @(*) begin
         free_slot0 = (rank_new0 > 4'd7) ? 4'd7 : rank_new0;
         free_slot1 = (rank_new1 > 4'd7) ? 4'd7 : rank_new1;
-        have_free_slot   = (occ_live < 4'd8);
-        have_free_slot_2 = (occ_live < 4'd7);
-    end
-    reg [2:0] pending_inc, pending_dec;
-    always @(*) begin
-        pending_inc = 3'd0;
-        if (alloc_rob_in & (pending_cnt + pending_inc < 3'd4))  pending_inc = pending_inc + 3'd1;
-        if (alloc_rob_in1 & (pending_cnt + pending_inc < 3'd4)) pending_inc = pending_inc + 3'd1;
-        pending_dec = 3'd0;
-        if (push_en0) pending_dec = pending_dec + 3'd1;
-        if (push_en1) pending_dec = pending_dec + 3'd1;
-    end
-    reg [2:0] pending_nx;
-    always @(*) begin
-        pending_nx = pending_cnt + pending_inc;
-        if (pending_nx > 3'd4) pending_nx = 3'd4;
-        if (pending_nx >= pending_dec) pending_nx = pending_nx - pending_dec;
-        else pending_nx = 3'd0;
     end
 
 //---- 唤醒（组合）：结果口广播按 idx+gen 双匹配 ----
-    reg [DEPTH-1:0] wake1, wake2, wake1p, wake2p;
+    reg [DEPTH-1:0] wake1, wake2, wake1p, wake2p, nack1, nack2;
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
             wake1[i] = ent_wait1[i] & ((we_alu  & (pt_alu  == ent_ps1[i])) |
@@ -422,10 +421,14 @@ module idu2(
                                (we_alu2 & (pt_alu2 == ent_ps2[i])) |
                                (we_mul  & (pt_mul  == ent_ps2[i])) |
                                (we_ld   & (pt_ld   == ent_ps2[i])));
-            wake1p[i] = ent_wait1[i] & ((mul_wb_nx & (pt_mulnx == ent_ps1[i])) |
-                               (ld_wb_nx  & (pt_ldnx  == ent_ps1[i])));
-            wake2p[i] = ent_wait2[i] & ((mul_wb_nx & (pt_mulnx == ent_ps2[i])) |
-                               (ld_wb_nx  & (pt_ldnx  == ent_ps2[i])));
+            wake1p[i] = ent_wait1[i] & ((mul_wake_q & (pt_mulwq == ent_ps1[i])) |
+                               (ld_wake_q  & (pt_ldwq  == ent_ps1[i])));
+            wake2p[i] = ent_wait2[i] & ((mul_wake_q & (pt_mulwq == ent_ps2[i])) |
+                               (ld_wake_q  & (pt_ldwq  == ent_ps2[i])));
+            nack1[i] = (mul_nack_q & (pt_mulnack == ent_ps1[i])) |
+                       (ld_nack_q  & (pt_ldnack  == ent_ps1[i]));
+            nack2[i] = (mul_nack_q & (pt_mulnack == ent_ps2[i])) |
+                       (ld_nack_q  & (pt_ldnack  == ent_ps2[i]));
         end
     end
 
@@ -435,9 +438,11 @@ module idu2(
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
             nx_wait1[i]= ent_wait1[i];
-            if (wake1[i] | wake1p[i]) nx_wait1[i] = 1'b0;
+            if (wake1[i] | wake1p[i] | (we & (pt_is0 == ent_ps1[i])) | (we1 & (pt_is1 == ent_ps1[i]))) nx_wait1[i] = 1'b0;
+            if (nack1[i]) nx_wait1[i] = 1'b1;
             nx_wait2[i]= ent_wait2[i];
-            if (wake2[i] | wake2p[i]) nx_wait2[i] = 1'b0;
+            if (wake2[i] | wake2p[i] | (we & (pt_is0 == ent_ps2[i])) | (we1 & (pt_is1 == ent_ps2[i]))) nx_wait2[i] = 1'b0;
+            if (nack2[i]) nx_wait2[i] = 1'b1;
         end
     end
 
@@ -471,18 +476,29 @@ module idu2(
     reg [1:0] bju_shift;
     reg bju_pending;
     reg       sel_go;
-    reg       res_ok_q;
+    reg       accept_now;
+    reg       accept_now1;
     reg       sel_go_irqret;
     reg       issue_v_irqret;
+    reg       sel_go_irqret1;
+    reg       issue_v1_irqret;
+    reg       sel_go1;
     reg       bju_issuing_now;
     always @(*) begin
         sel_go          = sel_vld_q & exec & ~flush_w;
-        res_ok_q        = 1'b1;
-        if (sel_class_q == CLS_LSU) res_ok_q = ~lsu_full_in;
-        if (sel_class_q == CLS_MUL) res_ok_q = sel_is_div_q ? div_ready_in : mul_ready_in;
+        sel_go1         = sel_vld1_q & exec & ~flush_w;
+        accept_now      = 1'b1;
+        if (sel_class_q == CLS_LSU) accept_now = unit_accept[FU_LSU];
+        if (sel_class_q == CLS_MUL) accept_now = sel_is_div_q ? unit_accept[FU_DIV] : unit_accept[FU_MUL];
+        accept_now1     = 1'b1;
+        if (sel_class1_q == CLS_LSU) accept_now1 = unit_accept[FU_LSU];
+        if (sel_class1_q == CLS_MUL) accept_now1 = sel_is_div1_q ? unit_accept[FU_DIV] : unit_accept[FU_MUL];
         sel_go_irqret   = sel_vld_q & exec & ~flush_con_exc & ~flush_con_jump;
         issue_v_irqret  = sel_go_irqret;
-        bju_issuing_now = sel_go & (sel_class_q == CLS_BJU);
+        sel_go_irqret1  = sel_vld1_q & exec & ~flush_con_exc & ~flush_con_jump;
+        issue_v1_irqret = sel_go_irqret1;
+        bju_issuing_now = (sel_go  & (sel_class_q  == CLS_BJU))
+                        | (sel_go1 & (sel_class1_q == CLS_BJU));
         bju_pending     = bju_shift[0] | bju_shift[1] | bju_issuing_now;
     end
     assign bju_in_flight = bju_shift[0];
@@ -491,8 +507,21 @@ module idu2(
 // 四、候选 / 选优 / 输出 mux
 //==============================================================================
     reg [DEPTH-1:0] ent_issuable;
+    reg [DEPTH-1:0] fu_ok;
+    reg [2:0] fu_code_now;
     reg       have_sel;
     reg [2:0] sel_slot;
+
+    always @(*) begin
+        for (i = 0; i < DEPTH; i = i + 1) begin
+            fu_code_now = (ent_class[i] == CLS_LSU) ? FU_LSU
+                        : (ent_class[i] == CLS_BJU) ? FU_BJU
+                        : (ent_class[i] == CLS_MUL) ? (ent_is_div[i] ? FU_DIV : FU_MUL)
+                        :                            FU_ALU;
+            fu_ok[i] = (fu_code_now == FU_ALU) ? (fu_ready[FU_ALU] | fu_ready[FU_ALU2])
+                                               : fu_ready[fu_code_now];
+        end
+    end
 
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1) begin
@@ -500,18 +529,15 @@ module idu2(
 //★ 这两路是【单操作数的就绪项】，必须并进各自那一项里 —— 整项 OR 会让"只有一个操作数到"的项也发出去。
             ent_issuable[i] = ent_valid[i]
                 & (~ent_wait1[i] | wake1[i] | wake1p[i] | (we & (pt_is0 == ent_ps1[i])) | (we1 & (pt_is1 == ent_ps1[i])))
-                & (~ent_wait2[i] | wake2[i] | wake2p[i] | (we & (pt_is0 == ent_ps2[i])) | (we1 & (pt_is1 == ent_ps2[i])));
+                & (~ent_wait2[i] | wake2[i] | wake2p[i] | (we & (pt_is0 == ent_ps2[i])) | (we1 & (pt_is1 == ent_ps2[i])))
+                & fu_ok[i];
             if (ent_class[i] == CLS_LSU)
                 ent_issuable[i] = ent_issuable[i]
                          & (ent_is_store[i] ? (~ent_has_older_lsu[i] & ~ent_has_older_bju[i])
                                             : ~ent_has_older_st[i])
-                         & ~bju_issuing_now & ~lsu_full_in;
+                         & ~bju_issuing_now;
             if (ent_class[i] == CLS_BJU)
                 ent_issuable[i] = ent_issuable[i] & ~ent_has_older_bju[i];
-//M 类：按算子分两条 ready 门控（乘法家族看 mul_ready_in、除法家族看 div_ready_in）——
-//查的是站项自己的寄存器字段，不经过出口 mux ⇒ 不闭零延时环。
-            if (ent_class[i] == CLS_MUL)
-                ent_issuable[i] = ent_issuable[i] & (ent_is_div[i] ? div_ready_in : mul_ready_in);
 //★ 【除法类的入队守卫】：与 CLS_LSU 同一套顺序判据，不许越到更老的未决分支前面去。
 //  分支误预测的冲刷边界就是那条分支自己 ⇒ 在途的除法若比它年轻，就会被同一次冲刷作废，
 //  而它的完成口还在单元里（32 拍迭代 + 提交链）⇒ 晚回来时槽已住上别人、世代又翻回同值，
@@ -522,7 +548,7 @@ module idu2(
                 ent_issuable[i] = ent_issuable[i] & ~ent_has_older_bju[i] & ~bju_pending;
             if (ent_csr_armed[i])
                 ent_issuable[i] = ent_issuable[i] & ~ent_has_older_any[i];
-            ent_issuable[i] = ent_issuable[i] & ~(issue_v & (i[2:0] == sel_slot_q)) & ~(issue_v1 & (i[2:0] == sel_slot1_q));
+            ent_issuable[i] = ent_issuable[i] & ~ent_issued[i];
         end
     end
 
@@ -552,6 +578,7 @@ module idu2(
 // 这种窗只有几拍，等即可。
     assign head_v_o = head_found;
     assign has_older_bju_sel_o = ent_has_older_bju[sel_slot_q];
+    assign has_older_bju1 = ent_has_older_bju[sel_slot1_q];
 
     always @(*) begin
         have_sel = 1'b0; sel_slot = 3'd0;
@@ -563,9 +590,19 @@ module idu2(
     reg [DEPTH-1:0] ent_issuable1;
     reg [2:0] sel_slot1;
     reg       have_sel1;
+    wire [1:0] sel_class0_now = ent_class[sel_slot];
+    reg        lane1_cap_ok;
     always @(*) begin
-        for (i = 0; i < DEPTH; i = i + 1)
-            ent_lane1_ok[i] = (ent_class[i] == CLS_ALU) & ~ent_exc_illegal[i];
+        for (i = 0; i < DEPTH; i = i + 1) begin
+            lane1_cap_ok = 1'b1;
+            if (have_sel) begin
+                if (sel_class0_now == CLS_MUL)
+                    lane1_cap_ok = (ent_class[i] != CLS_MUL);
+                else if ((sel_class0_now == CLS_LSU) | (sel_class0_now == CLS_BJU))
+                    lane1_cap_ok = (ent_class[i] != CLS_LSU) & (ent_class[i] != CLS_BJU);
+            end
+            ent_lane1_ok[i] = ~ent_exc_illegal[i] & lane1_cap_ok;
+        end
     end
     always @(*) begin
         for (i = 0; i < DEPTH; i = i + 1)
@@ -598,12 +635,15 @@ module idu2(
             byp_ok1 = 1'b0;
     end
 
-    assign issue_v1 = sel_vld1_q & exec & ~flush_w & byp_ok1;
-    assign issue_v = sel_go & res_ok_q & byp_ok;
+    assign issue_v1 = sel_vld1_q & exec & ~flush_w & byp_ok1 & accept_now1 & ~ent_wait1[sel_slot1_q] & ~ent_wait2[sel_slot1_q];
+    assign issue_v = sel_go & accept_now & byp_ok & ~ent_wait1[sel_slot_q] & ~ent_wait2[sel_slot_q];
 
 //mdu 两条接收口：一拍至多一条（类别与算子家族都取被选中那一项）
     assign mul_go = issue_v & (sel_class_q == CLS_MUL) & ~sel_is_div_q;
     assign div_go = issue_v & (sel_class_q == CLS_MUL) &  sel_is_div_q;
+    assign mul_go1 = issue_v1 & (sel_class1_q == CLS_MUL) & ~sel_is_div1_q;
+    assign div_go1 = issue_v1 & (sel_class1_q == CLS_MUL) &  sel_is_div1_q;
+    assign sel_class1_o = sel_class1_q;
 
 //出站操作数：立即数走项里的常数；否则取 prf 的寄存读（地址 = 选优拍那一条的 ps）；
 //发射拍结果口上电且 tag 命中 ⇒ 用口上值（早唤醒/当拍唤醒的旁路，省 1 拍）
@@ -714,8 +754,65 @@ module idu2(
         issue_gen1  = ent_gen[sel_slot1_q];
         we1         = ent_we[sel_slot1_q];
         alu_func4_1 = ent_alu_func4[sel_slot1_q];
+        opc1        = 7'd0;
+        fn10_1      = 10'd0;
+        fn10_ls_1   = 10'd0;
+        off_mem1    = ent_jmp_val[sel_slot1_q];
+        aux_addr1   = sel_aux1_q;
+        beq_off1    = 32'd0;
+        jalr_pred_addr1 = 32'd0;
+        jal_target1 = 32'd0;
+        br_flag1    = ent_br_flag[sel_slot1_q];
+        jal_flag1   = ent_jal_flag[sel_slot1_q];
+        jalr_flag1  = ent_jalr_flag[sel_slot1_q];
+        br_pred_taken1 = ent_br_pred_taken[sel_slot1_q];
+        exc_jal_misalign1 = ent_exc_jal_misalign[sel_slot1_q];
+        exc_ecall1  = ent_exc_ecall[sel_slot1_q];
+        exc_ebreak1 = ent_exc_ebreak[sel_slot1_q];
+        exc_irq_ret1= sel_irq_ret1_q & issue_v1_irqret;
+        case (sel_class1_q)
+            CLS_LSU: begin
+                opc1      = ent_is_store[sel_slot1_q] ? OPCODE_STORE : OPCODE_LOAD;
+                fn10_ls_1 = {7'd0, ent_ls_func3[sel_slot1_q]};
+            end
+            CLS_MUL: begin
+                opc1   = OPCODE_OP;
+                fn10_1 = {7'b0000001, ent_mul_op[sel_slot1_q]};
+            end
+            CLS_BJU: begin
+                if (ent_br_flag[sel_slot1_q])   beq_off1        = ent_jmp_val[sel_slot1_q];
+                if (ent_jalr_flag[sel_slot1_q]) jalr_pred_addr1 = ent_jmp_val[sel_slot1_q];
+                if (ent_jal_flag[sel_slot1_q])  jal_target1     = ent_jmp_val[sel_slot1_q];
+            end
+            default: ;
+        endcase
         if (!issue_v1) begin
             rd_out1 = 5'd0; issue_idx1 = 4'd0; issue_gen1 = 1'b0; we1 = 1'b0; alu_func4_1 = 4'd0;
+            opc1 = 7'd0; fn10_1 = 10'd0; fn10_ls_1 = 10'd0; off_mem1 = 32'd0;
+            aux_addr1 = 32'd0; beq_off1 = 32'd0; jalr_pred_addr1 = 32'd0; jal_target1 = 32'd0;
+            br_flag1 = 1'b0; jal_flag1 = 1'b0; jalr_flag1 = 1'b0; br_pred_taken1 = 1'b0;
+            exc_jal_misalign1 = 1'b0; exc_ecall1 = 1'b0; exc_ebreak1 = 1'b0; exc_irq_ret1 = 1'b0;
+        end
+    end
+
+    wire [5:0] ptcvt0 = {1'b1, commit_slot0, commit_gen0};
+    wire [5:0] ptcvt1 = {1'b1, commit_slot1, commit_gen1};
+    reg [DEPTH-1:0] cmtv1, cmtv2;
+    reg [5:0] rps1x [0:DEPTH-1];
+    reg [5:0] rps2x [0:DEPTH-1];
+    reg       rw1x [0:DEPTH-1];
+    reg       rw2x [0:DEPTH-1];
+    integer cvi;
+    always @(*) begin
+        for (cvi = 0; cvi < DEPTH; cvi = cvi + 1) begin
+            cmtv1[cvi] = (we_a & (ent_ps1[cvi] == ptcvt0)) | (we_b & (ent_ps1[cvi] == ptcvt1));
+            cmtv2[cvi] = (we_a & (ent_ps2[cvi] == ptcvt0)) | (we_b & (ent_ps2[cvi] == ptcvt1));
+            rps1x[cvi] = (we_a & (ent_ps1[cvi] == ptcvt0)) ? {1'b0, rd_a} :
+                         (we_b & (ent_ps1[cvi] == ptcvt1)) ? {1'b0, rd_b} : ent_ps1[cvi];
+            rps2x[cvi] = (we_a & (ent_ps2[cvi] == ptcvt0)) ? {1'b0, rd_a} :
+                         (we_b & (ent_ps2[cvi] == ptcvt1)) ? {1'b0, rd_b} : ent_ps2[cvi];
+            rw1x[cvi]  = cmtv1[cvi] ? 1'b0 : nx_wait1[cvi];
+            rw2x[cvi]  = cmtv2[cvi] ? 1'b0 : nx_wait2[cvi];
         end
     end
 
@@ -728,9 +825,14 @@ module idu2(
     wire [3:0] hole_b = sel_slot1_q;
     wire [3:0] mig_lo   = (hole_a <= hole_b) ? hole_a : hole_b;
     wire [3:0] mig_hi_m1 = ((hole_a <= hole_b) ? hole_b : hole_a) - 4'd1;
+    wire [3:0] sel_slot_nx  = sel_slot  - ({2'd0,(issue_v & (sel_slot_q  < sel_slot))}  + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot))});
+    wire [3:0] sel_slot1_nx = sel_slot1 - ({2'd0,(issue_v & (sel_slot_q  < sel_slot1))} + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot1))});
+    wire sel_vld_nx  = have_sel  & exec & ~flush_w;
+    wire sel_vld1_nx = have_sel1 & exec & ~flush_w;
     always @(posedge clk) begin
         if (rst_q) begin
-            pending_cnt  <= 3'd0;
+            station_pop       <= 2'd0;
+            station_flush_pop <= 4'd0;
             bju_shift   <= 2'd0;
             for (i = 0; i < DEPTH; i = i + 1) begin
                 ent_valid[i]   <= 1'b0;  ent_wait1[i] <= 1'b0;  ent_wait2[i] <= 1'b0;
@@ -745,6 +847,7 @@ module idu2(
                 ent_op1[i] <= 32'd0; ent_op2[i] <= 32'd0;
                 ent_ps1[i]  <= 6'd0;  ent_ps2[i]  <= 6'd0;
                 ent_imm1[i] <= 1'b0;  ent_imm2[i] <= 1'b0;
+                ent_issued[i] <= 1'b0;
             end
         end
         else begin
@@ -761,8 +864,9 @@ module idu2(
                         ent_valid[i]  <= 1'b0;  ent_wait1[i] <= 1'b0;  ent_wait2[i] <= 1'b0;
                     end
                     else begin
-                        ent_wait1[i] <= nx_wait1[i];  ent_wait2[i] <= nx_wait2[i];
+                        ent_wait1[i] <= rw1x[i];  ent_wait2[i] <= rw2x[i];
                         ent_op1[i]   <= ent_op1[i];   ent_op2[i]   <= ent_op2[i];
+                        ent_ps1[i]   <= rps1x[i];  ent_ps2[i]   <= rps2x[i];
                     end
                 end
             end
@@ -820,10 +924,10 @@ module idu2(
                         ent_exc_jal_misalign[i] <= ent_exc_jal_misalign[e_src];
                         ent_op1[i] <= ent_op1[e_src];
                         ent_op2[i] <= ent_op2[e_src];
-                        ent_wait1[i] <= nx_wait1[e_src];
-                        ent_wait2[i] <= nx_wait2[e_src];
-                        ent_ps1[i] <= ent_ps1[e_src];
-                        ent_ps2[i] <= ent_ps2[e_src];
+                        ent_wait1[i] <= rw1x[e_src];
+                        ent_wait2[i] <= rw2x[e_src];
+                        ent_ps1[i] <= rps1x[e_src];
+                        ent_ps2[i] <= rps2x[e_src];
                         ent_imm1[i] <= ent_imm1[e_src];
                         ent_imm2[i] <= ent_imm2[e_src];
                     end
@@ -908,10 +1012,11 @@ module idu2(
             end
 //---- 5.5 bju 在途移位 ----
             if (flush_w) bju_shift <= 2'd0;
-            else         bju_shift <= {bju_shift[0], (issue_v & (sel_class_q == CLS_BJU))};
+            else         bju_shift <= {bju_shift[0], (issue_v & (sel_class_q == CLS_BJU))
+                                                       | (issue_v1 & (sel_class1_q == CLS_BJU))};
 //---- 5.6 计数 ----
-            if (flush_w | trap_fire) pending_cnt <= 3'd0;
-            else                     pending_cnt <= pending_nx;
+            station_pop       <= (issue_v ? 2'd1 : 2'd0) + (issue_v1 ? 2'd1 : 2'd0);
+            station_flush_pop <= flush_kill_cnt;
         end
     end
 
@@ -922,10 +1027,10 @@ module idu2(
             bpa2[i] = we  & (pt_is0 == ent_ps2[i]);
             bpb1[i] = we1 & (pt_is1 == ent_ps1[i]);
             bpb2[i] = we1 & (pt_is1 == ent_ps2[i]);
-            bpm1[i] = mul_wb_nx & (pt_mulnx == ent_ps1[i]);
-            bpm2[i] = mul_wb_nx & (pt_mulnx == ent_ps2[i]);
-            bpl1[i] = ld_wb_nx & (pt_ldnx == ent_ps1[i]);
-            bpl2[i] = ld_wb_nx & (pt_ldnx == ent_ps2[i]);
+            bpm1[i] = mul_wake_q & (pt_mulwq == ent_ps1[i]);
+            bpm2[i] = mul_wake_q & (pt_mulwq == ent_ps2[i]);
+            bpl1[i] = ld_wake_q & (pt_ldwq == ent_ps1[i]);
+            bpl2[i] = ld_wake_q & (pt_ldwq == ent_ps2[i]);
         end
     end
 
@@ -937,6 +1042,7 @@ module idu2(
             sel_vld1_q  <= 1'b0;
             sel_ps1_q <= 6'd0;  sel_ps2_q <= 6'd0;  sel_aux_q <= 32'd0;
             sel_ps1b_q <= 6'd0; sel_ps2b_q <= 6'd0;
+            sel_class1_q <= 2'd0; sel_is_div1_q <= 1'b0; sel_irq_ret1_q <= 1'b0; sel_aux1_q <= 32'd0;
             byp1_q <= 3'd0;  byp2_q <= 3'd0;  byp3_q <= 3'd0;  byp4_q <= 3'd0;
         end
         else begin
@@ -944,10 +1050,10 @@ module idu2(
             byp2_q <= ~have_sel ? 3'd0 : bpl2[sel_slot] ? 3'd4 : bpm2[sel_slot] ? 3'd3 : bpa2[sel_slot] ? 3'd1 : bpb2[sel_slot] ? 3'd2 : 3'd0;
             byp3_q <= ~have_sel1 ? 3'd0 : bpl1[sel_slot1] ? 3'd4 : bpm1[sel_slot1] ? 3'd3 : bpa1[sel_slot1] ? 3'd1 : bpb1[sel_slot1] ? 3'd2 : 3'd0;
             byp4_q <= ~have_sel1 ? 3'd0 : bpl2[sel_slot1] ? 3'd4 : bpm2[sel_slot1] ? 3'd3 : bpa2[sel_slot1] ? 3'd1 : bpb2[sel_slot1] ? 3'd2 : 3'd0;
-            sel_slot_q  <= sel_slot  - ({2'd0,(issue_v & (sel_slot_q  < sel_slot))}  + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot))});
-            sel_slot1_q <= sel_slot1 - ({2'd0,(issue_v & (sel_slot_q  < sel_slot1))} + {2'd0,(issue_v1 & (sel_slot1_q < sel_slot1))});
-            sel_vld_q   <= have_sel & exec & ~flush_w;
-            sel_vld1_q  <= have_sel1 & exec & ~flush_w;
+            sel_slot_q  <= sel_slot_nx;
+            sel_slot1_q <= sel_slot1_nx;
+            sel_vld_q   <= sel_vld_nx;
+            sel_vld1_q  <= sel_vld1_nx;
             sel_class_q   <= ent_class[sel_slot];
             sel_is_div_q  <= ent_is_div[sel_slot];
             sel_irq_ret_q <= ent_exc_irq_ret[sel_slot];
@@ -956,20 +1062,25 @@ module idu2(
             sel_aux_q  <= ent_aux_addr[sel_slot];
             sel_ps1b_q <= ent_ps1[sel_slot1];
             sel_ps2b_q <= ent_ps2[sel_slot1];
+            sel_class1_q   <= ent_class[sel_slot1];
+            sel_is_div1_q  <= ent_is_div[sel_slot1];
+            sel_irq_ret1_q <= ent_exc_irq_ret[sel_slot1];
+            sel_aux1_q     <= ent_aux_addr[sel_slot1];
+            for (i = 0; i < DEPTH; i = i + 1)
+                ent_issued[i] <= (sel_vld_nx  & (i[2:0] == sel_slot_nx[2:0]))
+                               | (sel_vld1_nx & (i[2:0] == sel_slot1_nx[2:0]));
         end
     end
 
-    reg [3:0] occupancy_calc;
     always @(*) begin
-        occupancy_calc = occupancy;
-        if (alloc_en && have_free_slot) occupancy_calc = occupancy_calc + 4'd1;
-        if (issue_v)           occupancy_calc = occupancy_calc - 4'd1;
-        if (issue_v1)          occupancy_calc = occupancy_calc - 4'd1;
-        if (trap_fire | (flush_con_rob & ~rob_flush_part)) occupancy_calc = 4'd0;
+        flush_kill_cnt = 4'd0;
+        if (trap_fire | (flush_con_rob & ~rob_flush_part))
+            flush_kill_cnt = occupancy;
         else if (flush_con_rob & rob_flush_part) begin
             for (i = 0; i < DEPTH; i = i + 1)
                 if (ent_valid[i] && (flush_incl ? (ent_age[i] >= flush_part_age)
-                                                : (ent_age[i] >  flush_part_age))) occupancy_calc = occupancy_calc - 4'd1;
+                                                : (ent_age[i] >  flush_part_age)))
+                    flush_kill_cnt = flush_kill_cnt + 4'd1;
         end
     end
     always @(*) occupancy = {3'd0,ent_valid[0]} + {3'd0,ent_valid[1]} + {3'd0,ent_valid[2]} + {3'd0,ent_valid[3]} + {3'd0,ent_valid[4]} + {3'd0,ent_valid[5]} + {3'd0,ent_valid[6]} + {3'd0,ent_valid[7]};

@@ -80,9 +80,12 @@ module lsu(
 //  （sel → opc_out → mem_op → full_stall → 站候选 → sel）。这里取 s2_ok & s3_ok，不含 opcode。
     output reg  car_free,
     output reg mem_inflight,
-    output reg        ld_wb_nx,
-    output reg [3:0]  ld_nx_idx,
-    output reg        ld_nx_gen,
+    output reg        ld_wake_q,
+    output reg [3:0]  ld_wake_idx_q,
+    output reg        ld_wake_gen_q,
+    output reg        ld_nack_q,
+    output reg [3:0]  ld_nack_idx_q,
+    output reg        ld_nack_gen_q,
     (* max_fanout = 8 *) output reg [4:0] rd_load,
 //本条写回记录带的 ROB 索引（跟着数据走）
     (* max_fanout = 8 *) output reg [3:0]  ld_idx,
@@ -90,8 +93,11 @@ module lsu(
     output reg exc_ldst_misalign_out, exc_ldst_st_out,
     output reg [31:0] exc_ldst_addr_out,
 //故障指令【自己的】ROB 索引（与故障同拍寄存）：故障晚一拍到 cont，那时 issue_idx 已是下一条
-    output reg [3:0] exc_ldst_idx_out
+    output reg [3:0] exc_ldst_idx_out,
+    output accept
     );
+
+    assign accept = car_free;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -376,14 +382,38 @@ module lsu(
     end
 
     always @(*) begin
-        s3_v_nx    = s3_kill ? 1'b0 : (s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v));
+        s3_v_nx    = s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v);
         s3_kind_nx = s2_move ? s2_kind : s3_kind;
     end
 
+    reg ld_send;
     always @(*) begin
-        ld_wb_nx  = s3_v_nx & ~s3_kind_nx & ld_ready_nx;
-        ld_nx_idx = s2_move ? s2_idx : s3_idx;
-        ld_nx_gen = s2_move ? s2_gen : s3_gen;
+        ld_send = (new_put & ~is_st) | (s2_put_go & ~s2_kind);
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            ld_wake_q <= 1'b0;
+            ld_wake_idx_q <= 4'd0;
+            ld_wake_gen_q <= 1'b0;
+            ld_nack_q <= 1'b0;
+            ld_nack_idx_q <= 4'd0;
+            ld_nack_gen_q <= 1'b0;
+        end
+        else begin
+            ld_wake_q <= ld_send;
+            if (new_put) begin
+                ld_wake_idx_q <= idx_in;
+                ld_wake_gen_q <= gen_in;
+            end
+            else if (s2_put_go) begin
+                ld_wake_idx_q <= s2_idx;
+                ld_wake_gen_q <= s2_gen;
+            end
+            ld_nack_q <= ld_wake_q & ~ld_ready_nx;
+            ld_nack_idx_q <= ld_wake_idx_q;
+            ld_nack_gen_q <= ld_wake_gen_q;
+        end
     end
 //===============================================================
 // 时序：两级推进
