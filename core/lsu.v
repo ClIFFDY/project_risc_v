@@ -11,10 +11,10 @@
 // Tool Versions:
 // Description: 两级（发级 + 写回级）+ 直接入径
 //   级2（发送）：常态下 ld/st 直接进这一级，进来的当拍把地址/数据/be 摆上总线；下一拍进级3。
-//   级3（写回）：占用 ⇒ 组合拉高 stall（把入口顶住）——所以能进来的新指令只可能撞上级2，
-//                hazard 只看级2 就够。store 进级3 即算提交（下一拍让位）；load 等应答。
-//   miss（dcache_hold_in 当拍）：新指令进级3 停靠（操作数当拍锁进本级），miss 落下那拍
-//               级3 → 级2 前移一级，再照常发送。
+//   级3（写回）：占用 ⇒ 组合拉高 stall（把入口顶住）——所以能进来的新指令只可能撞上级2。
+//                store 进级3 即算提交（下一拍让位）；load 等应答。
+//   miss（dcache_hold 当拍）：新指令照样进级2（操作数当拍锁进本级），发送由 blank_bus 顶住；
+//                miss 落下那拍再摆总线，此后级2 → 级3 前移照常。
 //
 // Dependencies:
 //
@@ -28,34 +28,33 @@ module lsu(
     input clk, rst,
     input [7:0] flag_bus,
 //前置冲刷（早一拍），由 idu2 的 bju 在途位给出（源名 bju_in_flight）：
-//判定结果寄存后只能覆盖 c1..c4 与 wb，而错路指令在 c2 上会停留两拍
+//判定结果寄存后只覆盖到写回一级，而错路指令在冲刷生效前还会停留两拍
 //（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去
 //动 FIFO 指针、拉总线（store 也在这条路上），等寄存器清已经收不回来，故入口要多挡一拍。
-//不进 flag_bus：绕 cont 一圈会把这根信号挂上全片广播网（实测多花 0.45ns）。
+//不进 flag_bus：绕 cont 一圈会把这根信号挂上全片广播网。
     input bju_in_flight,
-//入口门（每条指令只收一次）：decoder 载荷【这一拍就要推进】才允许收。
+//入口门（每条指令只收一次）：出站载荷【这一拍就要推进】才允许收。
 //★ 必须用"本拍推进"而不是"上一拍推进过"：车厢满（stall_lsu_full）时前端会被冻住、
 //  payload_go 当拍就是 0，用上一拍那种"事后脉冲"会让这一条在新车厢里被静默丢掉
-//  （它已经进了 E4、ROB 也分配了项，却永远等不到 ld_we）⇒ 队头永远退不掉 ⇒ 自锁（实测）。
+//  （它已经进了 E4、ROB 也分配了项，却永远等不到 ld_we）⇒ 队头永远退不掉 ⇒ 自锁。
     input payload_go,
-//前送命中判据（消费者载荷里锁存的槽号/有效位，与 forw 当拍看到的同一份）：本模块结果口这一拍供的值是不是它的。
-//★ 本模块的"新值"（`ld_data_cur`）是组合的 ⇒ 命中位也走组合、与 `loaded`/`ld_idx` 同步给出，
-//  （寄一份反而会和数据错开一拍）。与消费者同一拍 ⇒ 用【载荷里锁存的】槽号比，不用当拍扫描。
     input [6:0] opcode,
     input [9:0] func10,
+//前送命中判据：消费者自己的 rs1/rs2（站项里的源寄存器号），本模块结果口这一拍供的值是不是它要的。
+//★ 判据用的是【载荷里锁存的】槽号，不用当拍扫描：两者必须与消费者同一拍，扫描会差一拍。
     input [4:0] rd_in, r1_post, r2_post,
 //ROB 索引载荷：与其它载荷同使能锁存，回填时用它写进 ROB 自己那一项
     input [3:0]  idx_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
     input        gen_in,
-//落地广播（来自写回级两个写口）：本单元据此把更老的同 rd 在途 load 作废
+//本条指令的操作数（站选中项的终值，访存地址与 store 数据都从这里算）
     input [31:0] r1_data_final, r2_data_final,
     input [31:0] offset_load0, offset_store0,
     input [31:0] bus_data_ext, bus_data_dcache, bus_data_tim,
-//dcache 的停顿：只在本模块内部生效，不进 flag_bus 的全核广播。
+//dcache 的停顿：只在本模块内部生效，不进 flag_bus 的全核广播（由 dcache 直连本模块）。
 //  miss 当拍不摆总线、等它落下的拍才发送；本模块的入口也照旧不看它（车厢占满由 full 顶住）。
-//  原先它是经 cont 绕一圈、经全核广播回来再给本模块用的，现在由 dcache 直连过来。
     input dcache_hold,
+    input ld_ready_nx,
     input        has_older_bju_in,
     input [3:0]  flush_idx_in,
     input [3:0]  head_ptr_in,
@@ -67,9 +66,9 @@ module lsu(
     output reg bus_valid_out,
     (* max_fanout = 8 *) output reg [31:0] ld_data_out,
     (* max_fanout = 8 *) output reg loaded,
-//本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 loaded/ld_idx 同拍给出，供 forw 直接选源
+//本拍写回有效（与 loaded 同拍）
     output reg ld_we,
-//三条停顿源【逐条】对外：cont 原样过路进 flag_bus，或运算在消费者模块内做
+//三条停顿源【逐条】对外：逐源各成网，或运算在消费者模块内做（不上 flag_bus 全核广播）
     output reg stall_lsu_haz,
     output reg stall_lsu_unload,
     output reg stall_lsu_full,
@@ -79,10 +78,19 @@ module lsu(
 //  （sel → opc_out → mem_op → full_stall → 站候选 → sel）。这里取 s2_ok & s3_ok，不含 opcode。
     output reg  car_free,
     output reg mem_inflight,
+    output reg        ld_wake_q,
+    output reg [3:0]  ld_wake_idx_q,
+    output reg        ld_wake_gen_q,
+    output reg        ld_nack_q,
+    output reg [3:0]  ld_nack_idx_q,
+    output reg        ld_nack_gen_q,
     (* max_fanout = 8 *) output reg [4:0] rd_load,
-//本条写回记录带的 ROB 索引（跟着数据走）
+//本条写回记录的 ROB 索引（与数据逐支同步；消费者自己拿去比源寄存器号）
     (* max_fanout = 8 *) output reg [3:0]  ld_idx,
     (* max_fanout = 8 *) output reg        ld_gen,
+//ROB 的"本拍退休"回报（0/1 两条）：见下面 s2_cmt 的注释
+    input        ret0_v, input [3:0] ret0_idx, input ret0_gen,
+    input        ret1_v, input [3:0] ret1_idx, input ret1_gen,
     output reg exc_ldst_misalign_out, exc_ldst_st_out,
     output reg [31:0] exc_ldst_addr_out,
 //故障指令【自己的】ROB 索引（与故障同拍寄存）：故障晚一拍到 cont，那时 issue_idx 已是下一条
@@ -115,8 +123,7 @@ module lsu(
     end
 
 //总线读数据与停顿的合流（按"顶层不运算"从 cpu_top 下放至此）：
-//三源按位或 —— 从设备必须每拍清零，否则残留值会被或进别人的读数据
-//（实测：读 UART 状态口拿到上一次 dtcm 读的值 → ee_printf 的 while 轮询死循环）。
+//三源按位或 —— 从设备必须每拍清零，否则残留值会被或进别人的读数据。
     reg [31:0] bus_data_in;
     reg ready_in;
     always @(*) begin
@@ -126,7 +133,6 @@ module lsu(
 
 //两级
 //  级2（发送）：miss 当拍照进（操作数锁好），等回填完再发；常态进级那拍就发。
-
 //               载荷带全（addr/wdat/be），s2_sent 记"发过没有"。
     reg        s2_v, s2_kind, s2_sent;
     reg        s2_oldbj, s3_oldbj;
@@ -159,6 +165,7 @@ module lsu(
     reg mem_op, is_st, new_in, new_in_pre, new_go, full_stall, bus_go;
     reg s2_noncache, new_noncache, s2_hold, new_hold;
     reg s3_done, s3_ok, s2_move, s2_ok, s2_put_go;
+    reg s3_v_nx, s3_kind_nx;
     reg ld_out, blank_bus, s2_put, new_put;
     reg ls_use_hit, miss;
     reg ls_use_ans;
@@ -168,12 +175,11 @@ module lsu(
     reg exc_ldst_misalign, size_bad_now;
 
 //===============================================================
-// 组合：入级/推进 + 冒险（只看级2）+ 入口
+// 组合：入级/推进 + 入口
 //===============================================================
 //访存地址 = 本条指令的 (rs1 + 偏移)，以及 store 的字节使能与数据。
-//★ 上游 mid_decoder 的 offset_load0_out 与 offset_store0_out 接的是【同一个信号】
-//（都是 imm_alu_out），所以这一个加法器同时服务 load 与 store —— 原来把 load 那一支
-//另外算了一遍、还在结果上摆 is_st 的 mux，纯属重复（最差路末端那个 LUT3 就是它）。
+//★ 上游载荷给 load 与 store 的偏移接的是【同一个信号】（都是载荷里的 imm），
+//所以这一个加法器同时服务 load 与 store —— 不再另算 load 那一支、也不再摆 is_st 的 mux。
 //offset_load0 端口因此不再使用（保留端口不动接口；综合会把那条无负载的线剪掉）。
     always @(*) begin
         addr_sum = r1_data_final + offset_store0;
@@ -204,9 +210,9 @@ module lsu(
     end
 
 //入口两道合法性：①非对齐（按访问宽度）②【宽度本身非法】（ld/sd 之类在 RV32 非法）。
-//②由 post_decoder 判成非法指令（cause 2）；这里再挡一道是为了让它【根本不进车厢】——
+//②由上游译码判成非法指令（cause 2）；这里再挡一道是为了让它【根本不进车厢】——
 //否则它会先上总线（非法宽度的 store 以 be=0000 上线、非法宽度的 load 读回垃圾还写回 rd），
-//而 lsu 两级车厢在冲刷拍是【不清】的。★ 这张白名单必须与 post_decoder 的白名单一致。
+//而 lsu 两级车厢在冲刷拍不做整清（只按年龄作废）。★ 这张白名单必须与上游译码的白名单一致。
     always @(*) begin
         byte_addr = addr_sum;
         exc_ldst_misalign = 1'b0;
@@ -254,10 +260,10 @@ module lsu(
         s3_ok    = ~s3_v | s3_done;
         s2_move  = s2_v & s2_sent & s3_ok;   // 没发过的级不许前移（否则请求就丢了）
         s2_ok    = ~s2_v | s2_move;
-//入口门排掉 mdu 两条与取指缺失（与旧版逐位一致）。自己那三条（haz/unload/full）不算：
-//车厢占用由 new_go/s2_ok 自己把关，或进来就成组合环。
-//★ 不要再把 stall_rob_full(9) / stall_pc_redir(8) 也排进来：重定向要等 ROB 排空，
-//  而队头那条访存正是被它挡在 lsu 门外 ⇒ ROB 永不排空 ⇒ 死锁（实测 exc_ldst_misalign 卡死）。
+//入口门只看本拍推进（payload_go）：mdu 与取指缺失不会体现为 lsu 的入级门。
+//自己那三条（haz/unload/full）不算：车厢占用由 new_go/s2_ok 自己把关，或进来就成组合环。
+//★ 不要再把 stall_rob_full(3) / stall_pc_redir(2) 也排进来：重定向要等 ROB 排空，
+//  而队头那条访存正是被它挡在 lsu 门外 ⇒ ROB 永不排空 ⇒ 死锁。
 //★ 冲刷窗口（含早一拍的前置冲刷）内【一条都不许进】：
 //  · 跳转/分支非对齐：边界 = 分支自己（bju），冲刷拍站在载荷上的后继是错路条 ⇒ 照旧挡；
 //  · 中断：边界 = 站里最老那条还没执行的指令，它自己【也要被冲掉】（要在 mret 之后重跑）
@@ -268,9 +274,9 @@ module lsu(
         new_go     = s3_ok & s2_ok;
 //空总线（blank）：miss 在跑，或"在途那笔读还没被应答" ⇒ 这一拍总线上不摆。
 //在途读 = 级3 里那笔读，或级2 里刚摆上、下一拍才进级3 的那笔读（后一项不能省：快慢设备
-//混跑时先回来的应答会串到前一条头上 —— 实测 ls_mix2 两条读结果互换）。
+//混跑时先回来的应答会串到前一条头上）。
 //dcache 1 拍应答 ⇒ 该摆下一笔的那拍 ready_in 正好是 1 ⇒ blank 为 0 ⇒ 快路径一拍不减速。
-        ld_out     = (s2_v & ~s2_kind & s2_sent) | (s3_v & ~s3_kind);
+        ld_out     = (s2_v & ~s2_kind & s2_sent & s2_noncache) | (s3_v & ~s3_kind);
         blank_bus  = miss | (ld_out & ~ready_in);
         s2_noncache  = ~((s2_addr[31:24]  == 8'd0) & (s2_addr[23:13]  == 11'h100));
         new_noncache = ~((cur_addr[31:24] == 8'd0) & (cur_addr[23:13] == 11'h100));
@@ -310,9 +316,8 @@ module lsu(
     end
 
 //冒险同时扫级2 与级3：级3 那笔还没被应答的 load，它的 rd 也要比。
-//  ★ 以往只扫级2，依据是「级3 占着 ⇒ unload 把入口顶住 ⇒ 新指令根本进不来」（见下面三条停顿源那段），
-//    即级3 的 RAW 是由 unload 的【无条件冻结】兜的，不是被检测出来的。现在让 haz 自己就能盖住两个槽，
-//    这样它才是完整的 RAW 判据（unload 的对外广播撤掉后，这里是唯一保护）。
+//  ★ 两个槽都必须扫：级3 的 RAW 不能只靠 unload 的无条件冻结兜（那还依赖入口结构），
+//    haz 自己就要盖住两个槽，它才是完整的 RAW 判据。
 //  ★ 级3 的判据取 s3_v & ~s3_done（与 unload 同条件）：store 进级3 即 done，自动排除；
 //    load 被应答那一拍 s3_done 抬起 ⇒ 不再算在途，消费者改由写口/前送去取数。
 //x0 不算依赖：在途项的 rd=0（store 那一级的 rd 就是 0）与操作数 x0 都排除。
@@ -325,8 +330,8 @@ module lsu(
                 ls_use_hit = 1'b1;
         end
 //★ s3 那一项【保持 s3_v & ~s3_done 原样】：本信号同时是 `new_in_pre` 的一部分，而非对齐故障
-//  判据 AND 在 `new_in_pre` 上 —— 改它的形状会让非对齐 load 不再报故障（实测：调成纯 s3_v，
-//  CoreMark 监视器报 178 次 [MIS]，全是奇地址 LH）。写回级多出的那一拍另用 `ls_use_ans` 顶（见下）。
+//  判据 AND 在 `new_in_pre` 上 —— 改它的形状会让非对齐 load 不再报故障。写回级多出的那一拍
+//  另用 `ls_use_ans` 顶（见下）。
         if (s3_v && ~s3_done && s3_rd != 5'd0) begin
             if (r1_post != 5'd0 && (s3_rd == r1_post))
                 ls_use_hit = 1'b1;
@@ -335,7 +340,8 @@ module lsu(
         end
     end
 
-//写回级多出来的那一拍：数据已被应答（ld_ans），但值还在写回级寄存器里、要到下一拍才上口。
+//写回级多出来的那一拍：数据当拍已应答（ld_ans）并上结果口，但要下一拍才经 ROB 的写回/前送口
+//交到消费者手里。
 //★ 它【只进广播】、不进 `new_in_pre` —— `ls_use_hit` 是入口门与非对齐故障判据的一部分，形状不能动。
     always @(*) begin
         ls_use_ans = 1'b0;
@@ -352,22 +358,78 @@ module lsu(
 //  unload = 级3 那笔 load 还没被应答（s3_kind=1 的 store 进级即 done，不产生等待）
 //  full   = 本级这条访存进不了级2（车厢满）
 //★ haz 与 unload 在「级3 有在途 load」这一段上是重叠的：haz 只顶上命中 rs 的那条（精确），
-//  unload 是无条件冻结（把不相关的条一起顶住）。重叠不影响正确性，且为"撤掉 unload 的对外广播"留后路。
+//  unload 是无条件冻结（把不相关的条一起顶住）。重叠不影响正确性。
     always @(*) begin
         stall_lsu_haz    = ls_use_hit | ls_use_ans;
         stall_lsu_unload = s3_v & ~s3_done;
         stall_lsu_full   = full_stall;
-        car_free         = s2_ok & s3_ok;
+//★ car_free 是喂给发射级的【入口门】（idu2: lsu_full = ~car_free），必须与 new_in_pre 逐项同门。
+//  本模块的冲刷窗口比别处宽一拍（多 OR 一个 bju_in_flight），漏掉它就会出现：
+//  请求照发 → new_in_pre=0 → 级2 不收 → 载荷静默蒸发 → ROB 里那条 load 永远等不到完成 ⇒ 整核自锁
+//  （实测：随机差分 seed14 死锁在 pc=0x78，lsu 空转、e6 的 load 从来没进过级2）。
+        car_free         = s2_ok & s3_ok & ~bju_in_flight;
     end
 
     reg [4:0] s2_age, s3_age, fl_age;
-    reg s2_kill, s3_kill;
+//★ 已经【退休】的项不许再按年龄作废。
+//  本核 store 的退休判据是"发出即置可退"（rob：ent_rd==0 & !pend ⇒ issue 就置 wr），
+//  而 store 可能在级2 里等 miss/总线空位好几拍，这期间 ROB 队头会【越过它】。
+//  队头一过，环位 (idx-head) 就回绕成大数 ⇒ 之后任何一次冲刷都会把这条【其实更老】的 store
+//  当成错路条杀掉（实测 CoreMark：`sb x31,0(x14)` 在 dcache miss 那拍进级2、4 拍后被冲刷掉，
+//  丢 1 个字节 ⇒ list/state 两个 CRC 全错）。ROB 本拍退休的那一条用 ret0/ret1 明确告诉我。
+    reg s2_kill, s3_kill, s2_ret, s3_ret, s2_cmt, s3_cmt;
     always @(*) begin
         s2_age = {1'b0, (s2_idx - head_ptr_in)};
         s3_age = {1'b0, (s3_idx - head_ptr_in)};
         fl_age = {1'b0, (flush_idx_in - head_ptr_in)};
-        s2_kill = s2_v & s2_oldbj & flush_commit & (s2_age > fl_age);
-        s3_kill = s3_v & s3_oldbj & flush_commit & (s3_age > fl_age);
+//★ 作废只看【年龄】：冲刷边界比我更年轻 ⇒ 我是错路 ⇒ 必须扔。原来还串了 s2_oldbj/s3_oldbj
+//  （"进来时有一条更老的 bju 在飞"），那是"冲刷者一定是我进站时那条 bju"的过强假设：
+//  两条 lane 各走各的，更老的分支可能和我【同一拍】才发出（bju_in_flight 还是 0）
+//  ⇒ oldbj=0 ⇒ 冲刷拍杀不掉我 ⇒ 一条错路的【外设访问】永远等不到应答（地址未映射，
+//  总线上没人答）⇒ 整核自锁。实测 CoreMark：pc 0x46c 的 `lw a4,0(s3)`（s3=0，错路）
+//  进了级3、请求摆在地址 0 上，dcache 不应答，cyc 7130 起再也不退休。
+//  年龄判据本身是对的：冲刷边界更年轻的项一定是错路，扔了不会丢架构写。
+        s2_ret = (ret0_v & (ret0_idx == s2_idx) & (ret0_gen == s2_gen)) |
+                 (ret1_v & (ret1_idx == s2_idx) & (ret1_gen == s2_gen));
+        s3_ret = (ret0_v & (ret0_idx == s3_idx) & (ret0_gen == s3_gen)) |
+                 (ret1_v & (ret1_idx == s3_idx) & (ret1_gen == s3_gen));
+        s2_kill = s2_v & ~s2_cmt & ~s2_ret & flush_commit & (s2_age > fl_age);
+        s3_kill = s3_v & ~s3_cmt & ~s3_ret & flush_commit & (s3_age > fl_age);
+    end
+
+    always @(*) begin
+        s3_v_nx    = s2_move ? 1'b1 : (s3_done ? 1'b0 : s3_v);
+        s3_kind_nx = s2_move ? s2_kind : s3_kind;
+    end
+
+    reg ld_send;
+    always @(*) begin
+        ld_send = (new_put & ~is_st) | (s2_put_go & ~s2_kind);
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            ld_wake_q <= 1'b0;
+            ld_wake_idx_q <= 4'd0;
+            ld_wake_gen_q <= 1'b0;
+            ld_nack_q <= 1'b0;
+            ld_nack_idx_q <= 4'd0;
+            ld_nack_gen_q <= 1'b0;
+        end
+        else begin
+            ld_wake_q <= ld_send;
+            if (new_put) begin
+                ld_wake_idx_q <= idx_in;
+                ld_wake_gen_q <= gen_in;
+            end
+            else if (s2_put_go) begin
+                ld_wake_idx_q <= s2_idx;
+                ld_wake_gen_q <= s2_gen;
+            end
+            ld_nack_q <= ld_wake_q & ~ld_ready_nx;
+            ld_nack_idx_q <= ld_wake_idx_q;
+            ld_nack_gen_q <= ld_wake_gen_q;
+        end
     end
 //===============================================================
 // 时序：两级推进
@@ -378,15 +440,18 @@ module lsu(
             s3_v <= 1'b0;
             s2_oldbj <= 1'b0;
             s3_oldbj <= 1'b0;
+            s2_cmt <= 1'b0;
+            s3_cmt <= 1'b0;
         end
         else begin
-            if (s3_done) begin                                          // 级3 走掉
-                s3_v <= 1'b0;
-            end
-            if (s2_put_go)
-                s2_sent <= 1'b1;  // 补摆
+//★ 级3 的"出"与"进"必须在同一条优先级链里判：级3 旧住户被冲刷作废的那一拍，
+//  级2 里那条【活着】的指令正好前移进来。原来把两句 kill 写在块尾当独立 if，
+//  它会盖掉同一沿 s2_move 刚写进去的 s3_v ⇒ 活着的那条进了级3 又立刻被作废、永不写回，
+//  ROB 那一项 wr 永远为 0、卡在队头 ⇒ 整核自锁（实测 WEIRD seed31：0x38 的 `lhu` 被
+//  0x30 那条 store 的冲刷连带杀掉，pc 停在 0x68 再不退休）。
+//  同理，级2 自己被作废时也不许连带清掉同一沿刚补位进来的新指令。
             if (s2_move) begin                                          // 级2 → 级3（请求已摆过）
-                s3_v <= 1'b1;
+                s3_v <= ~s2_kill;                                       // 来的是错路就不许落进级3
                 s3_kind <= s2_kind;
                 s3_rd <= s2_rd;
                 s3_size <= s2_size;
@@ -394,8 +459,14 @@ module lsu(
                 s3_idx <= s2_idx;
                 s3_gen <= s2_gen;
                 s3_oldbj <= s2_oldbj;
+                s3_cmt <= s2_cmt | s2_ret;
                 s2_v <= 1'b0;
             end
+            else if (s3_done | s3_kill) begin                           // 级3 走掉 / 被冲刷作废
+                s3_v <= 1'b0;
+            end
+            if (s2_put_go)
+                s2_sent <= 1'b1;  // 补摆
             if (new_in && new_go) begin                                 // 新指令进级2（miss 当拍也进；没摆就留着）
                 s2_v <= 1'b1;
                 s2_kind <= is_st;
@@ -408,39 +479,40 @@ module lsu(
                 s2_idx <= idx_in;
                 s2_gen <= gen_in;
                 s2_sent <= new_put;                                     // 没摆出去就保持 0，等不 blank 了再补摆
+                s2_cmt <= 1'b0;
                 s2_oldbj <= has_older_bju_in;
             end
         end
-            if (s2_kill) s2_v <= 1'b0;
-            if (s3_kill) s3_v <= 1'b0;
+//本拍被 ROB 退休的那条：即使还在级2 等总线，也从此不许再按年龄作废
+        if (s2_ret) s2_cmt <= 1'b1;
+        if (s2_kill && ~(new_in & new_go)) s2_v <= 1'b0;
     end
 
 //访存非对齐故障：判定的三样东西【寄存一拍】，并在同一块里把伴生量一起寄存（索引/读写标志/出错地址）——
 //  它们必须描述【同一条指令】，所以只能在这个沿上一起采。
 //★ 不能改成组合输出：故障 → cont 的 exc/flush_con_exc → flag_bus[7] → 本模块的 flush_w
-//  → new_in_pre → 故障，成组合环（实测：改成组合后第一条故障彻底消失）。
+//  → new_in_pre → 故障，成组合环。
 //★ 判定必须与 new_in_pre（入口条件）相与，不能只看 exc_ldst_misalign_now：
 //  被冲刷/停顿/冒险挡住的指令【本来就进不了 lsu】，它那一拍的 byte_addr 是错路指令的
-//  垃圾操作数（实测 CoreMark：一个被冲刷的错路 lh 判出 byte_addr=0xffffffff）⇒ 对它抛
-//  异常就是误判，会把好程序打断。
+//  垃圾操作数 ⇒ 对它抛异常就是误判，会把好程序打断。
 //★ 入口条件的口径是"冲刷窗口内一律不进"（见 new_in_pre 那段注释）⇒ 这里跟着新口径走：
 //  ① 错路条（含跳转冲刷那一拍站在载荷上的后继）⇒ flush_w=1 ⇒ new_in_pre=0 ⇒ 照旧不抛；
 //  ② 中断的边界那条【自己也已经死了】（含边界的杀集）⇒ 不必在这里替它抛故障。
 //  访存非对齐这条路原本也不会撞上冲刷：故障要寄存一拍、cont 下一拍才收到 exc_ldst_misalign_in
 //  ⇒ 故障条进 lsu 那一拍根本没有冲刷位，此时 new_in_pre 与原式逐位相同。
-//★ 寄存一拍之后，cont 侧的 pc 载荷(aux_addr_3)与 ROB 索引(issue_idx)已经换成下一条指令，
-//  所以它们也得配寄存版（见 cont 的 exc_pc_e4_q、cpu_top 的 exc_idx mux）。
+//★ 寄存一拍之后，cont 侧的 pc 载荷(exc_pc_in)与 ROB 索引(issue_idx_in)已经换成下一条指令，
+//  所以它们也得配寄存版（见 cont 的 exc_pc_in_d1、cont 内的 exc_idx mux）。
     always @(posedge clk) begin
         if (rst_q) begin
             exc_ldst_misalign_out <= 1'b0;
             exc_ldst_st_out <= 1'b0;
             exc_ldst_addr_out <= 32'd0;
-            exc_ldst_idx_out <= 3'd0;
+            exc_ldst_idx_out <= 4'd0;
         end
         else begin
 //★ 伴生量必须与故障【同一个条件】采：从前是无条件跟着寄存、靠"故障恒在那一拍"的隐含对齐；
 //  入口门改成"本拍推进"（payload_go）之后那一拍漂了，伴生量会采到隔壁那条指令
-//  （实测：一条 store 非对齐被报成 load，mcause 记成 4）。
+//  （一条 store 非对齐会被报成 load）。
             exc_ldst_misalign_out <= exc_ldst_misalign & new_in_pre;
             if (exc_ldst_misalign & new_in_pre) begin
                 exc_ldst_st_out   <= is_st;
@@ -455,15 +527,14 @@ module lsu(
         end
     end
 
-//写回级：数据在级3 被应答那一拍【当拍对外广播】（原来这里多留一拍，现已去掉）。
-//  去掉那一拍 = 让消费者早一拍拿到 load 结果（LSU→任意 发射→发射 从 4~5 拍降到 3~4 拍）。
+//写回级：数据在级3 被应答那一拍【当拍对外广播】⇒ 消费者早一拍拿到 load 结果。
 //  代价：数据从 dcache 的 BRAM 输出寄存器组合地出来（三源或 + 宽度对齐扩展 + 三路 mux），
-//  现在这段锥直接串到 ld_data_out / ld_we / loaded 这些口上（→ 消费者锥）。
+//  这段锥直接串到 ld_data_out / ld_we / loaded 这些口上（→ 消费者锥）。
     always @(*) begin
         ld_ans = s3_v & ~s3_kind & ready_in;
     end
 
-//写回口保持：广播那一拍之后再保持一拍，让落在 back2 槽的消费者也取得到
+//写回口保持：广播那一拍之后再保持一拍，让晚一拍取数的消费者也取得到
     always @(posedge clk) begin
         if (rst_q)
             ld_hold <= 1'b0;
@@ -492,7 +563,7 @@ module lsu(
         endcase
     end
 
-//写口侧的"永不落地"标记：只由本模块的 killed 记录驱动（原组合版冲刷作废已摘除，见上）
+//写口侧的广播/保持两拍：广播那拍（ld_ans）给数据 + ld_we，保持那拍（ld_hold）只给数据。
 //命中位跟着同一路数据走：广播那拍用 s3_rd/s3_idx/s3_gen，保持的第二拍用 *_hold —— 与 `ld_idx`
 //逐支同步，保证命中的那一路就是数据的那一路。
 //★ 广播那一拍（ld_ans）数据取自组合的 `ld_data_cur`：这正是去掉写回寄存后的路径，
@@ -522,14 +593,11 @@ module lsu(
 //  综合器不知道它无人消费，那一支的 mux 与输入锥真实存在 ⇒ 白多一条锥。
 //  取保持寄存值即可（本支无人消费）。
             ld_data_out = ld_hold_data;
-            ld_idx = 3'd0;
+            ld_idx = 4'd0;
             ld_gen = 1'b0;
         end
     end
 
     always @(*) mem_inflight = s2_v | s3_v;
-
-//在途 load 写记录（→ 发射级互锁）
-//在途 load 写记录（→ 发射级互锁）
 
 endmodule

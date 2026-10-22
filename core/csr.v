@@ -22,7 +22,7 @@
 
 module csr(
     input clk, rst,
-    input csr_wr_en, exc_irq_ret, exti, timi, softi, exc_ecall, flush_bju_exc, flush_con_exc,
+    input csr_wr_en, exc_irq_ret, exti, timi, softi, exc_ecall, flush_con_exc,
     input exc_mark_in,
 //站里至少有一个有效项：中断的 mepc/冲刷边界都取"站里最老有效项"，站空时那个号是陈旧槽
     input irq_head_v_in,

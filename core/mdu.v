@@ -11,11 +11,11 @@
 // Tool Versions:
 // Description: RV32M 乘除法单元，与 lsu 流水线行为【同步】。
 //
-//   关键约束（用户给定，本模块据此设计）：mdu 的提交时刻必须与 lsu 严格同偏移，
-//   这样 regfile 的三个写口永不共拍，不需要写口优先级仲裁。
-//   lsu 的读时序：T（指令在 lsu/decoder 级）→ T+1 地址上总线 → T+2 应答 → 写沿 T+3。
+//   关键约束：mdu 的提交时刻必须与 lsu 严格同偏移 —— 乘法两级流水、除法提交延迟链
+//   都按这个偏移设计，改级数就会打乱它与 lsu 的结果口相位。
+//   lsu 的读时序：T（指令在 lsu 级）→ T+1 地址上总线 → T+2 应答 → 写沿 T+3。
 //   所以乘法做成【两级】正好对齐：
-//     T      ：指令在 mdu 级，组合判 is_m
+//     T      ：指令在 mdu 级，组合判该走乘法口还是除法口
 //     T→T+1  ：锁操作数 a/b/op
 //     T+1    ：33×33 有符号乘法（组合，综合成 DSP48）
 //     T+1→T+2：锁乘积
@@ -37,11 +37,11 @@
 //   乘法用【一个】33×33 有符号乘法器覆盖全部 4 条：把两个操作数按需扩展成 33 位
 //   （有符号补符号位、无符号补 0）再相乘，MUL 取低 32、MULH/MULHSU/MULHU 取高 32。
 //
-//   操作数由 regfile 的【独立第三份读数据通路】供给（_mul），不与其他消费单元共享。
+//   操作数由站选中项的终值供给（随出站载荷进来），不占用 regfile 的读口。
 //
-//   本文件内 always 块按【流水级数】排列：
-//     第一级（锁操作数）→ 第二级（锁乘积）→ 除法迭代 → 提交链/输出保持
-//     → 组合输出（两条 ready + 写回仲裁）。
+//   本文件内 always 块按【流水级数】排列（两条 ready 在最前）：
+//     两条 ready → 第一级（锁操作数）→ 第二级（锁乘积）→ 除法迭代 → 提交链/输出保持
+//     → 组合输出（写回仲裁）。
 //
 // Dependencies:
 //
@@ -76,15 +76,21 @@ module mdu(
     input [31:0] div_r1, div_r2,
     (* max_fanout = 8 *) output reg [31:0] mul_data_out,
     (* max_fanout = 8 *) output reg mul_loaded, mul_we,
-//本模块这一拍供的值是不是消费者的（r1/r2 各一位）：与 mul_idx 逐支同步，供 forw 直接选源
+//本模块这一拍供的是哪一项的 rd（与 mul_idx/mul_gen 逐支同步，供消费者比源寄存器号）
     (* max_fanout = 8 *) output reg [4:0] rd_mul,
-//本条写回记录带的写序号（跟着数据走，写回级用它判谁更老）
+//本条写回记录带的 ROB 索引（跟着数据走，写回口用它定位自己那一项）
     output reg [3:0]  mul_idx,
     (* max_fanout = 8 *) output reg        mul_gen,
-//两条 ready 回站：只由本模块寄存器状态决定（不含对方通道、不含被选指令）⇒ 不闭零延时环。
+//两条 ready 回站：只由本模块寄存器状态 + 本拍的总线占用位决定（不含被选指令、不含对方通道）⇒ 不闭零延时环。
 //站侧按站项自己的算子门控（乘法项看 mul_ready、除法项看 div_ready），门控式与本模块的接收式逐字相同。
     output reg mul_ready,
-    output reg div_ready
+    output reg div_ready,
+    output reg        mul_wake_q,
+    output reg [3:0]  mul_wake_idx_q,
+    output reg        mul_wake_gen_q,
+    output reg        mul_nack_q,
+    output reg [3:0]  mul_nack_idx_q,
+    output reg        mul_nack_gen_q
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -98,11 +104,10 @@ module mdu(
 //flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
 //            stall_rob_full, stall_pc_redir,
 //            stall_icache_miss, stall_bus_hold}
-//控制位译码（行为块，放本模块最前）：本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），
-//不用流水线使能，故只取三条冲刷位。
-//本模块的冲刷窗口回到【与别的模块同宽】：m_push、除法 FSM 的作废、d_done 的清零都挂在这同一个
-//flush_w 上。
-//乘法第二级 / d_cmt_q / hold 有意不吃冲刷（它们冲刷拍握的一定比分支更老，见文件头注释）。
+//本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），不用流水线使能，故只取三条冲刷位。
+//本模块的冲刷窗口与别的模块同宽：除法 FSM 的作废（d_kill）与 d_done 的清零都挂在这个 flush_w 上；
+//乘法两级靠 mul_go 已排掉冲刷拍。乘法第二级 / d_cmt_q / hold 有意不吃冲刷
+//（它们冲刷拍握的一定比分支更老，见文件头注释）。
     reg flush_w, flush_con_exc;
     reg [4:0] d_age, flush_age;
     reg       d_kill;
@@ -113,8 +118,8 @@ module mdu(
 
 //冻结信号合流（本模块是消费者，或运算在这里做）：
 //  bus_hold   = 总线不可用（外部 hold）
-//  pipe_stall = 总线保持 / 取指缺失 / lsu 那三条（排掉自己的 haz/div 两位）
-//★ dcache 忙(2) 已撤出全核广播：乘法与 dcache 无关，本模块不再吃它（它只在 lsu 内部生效）。
+//  pipe_stall = 总线不可用（唯一一项）
+//★ dcache 忙已不在 flag_bus 上：乘法与 dcache 无关，本模块不吃它（它只直连 lsu）。
 //★ 不要并进 stall_rob_full(3) / stall_pc_redir(2)：ROB 排空要靠队头那条乘法完成，
 //  而乘法正被它挡在 mdu 门外 ⇒ ROB 永不排空 ⇒ 死锁（与 lsu 入口门同一个坑）。
     reg pipe_stall, bus_hold;
@@ -122,8 +127,7 @@ module mdu(
         bus_hold   = flag_bus[0];
 //★ 只留总线占用。【不能再并进"保留站满"】：站式之后站满恰恰是发射常态，
 //  而保留站对指令只【摆一拍】——那一拍门关着，这条乘/除就永远不发起，它的 ROB 项再也等不到
-//  完成口 ⇒ 队头卡死、整核死等（实测 div-01：一条 div 在 pc 走到 0x160 处发出后凭空消失）。
-//  原设计没有这个问题，是因为载荷会一直摆在门口等门开。
+//  完成口 ⇒ 队头卡死、整核死等。原设计没有这个问题，是因为载荷会一直摆在门口等门开。
         pipe_stall = flag_bus[0];   // [0]=总线占用
     end
 
@@ -166,10 +170,9 @@ module mdu(
     reg [31:0] d_q_quo;           // 迭代中的商
 
 //提交链
-//除法写口延迟：d_done 那拍 div 还停在 c2（stall 尚未放行），而程序序在它【前面】、
-//被同一个 stall 冻在 c3/c4 的 ALU 指令，要等放行后再走两级才到写口。若除法在 d_done
-//当拍就写，同 rd 时晚写的 ALU 指令会盖掉除法结果（CoreMark rv32im 的首个错误即此）。
-//按 c2 → c3 → c4 → 写口 的级数对齐，除法写口落在 d_done+3。
+//除法写口延迟：d_done 那拍 div 还在发射级，而程序序在它【前面】的 ALU 指令还要几拍才到写口。
+//若除法在 d_done 当拍就写，同 rd 时晚写的 ALU 指令会盖掉除法结果。
+//按流水级数对齐，除法写口落在 d_done+3（即 d_cmt_q[2]）。
     reg [2:0]  d_cmt_q;
     reg [4:0]  d_cmt_rd;
     reg [3:0]  d_cmt_idx;
@@ -200,7 +203,7 @@ module mdu(
     reg        d_cmt, d_pend, wb_conflict;
 
 //===============================================================
-// 两条 ready（回站的门控）—— 只由本模块寄存器状态决定
+// 两条 ready（回站的门控）—— 只由本模块寄存器状态 + 本拍总线占用位决定
 //===============================================================
 //乘法口：两级流水只要不被冻结就收（站一拍只出一条，容量天然够）。
 //★ 把 wb_conflict 也算进来：冲突拍乘法两级原地冻住，此时若还收新的乘法，
@@ -211,7 +214,7 @@ module mdu(
         div_ready = ~d_issued & ~d_busy & ~d_done & ~d_pend & ~pipe_stall;
     end
 
-//第一级：锁操作数。判据与 lsu 的 ld_enq 同形。
+//第一级：锁操作数。判据与 lsu 的入级门（new_in/new_put）同形。
 //★ 接收式 = 站侧门控式（mul_ready）逐字相同 ⇒ 站撤项那一拍必定被收下，不会静默丢。
 //★ 冲刷窗口内不许收：mul_go 本身就是"本拍真发出去"（issue_v 已经排掉冲刷拍）；
 //  中断的边界那条【自己也已经死了】（含边界的杀集）⇒ 没有"边界要放行"这一档。
@@ -219,7 +222,8 @@ module mdu(
         m_push = mul_ready && mul_go;
     end
 
-//乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与 alu 的写回级同呼吸。
+//乘法第一级：锁操作数。pipe_stall 期间【不推进】—— 与第二级、hold 同一条件，
+//这样乘法写口与 lsu 的写口相位始终对齐。
     always @(posedge clk) begin
         if (rst_q) begin
             m_v <= 1'b0;
@@ -311,12 +315,11 @@ module mdu(
             d_issued <= 1'b0;
         end
         else if (d_done_q) begin
-//★ 【站式改动】原来这里是 (d_done_q || !is_div)：那个 !is_div 判的是"当前摆在端口上那条不是
-//  除法"，原意是"这条除法已离开 mdu 级"。原设计里除法会一直冻在门口（is_div 恒 1），只有完成
-//  或冲刷才离开；站式之后【只摆一拍】——下一拍端口上就是别的指令了 ⇒ is_div 一掉，32 拍迭代
-//  刚起头就自己作废，那条除法永远完不成、它的 ROB 项再也等不到完成口
-//  （实测 div-01：pc 走到 0x160 后整核死等）。真正的作废由上面 flush_w 那一支负责
-//  （除法无副作用，冲刷就重来）。清 d_busy 仍要有：迭代分支进不去会让它粘死。
+//★ 【站式改动】原来这里是 (d_done_q || !is_div)：`!is_div` 判的是"当前摆在端口上那条不是
+//  除法"，站式之后【只摆一拍】——下一拍端口上就是别的指令了 ⇒ 若把它加回作废条件，
+//  32 拍迭代刚起头就自己作废，那条除法永远完不成、它的 ROB 项再也等不到完成口。
+//  真正的作废只由上面 d_kill（flush_w）那一支负责（除法无副作用，冲刷就重来）。
+//  清 d_busy 仍要有：迭代分支进不去会让它粘死。
             d_issued <= 1'b0;
             d_busy   <= 1'b0;
         end
@@ -337,11 +340,10 @@ module mdu(
                 d_neg_r <= d_sgn && d_dvd[31] && (d_b != 32'd0);
             end
         end
-//★ 发起条件必须等操作数真的就绪：`!stall_mulu_haz`（前一条乘法的结果还没回来）与 `!pipe_stall`
-//  （别的单元在停：载入用法相关、总线/缓存 hold）都要排掉。不能判 `!stall` —— stall 里含
-//  `stall_v` 而 stall_v 又含 is_div 本身，判了永远发不出去（死锁）。
-//★ 判据与回给站的 div_ready 逐字同源：站侧门控 = div_ready ⇒ 站撤项那一拍必定在这里发起，
-//  不会出现"发出去了、没接住"（老树靠"除法冻在门口等"保证，站式之后那条前提没有了）。
+//★ 发起条件 = div_go & div_ready：div_ready 已经排掉 FSM 忙、提交链未空与 pipe_stall，
+//  发起侧不再另加判据。★ 判据与回给站的 div_ready 逐字同源：站侧门控 = div_ready
+//  ⇒ 站撤项那一拍必定在这里发起，不会出现"发出去了、没接住"（老树靠"除法冻在门口等"
+//  保证，站式之后那条前提没有了）。
         else if (div_go && div_ready) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //d_issued 保证一条 div 只发起一次；否则算完后会无限重复发起、放行判据永远落不下去。
@@ -376,7 +378,11 @@ module mdu(
 
 //完成脉冲（比最后一次迭代晚一拍）
     always @(posedge clk) begin
-        if (rst_q || d_kill) begin
+        if (rst_q) begin
+            d_done   <= 1'b0;
+            d_done_q <= 1'b0;
+        end
+        else if (d_kill) begin
             d_done   <= 1'b0;
             d_done_q <= 1'b0;
         end
@@ -391,7 +397,7 @@ module mdu(
 //===============================================================
 //除法结果提交延迟链 + 输出保持（对应 lsu 的 ld_hold）
     always @(posedge clk) begin
-//【只由 rst 清】不能判 flush：d_done 一旦发出，说明这条 div 已在 c2 完成并即将离级，
+//【只由 rst 清】不能判 flush：d_done 一旦发出，说明这条 div 已完成并即将离级，
 //此时被冲刷不会重执行，结果必须照样提交（与乘法第二级不判 flush 同理）。
         if (rst_q) begin
             d_cmt_q <= 3'd0;
@@ -426,12 +432,12 @@ module mdu(
 //  撞口拍（d_cmt & m_pv）由 wb_conflict 让【除法先走】，乘法两级原地冻一拍、结果就躺在
 //  m_pv/m_p 里，不需要任何新寄存器，下一拍再报。
 //★ 没有这一条时的死法：撞口拍端口上出的是乘法的号，除法那一笔的完成口被吞掉，
-//  它的 ROB 项永远等不到 ⇒ 队头卡死（随机差分实测）。
+//  它的 ROB 项永远等不到 ⇒ 队头卡死。
     always @(*) begin
         d_cmt  = d_cmt_q[2];                          // 除法写口脉冲 = d_done+3
         d_pend = d_cmt_q[0] | d_cmt_q[1] | d_cmt_q[2]; // 除法结果前递窗口
         wb_conflict = d_cmt & m_pv;                    // 两者同拍要这唯一的口
-        mul_we = m_pv | d_cmt;              // 只在提交拍（对应 lsu 的 ld_pop）
+        mul_we = m_pv | d_cmt;              // 只在提交拍（对应 lsu 的 ld_we）
         if (d_cmt) begin
             mul_loaded   = 1'b1;
             rd_mul       = d_cmt_rd;
@@ -456,9 +462,30 @@ module mdu(
         else begin
             mul_loaded   = 1'b0;
             rd_mul       = 5'd0;
-            mul_idx      = 3'd0;
+            mul_idx      = 4'd0;
             mul_gen      = 1'b0;
             mul_data_out = 32'd0;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst_q) begin
+            mul_wake_q <= 1'b0;
+            mul_wake_idx_q <= 4'd0;
+            mul_wake_gen_q <= 1'b0;
+            mul_nack_q <= 1'b0;
+            mul_nack_idx_q <= 4'd0;
+            mul_nack_gen_q <= 1'b0;
+        end
+        else begin
+            mul_wake_q <= m_push & ~d_cmt_q[0];
+            if (m_push) begin
+                mul_wake_idx_q <= mul_idx_in;
+                mul_wake_gen_q <= mul_gen_in;
+            end
+            mul_nack_q <= mul_wake_q & (pipe_stall | wb_conflict);
+            mul_nack_idx_q <= mul_wake_idx_q;
+            mul_nack_gen_q <= mul_wake_gen_q;
         end
     end
 
