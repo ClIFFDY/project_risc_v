@@ -652,16 +652,21 @@ module idu2(
 //  impl 实测 375/500 条最差端点的终点都是 value_table_data_reg，布线占 79%。
 //  拆成标量后每个槽是独立的 32 位寄存器，D 端是一棵 7:1（带保持）的小 mux，布局能就近收敛。
 //  ★ 读口也必须逐项列成 case：数组元素在 always @(*) 里进不了敏感表（本项目实测过）。
-    reg [31:0] value_table_data_0,  value_table_data_1,  value_table_data_2,  value_table_data_3;
-    reg [31:0] value_table_data_4,  value_table_data_5,  value_table_data_6,  value_table_data_7;
+//★宏化旋钮：值表深度（必须 = ROB 深度）。16 = 大核 / 8 = 小核。
+//  ★ 改成数组是为了让深度真的是参数：原来 16 个显式寄存器 + case 树把分支上限写死了，
+//    深度一改就引用越界元素（iverilog 报 out-of-bounds、返回 x）。
+    parameter integer VALUE_TABLE_DEPTH = 16;
+    localparam [3:0] VT_IDX_MASK = VALUE_TABLE_DEPTH - 1;
+    reg [31:0] value_table_data   [0:VALUE_TABLE_DEPTH-1];
+    reg [31:0] value_table_data_s [0:VALUE_TABLE_DEPTH-1];
 //★ 2026-10-30：值表的【第二份】。访存专用流的两个读口只读这一份。
 //  为什么：值表是触发器阵列（写口多、进不了 RAM），6 个读口 = 6 棵 16:1 mux 树，
 //  全部得贴着同一份 512 个 FF 放，而消费者分散在 alu_0/alu_1/mdu/lsu ⇒ 布局只能摊开，route 占 79%。
 //  拆两份后每份只服务自己那几个消费者，树可以跟着消费者放。两份【内容恒等】，只是多一份寄存器。
 //  ★ 写点必须两处都写。case 分支里用 begin/end 包住两条赋值 —— 直接并列会被当成重复分支标签，
 //    只有第一条生效（实测：mem 那一份永远收不到写，访存流读到 0，整核在 pc=0x68 挂死）。
-    reg [15:0]  value_table_valid;
-    reg [15:0]  value_table_generation;
+    reg [VALUE_TABLE_DEPTH-1:0] value_table_valid;
+    reg [VALUE_TABLE_DEPTH-1:0] value_table_generation;
 //★ 2026-10-28：值阵列只接【5 个】写口 —— alu / alu_lane1 / mul / multiply_lane1 / ld。
 //  div / divide_lane1 不进阵列：除法在 CoreMark 里只有 ~150 次，占的等待不到 1%，
 //  但它要占两套 16 路写译码，而写口正是 impl 实测的最差路径（105 条失败端点全在这族）。
@@ -671,84 +676,34 @@ module idu2(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            value_table_data_0 <= 32'd0;
-            
-            value_table_data_1 <= 32'd0;
-            
-            value_table_data_2 <= 32'd0;
-            
-            value_table_data_3 <= 32'd0;
-            
-            value_table_data_4 <= 32'd0;
-            
-            value_table_data_5 <= 32'd0;
-            
-            value_table_data_6 <= 32'd0;
-            
-            value_table_data_7 <= 32'd0;
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            value_table_valid      <= 16'd0;
-            value_table_generation <= 16'd0;
+            for (pi = 0; pi < VALUE_TABLE_DEPTH; pi = pi + 1) begin
+                value_table_data[pi]   <= 32'd0;
+                value_table_data_s[pi] <= 32'd0;
+            end
+            value_table_valid      <= {VALUE_TABLE_DEPTH{1'b0}};
+            value_table_generation <= {VALUE_TABLE_DEPTH{1'b0}};
         end
         else begin
-            if (write_enable_alu_early) case (index_alu_early)
-                4'd0: begin value_table_data_0 <= data_alu_early;  end
-                4'd1: begin value_table_data_1 <= data_alu_early;  end
-                4'd2: begin value_table_data_2 <= data_alu_early;  end
-                4'd3: begin value_table_data_3 <= data_alu_early;  end
-                4'd4: begin value_table_data_4 <= data_alu_early;  end
-                4'd5: begin value_table_data_5 <= data_alu_early;  end
-                4'd6: begin value_table_data_6 <= data_alu_early;  end
-                4'd7: begin value_table_data_7 <= data_alu_early;  end
-            endcase
-            if (write_enable_alu_lane1_early) case (index_alu_lane1_early)
-                4'd0: begin value_table_data_0 <= data_alu_lane1_early;  end
-                4'd1: begin value_table_data_1 <= data_alu_lane1_early;  end
-                4'd2: begin value_table_data_2 <= data_alu_lane1_early;  end
-                4'd3: begin value_table_data_3 <= data_alu_lane1_early;  end
-                4'd4: begin value_table_data_4 <= data_alu_lane1_early;  end
-                4'd5: begin value_table_data_5 <= data_alu_lane1_early;  end
-                4'd6: begin value_table_data_6 <= data_alu_lane1_early;  end
-                4'd7: begin value_table_data_7 <= data_alu_lane1_early;  end
-            endcase
-            if (write_enable_mul_early) case (index_mul_early)
-                4'd0: begin value_table_data_0 <= data_mul_early;  end
-                4'd1: begin value_table_data_1 <= data_mul_early;  end
-                4'd2: begin value_table_data_2 <= data_mul_early;  end
-                4'd3: begin value_table_data_3 <= data_mul_early;  end
-                4'd4: begin value_table_data_4 <= data_mul_early;  end
-                4'd5: begin value_table_data_5 <= data_mul_early;  end
-                4'd6: begin value_table_data_6 <= data_mul_early;  end
-                4'd7: begin value_table_data_7 <= data_mul_early;  end
-            endcase
-            if (write_enable_multiply_lane1_early) case (index_multiply_lane1_early)
-                4'd0: begin value_table_data_0 <= data_multiply_lane1_early;  end
-                4'd1: begin value_table_data_1 <= data_multiply_lane1_early;  end
-                4'd2: begin value_table_data_2 <= data_multiply_lane1_early;  end
-                4'd3: begin value_table_data_3 <= data_multiply_lane1_early;  end
-                4'd4: begin value_table_data_4 <= data_multiply_lane1_early;  end
-                4'd5: begin value_table_data_5 <= data_multiply_lane1_early;  end
-                4'd6: begin value_table_data_6 <= data_multiply_lane1_early;  end
-                4'd7: begin value_table_data_7 <= data_multiply_lane1_early;  end
-            endcase
-            if (write_enable_ld_early) case (index_ld_early)
-                4'd0: begin value_table_data_0 <= data_ld_early;  end
-                4'd1: begin value_table_data_1 <= data_ld_early;  end
-                4'd2: begin value_table_data_2 <= data_ld_early;  end
-                4'd3: begin value_table_data_3 <= data_ld_early;  end
-                4'd4: begin value_table_data_4 <= data_ld_early;  end
-                4'd5: begin value_table_data_5 <= data_ld_early;  end
-                4'd6: begin value_table_data_6 <= data_ld_early;  end
-                4'd7: begin value_table_data_7 <= data_ld_early;  end
-            endcase
+            if (write_enable_alu_early) begin
+                value_table_data  [index_alu_early & VT_IDX_MASK] <= data_alu_early;
+                value_table_data_s[index_alu_early & VT_IDX_MASK] <= data_alu_early;
+            end
+            if (write_enable_alu_lane1_early) begin
+                value_table_data  [index_alu_lane1_early & VT_IDX_MASK] <= data_alu_lane1_early;
+                value_table_data_s[index_alu_lane1_early & VT_IDX_MASK] <= data_alu_lane1_early;
+            end
+            if (write_enable_mul_early) begin
+                value_table_data  [index_mul_early & VT_IDX_MASK] <= data_mul_early;
+                value_table_data_s[index_mul_early & VT_IDX_MASK] <= data_mul_early;
+            end
+            if (write_enable_multiply_lane1_early) begin
+                value_table_data  [index_multiply_lane1_early & VT_IDX_MASK] <= data_multiply_lane1_early;
+                value_table_data_s[index_multiply_lane1_early & VT_IDX_MASK] <= data_multiply_lane1_early;
+            end
+            if (write_enable_ld_early) begin
+                value_table_data  [index_ld_early & VT_IDX_MASK] <= data_ld_early;
+                value_table_data_s[index_ld_early & VT_IDX_MASK] <= data_ld_early;
+            end
 //valid / generation 仍是 16 位向量（只有 1 位宽，译码便宜）
             if (write_enable_alu_early) begin
                 value_table_valid[index_alu_early] <= 1'b1;
@@ -1042,69 +997,15 @@ module idu2(
         value_table_hit_b_0 = value_table_valid[queue_producer_b_0_slot] & (value_table_generation[queue_producer_b_0_slot] == queue_producer_b_0_generation);
         value_table_hit_a_1 = value_table_valid[queue_producer_a_1_slot] & (value_table_generation[queue_producer_a_1_slot] == queue_producer_a_1_generation);
         value_table_hit_b_1 = value_table_valid[queue_producer_b_1_slot] & (value_table_generation[queue_producer_b_1_slot] == queue_producer_b_1_generation);
-        case (queue_producer_a_0_slot)
-            4'd0: value_table_read_a_0 = value_table_data_0;
-            4'd1: value_table_read_a_0 = value_table_data_1;
-            4'd2: value_table_read_a_0 = value_table_data_2;
-            4'd3: value_table_read_a_0 = value_table_data_3;
-            4'd4: value_table_read_a_0 = value_table_data_4;
-            4'd5: value_table_read_a_0 = value_table_data_5;
-            4'd6: value_table_read_a_0 = value_table_data_6;
-            4'd7: value_table_read_a_0 = value_table_data_7;
-        endcase
-        case (queue_producer_b_0_slot)
-            4'd0: value_table_read_b_0 = value_table_data_0;
-            4'd1: value_table_read_b_0 = value_table_data_1;
-            4'd2: value_table_read_b_0 = value_table_data_2;
-            4'd3: value_table_read_b_0 = value_table_data_3;
-            4'd4: value_table_read_b_0 = value_table_data_4;
-            4'd5: value_table_read_b_0 = value_table_data_5;
-            4'd6: value_table_read_b_0 = value_table_data_6;
-            4'd7: value_table_read_b_0 = value_table_data_7;
-        endcase
-        case (queue_producer_a_1_slot)
-            4'd0: value_table_read_a_1 = value_table_data_0;
-            4'd1: value_table_read_a_1 = value_table_data_1;
-            4'd2: value_table_read_a_1 = value_table_data_2;
-            4'd3: value_table_read_a_1 = value_table_data_3;
-            4'd4: value_table_read_a_1 = value_table_data_4;
-            4'd5: value_table_read_a_1 = value_table_data_5;
-            4'd6: value_table_read_a_1 = value_table_data_6;
-            4'd7: value_table_read_a_1 = value_table_data_7;
-        endcase
-        case (queue_producer_b_1_slot)
-            4'd0: value_table_read_b_1 = value_table_data_0;
-            4'd1: value_table_read_b_1 = value_table_data_1;
-            4'd2: value_table_read_b_1 = value_table_data_2;
-            4'd3: value_table_read_b_1 = value_table_data_3;
-            4'd4: value_table_read_b_1 = value_table_data_4;
-            4'd5: value_table_read_b_1 = value_table_data_5;
-            4'd6: value_table_read_b_1 = value_table_data_6;
-            4'd7: value_table_read_b_1 = value_table_data_7;
-        endcase
+        value_table_read_a_0 = value_table_data[queue_producer_a_0_slot & VT_IDX_MASK];
+        value_table_read_b_0 = value_table_data[queue_producer_b_0_slot & VT_IDX_MASK];
+        value_table_read_a_1 = value_table_data_s[queue_producer_a_1_slot & VT_IDX_MASK];
+        value_table_read_b_1 = value_table_data_s[queue_producer_b_1_slot & VT_IDX_MASK];
 //---- 访存专用流（第三个读口）----
         value_table_hit_a_mem = value_table_valid[queue_producer_a_mem_slot] & (value_table_generation[queue_producer_a_mem_slot] == queue_producer_a_mem_generation);
         value_table_hit_b_mem = value_table_valid[queue_producer_b_mem_slot] & (value_table_generation[queue_producer_b_mem_slot] == queue_producer_b_mem_generation);
-        case (queue_producer_a_mem_slot)
-            4'd0: value_table_read_a_mem = value_table_data_0;
-            4'd1: value_table_read_a_mem = value_table_data_1;
-            4'd2: value_table_read_a_mem = value_table_data_2;
-            4'd3: value_table_read_a_mem = value_table_data_3;
-            4'd4: value_table_read_a_mem = value_table_data_4;
-            4'd5: value_table_read_a_mem = value_table_data_5;
-            4'd6: value_table_read_a_mem = value_table_data_6;
-            4'd7: value_table_read_a_mem = value_table_data_7;
-        endcase
-        case (queue_producer_b_mem_slot)
-            4'd0: value_table_read_b_mem = value_table_data_0;
-            4'd1: value_table_read_b_mem = value_table_data_1;
-            4'd2: value_table_read_b_mem = value_table_data_2;
-            4'd3: value_table_read_b_mem = value_table_data_3;
-            4'd4: value_table_read_b_mem = value_table_data_4;
-            4'd5: value_table_read_b_mem = value_table_data_5;
-            4'd6: value_table_read_b_mem = value_table_data_6;
-            4'd7: value_table_read_b_mem = value_table_data_7;
-        endcase
+        value_table_read_a_mem = value_table_data_s[queue_producer_a_mem_slot & VT_IDX_MASK];
+        value_table_read_b_mem = value_table_data_s[queue_producer_b_mem_slot & VT_IDX_MASK];
 //访存的两个源恒是寄存器（load/store 没有立即数源）⇒ 没有 immediate 这一档。
 //★ 2026-10-30：load 早唤醒已撤（见上方 load 前送那段），这里只剩前送这一档。
         load_forward_a_mem = queue_producer_a_mem_valid & write_enable_ld_early & (index_ld_early == queue_producer_a_mem_slot) & (generation_ld_early == queue_producer_a_mem_generation);

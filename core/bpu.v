@@ -110,14 +110,14 @@ module bpu(
 //  写口用 branch_unit_pc、读口用 pc_addr，两边【必须逐位同式】，否则训练落到别的格
 //  （老的全长注释批判过的那类"自己那格永远停在弱不跳、每执行一次错一次"）。
 //==============================================================================
-    localparam BHT_B = 9;              // 方向表索引位宽 ⇒ 2048 项
+    parameter integer BHT_B = 11;   // ★宏化旋钮：11=大核 / 9=小核              // 方向表索引位宽 ⇒ 2048 项
     localparam BHT_H = 4;               // 折进索引的高位个数（pc[16:13]）
     localparam BHT_D = (1 << BHT_B);
 
-    localparam BTB_B  = 9;             // 落点表索引位宽 ⇒ 2048 项
+    parameter integer BTB_B  = 11;   // ★宏化旋钮             // 落点表索引位宽 ⇒ 2048 项
     localparam BTB_H  = 4;              // 折进索引的高位个数（pc[16:13]）
     localparam BTB_D  = (1 << BTB_B);
-    localparam BTB_TW = 11;              // tag 位宽 pc[21:13]（索引 11 位 + tag 9 位 = pc[21:2]，精确）
+    localparam BTB_TW = 20 - BTB_B;   // 索引+tag 覆盖 pc[21:2]，索引窄了 tag 就自动变宽
 
     wire [BHT_B-1:0] bht_index_0 = pc_addr_0[BHT_B+1:2]
                                  ^ {pc_addr_0[BHT_B+BHT_H+1:BHT_B+2], {(BHT_B-BHT_H){1'b0}}};

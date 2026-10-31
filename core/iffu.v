@@ -134,10 +134,11 @@ module iffu(
 //  slot_replay 的作废不用补偿：本模块在推入【前】就把 instruction_effective 清 0，
 //  队列里存的那条本来就是 0 ⇒ idu1 解出来的 rs 自然是 0。
 
-    localparam [3:0] DEPTH = 4'd4;
+    parameter integer DEPTH = 8;   // ★宏化旋钮：8=大核 / 4=小核
+    localparam integer IDX_W = (DEPTH == 8) ? 3 : (DEPTH == 4) ? 2 : 3;
 
 //       [96:65] inst   [64:33] addr   [32] br_pred   [31:0] jalr_pred
-    reg [96:0] queue_data [0:3];
+    reg [96:0] queue_data [0:DEPTH-1];
     reg [3:0]  write_pointer, read_pointer;
     reg [3:0]  slot_index;
     reg [3:0]  count_in_use;
@@ -166,7 +167,7 @@ module iffu(
 //只有"保持到 4 才放"这一支用寄存器。
     reg full_registered, full_norm;
     always @(*) begin
-        full_norm = (count_in_use >= 4'd3) | (full_registered & (count_in_use > 4'd2));
+        full_norm = (count_in_use >= (DEPTH-1)) | (full_registered & (count_in_use > (DEPTH-2)));
         full      = full_norm;
     end
     always @(posedge clk) begin
@@ -192,11 +193,11 @@ module iffu(
 //写口
     always @(posedge clk) begin
         if (write_back_0)
-            queue_data[write_pointer[1:0]] <= push_lane0_data;
+            queue_data[write_pointer[IDX_W-1:0]] <= push_lane0_data;
         else if (write_back_1)
-            queue_data[write_pointer[1:0]] <= push_lane1_data;
+            queue_data[write_pointer[IDX_W-1:0]] <= push_lane1_data;
         if (write_back_0 & write_back_1)
-            queue_data[write_pointer[1:0] + 2'd1] <= push_lane1_data;
+            queue_data[write_pointer[IDX_W-1:0] + 1'd1] <= push_lane1_data;
     end
 
 //写指针
@@ -248,7 +249,7 @@ module iffu(
 //★ 有效性按【这一拍的指针】算（slot_index != write_pointer）：queue_data 的读拿到的是沿前的旧值，
 //  这一拍刚写进来的那一格还不是新数据 —— 拿它当有效会把陈旧值交付出去。
     always @(*) begin
-        stage0_data = queue_data[slot_index[1:0]];
+        stage0_data = queue_data[slot_index[IDX_W-1:0]];
 //★ 同上：stage*_valid 不再吃 clear。reason：clear 是"整队作废"，不是"本拍没有"。
 //  留在这里等于把冲刷网又接回 idu1 的推进锥（valid → alloc_lane → advance）。
         stage0_valid  = ~reset_registered & (slot_index != write_pointer);
@@ -265,7 +266,7 @@ module iffu(
     end
 
     always @(*) begin
-        stage1_data = queue_data[slot_index[1:0] + 2'd1];
+        stage1_data = queue_data[slot_index[IDX_W-1:0] + 1'd1];
         stage1_valid  = ~reset_registered & (slot_index != write_pointer) & ((slot_index + 4'd1) != write_pointer);
         next_lane1_instruction      = 32'd0;
         next_lane1_address      = 32'd0;

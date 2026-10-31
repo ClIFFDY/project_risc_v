@@ -19,7 +19,17 @@
 //   相位契约见 docs/spec_idu2_v2.md 第三节。
 //////////////////////////////////////////////////////////////////////////////////
 
-module cpu_top(
+module cpu_top #(
+//★★ 宏化旋钮：一份源码切档。默认值 = 大核（交付配置，行为与原树逐位相同）。
+    parameter integer LANES             = 2,    // 2 = 双发 / 1 = 单发
+    parameter integer ROB_DEPTH         = 16,   // 16 / 8（必须是 2 的幂）
+    parameter integer IFFU_DEPTH        = 8,    // 8 / 4
+    parameter integer VALUE_TABLE_DEPTH = 16,   // 必须 = ROB_DEPTH
+    parameter integer IC_INDEX_B        = 8,    // 8 = 64KB / 7 = 32KB
+    parameter integer BHT_B             = 11,   // 11 / 9
+    parameter integer BTB_B             = 11,   // 11 / 9
+    parameter integer ADDER_AT_D        = 0     // 1 = 访存地址加法搬到 D 端
+) (
     input clk, rst,
     input [31:0] bus_data_in_ext,
     input bus_loaded_in, bus_hold_in, exti,
@@ -459,7 +469,7 @@ module cpu_top(
 //==============================================================================
 // 前端：预测器
 //==============================================================================
-    bpu u_bpu (
+    bpu #(.BHT_B(BHT_B), .BTB_B(BTB_B)) u_bpu (
         .clk(clk), .rst(rst),
         .advance(advance_icache),
 //学习源只有 bju 一家：它同时知道"这是哪种跳转""它自己去哪""它自己的地址"
@@ -478,7 +488,7 @@ module cpu_top(
 //==============================================================================
 // 前端：指令缓存 + 指令紧耦合存储
 //==============================================================================
-    icache u_icache (
+    icache #(.IC_INDEX_B(IC_INDEX_B)) u_icache (
         .clk(clk), .rst(rst),
         .pc_address_0(pc_address_0), .pc_address_1(pc_address_1),
         .exception_interrupt(exception_interrupt), .exc_irq_ret(exception_interrupt_ret_ok),
@@ -521,7 +531,7 @@ module cpu_top(
 //==============================================================================
 // 前端：取指队列
 //==============================================================================
-    iffu u_iffu (
+    iffu #(.DEPTH(IFFU_DEPTH)) u_iffu (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
         .flush_pc_redirect(flush_pc_redir),
@@ -556,7 +566,7 @@ module cpu_top(
 //==============================================================================
 // 译码级
 //==============================================================================
-    idu1 u_idu1 (
+    idu1 #(.LANES(LANES)) u_idu1 (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]), .stall_rob_full_in(flag_bus[3]),
         .flush_pend(flush_pending),
@@ -664,7 +674,7 @@ module cpu_top(
 //==============================================================================
 // 发射级
 //==============================================================================
-    idu2 u_idu2 (
+    idu2 #(.VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH)) u_idu2 (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
         .flush_control_rob_registered(flush_con_rob_registered),
@@ -952,7 +962,7 @@ module cpu_top(
 //==============================================================================
 // 共享访存单元
 //==============================================================================
-    lsu #(.ADDER_AT_D(1)) u_lsu (   // 小核：地址加法搬到 D 端
+    lsu #(.ADDER_AT_D(ADDER_AT_D)) u_lsu (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
 //★ 总线被按住只在 LSU 内部生效（2026-10-31）：不再经 flag_bus[0] 去停整个前端。
@@ -999,7 +1009,7 @@ module cpu_top(
 //==============================================================================
 // 重排序缓冲
 //==============================================================================
-    rob u_rob (
+    rob #(.DEPTH(ROB_DEPTH)) u_rob (
         .clk(clk), .rst(rst),
         .allocation_en_0(alloc_enable_0), .allocation_en_1(alloc_enable_1),
         .allocation_rd_0(alloc_destination_register_0), .allocation_rd_1(alloc_destination_register_1),
@@ -1167,4 +1177,18 @@ module cpu_top(
         .bus_data_out(data_tim), .timer_interrupt(timer_interrupt), .ready(ready_tim)
     );
 
+//===============================================================
+// 宏化参数自检（综合丢弃，仿真时恒生效）—— 与 icache 的参数自检同构
+//===============================================================
+// synthesis translate_off
+    initial begin
+        if ((ROB_DEPTH < 4) || (ROB_DEPTH > 16) || ((ROB_DEPTH & (ROB_DEPTH-1)) != 0))
+            $display("CFG_FAIL: ROB_DEPTH=%0d 必须是 4..16 的 2 的幂", ROB_DEPTH);
+        else if (VALUE_TABLE_DEPTH != ROB_DEPTH)
+            $display("CFG_FAIL: VALUE_TABLE_DEPTH=%0d 必须等于 ROB_DEPTH=%0d", VALUE_TABLE_DEPTH, ROB_DEPTH);
+        else
+            $display("CFG_OK: LANES=%0d ROB=%0d IFFU=%0d VT=%0d IC_INDEX_B=%0d BHT=%0d BTB=%0d ADDER_AT_D=%0d",
+                     LANES, ROB_DEPTH, IFFU_DEPTH, VALUE_TABLE_DEPTH, IC_INDEX_B, BHT_B, BTB_B, ADDER_AT_D);
+    end
+// synthesis translate_on
 endmodule

@@ -111,8 +111,8 @@ module lsu(
     output reg [31:0] exception_load_store_pc_out
     );
 //★★ 地址加法器位置宏（参数，不用 ifdef）：
-//  0 = 现结构：D 端只锁两个加数，地址在 Q 端现算（默认）
-//  1 = 搬到 D 端：D 端把地址算完再寄存，Q 端只剩 >>2
+//  0 = 现结构：D 端只锁两个加数，地址在 Q 端现算（大核默认）
+//  1 = 搬到 D 端：D 端把地址算完再寄存，Q 端只剩 >>2（小核实测 +0.887ns，失败端点 4→0）
 //  ★ ADDER_AT_D 是 elaboration 常量，未选中那支不进网表（不是运行期 mux）。
     parameter integer ADDER_AT_D = 0;
 

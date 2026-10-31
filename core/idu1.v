@@ -203,6 +203,10 @@ module idu1(
     output [3:0]  lsu_producer_b_slot_out,
     output        lsu_producer_b_generation_out
     );
+//★宏化旋钮：2 = 双发（大核）、1 = 单发（小核）。
+//  LANES=1 时 alloc_lane1 恒 0 ⇒ iffu 每拍弹 1 条、h1 下一拍自己变队头，指令不丢；
+//  lane1 的载荷/单元随之变成死逻辑，综合自动裁掉。
+    parameter integer LANES = 2;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核，工具只能在布局阶段自己复制。每个模块各自打一拍，
 //寄存器就落在本模块旁边；全核都只打一拍，彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
@@ -423,8 +427,9 @@ module idu1(
         index_pick       = alloc_lane0 ? index_in_1 : index_in_0;
         generation_pick  = alloc_lane0 ? generation_in_1 : generation_in_0;
         is_mem_1 = (instruction_pick[6:0] == OPCODE_LOAD) | (instruction_pick[6:0] == OPCODE_STORE);
-        alloc_lane1 = 1'b0;   // ★LANES=1 裁剪：每拍只收 lane0，iffu 每拍弹 1 条，h1 下一拍自己变成队头
-//本行原式：alloc_lane1 = go & (alloc_lane0 ? instruction_valid_1 : instruction_valid_0)
+        alloc_lane1 = (LANES == 1) ? 1'b0 :
+                      (go & (alloc_lane0 ? instruction_valid_1 : instruction_valid_0)
+                          & (is_mem_1 ? 1'b0 : lane1_free));
         lane1_store = alloc_lane1 & ~is_mem_1 & ~flush_window;
         lsu_push_1  = 1'b0;
 //给 fifo 的推进量 = 本拍真正消费了几格（0/1/2）：指针按它走，不是"成对就 +2"。

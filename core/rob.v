@@ -233,8 +233,8 @@ module rob(
     output reg [31:0] exception_trap_value_delayed
     );
 
-localparam [4:0] DEPTH = 5'd8;
-localparam [3:0] DEPTH_MASK = DEPTH - 4'd1;   // DEPTH 必须是 2 的幂：指针一律 & DEPTH_MASK 回绕
+parameter integer DEPTH = 16;   // ★宏化旋钮：16=大核 / 8=小核（必须是 2 的幂）
+localparam [3:0] DEPTH_MASK = DEPTH - 1;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核，各模块各自打一拍，彼此没有相位差。
 reg reset_registered;
@@ -578,28 +578,8 @@ always @(*) begin
 //  ★ 组合而非寄存：队头同一拍可能刚退休，寄存版会把已退休那条当成返回点 ⇒ 它被执行两次。
 //==============================================================================
     always @(*) begin
-        case (head_pointer)
-            4'd0:  head_pc_out = entry_pc[0];
-            4'd1:  head_pc_out = entry_pc[1];
-            4'd2:  head_pc_out = entry_pc[2];
-            4'd3:  head_pc_out = entry_pc[3];
-            4'd4:  head_pc_out = entry_pc[4];
-            4'd5:  head_pc_out = entry_pc[5];
-            4'd6:  head_pc_out = entry_pc[6];
-            4'd7:  head_pc_out = entry_pc[7];
-            default: head_pc_out = 32'd0;
-        endcase
-        case (head_pointer)
-            4'd0:  head_valid_out = entry_valid[0];
-            4'd1:  head_valid_out = entry_valid[1];
-            4'd2:  head_valid_out = entry_valid[2];
-            4'd3:  head_valid_out = entry_valid[3];
-            4'd4:  head_valid_out = entry_valid[4];
-            4'd5:  head_valid_out = entry_valid[5];
-            4'd6:  head_valid_out = entry_valid[6];
-            4'd7:  head_valid_out = entry_valid[7];
-            default: head_valid_out = 1'b0;
-        endcase
+        head_pc_out = entry_pc[head_pointer];
+        head_valid_out = entry_valid[head_pointer];
     end
 
 //★ 改向在册（寄存一拍）：窗口内任一在册项带 entry_redirect ⇒ 给 idu2 挡新的访存发射。

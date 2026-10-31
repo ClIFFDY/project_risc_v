@@ -15,8 +15,8 @@
 //              ★ 2026-11-01：容量参数化。"扩容量"= 只改 IC_INDEX_B（组数位宽）一位，
 //                行大小 IC_WORD_B 不动、fill FSM 一行不动、itcm 不动（itcm 本来就是 64KB，
 //                read_address = mem_addr[15:2] 14 位顶满）。
-//                大核 IC_INDEX_B = 8 ⇒ 256 组 × 2 路 × 32 字 = 64KB；小核 = 7 ⇒ 32KB。
-//                小核另配：单发 + ROB 8 + iffu 4 + BHT/BTB 9 + 值表 8 槽 + 加法器在 D。
+//                当前 IC_INDEX_B = 8 ⇒ 256 组 × 2 路 × 32 字 = 64KB。
+//                IC_INDEX_B = 7 ⇒ 128 组 = 32KB（旧配置，行为逐位相同）。
 //              ★ 2026-10-27：两件事一起做了 ——
 //               ① 删掉"复位后把前 16KB 预装进 way0"的 bootloader：它把 4864 拍花在 CoreMark
 //                  计分区【外】，只换一个"第一段永远命中"的假象，其余什么也没买到。
@@ -112,7 +112,7 @@ module icache(
 //    IC_TAGW  = IC_TAG_B + 1    ⇐ tag 阵列字宽 = {valid, tag}
 //    IC_TAG_B = IC_FOLD + 2     ⇐ tag 高 2 位恒 0（pc[33:32] 不存在），低 IC_FOLD 位才是真 tag
     parameter integer IC_WORD_B  = 5;                                  // 行内字数位宽
-    parameter integer IC_INDEX_B = 7;                                  // 组数位宽（256 组）
+    parameter integer IC_INDEX_B = 8;                                  // 组数位宽（256 组）
     localparam integer IC_SETS   = 1 << IC_INDEX_B;                    // 组数
     localparam integer IC_TAG_B  = 32 - IC_WORD_B - IC_INDEX_B;        // tag_* 寄存器位宽
     localparam integer IC_TAGW   = IC_TAG_B + 1;                       // tag 阵列字宽
