@@ -37,8 +37,8 @@ module itcm(
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
-    reg rst_q;
-    always @(posedge clk) rst_q <= rst;
+    reg reset_registered;
+    always @(posedge clk) reset_registered <= rst;
 
 //指令存储 64KB（自举/回填来源）
     (* ram_style = "block" *) reg [31:0] itcm [0:16383];
@@ -50,47 +50,47 @@ module itcm(
     end
 
 //读口：mem_req 上升沿锁行首地址，随后 32 拍连吐一行
-    reg [13:0] raddr;
-    reg [5:0]  cnt;
-    reg        addr_v;
-    reg [31:0] d_r;
-    reg        v_d;
-    reg        req_d;
+    reg [13:0] read_address;
+    reg [5:0]  count;
+    reg        address_valid;
+    reg [31:0] data_registered;
+    reg        valid_delayed;
+    reg        request_delayed;
 
     reg start;
-    always @(*) start = mem_req & ~req_d;
+    always @(*) start = mem_req & ~request_delayed;
 
     always @(posedge clk) begin
-        if (rst_q) begin
-            raddr <= 14'd0;
-            cnt <= 6'd0;
-            addr_v <= 1'b0;
-            req_d <= 1'b0;
+        if (reset_registered) begin
+            read_address <= 14'd0;
+            count <= 6'd0;
+            address_valid <= 1'b0;
+            request_delayed <= 1'b0;
         end
         else begin
-            req_d <= mem_req;
+            request_delayed <= mem_req;
             if (start) begin
-                raddr  <= mem_addr[15:2];
-                cnt    <= 6'd32;
-                addr_v <= 1'b1;
+                read_address  <= mem_addr[15:2];
+                count    <= 6'd32;
+                address_valid <= 1'b1;
             end
-            else if (cnt != 6'd0) begin
-                raddr  <= raddr + 14'd1;
-                cnt    <= cnt - 6'd1;
-                addr_v <= 1'b1;
+            else if (count != 6'd0) begin
+                read_address  <= read_address + 14'd1;
+                count    <= count - 6'd1;
+                address_valid <= 1'b1;
             end
             else
-                addr_v <= 1'b0;
+                address_valid <= 1'b0;
         end
     end
 
 //单一地址表达式 + 输出寄存器：BRAM 的可推断模板
     always @(posedge clk) begin
-        d_r <= itcm[raddr];
-        v_d <= addr_v;
+        data_registered <= itcm[read_address];
+        valid_delayed <= address_valid;
     end
 
-    assign mem_data  = d_r;
-    assign mem_valid = v_d;
+    assign mem_data  = data_registered;
+    assign mem_valid = valid_delayed;
 
 endmodule
