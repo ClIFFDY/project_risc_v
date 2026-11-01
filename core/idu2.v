@@ -658,7 +658,6 @@ module idu2(
     parameter integer VALUE_TABLE_DEPTH = 16;
     localparam [3:0] VT_IDX_MASK = VALUE_TABLE_DEPTH - 1;
     reg [31:0] value_table_data   [0:VALUE_TABLE_DEPTH-1];
-    reg [31:0] value_table_data_s [0:VALUE_TABLE_DEPTH-1];
 //★ 2026-10-30：值表的【第二份】。访存专用流的两个读口只读这一份。
 //  为什么：值表是触发器阵列（写口多、进不了 RAM），6 个读口 = 6 棵 16:1 mux 树，
 //  全部得贴着同一份 512 个 FF 放，而消费者分散在 alu_0/alu_1/mdu/lsu ⇒ 布局只能摊开，route 占 79%。
@@ -678,7 +677,6 @@ module idu2(
         if (reset_registered) begin
             for (pi = 0; pi < VALUE_TABLE_DEPTH; pi = pi + 1) begin
                 value_table_data[pi]   <= 32'd0;
-                value_table_data_s[pi] <= 32'd0;
             end
             value_table_valid      <= {VALUE_TABLE_DEPTH{1'b0}};
             value_table_generation <= {VALUE_TABLE_DEPTH{1'b0}};
@@ -686,23 +684,18 @@ module idu2(
         else begin
             if (write_enable_alu_early) begin
                 value_table_data  [index_alu_early & VT_IDX_MASK] <= data_alu_early;
-                value_table_data_s[index_alu_early & VT_IDX_MASK] <= data_alu_early;
             end
             if (write_enable_alu_lane1_early) begin
                 value_table_data  [index_alu_lane1_early & VT_IDX_MASK] <= data_alu_lane1_early;
-                value_table_data_s[index_alu_lane1_early & VT_IDX_MASK] <= data_alu_lane1_early;
             end
             if (write_enable_mul_early) begin
                 value_table_data  [index_mul_early & VT_IDX_MASK] <= data_mul_early;
-                value_table_data_s[index_mul_early & VT_IDX_MASK] <= data_mul_early;
             end
             if (write_enable_multiply_lane1_early) begin
                 value_table_data  [index_multiply_lane1_early & VT_IDX_MASK] <= data_multiply_lane1_early;
-                value_table_data_s[index_multiply_lane1_early & VT_IDX_MASK] <= data_multiply_lane1_early;
             end
             if (write_enable_ld_early) begin
                 value_table_data  [index_ld_early & VT_IDX_MASK] <= data_ld_early;
-                value_table_data_s[index_ld_early & VT_IDX_MASK] <= data_ld_early;
             end
 //valid / generation 仍是 16 位向量（只有 1 位宽，译码便宜）
             if (write_enable_alu_early) begin
@@ -999,13 +992,13 @@ module idu2(
         value_table_hit_b_1 = value_table_valid[queue_producer_b_1_slot] & (value_table_generation[queue_producer_b_1_slot] == queue_producer_b_1_generation);
         value_table_read_a_0 = value_table_data[queue_producer_a_0_slot & VT_IDX_MASK];
         value_table_read_b_0 = value_table_data[queue_producer_b_0_slot & VT_IDX_MASK];
-        value_table_read_a_1 = value_table_data_s[queue_producer_a_1_slot & VT_IDX_MASK];
-        value_table_read_b_1 = value_table_data_s[queue_producer_b_1_slot & VT_IDX_MASK];
+        value_table_read_a_1 = value_table_data[queue_producer_a_1_slot & VT_IDX_MASK];
+        value_table_read_b_1 = value_table_data[queue_producer_b_1_slot & VT_IDX_MASK];
 //---- 访存专用流（第三个读口）----
         value_table_hit_a_mem = value_table_valid[queue_producer_a_mem_slot] & (value_table_generation[queue_producer_a_mem_slot] == queue_producer_a_mem_generation);
         value_table_hit_b_mem = value_table_valid[queue_producer_b_mem_slot] & (value_table_generation[queue_producer_b_mem_slot] == queue_producer_b_mem_generation);
-        value_table_read_a_mem = value_table_data_s[queue_producer_a_mem_slot & VT_IDX_MASK];
-        value_table_read_b_mem = value_table_data_s[queue_producer_b_mem_slot & VT_IDX_MASK];
+        value_table_read_a_mem = value_table_data[queue_producer_a_mem_slot & VT_IDX_MASK];
+        value_table_read_b_mem = value_table_data[queue_producer_b_mem_slot & VT_IDX_MASK];
 //访存的两个源恒是寄存器（load/store 没有立即数源）⇒ 没有 immediate 这一档。
 //★ 2026-10-30：load 早唤醒已撤（见上方 load 前送那段），这里只剩前送这一档。
         load_forward_a_mem = queue_producer_a_mem_valid & write_enable_ld_early & (index_ld_early == queue_producer_a_mem_slot) & (generation_ld_early == queue_producer_a_mem_generation);
