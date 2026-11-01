@@ -21,16 +21,16 @@
 
 module cpu_top #(
 //★★ 宏化旋钮：一份源码切档。默认值 = 大核（交付配置，行为与原树逐位相同）。
-    parameter integer LANES             = 2,    // 2 = 双发 / 1 = 单发
-    parameter integer ROB_DEPTH         = 16,   // 16 / 8（必须是 2 的幂）
-    parameter integer IFFU_DEPTH        = 8,    // 8 / 4
-    parameter integer VALUE_TABLE_DEPTH = 16,   // 必须 = ROB_DEPTH
-    parameter integer IC_INDEX_B        = 8,    // 8 = 64KB / 7 = 32KB
-    parameter integer BHT_B             = 11,   // 11 / 9
-    parameter integer BTB_B             = 11,   // 11 / 9
+    parameter integer LANES             = 1,    // 2 = 双发 / 1 = 单发
+    parameter integer ROB_DEPTH         = 8,   // 16 / 8（必须是 2 的幂）
+    parameter integer IFFU_DEPTH        = 4,    // 8 / 4
+    parameter integer VALUE_TABLE_DEPTH = 8,   // 必须 = ROB_DEPTH
+    parameter integer IC_INDEX_B        = 7,    // 8 = 64KB / 7 = 32KB
+    parameter integer BHT_B             = 9,   // 11 / 9
+    parameter integer BTB_B             = 9,   // 11 / 9
     parameter integer DC_SETS_B         = 8,   // 8 = 16KB / 7 = 8KB
     parameter integer ITCM_AW           = 14,  // 14 = 64KB / 13 = 32KB
-    parameter integer ADDER_AT_D        = 0     // 1 = 访存地址加法搬到 D 端
+    parameter integer ADDER_AT_D        = 1     // 1 = 访存地址加法搬到 D 端
 ) (
     input clk, rst,
     input [31:0] bus_data_in_ext,
