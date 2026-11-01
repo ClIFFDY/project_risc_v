@@ -47,6 +47,14 @@ module dcache(
     output reg [31:0] mem_addr, mem_write_data,
     output reg [3:0] mem_byte_enable
     );
+//★★ 宏化旋钮：dcache 组数位宽。8 = 256 组/16KB（默认），7 = 128 组/8KB。
+//  行恒 32 字节（word 3 位不变）。★ 缩容量的目的是让 tag 阵列（LUTRAM）与数据阵列（BRAM）
+//  在版图上靠得更近，直接缓解最差路径那条 8.35ns 的跨列布线。
+    parameter integer DC_SETS_B = 8;
+    localparam integer DC_SETS   = 1 << DC_SETS_B;
+    localparam integer DC_WORDS  = DC_SETS << 3;
+    localparam integer DC_TAG_B  = 32 - 3 - DC_SETS_B;
+    localparam integer DC_TAGW   = DC_TAG_B + 1;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -56,8 +64,8 @@ module dcache(
 
 //寄存器（按级分组）
 //第 0 级：本拍组合
-    reg [20:0] tag;
-    reg [7:0] index;
+    reg [DC_TAG_B-1:0] tag;
+    reg [DC_SETS_B-1:0] index;
     reg [2:0] word;
     reg [1:0] hit_way;
     reg cache_hit;
@@ -73,13 +81,13 @@ module dcache(
 //  LRU 只是替换提示量，晚一拍写不改变任何架构行为；回填那一路仍走当拍。
     reg        lru_hit_upd_q, lru_hit_value_q;
     reg [7:0]  lru_hit_index_q;
-    reg [10:0] read_address;
+    reg [DC_SETS_B+2:0] read_address;
 
     reg read_enable;
 
     reg is_fill_write, ram_write_enable;
     reg [3:0] ram_byte_enable;
-    reg [10:0] ram_write_address;
+    reg [DC_SETS_B+2:0] ram_write_address;
     reg        ram_write_way;
 
     reg [31:0] ram_write_data;
@@ -92,15 +100,15 @@ module dcache(
 //  （MUXF7+MUXF8 各两级），单独的 dcache 实现里它就是最差路径的前两级。
 //  折进 tag 后，valid 和 tag 一起从同一块 LUTRAM 读出来、一起比较，多出来的开销只是比较宽度 21→22。
 //  代价：tag 阵列必须显式清零（valid=0 编码成整个字为 0），不能再靠独立的 valid 向量兜底。
-    (* ram_style = "distributed" *) reg [21:0] way0_tag [0:255];   // [21]=valid, [20:0]=tag
-    (* ram_style = "distributed" *) reg [21:0] way1_tag [0:255];
+    (* ram_style = "distributed" *) reg [DC_TAGW-1:0] way0_tag [0:DC_SETS-1];   // [21]=valid, [20:0]=tag
+    (* ram_style = "distributed" *) reg [DC_TAGW-1:0] way1_tag [0:DC_SETS-1];
 //★ 2026-11-01 试过把 data 阵列按【路】拆成两块、两路并行读（way 只落到最后一级 mux），
 //  目标是断掉「读 tag → 命中 → 再读 data」这条两条 BRAM 串联。**实测失败，已回退**：
 //  拆开后 Vivado 推断不出 BRAM，落成 RAMD64E（分布式 RAM）⇒ 5925 个失败端点、WNS −3.278。
 //  根因是「dout <= way ? mem1[ra] : mem0[ra]」把两个存储器读混在一个寄存器里，推断器不认。
 //  结论：这条路要成立，必须给每块阵列各配一个输出寄存器再 mux，那等于每次命中多一拍。
-    (* ram_style = "block" *) reg [31:0] data_way0 [0:2047];
-    (* ram_style = "block" *) reg [31:0] data_way1 [0:2047];
+    (* ram_style = "block" *) reg [31:0] data_way0 [0:DC_WORDS-1];
+    (* ram_style = "block" *) reg [31:0] data_way1 [0:DC_WORDS-1];
     reg [31:0] dout0, dout1;
     reg        read_way_q;
     reg        dcache_sel_q;
@@ -109,14 +117,14 @@ module dcache(
 //  单是布线就 2.811 ns（扇出 189），把 dcache 的最差路径卡在 8.5 ns。
 //  复制是功能安全的（只多几个驱动器，值完全相同）。icache 的 read_address 也用了同一招。
 //  ★ 只给【阵列读】用；LRU 写、数据读地址仍用原来的 index，避免把复制带到别的锥上。
-    (* max_fanout = 8 *) wire [7:0] tag_index = bus_address_in[10:3];
+    (* max_fanout = 8 *) wire [DC_SETS_B-1:0] tag_index = bus_address_in[DC_SETS_B+2:3];
 
 //lru 必须是阵列，不能是宽向量：`reg [255:0] lru` 用运行时下标读写，会被综合成 256 个散
 //触发器 + 一棵 256:1 mux 树（实测 256 FDRE + 353 LUT6 + 42 MUXF7/F8，还带一条 fo=260 的
 //译码网），而阵列才推得成 LUTRAM。
 //★ 2026-10-30：valid 也照这个道理折进了 tag 字（见上），所以下面 initial 里必须把 tag 阵列清零 ——
 //  valid=0 现在编码成"整个 tag 字为 0"，不再有独立的 valid 向量兜底。
-    (* ram_style = "distributed" *) reg lru [0:255];
+    (* ram_style = "distributed" *) reg lru [0:DC_SETS-1];
 
 //★ valid 用【世代位】而不是常量 1：tag 字里存的是 `{valid_generation, tag}`，
 //  命中的判据是"这一位等于当拍的有效世代"。复位只要把这一位取反，整张表【一次全部作废】，
@@ -129,18 +137,18 @@ module dcache(
     reg [2:0] miss_word;
     reg [2:0] fill_count;
     reg [31:0] fill_addr;
-    reg [20:0] fill_tag;
-    reg [7:0] fill_index;
+    reg [DC_TAG_B-1:0] fill_tag;
+    reg [DC_SETS_B-1:0] fill_index;
 //★ 2026-10-31：缺失判定整体打一拍。
 //  原来「读 tag 阵列 → 比较 → 命中判定」当拍就要驱动 stage 与 fill_* 一整族的 CE，
 //  实测 tag 读之后还要 4.86 ns 才到 fill_index 的 CE（末段是一条扇出 30 的 miss_word 网）。
 //  现在：payload 用【便宜的使能】先锁进 _q 寄存器（只跟 read_request 走，不看命中），
 //  缺失只记一位 miss_q，下一拍才真的进回填。代价：每次缺失多一拍。
     reg        miss_q;
-    reg [7:0]  fill_index_q;
+    reg [DC_SETS_B-1:0] fill_index_q;
     reg [2:0]  fill_word_q;
     reg [31:0] fill_addr_q;
-    reg [20:0] fill_tag_q;
+    reg [DC_TAG_B-1:0] fill_tag_q;
     reg        fill_way_q;
     reg fill_way;
 
@@ -149,14 +157,14 @@ module dcache(
     integer i;
 
     initial begin
-        for (i = 0; i < 2048; i = i + 1) begin
+        for (i = 0; i < DC_WORDS; i = i + 1) begin
             data_way0[i] = 32'd0;
             data_way1[i] = 32'd0;
         end
-        for (i = 0; i < 256;  i = i + 1) begin
+        for (i = 0; i < DC_SETS;  i = i + 1) begin
             lru[i]  = 1'b0;
-            way0_tag[i] = 22'd0;    // 全 0 = valid=0
-            way1_tag[i] = 22'd0;
+            way0_tag[i] = {DC_TAGW{1'b0}};    // 全 0 = valid=0
+            way1_tag[i] = {DC_TAGW{1'b0}};
         end
         valid_generation = 1'b1;
     end
@@ -165,8 +173,8 @@ module dcache(
 // 第 0 级：本拍组合（请求与命中判定 + 写口合成）
 //===============================================================
     always @(*) begin
-        tag = bus_address_in[31:11];
-        index = bus_address_in[10:3];
+        tag = bus_address_in[31:DC_SETS_B+3];
+        index = bus_address_in[DC_SETS_B+2:3];
         word = bus_address_in[2:0];
         hit_way[0] = (way0_tag[tag_index] == {valid_generation, tag});
         hit_way[1] = (way1_tag[tag_index] == {valid_generation, tag});
@@ -330,8 +338,8 @@ module dcache(
                 fill_word_q  <= word;
                 fill_addr_q  <= (bus_address_in & 32'hFFFFFFF8) << 2;
                 fill_tag_q   <= tag;
-                fill_way_q   <= ((way0_tag[tag_index][21] != valid_generation)) ? 1'b0 :
-                                ((way1_tag[tag_index][21] != valid_generation)) ? 1'b1 : lru[index];
+                fill_way_q   <= ((way0_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b0 :
+                                ((way1_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b1 : lru[index];
             end
             if (read_request & cache_hit)
                 load_ready <= 1'b1;

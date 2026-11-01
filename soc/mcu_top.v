@@ -30,6 +30,8 @@ module mcu_top #(
     parameter integer IC_INDEX_B        = 8,
     parameter integer BHT_B             = 11,
     parameter integer BTB_B             = 11,
+    parameter integer DC_SETS_B         = 8,
+    parameter integer ITCM_AW           = 14,
     parameter integer ADDER_AT_D        = 0
 ) (
     input clk, rst,
@@ -50,7 +52,7 @@ module mcu_top #(
     wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w;
     wire        plic_exti;
 
-    cpu_top #(.LANES(LANES), .ROB_DEPTH(ROB_DEPTH), .IFFU_DEPTH(IFFU_DEPTH), .VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH), .IC_INDEX_B(IC_INDEX_B), .BHT_B(BHT_B), .BTB_B(BTB_B), .ADDER_AT_D(ADDER_AT_D)) u_cpu_top (
+    cpu_top #(.LANES(LANES), .ROB_DEPTH(ROB_DEPTH), .IFFU_DEPTH(IFFU_DEPTH), .VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH), .IC_INDEX_B(IC_INDEX_B), .BHT_B(BHT_B), .BTB_B(BTB_B), .ADDER_AT_D(ADDER_AT_D), .DC_SETS_B(DC_SETS_B), .ITCM_AW(ITCM_AW)) u_cpu_top (
         .clk(clk),
         .rst(rst_cpu),
         .bus_addr_out(bus_addr_f_cpu),

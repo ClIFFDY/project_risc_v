@@ -28,6 +28,8 @@ module cpu_top #(
     parameter integer IC_INDEX_B        = 8,    // 8 = 64KB / 7 = 32KB
     parameter integer BHT_B             = 11,   // 11 / 9
     parameter integer BTB_B             = 11,   // 11 / 9
+    parameter integer DC_SETS_B         = 8,   // 8 = 16KB / 7 = 8KB
+    parameter integer ITCM_AW           = 14,  // 14 = 64KB / 13 = 32KB
     parameter integer ADDER_AT_D        = 0     // 1 = 访存地址加法搬到 D 端
 ) (
     input clk, rst,
@@ -513,7 +515,7 @@ module cpu_top #(
         .mem_address(mem_address_icache), .mem_write_data(mem_wdata_icache), .mem_byte_enable(mem_byte_enable_icache)
     );
 
-    itcm u_itcm (
+    itcm #(.ITCM_AW(ITCM_AW)) u_itcm (
         .clk(clk), .rst(rst),
         .mem_req(mem_req_icache),
         .mem_addr(mem_address_icache),
@@ -1149,7 +1151,7 @@ module cpu_top #(
 //==============================================================================
 // 数据侧存储
 //==============================================================================
-    dcache u_dcache (
+    dcache #(.DC_SETS_B(DC_SETS_B)) u_dcache (
         .clk(clk), .rst(rst),
         .bus_address_in(dcache_address_lsu), .bus_data_in(dcache_data_lsu),
         .bus_byte_enable_in(dcache_byte_enable_lsu), .bus_write_enable_in(dcache_write_enable_lsu),

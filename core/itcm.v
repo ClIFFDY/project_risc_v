@@ -33,6 +33,10 @@ module itcm(
     output [31:0] mem_data,
     output mem_valid
     );
+//★★ 宏化旋钮：itcm 字数位宽。14 = 16384 字/64KB（默认），13 = 8192 字/32KB。
+//  缩它是为了减少 BRAM 占用（16 块 → 8 块），缓解 BRAM 列对布局的挤压。
+    parameter integer ITCM_AW = 14;
+    localparam integer ITCM_WORDS = 1 << ITCM_AW;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -41,16 +45,16 @@ module itcm(
     always @(posedge clk) reset_registered <= rst;
 
 //指令存储 64KB（自举/回填来源）
-    (* ram_style = "block" *) reg [31:0] itcm [0:16383];
+    (* ram_style = "block" *) reg [31:0] itcm [0:ITCM_WORDS-1];
     integer i;
     initial begin
-        for (i = 0; i < 16384; i = i + 1)
+        for (i = 0; i < ITCM_WORDS; i = i + 1)
             itcm[i] = 32'd0;
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/ins.hex", itcm);
     end
 
 //读口：mem_req 上升沿锁行首地址，随后 32 拍连吐一行
-    reg [13:0] read_address;
+    reg [ITCM_AW-1:0] read_address;
     reg [5:0]  count;
     reg        address_valid;
     reg [31:0] data_registered;
@@ -62,7 +66,7 @@ module itcm(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            read_address <= 14'd0;
+            read_address <= 0;
             count <= 6'd0;
             address_valid <= 1'b0;
             request_delayed <= 1'b0;
@@ -70,12 +74,12 @@ module itcm(
         else begin
             request_delayed <= mem_req;
             if (start) begin
-                read_address  <= mem_addr[15:2];
+                read_address  <= mem_addr[ITCM_AW+1:2];
                 count    <= 6'd32;
                 address_valid <= 1'b1;
             end
             else if (count != 6'd0) begin
-                read_address  <= read_address + 14'd1;
+                read_address  <= read_address + 1'b1;
                 count    <= count - 6'd1;
                 address_valid <= 1'b1;
             end
