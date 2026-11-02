@@ -32,29 +32,46 @@ module io_block_top(
     output            uart_ready,
     output     [31:0] plic_data,
     output            plic_ready,
+    output     [31:0] tim_data,
+    output            tim_ready,
     output     [31:0] gpio_data,
     output            gpio_ready,
     output     [31:0] i2c_data,
     output            i2c_ready,
+    output     [31:0] qspi_data,
+    output            qspi_ready,
     output            plic_exti
     );
 
     localparam
     PER_UART = 1,
     PER_PLIC = 2,
+    PER_TIM  = 3,
     PER_GPIO = 4,
-    PER_I2C  = 5;
+    PER_I2C  = 5,
+    PER_QSPI = 7;
+
+// PLIC 中断源编号（32 路向量里的位号）——不要散着写常量
+    localparam integer IRQ_UART = 1,
+                       IRQ_GPIO = 3,
+                       IRQ_I2C  = 4,
+                       IRQ_TIM  = 5;
 
     wire uart_rx_w, uart_tx_w;
-    wire uart_rx_irq, gpio_irq, i2c_irq;
+    wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq, qspi_irq;
     wire i2c_scl_oe, i2c_sda_oe, i2c_scl_in, i2c_sda_in;
+    wire tim_pwm1, tim_pwm2, tim_pwm3, tim_pwm4;
+    wire qspi_sck, qspi_cs_n;
+    wire [3:0] qspi_io_out, qspi_io_oe, qspi_io_in;
 
-    reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c;
+    reg bus_we_uart, bus_we_plic, bus_we_tim, bus_we_gpio, bus_we_i2c, bus_we_qspi;
     always @(*) begin
         bus_we_uart = bus_we_in & bus_sel_in[PER_UART];
         bus_we_plic = bus_we_in & bus_sel_in[PER_PLIC];
+        bus_we_tim  = bus_we_in & bus_sel_in[PER_TIM];
         bus_we_gpio = bus_we_in & bus_sel_in[PER_GPIO];
         bus_we_i2c  = bus_we_in & bus_sel_in[PER_I2C];
+        bus_we_qspi = bus_we_in & bus_sel_in[PER_QSPI];
     end
 
     uart_top u_uart (
@@ -85,10 +102,15 @@ module io_block_top(
         .sda_oe(i2c_sda_oe),
         .scl_oe(i2c_scl_oe),
         .tx(uart_tx_w),
-        .pwm1(1'b0),
-        .pwm2(1'b0),
-        .pwm3(1'b0),
-        .pwm4(1'b0),
+        .pwm1(tim_pwm1),
+        .pwm2(tim_pwm2),
+        .pwm3(tim_pwm3),
+        .pwm4(tim_pwm4),
+        .spi_sck(qspi_sck),
+        .spi_cs_n(qspi_cs_n),
+        .spi_io_out(qspi_io_out),
+        .spi_io_oe(qspi_io_oe),
+        .spi_io_in(qspi_io_in),
         .rx(uart_rx_w),
         .sda_in(i2c_sda_in),
         .scl_in(i2c_scl_in)
@@ -111,10 +133,43 @@ module io_block_top(
         .busy()
     );
 
+    tim_p u_tim (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_tim),
+        .ld_ready(tim_ready),
+        .bus_data_out(tim_data),
+        .tim_p_irq(tim_irq),
+        .pwm1(tim_pwm1),
+        .pwm2(tim_pwm2),
+        .pwm3(tim_pwm3),
+        .pwm4(tim_pwm4)
+    );
+
+    qspi u_qspi (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_qspi),
+        .ld_ready(qspi_ready),
+        .bus_data_out(qspi_data),
+        .qspi_irq(qspi_irq),
+        .sck(qspi_sck),
+        .cs_n(qspi_cs_n),
+        .io_out(qspi_io_out),
+        .io_oe(qspi_io_oe),
+        .io_in(qspi_io_in)
+    );
+
     plic u_plic (
         .clk(clk),
         .rst(rst_cpu),
-        .irq_sources({26'd0, 1'b0, i2c_irq, gpio_irq, 1'b0, uart_rx_irq, 1'b0}),
+        .irq_sources({25'd0, qspi_irq, tim_irq, i2c_irq, gpio_irq, 1'b0, uart_rx_irq, 1'b0}),
         .exti(plic_exti),
         .bus_addr_in(bus_addr_in),
         .bus_data_in(bus_data_in),

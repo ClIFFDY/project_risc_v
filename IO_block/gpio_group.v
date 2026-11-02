@@ -35,9 +35,18 @@ module gpio_group(
     input scl_oe,
     input tx,
     input pwm1, pwm2, pwm3, pwm4,
-    output reg rx, sda_in, scl_in
+    output reg rx, sda_in, scl_in,
+//QSPI 复用（2026-11-02 加）：SCK/CS_N 恒输出，IO[3:0] 由 oe 决定方向，
+//  回读走独立输入，和 SDA/SCL 同一套写法
+    input       spi_sck, spi_cs_n,
+    input [3:0] spi_io_out,
+    input [3:0] spi_io_oe,
+    output reg [3:0] spi_io_in
     );
 
+//低 4 位是原有编码（一个字节都不动），高 1 位 = MODE_EXT：
+//  MODE_EXT=0 → 走原编码；=1 → 低 4 位当新功能序号，给 QSPI 这种塞不下的用。
+//  这样老软件写的 MODE0..3 语义完全不变。
     localparam [3:0]
         UNUSE = 4'b0000,
         OUT = 4'b0001,
@@ -52,6 +61,14 @@ module gpio_group(
         PWM3 = 4'b1011,
         PWM4 = 4'b1100;
 
+    localparam [4:0]
+        M_SPI_SCK = 5'h11,
+        M_SPI_CS  = 5'h12,
+        M_SPI_IO0 = 5'h13,
+        M_SPI_IO1 = 5'h14,
+        M_SPI_IO2 = 5'h15,
+        M_SPI_IO3 = 5'h16;
+
     localparam [5:0]
         R_OUT = 6'h00,
         R_IN = 6'h04,
@@ -61,9 +78,11 @@ module gpio_group(
         R_MODE3 = 6'h14,
         R_IRQ_STAT = 6'h18,
         R_IRQ_TYPE0 = 6'h1c,
-        R_IRQ_TYPE1 = 6'h20;
+        R_IRQ_TYPE1 = 6'h20,
+        R_MODE_EXT = 6'h24;
 
     reg [3:0] gpio_mode [0:31];
+    reg [31:0] gpio_mode_ext;
     reg [31:0] gpio_output;
     reg [31:0] gpio_pin_in_q;
     reg [31:0] gpio_irq_status;
@@ -79,38 +98,62 @@ module gpio_group(
         gpio_pin_out = 32'd0;
         gpio_pin_oe = 32'd0;
         for (i = 0; i < 32; i = i + 1) begin
-            case (gpio_mode[i])
-            OUT: begin
+            case ({gpio_mode_ext[i], gpio_mode[i]})
+            {1'b0, OUT}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = gpio_output[i];
             end
-            TX: begin
+            {1'b0, TX}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = tx;
             end
-            PWM1: begin
+            {1'b0, PWM1}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = pwm1;
             end
-            PWM2: begin
+            {1'b0, PWM2}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = pwm2;
             end
-            PWM3: begin
+            {1'b0, PWM3}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = pwm3;
             end
-            PWM4: begin
+            {1'b0, PWM4}: begin
                 gpio_pin_oe[i] = 1'b1;
                 gpio_pin_out[i] = pwm4;
             end
-            SCL: begin
+            {1'b0, SCL}: begin
                 gpio_pin_oe[i] = scl_oe;
                 gpio_pin_out[i] = 1'b0;
             end
-            SDA: begin
+            {1'b0, SDA}: begin
                 gpio_pin_oe[i] = sda_oe;
                 gpio_pin_out[i] = 1'b0;
+            end
+            M_SPI_SCK: begin
+                gpio_pin_oe[i] = 1'b1;
+                gpio_pin_out[i] = spi_sck;
+            end
+            M_SPI_CS: begin
+                gpio_pin_oe[i] = 1'b1;
+                gpio_pin_out[i] = spi_cs_n;
+            end
+            M_SPI_IO0: begin
+                gpio_pin_oe[i]  = spi_io_oe[0];
+                gpio_pin_out[i] = spi_io_out[0];
+            end
+            M_SPI_IO1: begin
+                gpio_pin_oe[i]  = spi_io_oe[1];
+                gpio_pin_out[i] = spi_io_out[1];
+            end
+            M_SPI_IO2: begin
+                gpio_pin_oe[i]  = spi_io_oe[2];
+                gpio_pin_out[i] = spi_io_out[2];
+            end
+            M_SPI_IO3: begin
+                gpio_pin_oe[i]  = spi_io_oe[3];
+                gpio_pin_out[i] = spi_io_out[3];
             end
             default: ;
             endcase
@@ -124,13 +167,21 @@ module gpio_group(
         end
     endgenerate
 
-//SDA / SCL 模式脚的电平回读到 i2c
+//SDA / SCL 模式脚的电平回读到 i2c；QSPI 的 IO0..IO3 同样回读
     always @(*) begin
         sda_in = 1'b1;
         scl_in = 1'b1;
+        spi_io_in = 4'hF;          // 没复用到的线默认拉高（QSPI 空闲电平）
         for (i = 0; i < 32; i = i + 1) begin
-            if (gpio_mode[i] == SDA) sda_in = gpio_pin_bus[i];
-            if (gpio_mode[i] == SCL) scl_in = gpio_pin_bus[i];
+            if (!gpio_mode_ext[i] && gpio_mode[i] == SDA) sda_in = gpio_pin_bus[i];
+            if (!gpio_mode_ext[i] && gpio_mode[i] == SCL) scl_in = gpio_pin_bus[i];
+            case ({gpio_mode_ext[i], gpio_mode[i]})
+            M_SPI_IO0: spi_io_in[0] = gpio_pin_bus[i];
+            M_SPI_IO1: spi_io_in[1] = gpio_pin_bus[i];
+            M_SPI_IO2: spi_io_in[2] = gpio_pin_bus[i];
+            M_SPI_IO3: spi_io_in[3] = gpio_pin_bus[i];
+            default: ;
+            endcase
         end
     end
 
@@ -143,6 +194,7 @@ module gpio_group(
     always @(posedge clk) begin
         if (rst) begin
             for (i = 0; i < 32; i = i + 1) gpio_mode[i] <= UNUSE;
+            gpio_mode_ext <= 32'd0;
             gpio_output <= 32'd0;
             gpio_irq_status <= 32'd0;
             gpio_irq_type <= 64'd0;
@@ -154,14 +206,14 @@ module gpio_group(
             rx <= 1'b1;
 
             for (i = 0; i < 32; i = i + 1) begin
-                if (gpio_mode[i] == TX) gpio_output[i] <= tx;
-                else if (gpio_mode[i] == PWM1) gpio_output[i] <= pwm1;
-                else if (gpio_mode[i] == PWM2) gpio_output[i] <= pwm2;
-                else if (gpio_mode[i] == PWM3) gpio_output[i] <= pwm3;
-                else if (gpio_mode[i] == PWM4) gpio_output[i] <= pwm4;
-                if (gpio_mode[i] == RX) rx <= gpio_pin_bus[i];
+                if (!gpio_mode_ext[i] && gpio_mode[i] == TX) gpio_output[i] <= tx;
+                else if (!gpio_mode_ext[i] && gpio_mode[i] == PWM1) gpio_output[i] <= pwm1;
+                else if (!gpio_mode_ext[i] && gpio_mode[i] == PWM2) gpio_output[i] <= pwm2;
+                else if (!gpio_mode_ext[i] && gpio_mode[i] == PWM3) gpio_output[i] <= pwm3;
+                else if (!gpio_mode_ext[i] && gpio_mode[i] == PWM4) gpio_output[i] <= pwm4;
+                if (!gpio_mode_ext[i] && gpio_mode[i] == RX) rx <= gpio_pin_bus[i];
 
-                if (gpio_mode[i] == IRQ) begin
+                if (!gpio_mode_ext[i] && gpio_mode[i] == IRQ) begin
                     case (gpio_irq_type[2*i +: 2])
                     2'd0: if (gpio_pin_in_q[i] && !gpio_pin_bus[i]) gpio_irq_status[i] <= 1'b1;
                     2'd1: if (!gpio_pin_in_q[i] && gpio_pin_bus[i]) gpio_irq_status[i] <= 1'b1;
@@ -207,6 +259,17 @@ module gpio_group(
                             if (i/8 == (reg_sel - R_MODE0) >> 2)
                                 bus_data_out[4*(i%8) +: 4] <= gpio_mode[i];
                         end
+                        ld_ready <= 1'b1;
+                    end
+                end
+                R_MODE_EXT: begin
+                    if (bus_we_in) begin
+                        for (i = 0; i < 32; i = i + 1) begin
+                            if (bus_be_in[i/8]) gpio_mode_ext[i] <= bus_data_in[i];
+                        end
+                    end
+                    else begin
+                        bus_data_out <= gpio_mode_ext;
                         ld_ready <= 1'b1;
                     end
                 end

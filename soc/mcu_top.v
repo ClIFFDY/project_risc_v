@@ -30,12 +30,21 @@ module mcu_top #(
     parameter integer IC_INDEX_B        = 7,
     parameter integer BHT_B             = 9,
     parameter integer BTB_B             = 9,
-    parameter integer DC_SETS_B         = 8,
+    parameter integer DC_SETS_B         = 9,
     parameter integer ITCM_AW           = 14,
     parameter integer ADDER_AT_D        = 1
 ) (
     input clk, rst,
-    inout wire [31:0] gpio_pin_bus
+    inout wire [31:0] gpio_pin_bus,
+//L2 的下一级存储口（AHB-Lite 主机）：留给外部存储控制器，目前没有接器件
+    output     [31:0] l2_haddr, l2_hwdata,
+    output            l2_hwrite,
+    output     [1:0]  l2_htrans,
+    output     [2:0]  l2_hsize,
+    output     [3:0]  l2_hwstrb,
+    input      [31:0] l2_hrdata,
+    input             l2_hready,
+    output            l2_busy
     );
 
     wire rst_cpu;
@@ -48,8 +57,8 @@ module mcu_top #(
     wire [3:0]  bus_be_out;
     wire        bus_we_out;
 
-    wire [31:0] uart_data_w, plic_data_w, gpio_data_w, i2c_data_w;
-    wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w;
+    wire [31:0] uart_data_w, plic_data_w, tim_data_w, gpio_data_w, i2c_data_w, qspi_data_w;
+    wire        uart_ready_w, plic_ready_w, tim_ready_w, gpio_ready_w, i2c_ready_w, qspi_ready_w;
     wire        plic_exti;
 
     cpu_top #(.LANES(LANES), .ROB_DEPTH(ROB_DEPTH), .IFFU_DEPTH(IFFU_DEPTH), .VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH), .IC_INDEX_B(IC_INDEX_B), .BHT_B(BHT_B), .BTB_B(BTB_B), .ADDER_AT_D(ADDER_AT_D), .DC_SETS_B(DC_SETS_B), .ITCM_AW(ITCM_AW)) u_cpu_top (
@@ -63,7 +72,10 @@ module mcu_top #(
         .bus_data_in_ext(bus_data_b_cpu),
         .bus_loaded_in(bus_loaded_out),
         .bus_hold_in(bus_hold_out),
-        .exti(plic_exti)
+        .exti(plic_exti),
+        .l2_haddr(l2_haddr), .l2_hwdata(l2_hwdata), .l2_hwrite(l2_hwrite),
+        .l2_htrans(l2_htrans), .l2_hsize(l2_hsize), .l2_hwstrb(l2_hwstrb),
+        .l2_hrdata(l2_hrdata), .l2_hready(l2_hready), .l2_busy(l2_busy)
     );
 
     bus_con_top u_bus_con (
@@ -87,10 +99,14 @@ module mcu_top #(
         .uart_ready(uart_ready_w),
         .plic_data(plic_data_w),
         .plic_ready(plic_ready_w),
+        .tim_data(tim_data_w),
+        .tim_ready(tim_ready_w),
         .gpio_data(gpio_data_w),
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
-        .i2c_ready(i2c_ready_w)
+        .i2c_ready(i2c_ready_w),
+        .qspi_data(qspi_data_w),
+        .qspi_ready(qspi_ready_w)
     );
 
     io_block_top u_io_block (
@@ -106,10 +122,14 @@ module mcu_top #(
         .uart_ready(uart_ready_w),
         .plic_data(plic_data_w),
         .plic_ready(plic_ready_w),
+        .tim_data(tim_data_w),
+        .tim_ready(tim_ready_w),
         .gpio_data(gpio_data_w),
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
         .i2c_ready(i2c_ready_w),
+        .qspi_data(qspi_data_w),
+        .qspi_ready(qspi_ready_w),
         .plic_exti(plic_exti)
     );
 

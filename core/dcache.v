@@ -169,6 +169,11 @@ module dcache(
         valid_generation = 1'b1;
     end
 
+//★ 可缓存窗口 = 代码窗口(字地址[29:14]==0) 或 数据窗口(字地址[23:13]==11'h100)，
+//  与 lsu.v 的 stage1_non_cacheable / store_drain_non_cacheable 逐位一致。
+    wire IN_L2 = (bus_address_in[29:14] == 16'd0) ||
+                 ((bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100));
+
 //===============================================================
 // 第 0 级：本拍组合（请求与命中判定 + 写口合成）
 //===============================================================
@@ -181,8 +186,8 @@ module dcache(
         cache_hit = hit_way[0] || hit_way[1];
 
 //★ ~miss_q：缺失已经判出来、正等着下一拍进回填，这一拍不许再收同一个请求
-        read_request = (stage == 1'b0) && !miss_q && bus_valid_in && (bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100) && !bus_write_enable_in;
-        write_request = (stage == 1'b0) && !miss_q && bus_valid_in && (bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100) && bus_write_enable_in && !write_pending;
+        read_request = (stage == 1'b0) && !miss_q && bus_valid_in && IN_L2 && !bus_write_enable_in;
+        write_request = (stage == 1'b0) && !miss_q && bus_valid_in && IN_L2 && bus_write_enable_in && !write_pending;
 //store 命中即行内就地更新，一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。

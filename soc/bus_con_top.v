@@ -40,21 +40,25 @@ module bus_con_top(
     input             uart_ready,
     input      [31:0] plic_data,
     input             plic_ready,
+    input      [31:0] tim_data,
+    input             tim_ready,
     input      [31:0] gpio_data,
     input             gpio_ready,
     input      [31:0] i2c_data,
-    input             i2c_ready
+    input             i2c_ready,
+    input      [31:0] qspi_data,
+    input             qspi_ready
     );
 
     wire [31:0] m0_haddr, m0_hwdata, m0_hrdata;
     wire [1:0]  m0_htrans;
-    wire        m0_hwrite, m0_hready, m0_rd_valid;
+    wire        m0_hwrite, m0_hready, m0_hresp;
     wire [2:0]  m0_hsize, m0_hburst;
     wire [3:0]  m0_hwstrb;
 
     wire [31:0] s_haddr, s_hwdata, s_hrdata;
     wire [1:0]  s_htrans;
-    wire        s_hwrite, s_hready, s_rd_valid;
+    wire        s_hwrite, s_hready, s_hresp;
     wire [2:0]  s_hsize, s_hburst;
     wire [3:0]  s_hwstrb;
 
@@ -84,7 +88,7 @@ module bus_con_top(
         .hwstrb(m0_hwstrb),
         .hrdata(m0_hrdata),
         .hready(m0_hready),
-        .rd_valid(m0_rd_valid)
+        .hresp(m0_hresp)
     );
 
     ahb_interconnect u_ahb_ic (
@@ -99,7 +103,7 @@ module bus_con_top(
         .m0_hwstrb(m0_hwstrb),
         .m0_hrdata(m0_hrdata),
         .m0_hready(m0_hready),
-        .m0_rd_valid(m0_rd_valid),
+        .m0_hresp(m0_hresp),
         .s_haddr(s_haddr),
         .s_htrans(s_htrans),
         .s_hwrite(s_hwrite),
@@ -109,7 +113,7 @@ module bus_con_top(
         .s_hwstrb(s_hwstrb),
         .s_hrdata(s_hrdata),
         .s_hready(s_hready),
-        .s_rd_valid(s_rd_valid)
+        .s_hresp(s_hresp)
     );
 
     ahb_apb_bridge u_ahb_apb (
@@ -123,8 +127,9 @@ module bus_con_top(
         .hwdata(s_hwdata),
         .hwstrb(s_hwstrb),
         .hrdata(s_hrdata),
-        .hready(s_hready),
-        .rd_valid(s_rd_valid),
+        .hreadyout(s_hready),
+        .hreadyin(1'b1),          // 单从机：没有下游要接续
+        .hresp(s_hresp),
         .bus_addr_out(bus_addr_out),
         .bus_data_out(bus_data_out),
         .bus_be_out(bus_be_out),
@@ -134,10 +139,14 @@ module bus_con_top(
         .uart_ready(uart_ready),
         .plic_data(plic_data),
         .plic_ready(plic_ready),
+        .tim_data(tim_data),
+        .tim_ready(tim_ready),
         .gpio_data(gpio_data),
         .gpio_ready(gpio_ready),
         .i2c_data(i2c_data),
-        .i2c_ready(i2c_ready)
+        .i2c_ready(i2c_ready),
+        .qspi_data(qspi_data),
+        .qspi_ready(qspi_ready)
     );
 
 endmodule

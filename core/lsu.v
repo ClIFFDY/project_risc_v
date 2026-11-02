@@ -330,7 +330,12 @@ module lsu(
 //空总线（blank）：miss 在跑，或在途那笔读还没被应答（含级2 刚摆上、下一拍才进级3 的那笔）⇒ 不摆。
 //★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
-        stage1_non_cacheable = ~((stage1_word[31:24] == 8'd0) & (stage1_word[23:13] == 11'h100));
+//★ 2026-11-02：可缓存窗口扩到【代码窗口 + 数据窗口】，两个判据必须和 l2cache.v 一致。
+//  代码窗口（字节 0x0000_0000..0x0000_FFFF ⟺ 字地址 [29:14]==0）现在也走 dcache，
+//  这样 L1D 的 store 才能【写穿到 L2】并触发 L1I 作废 —— 否则 SMC 改的代码
+//  落在总线上，L2 和 icache 都不知道（一致性形同虚设）。
+        stage1_non_cacheable = ~(((stage1_word[29:14] == 16'd0)) ||
+                                 ((stage1_word[31:24] == 8'd0) & (stage1_word[23:13] == 11'h100)));
         load_out     = (stage1_valid & stage1_sent & stage1_non_cacheable) | stage2_valid;
 //  drain_req_valid 在册：它占着 dcache 口的那一拍不许再发读（否则请求被挤掉、永不应答）
 //★ bus_hold 并进 blank_bus：它同时挡住 load 的发送（stage1_put）和 store 的排空
@@ -393,8 +398,9 @@ module lsu(
     reg [31:0] store_drain_data;
     reg [3:0]  store_drain_byte_enable;
     always @(*) begin
-        store_drain_non_cacheable = ~((store_queue_a_address[31:24] == 8'd0) &&
-                                      (store_queue_a_address[23:13] == 11'h100));
+        store_drain_non_cacheable = ~(((store_queue_a_address[29:14] == 16'd0)) ||
+                                      ((store_queue_a_address[31:24] == 8'd0) &&
+                                       (store_queue_a_address[23:13] == 11'h100)));
 //★ 2026-10-30：mask + 移位在这里做。三个输入（原始数据 / offset / size）全是 SQ 的寄存器，
 //  所以这坨完全在 Q 端之后，入口那一拍的桶移就没有了。
         case (store_queue_a_size)

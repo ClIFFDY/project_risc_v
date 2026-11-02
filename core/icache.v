@@ -57,9 +57,14 @@ module icache(
 //  不是"另外再打一拍对齐"，而是**本来就是同一位**。下面 instruction_out 那个块里一起写。
     input        pc_take_0, pc_take_1,
     input [31:0] btb_target_0, btb_target_1,
-//回填应答（接核内 itcm）
+//回填应答（接核内 L2）
     input mem_valid,
     input [31:0] mem_data,
+//★ 一二级一致性（2026-11-02）：L2 被写穿的那一行，本 cache 里若有副本必须作废。
+//  来源是 l2mem 的写脉冲（dcache 写穿）。同一个放行条件：fill 在跑时先挂起，
+//  等这一行填完再作废（回填写进去的是 L2 的新数据，本来就没过期，等一等是安全的）。
+    input        invalidate,
+    input [31:0] invalidate_address,
 //本拍 pc 落到重定向目标（pc.v 的 redir_go，源名 flush_pc_redirect）：挡掉"跳转前那次取指"的陈旧交付
     input flush_pc_redirect,
 //取指队列满（iffu 的 full）：本拍放不下，交付寄存器保持、不再推进
@@ -205,6 +210,13 @@ module icache(
     reg [IC_WORD_B-1:0] fill_count;
     reg [31:0] fill_addr;
     reg [IC_TAG_B-1:0] fill_tag;
+
+//—— 一致性作废（L2 写穿 → 清掉本 cache 的同一行）——
+    reg  inv_pend;
+    wire [IC_INDEX_B-1:0] inv_index = invalidate_address[IC_WORD_B+IC_INDEX_B+1 : IC_WORD_B+2];
+    wire [IC_TAG_B-1:0]   inv_tag   = {2'b00, invalidate_address[31 : IC_WORD_B+IC_INDEX_B+2]};
+//回填在跑时先挂起：填进来的就是 L2 的新数据，晚一拍作废不会留下过期行。
+    wire inv_go = inv_pend && (stage == 1'b0);
     (* max_fanout = 32 *) reg [IC_INDEX_B-1:0] fill_index;
 
 //★ 前进判据：一条原因一个分支，顺序即优先级。分成两段只为时序：
@@ -574,10 +586,21 @@ module icache(
             fill_index <= 0;
             miss_word <= 0;
             lru <= 0;
+            inv_pend <= 1'b0;
 //way1_tag/way2_tag 不复位：有效位就在它自己最高位里，上电由 initial 清成 0 ⇒ 不命中。
 //带复位会让这 2x128x20 位全被综合成带复位的 FF（撑爆 slice 打包），去掉后能进分布式 RAM。
         end
         else begin
+//—— 一致性作废优先处理：和 fill 收尾写 tag 互斥（这里要求 stage==0）——
+            if (inv_go) inv_pend <= 1'b0;
+            if (invalidate) inv_pend <= 1'b1;      // 同拍有新的 ⇒ 保持挂起
+            if (inv_go) begin
+                if (way1_tag[inv_index][IC_TAGW-1] && (way1_tag[inv_index][IC_TAG_B-1:0] == inv_tag))
+                    way1_tag[inv_index] <= {IC_TAGW{1'b0}};
+                if (way2_tag[inv_index][IC_TAGW-1] && (way2_tag[inv_index][IC_TAG_B-1:0] == inv_tag))
+                    way2_tag[inv_index] <= {IC_TAGW{1'b0}};
+            end
+
             if (stage == 1'b0) begin
                 fill_end <= 1'b0;
                 if (hit_way_0[0])

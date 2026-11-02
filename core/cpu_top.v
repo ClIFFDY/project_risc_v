@@ -28,7 +28,7 @@ module cpu_top #(
     parameter integer IC_INDEX_B        = 7,    // 8 = 64KB / 7 = 32KB
     parameter integer BHT_B             = 9,   // 11 / 9
     parameter integer BTB_B             = 9,   // 11 / 9
-    parameter integer DC_SETS_B         = 8,   // 8 = 16KB / 7 = 8KB
+    parameter integer DC_SETS_B         = 9,   // 8 = 16KB / 7 = 8KB
     parameter integer ITCM_AW           = 14,  // 14 = 64KB / 13 = 32KB
     parameter integer ADDER_AT_D        = 1     // 1 = 访存地址加法搬到 D 端
 ) (
@@ -37,7 +37,17 @@ module cpu_top #(
     input bus_loaded_in, bus_hold_in, exti,
     output reg [31:0] bus_addr_out, bus_data_out,
     output reg [3:0] bus_be_out,
-    output reg bus_we_out, bus_valid_out
+    output reg bus_we_out, bus_valid_out,
+
+//---------------- L2 的下一级存储口（AHB-Lite 主机，接到 SoC 总线上）----------------
+    output     [31:0] l2_haddr, l2_hwdata,
+    output            l2_hwrite,
+    output     [1:0]  l2_htrans,
+    output     [2:0]  l2_hsize,
+    output     [3:0]  l2_hwstrb,
+    input      [31:0] l2_hrdata,
+    input             l2_hready,
+    output            l2_busy
     );
 
 //==============================================================================
@@ -334,6 +344,9 @@ module cpu_top #(
     wire [31:0] mem_address_dcache, mem_wdata_dcache, mem_data_dtcm;
     wire [3:0]  mem_byte_enable_dcache;
     wire        mem_req_dcache, mem_write_enable_dcache, mem_valid_dtcm;
+//L2 写穿通知 → icache 按行作废（一二级一致性）
+    wire        l2_write_pulse;
+    wire [31:0] l2_write_addr;
     wire        ready_tim, timer_interrupt;
     wire        hold_dcache, load_ready_dcache, load_ready_next_dcache, busy_dcache, request_blocked_dcache;
 //load 早唤醒：载入那条在【地址进 dcache 那一拍】就宣告下一拍有数（load_ready_next 的当拍版）
@@ -512,16 +525,13 @@ module cpu_top #(
         .advance(advance_icache),
         .r0_valid(r0_valid_icache), .r0_wrong_path(r0_wrong_path_icache), .deliver_wrong_path(deliver_wrong_path_icache),
         .mem_req(mem_req_icache), .mem_write_enable(mem_write_enable_icache),
-        .mem_address(mem_address_icache), .mem_write_data(mem_wdata_icache), .mem_byte_enable(mem_byte_enable_icache)
+        .mem_address(mem_address_icache), .mem_write_data(mem_wdata_icache), .mem_byte_enable(mem_byte_enable_icache),
+//一二级一致性：L2 被写穿 ⇒ 把命中同一行的两路作废
+        .invalidate(l2_write_pulse), .invalidate_address(l2_write_addr)
     );
 
-    itcm #(.ITCM_AW(ITCM_AW)) u_itcm (
-        .clk(clk), .rst(rst),
-        .mem_req(mem_req_icache),
-        .mem_addr(mem_address_icache),
-        .mem_data(mem_data_icache),
-        .mem_valid(mem_valid_icache)
-    );
+// itcm/dtcm 已由统一的二级存储 l2mem 取代（128KB，代码 0x0000 起 / 数据 0x4000 起）
+
 
 //交付口上这条指令自己的地址：直接取 icache 交付时随数据出的 inst_addr。
 //★ 取指地址与交付口之间的拍差只在这里换算一次。
@@ -1164,11 +1174,22 @@ module cpu_top #(
         .mem_addr(mem_address_dcache), .mem_write_data(mem_wdata_dcache), .mem_byte_enable(mem_byte_enable_dcache)
     );
 
-    dtcm u_dtcm (
+//==============================================================================
+// 二级存储：原 itcm + dtcm 合成一块 128KB BRAM
+//   代码窗口 → L2 偏移 0x0000（64KB）；数据窗口 → L2 偏移 0x4000（8KB）
+//   一致性：L1D 写穿到 L2（dcache 本来就是写穿），L2 的写脉冲回灌 icache 作废同一行
+//==============================================================================
+    l2cache #(.L2_AW(15), .L2_ILINE(32), .L2_DLINE(8)) u_l2cache (
         .clk(clk), .rst(rst),
-        .mem_req(mem_req_dcache), .mem_we(mem_write_enable_dcache),
-        .mem_addr(mem_address_dcache), .mem_write_data(mem_wdata_dcache), .mem_byte_enable(mem_byte_enable_dcache),
-        .mem_data(mem_data_dtcm), .mem_valid(mem_valid_dtcm), .mem_ready()
+        .i_req(mem_req_icache), .i_addr(mem_address_icache),
+        .i_data(mem_data_icache), .i_valid(mem_valid_icache),
+        .d_req(mem_req_dcache), .d_we(mem_write_enable_dcache),
+        .d_addr(mem_address_dcache), .d_wdata(mem_wdata_dcache), .d_be(mem_byte_enable_dcache),
+        .d_data(mem_data_dtcm), .d_valid(mem_valid_dtcm), .d_ready(),
+        .w_pulse(l2_write_pulse), .w_addr(l2_write_addr),
+        .m_haddr(l2_haddr), .m_hwrite(l2_hwrite), .m_htrans(l2_htrans), .m_hsize(l2_hsize),
+        .m_hwdata(l2_hwdata), .m_hwstrb(l2_hwstrb),
+        .m_hrdata(l2_hrdata), .m_hready(l2_hready), .m_busy(l2_busy)
     );
 
     tim_in u_tim_in (
