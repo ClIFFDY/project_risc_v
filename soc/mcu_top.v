@@ -23,16 +23,16 @@
 module mcu_top #(
 //★★ 宏化旋钮：与 cpu_top 同名同义，只为让综合顶层能选档（synth_design -generic / xelab -generic_top）。
 //  默认值 = 大核交付配置。
-    parameter integer LANES             = 1,
-    parameter integer ROB_DEPTH         = 8,
-    parameter integer IFFU_DEPTH        = 4,
-    parameter integer VALUE_TABLE_DEPTH = 8,
-    parameter integer IC_INDEX_B        = 7,
-    parameter integer BHT_B             = 9,
-    parameter integer BTB_B             = 9,
-    parameter integer DC_SETS_B         = 8,
+    parameter integer LANES             = 2,
+    parameter integer ROB_DEPTH         = 16,
+    parameter integer IFFU_DEPTH        = 8,
+    parameter integer VALUE_TABLE_DEPTH = 16,
+    parameter integer IC_INDEX_B        = 8,
+    parameter integer BHT_B             = 11,
+    parameter integer BTB_B             = 11,
+    parameter integer DC_SETS_B         = 9,
     parameter integer ITCM_AW           = 14,
-    parameter integer ADDER_AT_D        = 1
+    parameter integer ADDER_AT_D        = 0
 ) (
     input clk, rst,
     inout wire [31:0] gpio_pin_bus
