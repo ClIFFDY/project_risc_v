@@ -71,7 +71,7 @@ module dcache(
     reg cache_hit;
 
     reg read_request, write_request, write_pending, write_drive, read_drive;
-    reg write_update, hit_upd;
+    reg hit_upd;
     reg lru_write_enable, lru_write_value;
     reg [7:0] lru_write_index;
 //★ 2026-10-31：命中更新打一拍再写 LRU。
@@ -85,14 +85,32 @@ module dcache(
 
     reg read_enable;
 
-    reg is_fill_write, ram_write_enable;
+    reg is_fill_write;
+    reg way0_write_enable, way1_write_enable;
     reg [3:0] ram_byte_enable;
     reg [DC_SETS_B+2:0] ram_write_address;
-    reg        ram_write_way;
 
     reg [31:0] ram_write_data;
     reg [31:0] write_address, write_data;
     reg [3:0] write_byte_enable;
+
+//★★ 2026-11-04：命中判定【整体推后一拍】，store 与 LRU 共用这一份寄存量。
+//  原路径「stage1_base → LSU 加法/译码 → tag 阵列 → 22 位比较 → data_way*/ENARDEN」实测 13.62 ns
+//  （logic 5.29 / route 8.33，20 级），200 条最差端点里的 8 条真深路径全是这一条。
+//  现在：请求那一拍只锁载荷 —— 使能只看 read_request/write_request（不含命中判定），
+//  顺带把那一拍 LUTRAM 已经读出的两个 tag 字捉下来；下一拍直接用【寄存器】比出命中。
+//  store 那一路据此给两路各发一个写使能（way 不再出现在使能上，原来的 ram_write_way = hit_way[1]
+//  也是同一条链）；LRU 那一路据此更新。
+//  ★ 试过「tag 读地址在 store_pending 拍切到寄存器」——静态时序不认这个 mux，
+//    bus → 地址 → LUTRAM → 比较 → ENARDEN 照样成立（200/200 端点仍是 ENARDEN，WNS −2.331）。
+//  代价：一笔 store 占 dcache 口两拍（store_pending 期间 request_blocked），tag 读口只有一份。
+    reg        store_pending;
+    reg        access_valid_q;                       // 上一拍受理了一笔访问（读或写）
+    reg [DC_SETS_B+2:0] access_address_q;
+    reg [DC_TAG_B-1:0]  access_tag_q;
+    reg [DC_TAGW-1:0]   access_tag_word0_q, access_tag_word1_q;
+    reg [31:0] store_data_q;
+    reg [3:0]  store_byte_enable_q;
 
 //第 1 级与自举/回填：阵列与状态机
 //★ 2026-10-30：valid 折进 tag 字，和 icache 同构（icache.v:162-163、581 就是 `{1'b1, fill_tag}`）。
@@ -110,14 +128,17 @@ module dcache(
     (* ram_style = "block" *) reg [31:0] data_way0 [0:DC_WORDS-1];
     (* ram_style = "block" *) reg [31:0] data_way1 [0:DC_WORDS-1];
     reg [31:0] dout0, dout1;
-    reg        read_way_q;
-    reg        dcache_sel_q;
+    reg        out_sel_q;
+    reg        out_fill_q;
 //★ 2026-10-30：tag 阵列读地址单独复制一份并加 max_fanout。
 //  一个 8 位 index 要扇到 88 个 RAMD64E（256 深 × 22 位 × 2 路）的地址脚，实测那条网
 //  单是布线就 2.811 ns（扇出 189），把 dcache 的最差路径卡在 8.5 ns。
 //  复制是功能安全的（只多几个驱动器，值完全相同）。icache 的 read_address 也用了同一招。
 //  ★ 只给【阵列读】用；LRU 写、数据读地址仍用原来的 index，避免把复制带到别的锥上。
+//★ 2026-11-04：命中判定所需的两个 tag 字，在【请求那一拍】就顺手从 LUTRAM 捉下来。
+//  这只是同一份读结果多接一个触发器，不占第二个读口、也不改地址（地址仍是 bus_address_in 的切片）。
     (* max_fanout = 8 *) wire [DC_SETS_B-1:0] tag_index = bus_address_in[DC_SETS_B+2:3];
+    reg access_hit_way0, access_hit_way1;
 
 //lru 必须是阵列，不能是宽向量：`reg [255:0] lru` 用运行时下标读写，会被综合成 256 个散
 //触发器 + 一棵 256:1 mux 树（实测 256 FDRE + 353 LUT6 + 42 MUXF7/F8，还带一条 fo=260 的
@@ -143,8 +164,11 @@ module dcache(
 //  原来「读 tag 阵列 → 比较 → 命中判定」当拍就要驱动 stage 与 fill_* 一整族的 CE，
 //  实测 tag 读之后还要 4.86 ns 才到 fill_index 的 CE（末段是一条扇出 30 的 miss_word 网）。
 //  现在：payload 用【便宜的使能】先锁进 _q 寄存器（只跟 read_request 走，不看命中），
-//  缺失只记一位 miss_q，下一拍才真的进回填。代价：每次缺失多一拍。
+//  缺失下一拍才真的进回填。
+//★ 2026-11-04：miss_q 不再是触发器，改由【寄存过的】命中组合出来（相位与原 miss_q 完全相同，
+//  所以不多花一拍）。原来它挂在当拍的 tag 比较上，实测 WNS −0.084 的 200 条最差路径全指向它。
     reg        miss_q;
+    reg        access_read_q;                        // 上一拍受理的是读
     reg [DC_SETS_B-1:0] fill_index_q;
     reg [2:0]  fill_word_q;
     reg [31:0] fill_addr_q;
@@ -180,17 +204,21 @@ module dcache(
         hit_way[1] = (way1_tag[tag_index] == {valid_generation, tag});
         cache_hit = hit_way[0] || hit_way[1];
 
-//★ ~miss_q：缺失已经判出来、正等着下一拍进回填，这一拍不许再收同一个请求
+//★ 缺失：上一拍那笔读 + 寄存过的命中 ⇒ 这一拍进回填（与原 miss_q 同相）
+        miss_q = access_valid_q & access_read_q & ~(access_hit_way0 | access_hit_way1);
+//★ ~miss_q：缺失已经判出来、这一拍就要进回填，不许再收同一个请求
         read_request = (stage == 1'b0) && !miss_q && bus_valid_in && (bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100) && !bus_write_enable_in;
         write_request = (stage == 1'b0) && !miss_q && bus_valid_in && (bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100) && bus_write_enable_in && !write_pending;
 //store 命中即行内就地更新，一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
-        write_update = write_request && cache_hit;
+//★ 2026-11-04：命中判定不再当拍合成阵列写使能，见 access_* 的说明。
 //lru 收成【单写口】：命中改 index（stage==0），回填改 fill_index（fill_end 拍 stage 仍为 1）。
 //read_request / write_request / fill_end 三者两两互斥，所以一个写地址就能覆盖原来散在三处的写，
 //索引与值逐字保持原语义（命中时 way0 优先 ⇒ 值取 hit_way[0]）。
-        hit_upd  = (read_request || write_request) && cache_hit;
+//★ hit_upd 也改成吃【寄存过的】命中：原来它挂在当拍的 tag 比较上，实测 WNS −0.312 的
+//  200 条最差路径全指向 lru_hit_upd_q_reg/D（route 8.7 ns 占 69%），推后一拍就整段从 CLK 出发。
+        hit_upd  = access_valid_q & (access_hit_way0 | access_hit_way1);
 //命中更新取【打一拍】的那份；回填仍当拍（fill_end 本来就是这一拍末尾才定）。
 //两者撞拍时填表优先 ⇒ 丢掉一次命中更新，提示量，无妨。
         lru_write_enable   = lru_hit_upd_q || fill_end;
@@ -221,7 +249,7 @@ module dcache(
 //读口：hit 与 fill_end 合成一个地址/一个数据选择（每个 data 只有一个读口）
 //★ 读使能不等 cache_hit、地址不含 way 位：两路并行读，way 只选最后那个 mux
 //★ 2026-11-01：阵列【恒读】。地址（{index,word}）直接灌 BRAM 地址线，使能恒 1；
-//  「这次访问是不是我的窗口」整个交给【输出】判（dcache_sel_q，寄存一拍）。
+//  「这次访问是不是我的窗口」整个交给【输出】判（out_sel_q，寄存一拍）。
 //  道理：读到垃圾无所谓（消费者只认 load_ready），而"非本窗口输出 0"的互斥契约本来就成立在输出那一下。
 //  ★ 上一次写成 `fill_end || bus_valid_in` 反而更差 —— 因为 bus_valid_in 里裹着 ROB 的冲刷链；
 //    现在那条链已从 lsu 的发请求路径摘掉，所以这里可以彻底不看任何跨模块的组合量。
@@ -230,26 +258,27 @@ module dcache(
         load_ready_next = (read_request & cache_hit) | fill_end;
     end
 
-//写口：单写口 + 字节使能，三个写源合成【一个】写表达式，仍能推成 BRAM ——
-//  ① 回填（stage==1，整字，be 恒 1111）
-//  ② store 命中（stage==0，整字或子字，be 来自 lsu）
-//互斥性：write_request 要求 stage==0，is_fill_write 要求 stage==1；read_enable 要求 fill_end 或
-//  (read_request && hit)，而 read_request 要求 !bus_write_enable_in —— 三者两两不同拍，不会同拍读写同址。
+//写口：两路各一个写使能，回填与 store 写成【各自一个】表达式，仍能推成两块 BRAM ——
+//  ① 回填（stage==1，整字，be 恒 1111）→ 由 fill_way（寄存器）二选一
+//  ② store 命中（推后一拍，命中在 store_pending 那拍由寄存的 index/tag 比较得出）
+//互斥性：store_pending 只能在 stage==0 拍被置起，而回填要求 stage==1，两者不同拍。
 //整字写与字节写【必须在同一个 if 里按 be 展开成 WEBA[3:0]】：这才是单写口；
 //拆成两个写表达式才会变成"多个写操作"、才推不成 BRAM。
     always @(*) begin
         is_fill_write = (stage == 1'b1) && !fill_end && mem_valid;
-        ram_write_enable     = is_fill_write || write_update;
-        ram_byte_enable     = is_fill_write ? 4'b1111 : bus_byte_enable_in;
+//命中判定：两个输入都是寄存器（请求拍捉下的 tag 字 + 请求拍的 tag），整段从 CLK 出发
+        access_hit_way0 = (access_tag_word0_q == {valid_generation, access_tag_q});
+        access_hit_way1 = (access_tag_word1_q == {valid_generation, access_tag_q});
+        way0_write_enable = (is_fill_write & ~fill_way) | (store_pending & access_hit_way0);
+        way1_write_enable = (is_fill_write &  fill_way) | (store_pending & access_hit_way1);
+        ram_byte_enable     = is_fill_write ? 4'b1111 : store_byte_enable_q;
         if (is_fill_write) begin
             ram_write_address = {fill_index, fill_count};
-            ram_write_way     = fill_way;
             ram_write_data = mem_data;
         end
         else begin
-            ram_write_address = {index, word};
-            ram_write_way     = hit_way[1];
-            ram_write_data = bus_data_in;
+            ram_write_address = access_address_q;
+            ram_write_data = store_data_q;
         end
     end
 
@@ -257,19 +286,20 @@ module dcache(
 // 第 1 级：数据阵列写入与读数据输出
 //===============================================================
     always @(posedge clk) begin
-        if (ram_write_enable) begin
-            if (ram_write_way) begin
-                if (ram_byte_enable[0]) data_way1[ram_write_address][7:0]   <= ram_write_data[7:0];
-                if (ram_byte_enable[1]) data_way1[ram_write_address][15:8]  <= ram_write_data[15:8];
-                if (ram_byte_enable[2]) data_way1[ram_write_address][23:16] <= ram_write_data[23:16];
-                if (ram_byte_enable[3]) data_way1[ram_write_address][31:24] <= ram_write_data[31:24];
-            end
-            else begin
-                if (ram_byte_enable[0]) data_way0[ram_write_address][7:0]   <= ram_write_data[7:0];
-                if (ram_byte_enable[1]) data_way0[ram_write_address][15:8]  <= ram_write_data[15:8];
-                if (ram_byte_enable[2]) data_way0[ram_write_address][23:16] <= ram_write_data[23:16];
-                if (ram_byte_enable[3]) data_way0[ram_write_address][31:24] <= ram_write_data[31:24];
-            end
+        if (way0_write_enable) begin
+            if (ram_byte_enable[0]) data_way0[ram_write_address][7:0]   <= ram_write_data[7:0];
+            if (ram_byte_enable[1]) data_way0[ram_write_address][15:8]  <= ram_write_data[15:8];
+            if (ram_byte_enable[2]) data_way0[ram_write_address][23:16] <= ram_write_data[23:16];
+            if (ram_byte_enable[3]) data_way0[ram_write_address][31:24] <= ram_write_data[31:24];
+        end
+    end
+
+    always @(posedge clk) begin
+        if (way1_write_enable) begin
+            if (ram_byte_enable[0]) data_way1[ram_write_address][7:0]   <= ram_write_data[7:0];
+            if (ram_byte_enable[1]) data_way1[ram_write_address][15:8]  <= ram_write_data[15:8];
+            if (ram_byte_enable[2]) data_way1[ram_write_address][23:16] <= ram_write_data[23:16];
+            if (ram_byte_enable[3]) data_way1[ram_write_address][31:24] <= ram_write_data[31:24];
         end
     end
 
@@ -281,23 +311,26 @@ module dcache(
 //  Vivado 2019.1 判定 ram_style="block" 不可行、退回 LUTRAM（实测 5925 个失败端点、WNS −3.278）。
 //  现在每块阵列都是「RAM + 它自己的输出寄存器」，推断干净；mux 只吃两个寄存器的 Q 和
 //  一个【也寄存过】的 way，所以它和 BRAM 的读延迟同拍收口，不额外多一拍。
+//★ 2026-11-04：way 那一位不再单独存一份（原来的 read_way_q），直接用 access_hit_way1 ——
+//  它和 dout0/dout1 是同一拍锁进寄存器的（都指向前一拍那笔请求），只是来源换成寄存过的比较，
+//  于是最后一个挂在当拍 tag 比较上的消费者也没了。
     always @(posedge clk) begin
         if (reset_registered) begin
             dout0 <= 32'd0;
             dout1 <= 32'd0;
-            read_way_q <= 1'b0;
-            dcache_sel_q <= 1'b0;
+            out_sel_q <= 1'b0;
+            out_fill_q <= 1'b0;
         end
         else begin
-            read_way_q <= fill_end ? fill_way : hit_way[1];
+            out_fill_q <= fill_end;
 //“这次访问属于 dcache 窗口吗”寄存一拍 —— 只有输出那一拍需要它，所以它不在地址/使能链上
-            dcache_sel_q <= fill_end || read_request;
+            out_sel_q <= fill_end || read_request;
 //阵列恒读：地址直接灌地址线，使能恒 1
             dout0 <= data_way0[read_address];
             dout1 <= data_way1[read_address];
         end
     end
-    assign bus_data_out = dcache_sel_q ? (read_way_q ? dout1 : dout0) : 32'd0;
+    assign bus_data_out = out_sel_q ? ((out_fill_q ? fill_way : access_hit_way1) ? dout1 : dout0) : 32'd0;
 
 //===============================================================
 // 缺失回填状态机与 busy/hold 延拓
@@ -314,19 +347,28 @@ module dcache(
             lru_hit_upd_q   <= 1'b0;
             lru_hit_value_q <= 1'b0;
             lru_hit_index_q <= 8'd0;
-            miss_q          <= 1'b0;
+            access_read_q   <= 1'b0;
             fill_index_q    <= 8'd0;
             fill_word_q     <= 3'd0;
             fill_addr_q     <= 32'd0;
             fill_tag_q      <= 21'd0;
             fill_way_q      <= 1'b0;
+            store_pending   <= 1'b0;
+            access_valid_q  <= 1'b0;
+            access_address_q <= 11'd0;
+            access_tag_q    <= 21'd0;
+            access_tag_word0_q <= {DC_TAGW{1'b0}};
+            access_tag_word1_q <= {DC_TAGW{1'b0}};
+            store_data_q    <= 32'd0;
+            store_byte_enable_q <= 4'd0;
         end
         else begin
             load_ready <= 1'b0;
-//命中更新先锁一拍：把「读 tag → 比较」从 LRU 写使能那一拍里拿出来
+//命中更新：索引和 way 都取【请求拍捉下的那份】，与 hit_upd 的相位对齐。
+//  再往下一拍才落到 LRU 阵列（lru_hit_upd_q），即命中后两拍写完，提示量，晚一拍无妨。
             lru_hit_upd_q   <= hit_upd;
-            lru_hit_index_q <= index;
-            lru_hit_value_q <= hit_way[0];
+            lru_hit_index_q <= access_address_q[DC_SETS_B+2:3];
+            lru_hit_value_q <= access_hit_way0;
 
             if (lru_write_enable)
                 lru[lru_write_index] <= lru_write_value;
@@ -343,8 +385,7 @@ module dcache(
             end
             if (read_request & cache_hit)
                 load_ready <= 1'b1;
-//缺失只记一位，下一拍才真的进回填
-            miss_q <= read_request & ~cache_hit;
+//缺失判定上一拍就做完了，这一拍直接进回填
             if (miss_q) begin
                 stage <= 1'b1;
                 miss_word  <= fill_word_q;
@@ -362,6 +403,21 @@ module dcache(
                     write_data <= bus_data_in;
                     write_byte_enable <= bus_byte_enable_in;
                 end
+            end
+//★★ 命中判定推后一拍：这一拍只锁载荷 + 捉 tag 字。使能只看 read_request/write_request，
+//   不回读命中判定；命中/way 留到下一拍用这里的寄存量算。
+            store_pending  <= write_request;
+            access_valid_q <= read_request | write_request;
+            access_read_q  <= read_request;
+            if (read_request | write_request) begin
+                access_address_q   <= {index, word};
+                access_tag_q       <= tag;
+                access_tag_word0_q <= way0_tag[tag_index];
+                access_tag_word1_q <= way1_tag[tag_index];
+            end
+            if (write_request) begin
+                store_data_q        <= bus_data_in;
+                store_byte_enable_q <= bus_byte_enable_in;
             end
 
             if (write_pending && mem_ready)
@@ -389,7 +445,8 @@ module dcache(
     end
 
 //★ request_blocked：纯状态量，见端口处的说明。写要额外等 write_pending（写回没发完不收新写）。
-    assign request_blocked = (stage != 1'b0) | write_pending;
+//  store_pending 那拍 tag 读口被推后的那笔占着，收新请求会把它的命中判定读坏 ⇒ 也挡一拍。
+    assign request_blocked = (stage != 1'b0) | write_pending | store_pending;
 
 //busy 的 1 拍延拓（原 cpu_top 的 d_hold_int，按"顶层不运算"下放到此）：
 //fill_end 拍 busy 就掉、load_ready 要再等一拍，这 1 拍空窗必须兜住。
