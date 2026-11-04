@@ -68,8 +68,6 @@ module idu1(
     output reg [4:0]  source_a_out_0, source_b_out_0,
     output reg [3:0]  index_out_0,
     output reg        generation_out_0,
-//入队那拍取好的生产者号，随条目穿队列（= lsu fifo 条目里那段 tag 的同构物）
-    output reg [5:0]  prod_a_out_0, prod_b_out_0,
     output reg        payload_valid_out_0,
 //rob 分配口（在队头上按 opcode 分类解）
     output reg        payload_fresh_out_0,
@@ -84,6 +82,11 @@ module idu1(
 //★ 保持四根分开，ROB 只在判据里或，不合成一根。
     output reg        alloc_ecall_0, alloc_ebreak_0, alloc_illegal_0, alloc_mret_0,
     output reg [4:0]  alloc_rd_0,
+//★ 2026-11-04 真 PRF：这一条被分到的物理号，交给 rob 随项存（提交定格 / 冲刷回收都用它）
+    output [5:0]      alloc_phys_0,
+//★ 2026-11-04 真 PRF：给 PRF 的就绪位当门（本拍分配的号 / 冲刷后仍在用的号）
+    output [63:0]     alloc_onehot_0,
+    output [63:0]     arch_next_onehot_0,
 //全译码（随 S 级寄存器送 idu2 的入站：分类 / 各单元字段 / 异常标记 / 非寄存器操作数覆盖）
     output reg [1:0]  dec_class_0,
     output reg        dec_we_0,
@@ -125,7 +128,6 @@ module idu1(
     output reg [4:0] source_b_out_1,
     output reg [3:0]  index_out_1,
     output reg        generation_out_1,
-    output reg [5:0]  prod_a_out_1, prod_b_out_1,
     output reg        payload_valid_out_1,
     output reg        payload_fresh_out_1,
     output reg        alloc_en_1,
@@ -134,6 +136,7 @@ module idu1(
     output reg        alloc_pend_1,
     output reg        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1,
     output reg [4:0]  alloc_rd_1,
+    output [5:0]      alloc_phys_1,
     output reg [1:0]  dec_class_1,
     output reg        dec_we_1,
     output reg [4:0]  dec_rd_1,
@@ -166,29 +169,14 @@ module idu1(
 //  写者顶掉，地址算成 0x468，tohost 的写丢）。所以在【进队那一拍】就把 tag 查好、随条目带走。
 //==============================================================================
     input         lsu_pop_in,
-//---- 提交口（只用来清条目里的生产者 tag）----
+//---- 提交口（rename 的架构映射定格 / 空闲表回收）----
     input         write_enable_a_in, write_enable_b_in,
-    input  [3:0]  commit_slot0_in, commit_slot1_in,
-    input         commit_gen0_in, commit_gen1_in,
     input  [4:0]  commit_rd0_in, commit_rd1_in,
-//---- 进队条目的生产者 tag（idu2 在【进队那一拍】查表给出）
-//★ 2026-10-31：取号点从现在起只有一个 —— 前端队头（= 本级 D）。按前端槽位分两组：
-//    lsu_push_prod_*   h0 那一组（lane0 与访存条共用同一份，两者本来就是同一条）
-//    push1_prod_*      h1 那一组（只有双发、且 h0 已经有人接的时候才有效）
-//  打包成 a/b 各 6 位 = {valid, slot[3:0], generation}。
-    input  [5:0]  lsu_push_prod_a, lsu_push_prod_b,
-    input  [5:0]  push1_prod_a, push1_prod_b,
-//---- 进队事件与字段（idu2 用它们做 pstat 登记并查 tag）----
-//★ 2026-10-31：lsu_push_* 的含义从"访存条"放宽成"h0 这一条要被收"；是不是访存另给 lsu_push_is_mem。
-    output        lsu_push_valid, lsu_push_is_mem,
-    output [4:0]  lsu_push_source_a, lsu_push_source_b, lsu_push_destination,
-    output [3:0]  lsu_push_index,
-    output        lsu_push_generation,
-//h1 那一组：只有 alloc_lane0 & alloc_lane1 时成立（lane1 只有在 lane0 已接走 h0 时才拿 h1）
-    output        push1_valid,
-    output [4:0]  push1_source_a, push1_source_b, push1_destination,
-    output [3:0]  push1_index,
-    output        push1_generation,
+//★ 2026-11-04 真 PRF：提交项的物理号 + 冲刷掩码（在册全部项的物理号 one-hot OR）
+    input  [5:0]  commit_phys0_in, commit_phys1_in,
+    input  [63:0] squash_phys_mask_in,
+//★ ROB 满：rename 的分配必须和 rob 的分配口【逐字同门】，否则发了号而 ROB 没接 ⇒ 漏号
+    input         rob_full_in,
 //---- 队头（出队侧）----
     output [31:0] lsu_instruction_out, lsu_auxiliary_address_out, lsu_immediate_out,
     output [4:0]  lsu_source_a_out, lsu_source_b_out, lsu_destination_register_out,
@@ -196,12 +184,10 @@ module idu1(
     output        lsu_is_store_out, lsu_write_enable_out,
     output [3:0]  lsu_index_out,
     output        lsu_generation_out, lsu_valid_out,
-    output        lsu_producer_a_valid_out,
-    output [3:0]  lsu_producer_a_slot_out,
-    output        lsu_producer_a_generation_out,
-    output        lsu_producer_b_valid_out,
-    output [3:0]  lsu_producer_b_slot_out,
-    output        lsu_producer_b_generation_out
+//★ 2026-11-04 真 PRF：条目里带的是两个源的【物理号】（6 位各一个，与原来的 tag 同宽）
+    output [5:0]  lsu_phys_a_out, lsu_phys_b_out,
+//★ 两条 lane 的载荷队列也各带两个源的物理号（idu2 的 D 级直接用）
+    output reg [5:0]  phys_a_out_0, phys_b_out_0, phys_a_out_1, phys_b_out_1
     );
 //★宏化旋钮：2 = 双发（大核）、1 = 单发（小核）。
 //  LANES=1 时 alloc_lane1 恒 0 ⇒ iffu 每拍弹 1 条、h1 下一拍自己变队头，指令不丢；
@@ -310,7 +296,8 @@ module idu1(
     reg [4:0]  skid_source_a_out_0, skid_source_b_out_0;
     reg [3:0]  skid_index_out_0;
     reg        skid_generation_out_0;
-    reg [5:0]  skid_prod_a_out_0, skid_prod_b_out_0;
+//★ 2026-11-04 真 PRF：与 prod 同生命周期的物理号（prod 被提交清掉时它【不清】，号是稳定的）
+    reg [5:0]  skid_phys_a_out_0, skid_phys_b_out_0, skid_phys_a_out_1, skid_phys_b_out_1;
     reg [1:0]  skid_dec_class_0;
     reg        skid_dec_we_0;
     reg [4:0]  skid_dec_rd_0;
@@ -330,7 +317,6 @@ module idu1(
     reg [4:0]  skid_source_a_out_1, skid_source_b_out_1;
     reg [3:0]  skid_index_out_1;
     reg        skid_generation_out_1;
-    reg [5:0]  skid_prod_a_out_1, skid_prod_b_out_1;
     reg [1:0]  skid_dec_class_1;
     reg        skid_dec_we_1;
     reg [4:0]  skid_dec_rd_1;
@@ -348,15 +334,12 @@ module idu1(
     reg [3:0]  index_pick;
     reg        generation_pick;
     reg [31:0] lsu_push_instruction;
-    reg [3:0]  lsu_push_index_reg;
-    reg        lsu_push_generation_reg;
 // 读写指针（2026-10-31）：移位版每拍要搬最多 3 条 91 位；指针版只让指针转，数据格不动。
     reg [1:0]  lsu_read_pointer, lsu_write_pointer;
     reg [LSU_QUEUE_WIDTH-1:0] lsu_head;
     reg [LSU_QUEUE_WIDTH-1:0] lsu_clear_0, lsu_clear_1, lsu_clear_2, lsu_clear_3;
     reg        lsu_tag_hit_0a, lsu_tag_hit_0b, lsu_tag_hit_1a, lsu_tag_hit_1b;
     reg        lsu_tag_hit_2a, lsu_tag_hit_2b, lsu_tag_hit_3a, lsu_tag_hit_3b;
-    reg        lsu_tag_b_hit_0, lsu_tag_b_hit_1, lsu_tag_b_hit_2, lsu_tag_b_hit_3;
     always @(*) begin
         flush_window = flush_control_in[2] | flush_control_in[1] | flush_control_in[0];
 //★ 2026-10-31：只留 rob_full。
@@ -407,7 +390,9 @@ module idu1(
 //  先读后写不收敛，本仓踩过。
 //★ 只看本地计数器：不许再依赖 idu2 当拍弹不弹（那会把 lsu 的 stage_free 拉进 iffu 的推进锥）
         lsu_room = 3'd4 - lsu_queue_count;
-        alloc_lane0 = go & instruction_valid_0 & (is_mem_0 ? (lsu_room != 3'd0) : lane0_free);
+        alloc_lane0 = go & instruction_valid_0 & (is_mem_0 ? (lsu_room != 3'd0) : lane0_free)
+                    & ~(rename_bank_empty_0 & (destination_decoded != 5'd0));
+
 //★ `~flush_window` 挂在【落盘】上，不挂在推进上（2026-10-31）：
 //  冲刷拍照样从 iffu 弹（advance 不为 0，指针照走），但弹出来的那条【不进任何队列】——
 //  它本来就是错路的。ROB 的分配口自带 `!flush_control_rob`，所以这是全链一致的。
@@ -429,7 +414,9 @@ module idu1(
         is_mem_1 = (instruction_pick[6:0] == OPCODE_LOAD) | (instruction_pick[6:0] == OPCODE_STORE);
         alloc_lane1 = (LANES == 1) ? 1'b0 :
                       (go & (alloc_lane0 ? instruction_valid_1 : instruction_valid_0)
-                          & (is_mem_1 ? 1'b0 : lane1_free));
+                          & (is_mem_1 ? 1'b0 : lane1_free))
+                      & ~(rename_bank_empty_1 & (destination_decoded_1 != 5'd0));
+
         lane1_store = alloc_lane1 & ~is_mem_1 & ~flush_window;
         lsu_push_1  = 1'b0;
 //给 fifo 的推进量 = 本拍真正消费了几格（0/1/2）：指针按它走，不是"成对就 +2"。
@@ -437,14 +424,12 @@ module idu1(
         lane0_load_o = alloc_lane0;
 //进队条目（每拍最多一条），tag 由 idu2 在【这一拍】查表给出。
         lsu_push_instruction    = lsu_push_0 ? instruction_in_0 : instruction_pick;
-        lsu_push_index_reg      = lsu_push_0 ? index_in_0       : index_pick;
-        lsu_push_generation_reg = lsu_push_0 ? generation_in_0  : generation_pick;
         lsu_entry = {lsu_push_instruction[19:15], lsu_push_instruction[24:20],
                      lsu_push_0 ? instruction_in_0 : instruction_pick,
                      lsu_push_0 ? address_in_0     : address_pick,
                      lsu_push_0 ? index_in_0       : index_pick,
                      lsu_push_0 ? generation_in_0  : generation_pick,
-                     lsu_push_prod_a, lsu_push_prod_b};
+                     lsu_push_phys_a, lsu_push_phys_b};
         lane1_push = lane1_store & ((alloc_lane0 ? address_in_1 : address_in_0) != 32'd0);
     end
 
@@ -1263,65 +1248,28 @@ module idu1(
     assign lsu_index_out                = lsu_head_index;
     assign lsu_generation_out           = lsu_head_generation;
     assign lsu_valid_out                = (lsu_queue_count != 3'd0);
-    assign lsu_producer_a_valid_out      = lsu_head[11];
-    assign lsu_producer_a_slot_out       = lsu_head[10:7];
-    assign lsu_producer_a_generation_out = lsu_head[6];
-    assign lsu_producer_b_valid_out      = lsu_head[5];
-    assign lsu_producer_b_slot_out       = lsu_head[4:1];
-    assign lsu_producer_b_generation_out = lsu_head[0];
+//★ 2026-11-04 真 PRF：条目 [11:6] = rs1 的物理号，[5:0] = rs2 的物理号（与原 tag 同宽）
+    assign lsu_phys_a_out                = lsu_head[11:6];
+    assign lsu_phys_b_out                = lsu_head[5:0];
 
-//进队事件与字段（给 idu2 做 pstat 登记 + 查 tag）
-//★ 2026-10-31：取号点只有一个 —— 前端队头。所以这里描述的是"h0 / h1 这两格"，
-//  不是"要进哪条队列"。h0 这一份同时被 lane0 和访存条用（本来就是同一条）；
-//  h1 那一份只在双发时成立，lane1 没拿 h1 时它直接被忽略。
-//  ★ 注意次序：这些量必须在本块的 alloc 之后才成形（先定谁被收，再用它的 rs 去查表）。
-    assign lsu_push_valid       = alloc_lane0 & ~flush_window;
-    assign lsu_push_is_mem      = lsu_push_0;
-//★ 这里必须用【译码后的 rs】，不能用 instruction[19:15]/[24:20] 的裸切片：
-//  以前只有访存条走这一组（LOAD/STORE 那段位正好是 rs1/rs2），现在所有条都走 ⇒
-//  LUI/AUIPC/JAL 这些没有 rs 的，位段是立即数，裸切片会给自己认一个假生产者
-//  （实测 w11：`lui x14,0xe1762` 的 [19:15]=14 ⇒ 认了 x14 的生产者 ⇒ 写回值变成 e1762001）。
-    assign lsu_push_source_a    = source_a_dec_0;
-    assign lsu_push_source_b    = source_b_dec_0;
-    assign lsu_push_destination = destination_pick_decoded;
-    assign lsu_push_index       = index_in_0;
-    assign lsu_push_generation  = generation_in_0;
+//★ 2026-11-04 真 PRF：进队条目带的是两个源的【物理号】，在进队这一拍由 rename 查出。
+//  查找口的驱动必须用【译码后的 rs】：LUI/AUIPC/JAL 这些没有 rs 的，
+//  instruction[19:15]/[24:20] 是立即数位段，裸切片会给自己认一个假号（实测 w11）。
+    wire [4:0]  lsu_push_source_a, lsu_push_source_b;
+    wire [4:0]  push1_source_a, push1_source_b;
+    wire [5:0]  lsu_push_phys_a, lsu_push_phys_b;
+    assign lsu_push_source_a = source_a_dec_0;
+    assign lsu_push_source_b = source_b_dec_0;
 //★ push1 = "lane1 这一拍收的那一条"，不一定是 h1：alloc_lane0=0 时 lane1 拿的是 h0。
-//  这一格必须跟着走，否则"h0 被 lane1 收"那条永远不会被登记成写者。
-//  查表那边天然对：alloc_lane0=0 时 h0 不登记，with_older 就等于 cleared。
-    assign push1_valid          = alloc_lane1 & ~flush_window;
-    assign push1_source_a       = alloc_lane0 ? source_a_dec_1 : source_a_dec_0;
-    assign push1_source_b       = alloc_lane0 ? source_b_dec_1 : source_b_dec_0;
-    assign push1_destination    = alloc_lane0 ? destination_pick_decoded_1 : destination_pick_decoded;
-    assign push1_index          = alloc_lane0 ? index_in_1 : index_in_0;
-    assign push1_generation     = alloc_lane0 ? generation_in_1 : generation_in_0;
+//  这一格必须跟着走，否则"h0 被 lane1 收"那条的源就查错了。
+    assign push1_source_a    = alloc_lane0 ? source_a_dec_1 : source_a_dec_0;
+    assign push1_source_b    = alloc_lane0 ? source_b_dec_1 : source_b_dec_0;
+    assign lsu_push_phys_a   = lookup_a_phys;
+    assign lsu_push_phys_b   = lookup_b_phys;
 
-//★ 冲刷：只留【比冲刷点老】的条目，口径与 lane 的 keep_* 逐字同门。
-//  条目按程序序排列 ⇒ 被杀的一定是后缀 ⇒ 留下来的永远是前缀，压缩就是"取前缀"。
-    always @(*) begin
-//★ lsu_keep_* 已删（2026-10-31）：rob 的 flush_partial 恒 0、kill_arc 恒 1 ⇒ 它们恒 0
-//  ⇒ 冲刷拍整个访存 FIFO 直接清空，不存在"留住比边界老的条目"这一档。
-//生产者 tag 的提交清：与 idu2 的 Q 里 commit_hit 同一个口径（槽 + 世代就唯一确定那条生产者）。
-        lsu_tag_hit_0a = write_enable_a_in & (commit_rd0_in == lsu_queue_0[90:86]) & (lsu_queue_0[10:7] == commit_slot0_in) & (lsu_queue_0[6]  == commit_gen0_in);
-        lsu_tag_hit_0b = write_enable_b_in & (commit_rd1_in == lsu_queue_0[90:86]) & (lsu_queue_0[10:7] == commit_slot1_in) & (lsu_queue_0[6]  == commit_gen1_in);
-        lsu_tag_hit_1a = write_enable_a_in & (commit_rd0_in == lsu_queue_1[90:86]) & (lsu_queue_1[10:7] == commit_slot0_in) & (lsu_queue_1[6]  == commit_gen0_in);
-        lsu_tag_hit_1b = write_enable_b_in & (commit_rd1_in == lsu_queue_1[90:86]) & (lsu_queue_1[10:7] == commit_slot1_in) & (lsu_queue_1[6]  == commit_gen1_in);
-        lsu_tag_hit_2a = write_enable_a_in & (commit_rd0_in == lsu_queue_2[90:86]) & (lsu_queue_2[10:7] == commit_slot0_in) & (lsu_queue_2[6]  == commit_gen0_in);
-        lsu_tag_hit_2b = write_enable_b_in & (commit_rd1_in == lsu_queue_2[90:86]) & (lsu_queue_2[10:7] == commit_slot1_in) & (lsu_queue_2[6]  == commit_gen1_in);
-        lsu_tag_hit_3a = write_enable_a_in & (commit_rd0_in == lsu_queue_3[90:86]) & (lsu_queue_3[10:7] == commit_slot0_in) & (lsu_queue_3[6]  == commit_gen0_in);
-        lsu_tag_hit_3b = write_enable_b_in & (commit_rd1_in == lsu_queue_3[90:86]) & (lsu_queue_3[10:7] == commit_slot1_in) & (lsu_queue_3[6]  == commit_gen1_in);
-//★ b 口那一半单独一套：两半是【两个不同的生产者】，只清 a 那一半会让 b 的 tag 一直挂着，
-//  等到槽被重新分配、世代又刚好对上，就命中一个别人的值（实测 seed1：tohost 存进去 0xdda33000）。
-        lsu_tag_b_hit_0 = (write_enable_a_in & (commit_rd0_in == lsu_queue_0[85:81]) & (lsu_queue_0[4:1] == commit_slot0_in) & (lsu_queue_0[0] == commit_gen0_in))
-                        | (write_enable_b_in & (commit_rd1_in == lsu_queue_0[85:81]) & (lsu_queue_0[4:1] == commit_slot1_in) & (lsu_queue_0[0] == commit_gen1_in));
-        lsu_tag_b_hit_1 = (write_enable_a_in & (commit_rd0_in == lsu_queue_1[85:81]) & (lsu_queue_1[4:1] == commit_slot0_in) & (lsu_queue_1[0] == commit_gen0_in))
-                        | (write_enable_b_in & (commit_rd1_in == lsu_queue_1[85:81]) & (lsu_queue_1[4:1] == commit_slot1_in) & (lsu_queue_1[0] == commit_gen1_in));
-        lsu_tag_b_hit_2 = (write_enable_a_in & (commit_rd0_in == lsu_queue_2[85:81]) & (lsu_queue_2[4:1] == commit_slot0_in) & (lsu_queue_2[0] == commit_gen0_in))
-                        | (write_enable_b_in & (commit_rd1_in == lsu_queue_2[85:81]) & (lsu_queue_2[4:1] == commit_slot1_in) & (lsu_queue_2[0] == commit_gen1_in));
-        lsu_tag_b_hit_3 = (write_enable_a_in & (commit_rd0_in == lsu_queue_3[85:81]) & (lsu_queue_3[4:1] == commit_slot0_in) & (lsu_queue_3[0] == commit_gen0_in))
-                        | (write_enable_b_in & (commit_rd1_in == lsu_queue_3[85:81]) & (lsu_queue_3[4:1] == commit_slot1_in) & (lsu_queue_3[0] == commit_gen1_in));
-    end
-
+//★ 冲刷：整条 FIFO 直接清（rob 的 flush_partial 恒 0、kill_arc 恒 1）。
+//★ 2026-11-04 真 PRF：条目里不再有"生产者 tag"要按提交清 —— 换成物理号之后，
+//  值在写回那一拍就进了 PRF，谁提交都不改它。这里只剩【进队覆盖】一条路径。
     always @(posedge clk) begin
         if (reset_registered) begin
             lsu_queue_0 <= {LSU_QUEUE_WIDTH{1'b0}};
@@ -1333,27 +1281,16 @@ module idu1(
             lsu_write_pointer <= 2'd0;
         end
         else if (flush_pend) begin
-//★ 与出队格同一条：清用【寄存版】冲刷（组合版会把 csr 中断锥拉进本组寄存器）。
-//  指针与计数回 0，数据格不动（只在 count>0 时被读）。
+//★ 清用【寄存版】冲刷（组合版会把 csr 中断锥拉进本组寄存器）。指针与计数回 0，数据格不动。
             lsu_queue_count <= 3'd0;
             lsu_read_pointer <= 2'd0;
             lsu_write_pointer <= 2'd0;
         end
         else begin
-//★ 提交清按【物理格】判，指针只决定谁是队头，不改变 tag 比较的落点。
-//  清 → 写，后者赢（新进队那条自带自己的 tag）。
             lsu_clear_0 = lsu_queue_0;
             lsu_clear_1 = lsu_queue_1;
             lsu_clear_2 = lsu_queue_2;
             lsu_clear_3 = lsu_queue_3;
-            if (lsu_tag_hit_0a | lsu_tag_hit_0b) lsu_clear_0[11] = 1'b0;
-            if (lsu_tag_hit_1a | lsu_tag_hit_1b) lsu_clear_1[11] = 1'b0;
-            if (lsu_tag_hit_2a | lsu_tag_hit_2b) lsu_clear_2[11] = 1'b0;
-            if (lsu_tag_hit_3a | lsu_tag_hit_3b) lsu_clear_3[11] = 1'b0;
-            if (lsu_tag_b_hit_0) lsu_clear_0[5] = 1'b0;
-            if (lsu_tag_b_hit_1) lsu_clear_1[5] = 1'b0;
-            if (lsu_tag_b_hit_2) lsu_clear_2[5] = 1'b0;
-            if (lsu_tag_b_hit_3) lsu_clear_3[5] = 1'b0;
             if (lsu_push_0 | lsu_push_1) begin
                 case (lsu_write_pointer)
                     2'd0: lsu_clear_0 = lsu_entry;
@@ -1379,37 +1316,6 @@ module idu1(
     end
 
 //==============================================================================
-// tag 在队列里也要被【提交清】（2026-10-31）
-//   tag 是进队那拍取的，比进 idu2 的 Q 早 1~3 拍。生产者恰好在这段里提交 ⇒ 值已经进寄存器堆，
-//   tag 却还挂着 —— 消费者永远等一个再也不会出现的提交，整核锁死。
-//   （实测 w10：idu2 的 Q 等 slot7/gen1 的 b 口生产者，等到 20000 拍。）
-//   lsu fifo 一直有这一手（lsu_tag_hit_* / lsu_tag_b_hit_*）；lane 这边原来靠"取号就在 D 拍"免掉了。
-//   两格都要清：队头那一格，和第二格（它抬上来时按自己的命再清一次）。
-//==============================================================================
-    reg        lane0_head_prod_a_hit, lane0_head_prod_b_hit;
-    reg        lane0_skid_prod_a_hit, lane0_skid_prod_b_hit;
-    reg        lane1_head_prod_a_hit, lane1_head_prod_b_hit;
-    reg        lane1_skid_prod_a_hit, lane1_skid_prod_b_hit;
-    always @(*) begin
-        lane0_head_prod_a_hit = (write_enable_a_in & (commit_rd0_in == source_a_out_0) & (prod_a_out_0[4:1] == commit_slot0_in) & (prod_a_out_0[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == source_a_out_0) & (prod_a_out_0[4:1] == commit_slot1_in) & (prod_a_out_0[0] == commit_gen1_in));
-        lane0_head_prod_b_hit = (write_enable_a_in & (commit_rd0_in == source_b_out_0) & (prod_b_out_0[4:1] == commit_slot0_in) & (prod_b_out_0[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == source_b_out_0) & (prod_b_out_0[4:1] == commit_slot1_in) & (prod_b_out_0[0] == commit_gen1_in));
-        lane0_skid_prod_a_hit = (write_enable_a_in & (commit_rd0_in == skid_source_a_out_0) & (skid_prod_a_out_0[4:1] == commit_slot0_in) & (skid_prod_a_out_0[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == skid_source_a_out_0) & (skid_prod_a_out_0[4:1] == commit_slot1_in) & (skid_prod_a_out_0[0] == commit_gen1_in));
-        lane0_skid_prod_b_hit = (write_enable_a_in & (commit_rd0_in == skid_source_b_out_0) & (skid_prod_b_out_0[4:1] == commit_slot0_in) & (skid_prod_b_out_0[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == skid_source_b_out_0) & (skid_prod_b_out_0[4:1] == commit_slot1_in) & (skid_prod_b_out_0[0] == commit_gen1_in));
-        lane1_head_prod_a_hit = (write_enable_a_in & (commit_rd0_in == source_a_out_1) & (prod_a_out_1[4:1] == commit_slot0_in) & (prod_a_out_1[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == source_a_out_1) & (prod_a_out_1[4:1] == commit_slot1_in) & (prod_a_out_1[0] == commit_gen1_in));
-        lane1_head_prod_b_hit = (write_enable_a_in & (commit_rd0_in == source_b_out_1) & (prod_b_out_1[4:1] == commit_slot0_in) & (prod_b_out_1[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == source_b_out_1) & (prod_b_out_1[4:1] == commit_slot1_in) & (prod_b_out_1[0] == commit_gen1_in));
-        lane1_skid_prod_a_hit = (write_enable_a_in & (commit_rd0_in == skid_source_a_out_1) & (skid_prod_a_out_1[4:1] == commit_slot0_in) & (skid_prod_a_out_1[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == skid_source_a_out_1) & (skid_prod_a_out_1[4:1] == commit_slot1_in) & (skid_prod_a_out_1[0] == commit_gen1_in));
-        lane1_skid_prod_b_hit = (write_enable_a_in & (commit_rd0_in == skid_source_b_out_1) & (skid_prod_b_out_1[4:1] == commit_slot0_in) & (skid_prod_b_out_1[0] == commit_gen0_in))
-                              | (write_enable_b_in & (commit_rd1_in == skid_source_b_out_1) & (skid_prod_b_out_1[4:1] == commit_slot1_in) & (skid_prod_b_out_1[0] == commit_gen1_in));
-    end
-
-//==============================================================================
 // lane0 载荷 = 2 深 FIFO（头 + 影子）
 //   一次算下一态，次序固定为【先出队，再入队】：
 //     1. 出队：accept 且头里有货 → 影子抬进头（影子空就只是清头）
@@ -1428,8 +1334,8 @@ module idu1(
             source_b_out_0 <= 5'd0;
             index_out_0 <= 4'd0;
             generation_out_0 <= 1'b0;
-            prod_a_out_0 <= 6'd0;
-            prod_b_out_0 <= 6'd0;
+            phys_a_out_0 <= 6'd0;
+            phys_b_out_0 <= 6'd0;
             dec_class_0 <= 2'd0;
             dec_we_0 <= 1'b0;
             dec_rd_0 <= 5'd0;
@@ -1462,8 +1368,8 @@ module idu1(
                 source_b_out_0 <= skid_source_b_out_0;
                 index_out_0 <= skid_index_out_0;
                 generation_out_0 <= skid_generation_out_0;
-                prod_a_out_0 <= lane0_skid_prod_a_hit ? 6'd0 : skid_prod_a_out_0;
-                prod_b_out_0 <= lane0_skid_prod_b_hit ? 6'd0 : skid_prod_b_out_0;
+                phys_a_out_0 <= skid_phys_a_out_0;
+                phys_b_out_0 <= skid_phys_b_out_0;
                 dec_class_0 <= skid_dec_class_0;
                 dec_we_0 <= skid_dec_we_0;
                 dec_rd_0 <= skid_dec_rd_0;
@@ -1494,8 +1400,8 @@ module idu1(
                 source_b_out_0 <= source_b_dec_0;
                 index_out_0 <= index_in_0;
                 generation_out_0 <= generation_in_0;
-                prod_a_out_0 <= lsu_push_prod_a;
-                prod_b_out_0 <= lsu_push_prod_b;
+                phys_a_out_0 <= lookup_a_phys;
+                phys_b_out_0 <= lookup_b_phys;
                 dec_class_0 <= class_decoded;
                 dec_we_0 <= write_enable_decoded;
                 dec_rd_0 <= destination_pick_decoded;
@@ -1519,8 +1425,6 @@ module idu1(
             end
 //---- 头原地不动：生产者可能就在这一拍提交 ⇒ 清掉它的 tag ----
             else begin
-                if (lane0_head_prod_a_hit) prod_a_out_0 <= 6'd0;
-                if (lane0_head_prod_b_hit) prod_b_out_0 <= 6'd0;
             end
 //---- 3) 入队到影子：出队后头仍占着（此时 lane0_free 已保证影子是空的）----
             if (lane0_push & lane0_head_after_pop) begin
@@ -1531,8 +1435,8 @@ module idu1(
                 skid_source_b_out_0 <= source_b_dec_0;
                 skid_index_out_0 <= index_in_0;
                 skid_generation_out_0 <= generation_in_0;
-                skid_prod_a_out_0 <= lsu_push_prod_a;
-                skid_prod_b_out_0 <= lsu_push_prod_b;
+                skid_phys_a_out_0 <= lookup_a_phys;
+                skid_phys_b_out_0 <= lookup_b_phys;
                 skid_dec_class_0 <= class_decoded;
                 skid_dec_we_0 <= write_enable_decoded;
                 skid_dec_rd_0 <= destination_pick_decoded;
@@ -1560,8 +1464,6 @@ module idu1(
             end
             else begin
 //第二格原地不动：同样要按提交清 tag（它比队头更晚进 idu2，窗口更长）
-                if (lane0_skid_prod_a_hit) skid_prod_a_out_0 <= 6'd0;
-                if (lane0_skid_prod_b_hit) skid_prod_b_out_0 <= 6'd0;
             end
 //★ 冲刷清与原来同门（装载赢）：有效位在相邻那一块已经清掉，影子这里只要清 skid_valid ——
 //  数据留着没人读（头有效位=0 时下游一个字都不看，与原来留脏头的做法一致）。
@@ -1578,8 +1480,8 @@ module idu1(
             source_b_out_1 <= 5'd0;
             index_out_1 <= 4'd0;
             generation_out_1 <= 1'b0;
-            prod_a_out_1 <= 6'd0;
-            prod_b_out_1 <= 6'd0;
+            phys_a_out_1 <= 6'd0;
+            phys_b_out_1 <= 6'd0;
             dec_class_1 <= 2'd0;
             dec_we_1 <= 1'b0;
             dec_rd_1 <= 5'd0;
@@ -1612,8 +1514,8 @@ module idu1(
                 source_b_out_1 <= skid_source_b_out_1;
                 index_out_1 <= skid_index_out_1;
                 generation_out_1 <= skid_generation_out_1;
-                prod_a_out_1 <= lane1_skid_prod_a_hit ? 6'd0 : skid_prod_a_out_1;
-                prod_b_out_1 <= lane1_skid_prod_b_hit ? 6'd0 : skid_prod_b_out_1;
+                phys_a_out_1 <= skid_phys_a_out_1;
+                phys_b_out_1 <= skid_phys_b_out_1;
                 dec_class_1 <= skid_dec_class_1;
                 dec_we_1 <= skid_dec_we_1;
                 dec_rd_1 <= skid_dec_rd_1;
@@ -1645,8 +1547,8 @@ module idu1(
                 index_out_1 <= index_stage1;
                 generation_out_1 <= generation_stage1;
 //★ lane1 的 tag 恒取自 push1 那一组（它已经按实际拿到的格子偏好了）。
-                prod_a_out_1 <= push1_prod_a;
-                prod_b_out_1 <= push1_prod_b;
+                phys_a_out_1 <= lookup_c_phys;
+                phys_b_out_1 <= lookup_d_phys;
                 dec_class_1 <= class_decoded_1;
                 dec_we_1 <= write_enable_decoded_1;
                 dec_rd_1 <= destination_pick_decoded_1;
@@ -1670,8 +1572,6 @@ module idu1(
             end
 //---- 头原地不动：生产者可能就在这一拍提交 ⇒ 清掉它的 tag ----
             else begin
-                if (lane1_head_prod_a_hit) prod_a_out_1 <= 6'd0;
-                if (lane1_head_prod_b_hit) prod_b_out_1 <= 6'd0;
             end
 //---- 3) 入队到影子：出队后头仍占着（此时 lane1_free 已保证影子是空的）----
             if (lane1_push & lane1_head_after_pop) begin
@@ -1682,8 +1582,8 @@ module idu1(
                 skid_source_b_out_1 <= source_b_stage1;
                 skid_index_out_1 <= index_stage1;
                 skid_generation_out_1 <= generation_stage1;
-                skid_prod_a_out_1 <= push1_prod_a;
-                skid_prod_b_out_1 <= push1_prod_b;
+                skid_phys_a_out_1 <= lookup_c_phys;
+                skid_phys_b_out_1 <= lookup_d_phys;
                 skid_dec_class_1 <= class_decoded_1;
                 skid_dec_we_1 <= write_enable_decoded_1;
                 skid_dec_rd_1 <= destination_pick_decoded_1;
@@ -1710,12 +1610,51 @@ module idu1(
                 skid_valid_1 <= 1'b0;
             end
             else begin
-                if (lane1_skid_prod_a_hit) skid_prod_a_out_1 <= 6'd0;
-                if (lane1_skid_prod_b_hit) skid_prod_b_out_1 <= 6'd0;
             end
 //★ 同 lane0：冲刷清与原来同门（装载赢），有效位在相邻那一块已清。
             if (flush_pend & ~lane1_store) skid_valid_1 <= 1'b0;
         end
     end
+
+//==============================================================================
+// 真 PRF 的重命名表（2026-11-04）
+//   rat/arch_map/free_vector 都在 rename 里。这里只用它算两件事：
+//   ① 本条指令 rd 分到的物理号（交给 rob 随项存）
+//   ② rs1/rs2 翻译成的物理号（下一步替换 idu2 的 (槽,世代) 生产者表时用）
+//   分配点选在 idu1 的解码/分配拍 —— 和 rob 的槽分配是同一拍、同一条指令。
+//==============================================================================
+    wire [5:0] rename_phys_rd_0, rename_phys_rd_1;
+    wire [5:0] rename_phys_rs1_0, rename_phys_rs2_0;
+    wire [5:0] rename_phys_rs1_1, rename_phys_rs2_1;
+    wire       rename_stall_0, rename_stall_1;
+    wire       rename_bank_empty_0, rename_bank_empty_1;
+    wire [5:0] lookup_a_phys, lookup_b_phys, lookup_c_phys, lookup_d_phys;
+    wire [63:0] rename_alloc_onehot, rename_arch_next_onehot;
+
+    rename u_rename (
+        .clk(clk), .rst(rst),
+        .alloc_en_0(alloc_lane0 & ~rob_full_in), .alloc_we_0(destination_decoded != 5'd0), .alloc_rd_0(destination_decoded),
+        .alloc_rs1_0(source_a_dec_0), .alloc_rs2_0(source_b_dec_0),
+        .phys_rd_0(rename_phys_rd_0), .phys_rs1_0(rename_phys_rs1_0), .phys_rs2_0(rename_phys_rs2_0),
+        .alloc_en_1(alloc_lane1 & ~rob_full_in), .alloc_we_1(destination_decoded_1 != 5'd0), .alloc_rd_1(destination_decoded_1),
+        .alloc_rs1_1(source_a_dec_1), .alloc_rs2_1(source_b_dec_1),
+        .phys_rd_1(rename_phys_rd_1), .phys_rs1_1(rename_phys_rs1_1), .phys_rs2_1(rename_phys_rs2_1),
+        .alloc_stall_0(rename_stall_0), .alloc_stall_1(rename_stall_1),
+        .bank_empty_0(rename_bank_empty_0), .bank_empty_1(rename_bank_empty_1),
+        .lookup_a(lsu_push_source_a), .lookup_b(lsu_push_source_b),
+        .lookup_c(push1_source_a),              .lookup_d(push1_source_b),
+        .lookup_a_phys(lookup_a_phys), .lookup_b_phys(lookup_b_phys),
+        .lookup_c_phys(lookup_c_phys), .lookup_d_phys(lookup_d_phys),
+        .commit_we_a(write_enable_a_in), .commit_rd_a(commit_rd0_in), .commit_phys_a(commit_phys0_in),
+        .commit_we_b(write_enable_b_in), .commit_rd_b(commit_rd1_in), .commit_phys_b(commit_phys1_in),
+        .flush(|flush_control_in),
+        .squash_mask(squash_phys_mask_in),
+        .alloc_onehot(rename_alloc_onehot), .arch_next_onehot(rename_arch_next_onehot)
+    );
+
+    assign alloc_phys_0 = rename_phys_rd_0;
+    assign alloc_onehot_0 = rename_alloc_onehot;
+    assign arch_next_onehot_0 = rename_arch_next_onehot;
+    assign alloc_phys_1 = rename_phys_rd_1;
 
 endmodule

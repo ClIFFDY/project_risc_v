@@ -127,6 +127,9 @@ module cpu_top #(
     wire        alloc_ecall_0, alloc_ebreak_0, alloc_illegal_0, alloc_mret_0;
     wire        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1;
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
+//★ 2026-11-04 真 PRF：物理号与冲刷掩码
+    wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
+    wire [63:0] squash_phys_mask;
     wire [3:0]  alloc_index_0, alloc_index_1;
     wire        alloc_generation_0, alloc_generation_1;
 
@@ -189,26 +192,23 @@ module cpu_top #(
 //---- 访存专用流：idu1 的 LSU FIFO <-> idu2 ----
     wire [31:0] lsu_instruction_idu1, lsu_auxiliary_address_idu1, lsu_immediate_idu1;
     wire [4:0]  lsu_source_a_idu1, lsu_source_b_idu1, lsu_destination_register_idu1;
-    wire [4:0]  lsu_push_source_a_idu1, lsu_push_source_b_idu1, lsu_push_destination_idu1;
     wire [2:0]  lsu_load_store_function3_idu1;
-    wire [3:0]  lsu_index_idu1, lsu_push_index_idu1;
+    wire [3:0]  lsu_index_idu1;
     wire        lsu_is_store_idu1, lsu_write_enable_idu1, lsu_generation_idu1, lsu_valid_idu1;
-    wire        lsu_producer_a_valid_idu1, lsu_producer_a_generation_idu1;
-    wire [3:0]  lsu_producer_a_slot_idu1;
-    wire        lsu_producer_b_valid_idu1, lsu_producer_b_generation_idu1;
-    wire [3:0]  lsu_producer_b_slot_idu1;
-    wire        lsu_pop_idu2, lsu_push_valid_idu1, lsu_push_generation_idu1;
+    wire        lsu_pop_idu2;
     wire        payload_fresh_0, payload_fresh_1;
-//进队那拍取好的生产者号，打包 {valid, slot[3:0], generation}
-//  push0 = h0（lane0 与访存条共用同一份），push1 = h1（双发时才有）
-    wire [5:0]  push0_prod_a_idu2, push0_prod_b_idu2;
-    wire [5:0]  push1_prod_a_idu2, push1_prod_b_idu2;
-//载荷随条目带进 idu2 的 tag
-    wire [5:0]  prod_a_idu1_0, prod_b_idu1_0, prod_a_idu1_1, prod_b_idu1_1;
-//h1 那一格的进队描述（rs1/rs2/rd/index/gen）
-    wire        push1_valid_idu1, push1_generation_idu1, lsu_push_is_mem_idu1;
-    wire [4:0]  push1_source_a_idu1, push1_source_b_idu1, push1_destination_idu1;
-    wire [3:0]  push1_index_idu1;
+//★ 2026-11-04 真 PRF：idu1/idu2 之间走的是【物理号】，不再有生产者 tag
+    wire [5:0]  phys_a_out_0, phys_b_out_0, phys_a_out_1, phys_b_out_1;
+    wire [5:0]  lsu_phys_a_idu1, lsu_phys_b_idu1;
+    wire [63:0] alloc_onehot, arch_next_onehot, prf_ready;
+//---- PRF 读口 ----
+    wire [5:0]  prf_read_a_0_phys, prf_read_b_0_phys, prf_read_a_1_phys, prf_read_b_1_phys;
+    wire [5:0]  prf_read_a_m_phys, prf_read_b_m_phys;
+    wire [31:0] prf_data_a_0, prf_data_b_0, prf_data_a_1, prf_data_b_1, prf_data_a_mem, prf_data_b_mem;
+//---- PRF 写口（物理号由 rob 按槽查出来；live = 本项还有效且世代对得上）----
+    wire [5:0]  prf_wb_phys_0, prf_wb_phys_1, prf_ld_phys_wb;
+    wire        prf_wb_live_0, prf_wb_live_1, prf_ld_live_wb, prf_ld_early_live;
+    wire [5:0]  phys_alu_early_0, phys_alu_early_1, ld_phys_early;
 //idu1 本拍 lane0 装没装：决定 lane1 的读口地址取队头 h0 还是第二格 h1
     wire        lane0_load;
 
@@ -216,18 +216,21 @@ module cpu_top #(
 // 单元结果口
 //==============================================================================
     wire [31:0] source_index_alu_0, source_index_alu_1, csr_result_alu_0, csr_result_alu_1;
-//前送表的写表用：7 个结果口的 D 端
+//★★ 2026-11-04：执行单元收成 exu（bju/alu/mdu 一层），每 lane 只留【一个】值表写口。
+//  原来 7 个早写口（alu0 alu1 mul0 mul1 div0 div1 ld），值表因此要复制好几份。
+//  exu 内部按 div > mul > alu 抢口，抢不到的进本类影子寄存器 ⇒ lane 侧只剩一根结果线。
+//  现在值表写口 = 3 个：lane0 / lane1 / LD，寄存器堆才谈得上按 bank 复制两份。
+    wire [31:0] result_port_0_data, result_port_1_data;
+    wire        result_port_0_enable, result_port_1_enable;
+    wire [3:0]  result_port_0_index, result_port_1_index;
+    wire        result_port_0_generation, result_port_1_generation;
+    wire        result_port_0_overflow, result_port_1_overflow;
+//旁路那一组【只认 ALU】：mdu 的结果不进前送网（这是硬规矩），所以它不能跟结果口共用信号
     wire [31:0] source_index_alu_early_0, source_index_alu_early_1;
-    wire [31:0] mul_data_early_0, mul_data_early_1;
-    wire [31:0] div_data_early_0, div_data_early_1;
-    wire [31:0] load_data_early_lsu;
-//早唤醒用：7 个结果口的身份 D 端
     wire        write_enable_alu_early_0, write_enable_alu_early_1;
     wire [3:0]  index_alu_early_0, index_alu_early_1;
     wire        generation_alu_early_0, generation_alu_early_1;
-    wire        mul_write_enable_early_0, mul_write_enable_early_1, div_write_enable_early_0, div_write_enable_early_1;
-    wire [3:0]  mul_index_early_0, mul_index_early_1, div_index_early_0, div_index_early_1;
-    wire        mul_generation_early_0, mul_generation_early_1, div_generation_early_0, div_generation_early_1;
+    wire [31:0] load_data_early_lsu;
     wire        load_write_enable_early_lsu, load_generation_early_lsu;
     wire [3:0]  load_index_early_lsu;
     wire [3:0]  index_alu_0, index_alu_1;
@@ -597,6 +600,7 @@ module cpu_top #(
         .alloc_ecall_0(alloc_ecall_0), .alloc_ebreak_0(alloc_ebreak_0),
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
         .alloc_rd_0(alloc_destination_register_0),
+        .alloc_phys_0(alloc_phys_0),
         .dec_class_0(decoded_class_0), .dec_we_0(decoded_write_enable_0), .dec_rd_0(decoded_destination_register_0),
         .dec_is_st_0(decoded_is_store_0), .dec_mulop_0(decoded_mulop_0), .dec_lsf3_0(decoded_load_store_function3_0),
         .dec_func4_0(decoded_func4_0), .dec_csrf3_0(decoded_csr_function3_0),
@@ -624,6 +628,7 @@ module cpu_top #(
         .alloc_ecall_1(alloc_ecall_1), .alloc_ebreak_1(alloc_ebreak_1),
         .alloc_illegal_1(alloc_illegal_1), .alloc_mret_1(alloc_mret_1),
         .alloc_rd_1(alloc_destination_register_1),
+        .alloc_phys_1(alloc_phys_1),
         .dec_class_1(decoded_class_1), .dec_we_1(decoded_write_enable_1), .dec_rd_1(decoded_destination_register_1),
         .dec_is_st_1(decoded_is_store_1), .dec_mulop_1(decoded_mulop_1), .dec_lsf3_1(decoded_load_store_function3_1),
         .dec_func4_1(decoded_func4_1), .dec_csrf3_1(decoded_csr_function3_1),
@@ -637,23 +642,13 @@ module cpu_top #(
         .lsu_pop_in(lsu_pop_idu2),
         .payload_fresh_out_0(payload_fresh_0), .payload_fresh_out_1(payload_fresh_1),
         .write_enable_a_in(commit_we0), .write_enable_b_in(commit_we1),
-        .commit_slot0_in(commit_slot0), .commit_slot1_in(commit_slot1),
-        .commit_gen0_in(commit_gen0), .commit_gen1_in(commit_gen1),
         .commit_rd0_in(commit_rd0), .commit_rd1_in(commit_rd1),
-        .lsu_push_prod_a(push0_prod_a_idu2), .lsu_push_prod_b(push0_prod_b_idu2),
-        .push1_prod_a(push1_prod_a_idu2), .push1_prod_b(push1_prod_b_idu2),
-        .lsu_push_valid(lsu_push_valid_idu1), .lsu_push_is_mem(lsu_push_is_mem_idu1),
-        .lsu_push_source_a(lsu_push_source_a_idu1), .lsu_push_source_b(lsu_push_source_b_idu1),
-        .lsu_push_destination(lsu_push_destination_idu1),
-        .lsu_push_index(lsu_push_index_idu1),
-        .lsu_push_generation(lsu_push_generation_idu1),
-        .push1_valid(push1_valid_idu1),
-        .push1_source_a(push1_source_a_idu1), .push1_source_b(push1_source_b_idu1),
-        .push1_destination(push1_destination_idu1),
-        .push1_index(push1_index_idu1),
-        .push1_generation(push1_generation_idu1),
-        .prod_a_out_0(prod_a_idu1_0), .prod_b_out_0(prod_b_idu1_0),
-        .prod_a_out_1(prod_a_idu1_1), .prod_b_out_1(prod_b_idu1_1),
+        .commit_phys0_in(commit_phys0), .commit_phys1_in(commit_phys1),
+        .squash_phys_mask_in(squash_phys_mask),
+        .rob_full_in(rob_full),
+        .phys_a_out_0(phys_a_out_0), .phys_b_out_0(phys_b_out_0),
+        .phys_a_out_1(phys_a_out_1), .phys_b_out_1(phys_b_out_1),
+        .alloc_onehot_0(alloc_onehot), .arch_next_onehot_0(arch_next_onehot),
         .lsu_instruction_out(lsu_instruction_idu1),
         .lsu_auxiliary_address_out(lsu_auxiliary_address_idu1),
         .lsu_immediate_out(lsu_immediate_idu1),
@@ -665,18 +660,13 @@ module cpu_top #(
         .lsu_index_out(lsu_index_idu1),
         .lsu_generation_out(lsu_generation_idu1),
         .lsu_valid_out(lsu_valid_idu1),
-        .lsu_producer_a_valid_out(lsu_producer_a_valid_idu1),
-        .lsu_producer_a_slot_out(lsu_producer_a_slot_idu1),
-        .lsu_producer_a_generation_out(lsu_producer_a_generation_idu1),
-        .lsu_producer_b_valid_out(lsu_producer_b_valid_idu1),
-        .lsu_producer_b_slot_out(lsu_producer_b_slot_idu1),
-        .lsu_producer_b_generation_out(lsu_producer_b_generation_idu1)
+        .lsu_phys_a_out(lsu_phys_a_idu1), .lsu_phys_b_out(lsu_phys_b_idu1)
     );
 
 //==============================================================================
 // 发射级
 //==============================================================================
-    idu2 #(.VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH)) u_idu2 (
+    idu2 u_idu2 (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
         .flush_control_rob_registered(flush_con_rob_registered),
@@ -718,63 +708,41 @@ module cpu_top #(
         .mem_destination_register_in(lsu_destination_register_idu1),
         .mem_auxiliary_address_in(lsu_auxiliary_address_idu1),
         .mem_immediate_in(lsu_immediate_idu1),
-        .mem_rdata1_in(rdata5), .mem_rdata2_in(rdata6),
         .mem_index_in(lsu_index_idu1), .mem_generation_in(lsu_generation_idu1),
         .mem_is_store_in(lsu_is_store_idu1),
         .mem_load_store_function3_in(lsu_load_store_function3_idu1),
         .mem_valid_in(lsu_valid_idu1),
-        .mem_producer_a_valid_in(lsu_producer_a_valid_idu1),
-        .mem_producer_a_slot_in(lsu_producer_a_slot_idu1),
-        .mem_producer_a_generation_in(lsu_producer_a_generation_idu1),
-        .mem_producer_b_valid_in(lsu_producer_b_valid_idu1),
-        .mem_producer_b_slot_in(lsu_producer_b_slot_idu1),
-        .mem_producer_b_generation_in(lsu_producer_b_generation_idu1),
+//★ 真 PRF：访存条目里的两个源物理号（idu1 在进队那一拍就查好了，随条目走）
+        .mem_phys_a_in(lsu_phys_a_idu1), .mem_phys_b_in(lsu_phys_b_idu1),
         .mem_pop_out(lsu_pop_idu2),
-        .lane0_fresh_in(payload_fresh_0), .lane1_fresh_in(payload_fresh_1),
-        .mem_push_valid(lsu_push_valid_idu1), .mem_push_is_mem(lsu_push_is_mem_idu1),
-        .mem_push_rs1_in(lsu_push_source_a_idu1), .mem_push_rs2_in(lsu_push_source_b_idu1),
-        .mem_push_destination_register_in(lsu_push_destination_idu1),
-        .mem_push_index_in(lsu_push_index_idu1),
-        .mem_push_generation_in(lsu_push_generation_idu1),
-        .push1_valid_in(push1_valid_idu1),
-        .push1_rs1_in(push1_source_a_idu1), .push1_rs2_in(push1_source_b_idu1),
-        .push1_destination_register_in(push1_destination_idu1),
-        .push1_index_in(push1_index_idu1),
-        .push1_generation_in(push1_generation_idu1),
-        .mem_push_prod_a_out(push0_prod_a_idu2), .mem_push_prod_b_out(push0_prod_b_idu2),
-        .push1_prod_a_out(push1_prod_a_idu2), .push1_prod_b_out(push1_prod_b_idu2),
-        .lane0_prod_a_in(prod_a_idu1_0), .lane0_prod_b_in(prod_b_idu1_0),
-        .lane1_prod_a_in(prod_a_idu1_1), .lane1_prod_b_in(prod_b_idu1_1),
 
-//结果口：只接 32 位数据 + 身份 D 端（原来的"身份 Q 端"一组 idu2 从没读过，已删）
+//结果口：只接 32 位数据 + 前送身份（按物理号）
         .data_alu_early(source_index_alu_early_0),
         .data_alu_lane1_early(source_index_alu_early_1),
-        .data_mul_early(mul_data_early_0),
-        .data_multiply_lane1_early(mul_data_early_1),
-        .data_div_early(div_data_early_0),
-        .data_divide_lane1_early(div_data_early_1),
         .data_ld_early(load_data_early_lsu),
-        .write_enable_alu_early(write_enable_alu_early_0),   .index_alu_early(index_alu_early_0),   .generation_alu_early(generation_alu_early_0),
-        .write_enable_alu_lane1_early(write_enable_alu_early_1),  .index_alu_lane1_early(index_alu_early_1),  .generation_alu_lane1_early(generation_alu_early_1),
-        .write_enable_mul_early(mul_write_enable_early_0),   .index_mul_early(mul_index_early_0),   .generation_mul_early(mul_generation_early_0),
-        .write_enable_multiply_lane1_early(mul_write_enable_early_1),  .index_multiply_lane1_early(mul_index_early_1),  .generation_multiply_lane1_early(mul_generation_early_1),
-        .write_enable_div_early(div_write_enable_early_0),   .index_div_early(div_index_early_0),   .generation_div_early(div_generation_early_0),
-        .write_enable_divide_lane1_early(div_write_enable_early_1),  .index_divide_lane1_early(div_index_early_1),  .generation_divide_lane1_early(div_generation_early_1),
-        .write_enable_ld_early(load_write_enable_early_lsu),   .index_ld_early(load_index_early_lsu),   .generation_ld_early(load_generation_early_lsu),
+//旁路：只吃 ALU 自己那一组 + LOAD；mdu 的结果绝不进旁路网
+        .write_enable_alu_early(write_enable_alu_early_0),       .phys_alu_early_0(phys_alu_early_0),
+        .write_enable_alu_lane1_early(write_enable_alu_early_1), .phys_alu_early_1(phys_alu_early_1),
+        .write_enable_ld_early(load_write_enable_early_lsu),     .ld_phys_early(ld_phys_early),
 
-        .write_enable_a(commit_we0), .destination_register_a(commit_rd0),
-        .write_enable_b(commit_we1), .destination_register_b(commit_rd1),
-        .commit_slot0(commit_slot0), .commit_slot1(commit_slot1),
-        .commit_gen0(commit_gen0),  .commit_gen1(commit_gen1),
-        .commit_data0(commit_data0), .commit_data1(commit_data1),
+//D 级那一格两个源的物理号 + PRF 读口 / 就绪位
+        .rs1_phys_in(phys_a_out_0),       .rs2_phys_in(phys_b_out_0),
+        .rs1_phys_in_lane1(phys_a_out_1), .rs2_phys_in_lane1(phys_b_out_1),
+        .prf_read_a_0_phys(prf_read_a_0_phys), .prf_read_b_0_phys(prf_read_b_0_phys),
+        .prf_read_a_1_phys(prf_read_a_1_phys), .prf_read_b_1_phys(prf_read_b_1_phys),
+        .prf_read_a_m_phys(prf_read_a_m_phys), .prf_read_b_m_phys(prf_read_b_m_phys),
+        .prf_data_a_0(prf_data_a_0), .prf_data_b_0(prf_data_b_0),
+        .prf_data_a_1(prf_data_a_1), .prf_data_b_1(prf_data_b_1),
+        .prf_data_a_mem(prf_data_a_mem), .prf_data_b_mem(prf_data_b_mem),
+        .prf_ready_in(prf_ready),
 
+//---- 冲刷 / 陷阱 / 年龄基准 ----
         .flush_inclusive_registered(flush_inclusive_registered), .flush_index_registered(flush_index_registered),
         .flush_pending(flush_pending),
         .trap_fire_registered(trap_fire), .head_one_hot_registered(head_one_hot_registered),
         .above(above_registered),
-
-        .lsu_full(~carriage_free_lsu),   // 只看结构（访存车 / SQ）
-        .load_wake_valid(load_wake_valid), .load_wake_index(load_wake_index_lsu), .load_wake_generation(load_wake_generation_lsu),
+//---- 单元就绪 / 访存危险 / load 早唤醒 ----
+        .lsu_full(~carriage_free_lsu),
         .bypass_load_a_0(bypass_load_a_0), .bypass_load_b_0(bypass_load_b_0),
         .bypass_load_a_1(bypass_load_a_1), .bypass_load_b_1(bypass_load_b_1),
         .load_hazard_valid_0(load_hazard_valid_0), .load_hazard_rd_0(load_hazard_rd_0),
@@ -782,10 +750,6 @@ module cpu_top #(
         .mdu_mul_ok_0(mul_ready_0), .mdu_div_ok_0(div_ready_0),
         .mdu_mul_ok_1(mul_ready_1), .mdu_div_ok_1(div_ready_1),
         .bju_ok_0(1'b1), .bju_ok_1(1'b1),
-
-        .rdata1_in(rdata1), .rdata2_in(rdata2),
-        .rdata3_in(rdata3), .rdata4_in(rdata4),
-
         .issue_valid_0(issue_valid_0), .destination_register_0(destination_register_0), .issue_index_0(issue_index_0),
         .issue_generation_0(issue_generation_0), .write_enable_0(write_enable_0), .sel_class_0(),
         .opcode_0(), .function10_0(function10_0), .function10_load_store_0(function10_load_store_0),
@@ -827,11 +791,44 @@ module cpu_top #(
     );
 
 //==============================================================================
-// 执行单元：每 lane 一套 alu / mdu / bju
+// 真 PRF：64 个物理号 × 32 位的寄存器堆
+//   6 个组合读口（lane0 a/b、lane1 a/b、访存流 a/b），3 个写口（lane0 结果 / lane1 结果 / LOAD）。
+//   写口的物理号由 rob 按槽查出来 —— 结果口上带的还是槽号，物理号是实现细节，放在 rob 里最省。
+//   live：冲刷之后在飞的结果还会落完，那些项的号可能已经被回收再分配，晚到的死写一律拦掉。
 //==============================================================================
-    alu u_alu_0 (
+    prf u_prf (
         .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
+        .read_a_0_phys(prf_read_a_0_phys), .read_b_0_phys(prf_read_b_0_phys),
+        .read_a_1_phys(prf_read_a_1_phys), .read_b_1_phys(prf_read_b_1_phys),
+        .read_a_m_phys(prf_read_a_m_phys), .read_b_m_phys(prf_read_b_m_phys),
+        .read_a_0_data(prf_data_a_0), .read_b_0_data(prf_data_b_0),
+        .read_a_1_data(prf_data_a_1), .read_b_1_data(prf_data_b_1),
+        .read_a_m_data(prf_data_a_mem), .read_b_m_data(prf_data_b_mem),
+
+        .write_en_0(result_port_0_enable), .write_live_0(prf_wb_live_0),
+        .write_phys_0(prf_wb_phys_0),      .write_data_0(result_port_0_data),
+        .write_en_1(result_port_1_enable), .write_live_1(prf_wb_live_1),
+        .write_phys_1(prf_wb_phys_1),      .write_data_1(result_port_1_data),
+        .write_en_2(load_write_enable_lsu), .write_live_2(prf_ld_live_wb),
+        .write_phys_2(prf_ld_phys_wb),            .write_data_2(load_data_lsu),
+        .write_en_3(load_write_enable_early_lsu), .write_live_3(prf_ld_early_live),
+        .write_phys_3(ld_phys_early),             .write_data_3(load_data_early_lsu),
+
+        .ready(prf_ready),
+        .alloc_mask(alloc_onehot),
+        .flush(|flag_bus[7:5]),
+        .flush_arch_mask(arch_next_onehot)
+    );
+
+//==============================================================================
+// 执行单元：每 lane 一个 exu（alu / mdu / bju 收进一层，结果口在层内仲裁）
+//   对外只剩一个值表写口：div > mul > alu 抢，抢不到的进本类影子（ALU 最低，本来就是旁路源）
+//   早唤醒那份（*_early）也只剩一根：值表按结果口写，不再按类各写一份。
+//==============================================================================
+    exu u_exu_0 (
+        .clk(clk), .rst(rst),
+        .flush_control_in(flag_bus[7:5]), .flush_index_in(flush_index),
+
         .write_enable_in(write_enable_0), .jal_flag(jump_link_flag_0), .jalr_flag(jump_link_register_flag_0),
         .cs_wr_en(csr_write_enable_0),
         .destination_in(destination_register_0), .index_in(issue_index_0), .generation_in(issue_generation_0),
@@ -839,16 +836,58 @@ module cpu_top #(
         .auxiliary_address_in(auxiliary_address_0),
         .source_a_data(operand_data_a_0), .r2_data(operand_data_b_0), .cs_data(csr_data_combinational),
         .bypass_load_a(bypass_load_a_0), .bypass_load_b(bypass_load_b_0), .load_data_forward(load_data_early_lsu),
-        .destination_out(), .index_out(index_alu_0), .generation_out(generation_alu_0),
-        .result(source_index_alu_0), .result_csr(csr_result_alu_0),
-        .result_now(), .result_early(source_index_alu_early_0),
-        .write_enable_early(write_enable_alu_early_0), .index_early(index_alu_early_0), .generation_early(generation_alu_early_0),
-        .write_enable(write_enable_alu_0)
+
+        .branch_unit_function4_in(bju_func4_0),
+        .beq_offset_in(beq_offset_0),
+        .jump_link_register_prediction_address_in(jump_link_register_prediction_address_0),
+        .jump_link_target_in(jump_link_target_0),
+        .branch_prediction_taken_in(branch_prediction_taken_0),
+        .advance_in(issue_valid_0),
+
+        .multiply_go(mul_go_0), .multiply_function10(function10_0),
+        .divide_go(div_go_0),   .divide_function10(function10_0),
+
+        .alu_destination_out(),
+        .alu_index_out(index_alu_0), .alu_generation_out(generation_alu_0),
+        .alu_result(source_index_alu_0), .alu_result_csr(csr_result_alu_0),
+        .alu_result_early(source_index_alu_early_0),
+        .alu_write_enable_early(write_enable_alu_early_0), .alu_index_early(index_alu_early_0), .alu_generation_early(generation_alu_early_0),
+        .alu_write_enable(write_enable_alu_0),
+
+        .multiply_data_out(mul_data_0), .multiply_loaded(mul_write_enable_0),
+        .multiply_data_early(), .divide_data_early(),
+        .multiply_write_enable_early(), .multiply_index_early(), .multiply_generation_early(),
+        .divide_write_enable_early(), .divide_index_early(), .divide_generation_early(),
+        .multiply_index_out(mul_index_0), .multiply_generation_out(mul_generation_0),
+        .divide_data_out(div_data_0), .divide_loaded(div_write_enable_0),
+        .divide_index_out(div_index_0), .divide_generation_out(div_generation_0),
+        .multiply_ready(mul_ready_0), .divide_ready(div_ready_0),
+
+        .success(success_0), .branch_failure(branch_fail_0), .jump_link_register_failure(jump_link_register_fail_0),
+        .exception_target_misalign(exception_target_misalign_0),
+        .jump_target(jump_target_0), .jump_link_register_target_registered(jump_link_register_target_0),
+        .branch_pc_index(branch_pc_index_0), .branch_pc_registered(branch_pc_0),
+        .jump_link_register_target_valid_registered(jump_link_register_valid_0),
+        .branch_prediction_taken_registered(branch_prediction_taken_registered_0),
+        .judged_index(bju_index_i_0), .index_registered(bju_index_registered_0),
+        .judged_registered(judged_0), .redirect_registered(redir_registered_0), .generation_registered(generation_registered_0),
+        .branch_unit_kind(bju_kind_0), .branch_unit_taken(bju_taken_0),
+        .branch_unit_pc(bju_pc_0), .branch_unit_target(bju_target_0),
+        .exception_pc_registered(exception_pc_registered_0), .exception_pc_judged(exception_pc_i_0),
+        .exception_ecall_judged(exception_ecall_0), .exception_ebreak_judged(exception_ebreak_0),
+        .exception_illegal_judged(exception_illegal_0), .exception_interrupt_return_judged(exception_interrupt_ret_0),
+        .exception_ecall_registered(exception_ecall_registered_0), .exception_ebreak_registered(exception_ebreak_registered_0),
+        .exception_illegal_registered(exception_illegal_registered_0), .exception_interrupt_return_registered(exception_interrupt_ret_registered_0),
+
+        .result_write_enable(result_port_0_enable), .result_index(result_port_0_index),
+        .result_generation(result_port_0_generation), .result_data(result_port_0_data),
+        .result_overflow(result_port_0_overflow)
     );
 
-    alu u_alu_1 (
+    exu u_exu_1 (
         .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
+        .flush_control_in(flag_bus[7:5]), .flush_index_in(flush_index),
+
         .write_enable_in(write_enable_1), .jal_flag(jump_link_flag_1), .jalr_flag(jump_link_register_flag_1),
         .cs_wr_en(csr_write_enable_1),
         .destination_in(destination_register_1), .index_in(issue_index_1), .generation_in(issue_generation_1),
@@ -856,109 +895,52 @@ module cpu_top #(
         .auxiliary_address_in(auxiliary_address_1),
         .source_a_data(operand_data_a_1), .r2_data(operand_data_b_1), .cs_data(csr_data_combinational),
         .bypass_load_a(bypass_load_a_1), .bypass_load_b(bypass_load_b_1), .load_data_forward(load_data_early_lsu),
-        .destination_out(), .index_out(index_alu_1), .generation_out(generation_alu_1),
-        .result(source_index_alu_1), .result_csr(csr_result_alu_1),
-        .result_now(), .result_early(source_index_alu_early_1),
-        .write_enable_early(write_enable_alu_early_1), .index_early(index_alu_early_1), .generation_early(generation_alu_early_1),
-        .write_enable(write_enable_alu_1)
-    );
 
-    mdu u_mdu_0 (
-        .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
-        .multiply_go(mul_go_0), .multiply_function10(function10_0), .multiply_destination(destination_register_0),
-        .multiply_index_in(issue_index_0), .multiply_generation_in(issue_generation_0),
-        .multiply_source_a(operand_data_a_0), .mul_r2(operand_data_b_0),
-        .divide_go(div_go_0), .divide_function10(function10_0), .divide_destination(destination_register_0),
-        .divide_index_in(issue_index_0), .divide_generation_in(issue_generation_0),
-        .divide_source_a(operand_data_a_0), .div_r2(operand_data_b_0),
-        .multiply_data_out(mul_data_0), .multiply_loaded(mul_write_enable_0), .multiply_write_enable(),
-        .multiply_data_early(mul_data_early_0), .divide_data_early(div_data_early_0),
-        .multiply_write_enable_early(mul_write_enable_early_0), .multiply_index_early(mul_index_early_0), .multiply_generation_early(mul_generation_early_0),
-        .divide_write_enable_early(div_write_enable_early_0), .divide_index_early(div_index_early_0), .divide_generation_early(div_generation_early_0),
-        .rd_mul(), .multiply_index(mul_index_0), .multiply_generation(mul_generation_0),
-        .divide_data_out(div_data_0), .divide_loaded(div_write_enable_0), .divide_write_enable(),
-        .rd_div(), .divide_index(div_index_0), .divide_generation(div_generation_0),
-        .multiply_ready(mul_ready_0), .divide_ready(div_ready_0),
-        .multiply_wake_registered(), .multiply_wake_index_registered(), .multiply_wake_generation_registered(),
-        .multiply_nack_registered(), .multiply_nack_index_registered(), .multiply_nack_generation_registered()
-    );
-
-    mdu u_mdu_1 (
-        .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
-        .multiply_go(mul_go_1), .multiply_function10(function10_1), .multiply_destination(destination_register_1),
-        .multiply_index_in(issue_index_1), .multiply_generation_in(issue_generation_1),
-        .multiply_source_a(operand_data_a_1), .mul_r2(operand_data_b_1),
-        .divide_go(div_go_1), .divide_function10(function10_1), .divide_destination(destination_register_1),
-        .divide_index_in(issue_index_1), .divide_generation_in(issue_generation_1),
-        .divide_source_a(operand_data_a_1), .div_r2(operand_data_b_1),
-        .multiply_data_out(mul_data_1), .multiply_loaded(mul_write_enable_1), .multiply_write_enable(),
-        .multiply_data_early(mul_data_early_1), .divide_data_early(div_data_early_1),
-        .multiply_write_enable_early(mul_write_enable_early_1), .multiply_index_early(mul_index_early_1), .multiply_generation_early(mul_generation_early_1),
-        .divide_write_enable_early(div_write_enable_early_1), .divide_index_early(div_index_early_1), .divide_generation_early(div_generation_early_1),
-        .rd_mul(), .multiply_index(mul_index_1), .multiply_generation(mul_generation_1),
-        .divide_data_out(div_data_1), .divide_loaded(div_write_enable_1), .divide_write_enable(),
-        .rd_div(), .divide_index(div_index_1), .divide_generation(div_generation_1),
-        .multiply_ready(mul_ready_1), .divide_ready(div_ready_1),
-        .multiply_wake_registered(), .multiply_wake_index_registered(), .multiply_wake_generation_registered(),
-        .multiply_nack_registered(), .multiply_nack_index_registered(), .multiply_nack_generation_registered()
-    );
-
-    bju u_bju_0 (
-        .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
-        .source_a_data_in(operand_data_a_0), .source_b_data_in(operand_data_b_0),
-        .branch_unit_function4_in(bju_func4_0),
-        .pc_plus4_in(auxiliary_address_0), .br_off_in(beq_offset_0),
-        .jalr_pred_tgt_in(jump_link_register_prediction_address_0),
-        .branch_prediction_taken_in(branch_prediction_taken_0),
-        .jal_tgt_in(jump_link_target_0),
-        .advance_in(issue_valid_0),
-        .success(success_0), .branch_failure(branch_fail_0), .jump_link_register_failure(jump_link_register_fail_0),
-        .index_in(issue_index_0), .generation_in(issue_generation_0),
-        .index_registered(bju_index_registered_0), .judged_registered(judged_0), .generation_registered(generation_registered_0), .redirect_registered(redir_registered_0),
-        .jump_target(jump_target_0), .jump_link_register_target_registered(jump_link_register_target_0),
-        .branch_pc_index(branch_pc_index_0), .branch_pc_registered(branch_pc_0),
-        .branch_unit_kind(bju_kind_0), .branch_unit_taken(bju_taken_0),
-        .branch_unit_pc(bju_pc_0), .branch_unit_target(bju_target_0),
-        .exception_target_misalign(exception_target_misalign_0),
-        .jump_link_register_target_valid_registered(jump_link_register_valid_0), .branch_prediction_taken_registered(branch_prediction_taken_registered_0),
-        .exception_branch_unit(), .judged_index(bju_index_i_0), .exception_pc_registered(exception_pc_registered_0),
-        .exception_ecall_judged(exception_ecall_0), .exception_ebreak_judged(exception_ebreak_0),
-        .exception_illegal_judged(exception_illegal_0), .exception_interrupt_return_judged(exception_interrupt_ret_0),
-        .exception_ecall_registered(exception_ecall_registered_0), .exception_ebreak_registered(exception_ebreak_registered_0),
-        .exception_illegal_registered(exception_illegal_registered_0), .exception_interrupt_return_registered(exception_interrupt_ret_registered_0),
-        .exception_pc_judged(exception_pc_i_0),
-        .flush_index_in(flush_index)
-    );
-
-    bju u_bju_1 (
-        .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]),
-        .source_a_data_in(operand_data_a_1), .source_b_data_in(operand_data_b_1),
         .branch_unit_function4_in(bju_func4_1),
-        .pc_plus4_in(auxiliary_address_1), .br_off_in(beq_offset_1),
-        .jalr_pred_tgt_in(jump_link_register_prediction_address_1),
+        .beq_offset_in(beq_offset_1),
+        .jump_link_register_prediction_address_in(jump_link_register_prediction_address_1),
+        .jump_link_target_in(jump_link_target_1),
         .branch_prediction_taken_in(branch_prediction_taken_1),
-        .jal_tgt_in(jump_link_target_1),
         .advance_in(issue_valid_1),
+
+        .multiply_go(mul_go_1), .multiply_function10(function10_1),
+        .divide_go(div_go_1),   .divide_function10(function10_1),
+
+        .alu_destination_out(),
+        .alu_index_out(index_alu_1), .alu_generation_out(generation_alu_1),
+        .alu_result(source_index_alu_1), .alu_result_csr(csr_result_alu_1),
+        .alu_result_early(source_index_alu_early_1),
+        .alu_write_enable_early(write_enable_alu_early_1), .alu_index_early(index_alu_early_1), .alu_generation_early(generation_alu_early_1),
+        .alu_write_enable(write_enable_alu_1),
+
+        .multiply_data_out(mul_data_1), .multiply_loaded(mul_write_enable_1),
+        .multiply_data_early(), .divide_data_early(),
+        .multiply_write_enable_early(), .multiply_index_early(), .multiply_generation_early(),
+        .divide_write_enable_early(), .divide_index_early(), .divide_generation_early(),
+        .multiply_index_out(mul_index_1), .multiply_generation_out(mul_generation_1),
+        .divide_data_out(div_data_1), .divide_loaded(div_write_enable_1),
+        .divide_index_out(div_index_1), .divide_generation_out(div_generation_1),
+        .multiply_ready(mul_ready_1), .divide_ready(div_ready_1),
+
         .success(success_1), .branch_failure(branch_fail_1), .jump_link_register_failure(jump_link_register_fail_1),
-        .index_in(issue_index_1), .generation_in(issue_generation_1),
-        .index_registered(bju_index_registered_1), .judged_registered(judged_1), .generation_registered(generation_registered_1), .redirect_registered(redir_registered_1),
+        .exception_target_misalign(exception_target_misalign_1),
         .jump_target(jump_target_1), .jump_link_register_target_registered(jump_link_register_target_1),
         .branch_pc_index(branch_pc_index_1), .branch_pc_registered(branch_pc_1),
+        .jump_link_register_target_valid_registered(jump_link_register_valid_1),
+        .branch_prediction_taken_registered(branch_prediction_taken_registered_1),
+        .judged_index(bju_index_i_1), .index_registered(bju_index_registered_1),
+        .judged_registered(judged_1), .redirect_registered(redir_registered_1), .generation_registered(generation_registered_1),
         .branch_unit_kind(bju_kind_1), .branch_unit_taken(bju_taken_1),
         .branch_unit_pc(bju_pc_1), .branch_unit_target(bju_target_1),
-        .exception_target_misalign(exception_target_misalign_1),
-        .jump_link_register_target_valid_registered(jump_link_register_valid_1), .branch_prediction_taken_registered(branch_prediction_taken_registered_1),
-        .exception_branch_unit(), .judged_index(bju_index_i_1), .exception_pc_registered(exception_pc_registered_1),
+        .exception_pc_registered(exception_pc_registered_1), .exception_pc_judged(exception_pc_i_1),
         .exception_ecall_judged(exception_ecall_1), .exception_ebreak_judged(exception_ebreak_1),
         .exception_illegal_judged(exception_illegal_1), .exception_interrupt_return_judged(exception_interrupt_ret_1),
         .exception_ecall_registered(exception_ecall_registered_1), .exception_ebreak_registered(exception_ebreak_registered_1),
         .exception_illegal_registered(exception_illegal_registered_1), .exception_interrupt_return_registered(exception_interrupt_ret_registered_1),
-        .exception_pc_judged(exception_pc_i_1),
-        .flush_index_in(flush_index)
+
+        .result_write_enable(result_port_1_enable), .result_index(result_port_1_index),
+        .result_generation(result_port_1_generation), .result_data(result_port_1_data),
+        .result_overflow(result_port_1_overflow)
     );
 
 //==============================================================================
@@ -1015,6 +997,7 @@ module cpu_top #(
         .clk(clk), .rst(rst),
         .allocation_en_0(alloc_enable_0), .allocation_en_1(alloc_enable_1),
         .allocation_rd_0(alloc_destination_register_0), .allocation_rd_1(alloc_destination_register_1),
+        .allocation_phys_0(alloc_phys_0), .allocation_phys_1(alloc_phys_1),
         .allocation_we_0(alloc_write_enable_0), .allocation_we_1(alloc_write_enable_1),
         .allocation_jmp_0(alloc_jmp_0), .allocation_jmp_1(alloc_jmp_1),
         .allocation_pend_0(alloc_pending_0), .allocation_pend_1(alloc_pending_1),
@@ -1062,6 +1045,18 @@ module cpu_top #(
         .commit_slot0(commit_slot0), .commit_gen0(commit_gen0),
         .commit_write_enable_1(commit_we1), .commit_destination_1(commit_rd1), .commit_data1(commit_data1),
         .commit_slot1(commit_slot1), .commit_gen1(commit_gen1),
+        .commit_phys0(commit_phys0), .commit_phys1(commit_phys1),
+        .squash_phys_mask(squash_phys_mask),
+//★ 真 PRF 的写口：物理号按槽查出来 + 存活判据
+        .prf_wb_en_0(result_port_0_enable), .prf_wb_index_0(result_port_0_index), .prf_wb_generation_0(result_port_0_generation),
+        .prf_wb_en_1(result_port_1_enable), .prf_wb_index_1(result_port_1_index), .prf_wb_generation_1(result_port_1_generation),
+        .prf_ld_index(load_index_lsu), .prf_ld_generation(load_generation_lsu),
+        .prf_ld_early_index(load_index_early_lsu), .prf_ld_early_generation(load_generation_early_lsu),
+        .prf_ld_early_phys(ld_phys_early), .prf_ld_early_live(prf_ld_early_live),
+        .prf_wb_phys_0(prf_wb_phys_0), .prf_wb_phys_1(prf_wb_phys_1), .prf_ld_phys(prf_ld_phys_wb),
+        .prf_wb_live_0(prf_wb_live_0), .prf_wb_live_1(prf_wb_live_1), .prf_ld_live(prf_ld_live_wb),
+        .prf_alu_early_index_0(index_alu_early_0), .prf_alu_early_index_1(index_alu_early_1),
+        .prf_alu_early_phys_0(phys_alu_early_0), .prf_alu_early_phys_1(phys_alu_early_1),
 
         .head_pointer(head_pointer), .full(rob_full), .slot_above_head(above),
         .slot_above_head_registered(above_registered), .head_one_hot_registered(head_one_hot_registered), .retire_step(rob_ret_step),
@@ -1072,6 +1067,10 @@ module cpu_top #(
 
 //==============================================================================
 // 寄存器堆（两条提交写口）
+//★ 2026-11-04 真 PRF 落地后，这一份【已经没有读者】了：操作数全部从 u_prf 取，
+//  rdata1..6 不再接任何模块。留着只为"架构值另有一份可读副本"这个对照，
+//  综合会把它和 commit_data 那条广播一起裁掉（没有任何扇出）。
+//  真要收回这 1024 个触发器就把这个实例和 rdata* 一起删 —— 不影响功能。
 //==============================================================================
     regfile u_regfile (
         .clk(clk), .rst(rst),

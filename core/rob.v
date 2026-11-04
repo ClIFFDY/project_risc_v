@@ -65,6 +65,10 @@ module rob(
     input [4:0]  allocation_rd_1,
     input        allocation_we_0,
     input        allocation_we_1,
+//★ 2026-11-04 真 PRF：这一条被分到的物理号，跟着 ROB 项走。
+//  提交时它定格进 arch_map；冲刷时把在册项的物理号一起还给空闲表。
+    input [5:0]  allocation_phys_0,
+    input [5:0]  allocation_phys_1,
     input        allocation_jmp_0,
     input        allocation_jmp_1,
 //M 类 / LOAD：即使 rd==0 也会回报完成口，不许在"发出即置可退"里退休
@@ -174,6 +178,24 @@ module rob(
     output reg [31:0] commit_data1,
     output reg [3:0]  commit_slot1,
     output reg        commit_gen1,
+//★ 2026-11-04 真 PRF：这两条提交项各自的物理号（arch_map 定格用）
+    output reg [5:0]  commit_phys0,
+    output reg [5:0]  commit_phys1,
+//★ 冲刷掩码：本拍在册的全部项物理号各展成 one-hot 后 OR 起来，直接给 rename 回收。
+//  kill_arc 已删 ⇒ 本设计每次冲刷都是整表作废，不需要按边界挑。
+    output reg [63:0] squash_phys_mask,
+//★ 2026-11-04 真 PRF：三个写回口的物理号 + 存活判据。
+//  live = 本项还有效、且世代对得上 —— 冲刷之后在飞的结果还会落完，
+//  那些项的物理号可能已经被回收再分配，晚到的死写不许进阵列。
+    input        prf_wb_en_0, input [3:0] prf_wb_index_0, input prf_wb_generation_0,
+    input        prf_wb_en_1, input [3:0] prf_wb_index_1, input prf_wb_generation_1,
+    input [3:0]  prf_ld_index, input prf_ld_generation,
+    input [3:0]  prf_alu_early_index_0, prf_alu_early_index_1,
+    input [3:0]  prf_ld_early_index, input prf_ld_early_generation,
+    output [5:0] prf_ld_early_phys, output prf_ld_early_live,
+    output [5:0] prf_alu_early_phys_0, prf_alu_early_phys_1,
+    output [5:0] prf_wb_phys_0, prf_wb_phys_1, prf_ld_phys,
+    output       prf_wb_live_0, prf_wb_live_1, prf_ld_live,
 //状态
 //★ 提交口改向：队头这一项是"判错过了"的分支 ⇒ 本拍改 PC、并把它之后的全杀掉。
 //  队头即边界 ⇒ "所有在途项都比边界年轻"是定理，消费端不再需要年龄判据。
@@ -255,6 +277,8 @@ reg [4:0]  entry_count_next;
 reg [4:0]  entry_tag [0:DEPTH-1];
 reg [4:0]  tail_tag, tail_tag_next;
 reg [4:0]  entry_destination_register [0:DEPTH-1];
+//★ 2026-11-04：每槽的物理号（真 PRF）。只有【复位 + 分配】两个写源，与 rd 同条件同沿。
+reg [5:0]  entry_phys [0:DEPTH-1];
 //每槽的世代位：每次分配翻转一次。完成上报必须世代一致才被接受 —— 这是"迟到上报
 //打进新住户"的唯一根治手段（entry_valid 挡不住"新住户也 valid"）。
 reg        entry_generation  [0:DEPTH-1];
@@ -291,7 +315,9 @@ reg [4:0]  commit_rd0_comb, commit_rd1_comb;
 reg [31:0] commit_data0_comb, commit_data1_comb;
 reg [3:0]  commit_slot0_comb, commit_slot1_comb;
 reg        commit_gen0_comb, commit_gen1_comb;
+reg [5:0]  commit_phys0_comb, commit_phys1_comb;
 integer ri;
+integer si;
 
 //项状态阵列（v / wr / ex / data / jdg）：唯一被三个区共写的对象，只能有一个 always 块
 //（在本区末尾）：分配建项 / 完成回填 / 退役清项 / 冲刷与陷阱清项。
@@ -395,6 +421,7 @@ always @(*) begin
             for (ai = 0; ai < DEPTH; ai = ai + 1) begin
                 entry_tag[ai]  <= 5'd0;
                 entry_destination_register[ai]   <= 5'd0;
+                entry_phys[ai]   <= 6'd0;
                 entry_generation[ai]  <= 1'b0;
                 entry_jump[ai]  <= 1'b0;
                 entry_pending[ai] <= 1'b0;
@@ -406,6 +433,7 @@ always @(*) begin
                 entry_tag[tail_pointer]  <= tail_tag;
 //前送表的目的寄存器号（保守侧：SYSTEM 也算写，带上 rd != 0 后只剩非法编码会"报了写其实不写"）。
                 entry_destination_register[tail_pointer]   <= (allocation_we_0 && (allocation_rd_0 != 5'd0)) ? allocation_rd_0 : 5'd0;
+                entry_phys[tail_pointer]                   <= (allocation_we_0 && (allocation_rd_0 != 5'd0)) ? allocation_phys_0 : 6'd0;
                 entry_generation[tail_pointer]  <= ~entry_generation[tail_pointer];
                 entry_jump[tail_pointer]  <= allocation_jmp_0;
                 entry_pending[tail_pointer] <= allocation_pend_0;
@@ -415,6 +443,7 @@ always @(*) begin
             if (allocation_en_1 && !full && !flush_control_rob) begin
                 entry_tag[allocation_index_1] <= tail_tag + {4'd0, allocation_en_0};
                 entry_destination_register[allocation_index_1]   <= (allocation_we_1 && (allocation_rd_1 != 5'd0)) ? allocation_rd_1 : 5'd0;
+                entry_phys[allocation_index_1]                   <= (allocation_we_1 && (allocation_rd_1 != 5'd0)) ? allocation_phys_1 : 6'd0;
                 entry_generation[allocation_index_1]  <= ~entry_generation[allocation_index_1];
                 entry_jump[allocation_index_1]  <= allocation_jmp_1;
                 entry_pending[allocation_index_1] <= allocation_pend_1;
@@ -514,10 +543,20 @@ always @(*) begin
 //★ entry_destination_register != 0 与 head_ok 里的 !entry_exception 是两道独立的门：故障项的 entry_destination_register 可能非 0。
         commit_we0_comb   = head_ok && (entry_destination_register[head_pointer] != 5'd0);
         commit_rd0_comb   = entry_destination_register[head_pointer];
+        commit_phys0_comb = entry_phys[head_pointer];
         commit_data0_comb = entry_data[head_pointer];
         commit_we1_comb   = head_next_ok && (entry_destination_register[head_next_pointer] != 5'd0);
         commit_rd1_comb   = entry_destination_register[head_next_pointer];
+        commit_phys1_comb = entry_phys[head_next_pointer];
         commit_data1_comb = entry_data[head_next_pointer];
+
+//★ 2026-11-04 真 PRF：冲刷时把【在册全部项】的物理号各展成 one-hot 再 OR，直接交给 rename 回收。
+//  kill_arc 已删（每次冲刷整表作废、没有"部分冲刷"），所以这里不需要按边界挑。
+//  没写回的项 entry_phys 恒 0，贡献的是 bit0（物理 0 = x0，rename 那边会掩掉）。
+        squash_phys_mask = 64'd0;
+        for (si = 0; si < DEPTH; si = si + 1)
+            if (entry_valid[si])
+                squash_phys_mask = squash_phys_mask | (64'd1 << entry_phys[si]);
         commit_slot0_comb = head_pointer;
         commit_gen0_comb  = entry_generation[head_pointer];
         commit_slot1_comb = head_next_pointer;
@@ -646,13 +685,17 @@ always @(*) begin
             commit_slot1 <= 4'd0;
             commit_gen0  <= 1'b0;
             commit_gen1  <= 1'b0;
+            commit_phys0 <= 6'd0;
+            commit_phys1 <= 6'd0;
         end
         else begin
             commit_write_enable_0   <= commit_we0_comb;
             commit_destination_0   <= commit_rd0_comb;
+            commit_phys0 <= commit_phys0_comb;
             commit_data0 <= commit_data0_comb;
             commit_write_enable_1   <= commit_we1_comb;
             commit_destination_1   <= commit_rd1_comb;
+            commit_phys1 <= commit_phys1_comb;
             commit_data1 <= commit_data1_comb;
             commit_slot0 <= commit_slot0_comb;
             commit_slot1 <= commit_slot1_comb;
@@ -840,6 +883,19 @@ always @(*) begin
         end
     end
 
-
+//==============================================================================
+// 真 PRF 写口的物理号 / 存活判据
+//   连续赋值（不进 always @(*)）—— 数组元素在 always @(*) 里进不了敏感表，本仓踩过。
+//==============================================================================
+    assign prf_wb_phys_0 = entry_phys[prf_wb_index_0];
+    assign prf_wb_phys_1 = entry_phys[prf_wb_index_1];
+    assign prf_ld_phys   = entry_phys[prf_ld_index];
+    assign prf_alu_early_phys_0 = entry_phys[prf_alu_early_index_0];
+    assign prf_ld_early_phys    = entry_phys[prf_ld_early_index];
+    assign prf_ld_early_live    = entry_valid[prf_ld_early_index] & (entry_generation[prf_ld_early_index] == prf_ld_early_generation);
+    assign prf_alu_early_phys_1 = entry_phys[prf_alu_early_index_1];
+    assign prf_wb_live_0 = prf_wb_en_0 & entry_valid[prf_wb_index_0] & (entry_generation[prf_wb_index_0] == prf_wb_generation_0);
+    assign prf_wb_live_1 = prf_wb_en_1 & entry_valid[prf_wb_index_1] & (entry_generation[prf_wb_index_1] == prf_wb_generation_1);
+    assign prf_ld_live   =                 entry_valid[prf_ld_index]   & (entry_generation[prf_ld_index]   == prf_ld_generation);
 
 endmodule
