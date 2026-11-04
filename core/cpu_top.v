@@ -129,6 +129,8 @@ module cpu_top #(
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
 //★ 2026-11-04 真 PRF：物理号与冲刷掩码
     wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
+//精确冲刷第 1 步：分配时顶掉的旧映射（随 ROB 项存，将来回滚 rat 用；现在没有读者）
+    wire [5:0]  alloc_old_phys_0, alloc_old_phys_1;
 //★ 2026-11-04（CSR 步骤 C）：CSR 随 ROB 项走、在提交拍落地。载荷 {写使能 1, 地址 12, funct3 3, 源 6}。
     wire        alloc_csr_0, alloc_csr_1;
     wire [21:0] alloc_csr_payload_0, alloc_csr_payload_1;
@@ -618,7 +620,7 @@ module cpu_top #(
         .alloc_ecall_0(alloc_ecall_0), .alloc_ebreak_0(alloc_ebreak_0),
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
         .alloc_rd_0(alloc_destination_register_0),
-        .alloc_phys_0(alloc_phys_0),
+        .alloc_phys_0(alloc_phys_0), .alloc_old_phys_0(alloc_old_phys_0),
         .alloc_csr_0(alloc_csr_0), .alloc_csr_payload_0(alloc_csr_payload_0),
         .dec_class_0(decoded_class_0), .dec_we_0(decoded_write_enable_0), .dec_rd_0(decoded_destination_register_0),
         .dec_is_st_0(decoded_is_store_0), .dec_mulop_0(decoded_mulop_0), .dec_lsf3_0(decoded_load_store_function3_0),
@@ -647,7 +649,7 @@ module cpu_top #(
         .alloc_ecall_1(alloc_ecall_1), .alloc_ebreak_1(alloc_ebreak_1),
         .alloc_illegal_1(alloc_illegal_1), .alloc_mret_1(alloc_mret_1),
         .alloc_rd_1(alloc_destination_register_1),
-        .alloc_phys_1(alloc_phys_1),
+        .alloc_phys_1(alloc_phys_1), .alloc_old_phys_1(alloc_old_phys_1),
         .alloc_csr_1(alloc_csr_1), .alloc_csr_payload_1(alloc_csr_payload_1),
         .dec_class_1(decoded_class_1), .dec_we_1(decoded_write_enable_1), .dec_rd_1(decoded_destination_register_1),
         .dec_is_st_1(decoded_is_store_1), .dec_mulop_1(decoded_mulop_1), .dec_lsf3_1(decoded_load_store_function3_1),
@@ -1023,6 +1025,7 @@ module cpu_top #(
         .allocation_en_0(alloc_enable_0), .allocation_en_1(alloc_enable_1),
         .allocation_rd_0(alloc_destination_register_0), .allocation_rd_1(alloc_destination_register_1),
         .allocation_phys_0(alloc_phys_0), .allocation_phys_1(alloc_phys_1),
+        .allocation_old_phys_0(alloc_old_phys_0), .allocation_old_phys_1(alloc_old_phys_1),
         .allocation_we_0(alloc_write_enable_0), .allocation_we_1(alloc_write_enable_1),
         .allocation_jmp_0(alloc_jmp_0), .allocation_jmp_1(alloc_jmp_1),
         .allocation_pend_0(alloc_pending_0), .allocation_pend_1(alloc_pending_1),

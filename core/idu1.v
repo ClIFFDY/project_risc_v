@@ -89,6 +89,9 @@ module idu1(
     output reg [21:0] alloc_csr_payload_0,
 //★ 2026-11-04 真 PRF：这一条被分到的物理号，交给 rob 随项存（提交定格 / 冲刷回收都用它）
     output [5:0]      alloc_phys_0,
+//★ 2026-11-04（精确冲刷第 1 步）：这一条分配时顶掉的那个映射（= rat[rd] 的旧值），随 ROB 项走。
+//  精确冲刷时用它把 rat 回滚到边界那一刻，而不必整表抄 arch_map。本步只存不用，对通路透明。
+    output [5:0]      alloc_old_phys_0,
 //★ 2026-11-04 真 PRF：给 PRF 的就绪位当门（本拍分配的号 / 冲刷后仍在用的号）
     output [63:0]     alloc_onehot_0,
     output [63:0]     arch_next_onehot_0,
@@ -145,6 +148,8 @@ module idu1(
     output reg        alloc_csr_1,
     output reg [21:0] alloc_csr_payload_1,
     output [5:0]      alloc_phys_1,
+//★ 同 lane0：分配时顶掉的旧映射
+    output [5:0]      alloc_old_phys_1,
     output reg [1:0]  dec_class_1,
     output reg        dec_we_1,
     output reg [4:0]  dec_rd_1,
@@ -1637,6 +1642,7 @@ module idu1(
     wire       rename_stall_0, rename_stall_1;
     wire       rename_bank_empty_0, rename_bank_empty_1;
     wire [5:0] lookup_a_phys, lookup_b_phys, lookup_c_phys, lookup_d_phys;
+    wire [5:0] old_phys_0, old_phys_1;
     wire [63:0] rename_alloc_onehot, rename_arch_next_onehot;
 
     rename u_rename (
@@ -1644,6 +1650,7 @@ module idu1(
         .alloc_en_0(alloc_lane0 & ~rob_full_in), .alloc_we_0(destination_decoded != 5'd0), .alloc_rd_0(destination_decoded),
         .alloc_rs1_0(source_a_dec_0), .alloc_rs2_0(source_b_dec_0),
         .phys_rd_0(rename_phys_rd_0), .phys_rs1_0(rename_phys_rs1_0), .phys_rs2_0(rename_phys_rs2_0),
+        .old_phys_0(old_phys_0), .old_phys_1(old_phys_1),
         .alloc_en_1(alloc_lane1 & ~rob_full_in), .alloc_we_1(destination_decoded_1 != 5'd0), .alloc_rd_1(destination_decoded_1),
         .alloc_rs1_1(source_a_dec_1), .alloc_rs2_1(source_b_dec_1),
         .phys_rd_1(rename_phys_rd_1), .phys_rs1_1(rename_phys_rs1_1), .phys_rs2_1(rename_phys_rs2_1),
@@ -1661,6 +1668,8 @@ module idu1(
     );
 
     assign alloc_phys_0 = rename_phys_rd_0;
+    assign alloc_old_phys_0 = old_phys_0;
+    assign alloc_old_phys_1 = old_phys_1;
     assign alloc_onehot_0 = rename_alloc_onehot;
     assign arch_next_onehot_0 = rename_arch_next_onehot;
     assign alloc_phys_1 = rename_phys_rd_1;

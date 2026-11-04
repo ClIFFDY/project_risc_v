@@ -69,6 +69,10 @@ module rob(
 //  提交时它定格进 arch_map；冲刷时把在册项的物理号一起还给空闲表。
     input [5:0]  allocation_phys_0,
     input [5:0]  allocation_phys_1,
+//★ 2026-11-04（精确冲刷第 1 步）：分配时被顶掉的旧映射 = 分配那一拍 rat[rd] 的原值。
+//  精确冲刷时按「击杀集合里同架构号最老那条」的 old_phys 回滚 rat。本步只存不用，对通路透明。
+    input [5:0]  allocation_old_phys_0,
+    input [5:0]  allocation_old_phys_1,
 //★ 2026-11-04（CSR 步骤 C）：CSR 指令与它的载荷 {写使能 1, 地址 12, funct3 3, 源 6}。
 //  ★ 载荷**单独一组阵列**，不借 entry_target：借用的第一版实测把 entry_target 的 D 脚变成一个
 //    跨 bju/lsu/idu1 三处的大 mux（它本来有判定口和异常口两个写源，再加分配拍这一个），
@@ -287,7 +291,7 @@ reg [4:0]  entry_destination_register [0:DEPTH-1];
 //★ 2026-11-04：每槽的物理号（真 PRF）。只有【复位 + 分配】两个写源，与 rd 同条件同沿。
 reg [5:0]  entry_phys [0:DEPTH-1];
 //★ 2026-11-04：这一项分配时顶掉的那个映射（rat[rd] 的旧值），精确冲刷回滚用。
-//  暂时只存不用：现在的冲刷仍然是整窗作废，接回滚是下一步。
+//  第 1 步（透明中间态）已经接线并每项存下来；回滚逻辑是下一步，现在没有任何读者。
 reg [5:0]  entry_old_phys [0:DEPTH-1];
 //每槽的世代位：每次分配翻转一次。完成上报必须世代一致才被接受 —— 这是"迟到上报
 //打进新住户"的唯一根治手段（entry_valid 挡不住"新住户也 valid"）。
@@ -296,8 +300,14 @@ reg        entry_jump  [0:DEPTH-1];
 reg        entry_pending [0:DEPTH-1];
 reg        entry_system  [0:DEPTH-1];
 //★ 2026-11-04（CSR 步骤 C）：这一项是不是 CSR 指令，以及它的载荷（单独一组，理由见端口注释）。
+//  ★ 载荷阵列必须显式声明成分布式 RAM：落成触发器时每个 D 脚都是 `we ? payload : Q`，
+//    写使能里带着 entry_count 比较（!full），一根网扇到 22×16=352 个 D 脚 ⇒ 实测 top200 里
+//    166 条的终点是它，WNS 只剩 +0.054。
+//  ★ 而且它【不能进复位循环】：带复位的阵列推断不成 RAM（只加 ram_style 没用，dp3 实测
+//    WNS 一位没动、利用率逐字相同）。它只在 entry_csr==1 时被读，而 entry_csr 每次分配都写
+//    ⇒ 陈值永远不会被消费，不清是安全的。
 reg        entry_csr     [0:DEPTH-1];
-reg [21:0] entry_csr_payload [0:DEPTH-1];
+(* ram_style = "distributed" *) reg [21:0] entry_csr_payload [0:DEPTH-1];
 integer ai;
 
 //重建口：物理槽序，静态下标（零 mux）
@@ -435,12 +445,12 @@ always @(*) begin
                 entry_tag[ai]  <= 5'd0;
                 entry_destination_register[ai]   <= 5'd0;
                 entry_phys[ai]   <= 6'd0;
+                entry_old_phys[ai] <= 6'd0;
                 entry_generation[ai]  <= 1'b0;
                 entry_jump[ai]  <= 1'b0;
                 entry_pending[ai] <= 1'b0;
                 entry_system[ai]  <= 1'b0;
                 entry_csr[ai]     <= 1'b0;
-                entry_csr_payload[ai] <= 22'd0;
             end
         end
         else begin
@@ -449,6 +459,7 @@ always @(*) begin
 //前送表的目的寄存器号（保守侧：SYSTEM 也算写，带上 rd != 0 后只剩非法编码会"报了写其实不写"）。
                 entry_destination_register[tail_pointer]   <= (allocation_we_0 && (allocation_rd_0 != 5'd0)) ? allocation_rd_0 : 5'd0;
                 entry_phys[tail_pointer]                   <= (allocation_we_0 && (allocation_rd_0 != 5'd0)) ? allocation_phys_0 : 6'd0;
+                entry_old_phys[tail_pointer]               <= (allocation_we_0 && (allocation_rd_0 != 5'd0)) ? allocation_old_phys_0 : 6'd0;
                 entry_generation[tail_pointer]  <= ~entry_generation[tail_pointer];
                 entry_jump[tail_pointer]  <= allocation_jmp_0;
                 entry_pending[tail_pointer] <= allocation_pend_0;
@@ -461,6 +472,7 @@ always @(*) begin
                 entry_tag[allocation_index_1] <= tail_tag + {4'd0, allocation_en_0};
                 entry_destination_register[allocation_index_1]   <= (allocation_we_1 && (allocation_rd_1 != 5'd0)) ? allocation_rd_1 : 5'd0;
                 entry_phys[allocation_index_1]                   <= (allocation_we_1 && (allocation_rd_1 != 5'd0)) ? allocation_phys_1 : 6'd0;
+                entry_old_phys[allocation_index_1]               <= (allocation_we_1 && (allocation_rd_1 != 5'd0)) ? allocation_old_phys_1 : 6'd0;
                 entry_generation[allocation_index_1]  <= ~entry_generation[allocation_index_1];
                 entry_jump[allocation_index_1]  <= allocation_jmp_1;
                 entry_pending[allocation_index_1] <= allocation_pend_1;
