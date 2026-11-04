@@ -82,6 +82,11 @@ module idu1(
 //★ 保持四根分开，ROB 只在判据里或，不合成一根。
     output reg        alloc_ecall_0, alloc_ebreak_0, alloc_illegal_0, alloc_mret_0,
     output reg [4:0]  alloc_rd_0,
+//★ 2026-11-04（CSR 步骤 C）：这条是 CSR 指令，以及随 ROB 项走的载荷
+//  {写使能 1, csr 地址 12, funct3 3, 源 6}。源 = 立即数形式的 zimm，或寄存器形式的 rs1 物理号；
+//  提交拍由 funct3[2] 二选一（1xx = 立即数形式，恰好就是本条）。
+    output reg        alloc_csr_0,
+    output reg [21:0] alloc_csr_payload_0,
 //★ 2026-11-04 真 PRF：这一条被分到的物理号，交给 rob 随项存（提交定格 / 冲刷回收都用它）
     output [5:0]      alloc_phys_0,
 //★ 2026-11-04 真 PRF：给 PRF 的就绪位当门（本拍分配的号 / 冲刷后仍在用的号）
@@ -136,6 +141,9 @@ module idu1(
     output reg        alloc_pend_1,
     output reg        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1,
     output reg [4:0]  alloc_rd_1,
+//★ 同 lane0：CSR / 载荷
+    output reg        alloc_csr_1,
+    output reg [21:0] alloc_csr_payload_1,
     output [5:0]      alloc_phys_1,
     output reg [1:0]  dec_class_1,
     output reg        dec_we_1,
@@ -162,7 +170,7 @@ module idu1(
 // 访存专用流（LSU FIFO）
 //   iffu 队头按【这一格的 opcode】分流三路：lane0 / lane1 / 这里。每拍最多进一条。
 //   条目只存 {instruction, pc, rob 索引, 世代, 两个源的生产者 tag} —— rs1/rs2/imm 一律不存：
-//   队头是寄存器，组合译码 + regfile 组合读正好一拍落到 idu2 的 D。
+//   队头是寄存器，组合译码正好一拍落到 idu2 的 D；操作数不在这里读，由 idu2 按物理号从 prf 取。
 //★ 生产者 tag 为什么随条目走：访存条在 FIFO 里可能躺好几拍才轮到 idu2 的 D，
 //  而 pstat 只保留"最年轻的写者"。等它出队时才查表，查到的是那些【比它年轻】、
 //  在它排队期间已经登记的写者 ⇒ 拿错值（实测 seed8：`sw x31,116(x1)` 的 x1 被一条更年轻的
@@ -1656,5 +1664,26 @@ module idu1(
     assign alloc_onehot_0 = rename_alloc_onehot;
     assign arch_next_onehot_0 = rename_arch_next_onehot;
     assign alloc_phys_1 = rename_phys_rd_1;
+
+//==============================================================================
+//  CSR 随项载荷（2026-11-04，CSR 步骤 C：读-改-写搬出执行级）
+//  ★ 为什么放在文件末尾：lookup_*_phys 的声明在 rename 例化旁边（本文件一贯的声明顺序），
+//    写在前面会变成"先使用后声明"（iverilog 直接当错误）。
+//  ★ 源字段两种形态：csrrwi/rsrsi/rrci 的 rs1 字段是 zimm，idu1 已经按立即数解释
+//    （source_a_immediate_*），这里就填 zimm；其余填 rs1 的物理号。
+//    提交口用 funct3[2] 二选一 —— 1xx 恰好就是立即数形式。
+//  ★ 寄存器形式下 rs1=x0 ⇔ 物理号 0（0 号永不写入）⇒ 提交口可以用"源字段 != 0"重算
+//    csr_wr_dec 那个"源非 0 才写"的判据，不必再单独带一根。
+//==============================================================================
+    always @(*) begin
+        alloc_csr_0 = csr_write_enable_decoded;
+        alloc_csr_payload_0 = {csr_write_commit_decoded, csr_address_decoded, csr_function3_decoded,
+                               source_a_immediate_decoded ? {1'b0, source_a_immediate_value_decoded[4:0]}
+                                                          : lookup_a_phys};
+        alloc_csr_1 = csr_write_enable_decoded_1;
+        alloc_csr_payload_1 = {csr_write_commit_decoded_1, csr_address_decoded_1, csr_function3_decoded_1,
+                               source_a_immediate_decoded_1 ? {1'b0, source_a_immediate_value_decoded_1[4:0]}
+                                                            : lookup_c_phys};
+    end
 
 endmodule

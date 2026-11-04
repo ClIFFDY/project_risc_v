@@ -69,6 +69,15 @@ module rob(
 //  提交时它定格进 arch_map；冲刷时把在册项的物理号一起还给空闲表。
     input [5:0]  allocation_phys_0,
     input [5:0]  allocation_phys_1,
+//★ 2026-11-04（CSR 步骤 C）：CSR 指令与它的载荷 {写使能 1, 地址 12, funct3 3, 源 6}。
+//  ★ 载荷**单独一组阵列**，不借 entry_target：借用的第一版实测把 entry_target 的 D 脚变成一个
+//    跨 bju/lsu/idu1 三处的大 mux（它本来有判定口和异常口两个写源，再加分配拍这一个），
+//    12.5ns 下直接成了最差路径（−0.852/432，比不借用的 −0.588/159 还差）。
+//    单独一组只有【分配】一个写源，D 脚就是载荷本身。代价 22×16 = 352 FF。
+    input        allocation_csr_0,
+    input [21:0] allocation_csr_payload_0,
+    input        allocation_csr_1,
+    input [21:0] allocation_csr_payload_1,
     input        allocation_jmp_0,
     input        allocation_jmp_1,
 //M 类 / LOAD：即使 rd==0 也会回报完成口，不许在"发出即置可退"里退休
@@ -170,17 +179,15 @@ module rob(
 //退口：寄存器堆的两条写口（口 A = head、口 B = head+1）
     output reg        commit_write_enable_0,
     output reg [4:0]  commit_destination_0,
-    output reg [31:0] commit_data0,
-    output reg [3:0]  commit_slot0,
-    output reg        commit_gen0,
     output reg        commit_write_enable_1,
     output reg [4:0]  commit_destination_1,
-    output reg [31:0] commit_data1,
-    output reg [3:0]  commit_slot1,
-    output reg        commit_gen1,
 //★ 2026-11-04 真 PRF：这两条提交项各自的物理号（arch_map 定格用）
     output reg [5:0]  commit_phys0,
     output reg [5:0]  commit_phys1,
+//★ CSR 提交口（与 commit_write_enable_* 同相，打一拍）：csr.v 在这一拍做读-改-写并落地。
+//  载荷 = {写使能, 地址, funct3, 源}，原样吐出去，不在这里解释。
+    output reg        commit_csr_valid,
+    output reg [21:0] commit_csr_payload,
 //★ 冲刷掩码：本拍在册的全部项物理号各展成 one-hot 后 OR 起来，直接给 rename 回收。
 //  kill_arc 已删 ⇒ 本设计每次冲刷都是整表作废，不需要按边界挑。
     output reg [63:0] squash_phys_mask,
@@ -279,12 +286,18 @@ reg [4:0]  tail_tag, tail_tag_next;
 reg [4:0]  entry_destination_register [0:DEPTH-1];
 //★ 2026-11-04：每槽的物理号（真 PRF）。只有【复位 + 分配】两个写源，与 rd 同条件同沿。
 reg [5:0]  entry_phys [0:DEPTH-1];
+//★ 2026-11-04：这一项分配时顶掉的那个映射（rat[rd] 的旧值），精确冲刷回滚用。
+//  暂时只存不用：现在的冲刷仍然是整窗作废，接回滚是下一步。
+reg [5:0]  entry_old_phys [0:DEPTH-1];
 //每槽的世代位：每次分配翻转一次。完成上报必须世代一致才被接受 —— 这是"迟到上报
 //打进新住户"的唯一根治手段（entry_valid 挡不住"新住户也 valid"）。
 reg        entry_generation  [0:DEPTH-1];
 reg        entry_jump  [0:DEPTH-1];
 reg        entry_pending [0:DEPTH-1];
 reg        entry_system  [0:DEPTH-1];
+//★ 2026-11-04（CSR 步骤 C）：这一项是不是 CSR 指令，以及它的载荷（单独一组，理由见端口注释）。
+reg        entry_csr     [0:DEPTH-1];
+reg [21:0] entry_csr_payload [0:DEPTH-1];
 integer ai;
 
 //重建口：物理槽序，静态下标（零 mux）
@@ -312,10 +325,10 @@ reg        head_next_ok;
 //提交口的组合版（打拍前）：head_ok / entry_destination_register[head_pointer] / entry_data[head_pointer]
 reg        commit_we0_comb, commit_we1_comb;
 reg [4:0]  commit_rd0_comb, commit_rd1_comb;
-reg [31:0] commit_data0_comb, commit_data1_comb;
-reg [3:0]  commit_slot0_comb, commit_slot1_comb;
-reg        commit_gen0_comb, commit_gen1_comb;
 reg [5:0]  commit_phys0_comb, commit_phys1_comb;
+//CSR 提交口（打拍前）：队头这一项是 CSR 就吐载荷
+reg        commit_csr_comb;
+reg [21:0] commit_csr_payload_comb;
 integer ri;
 integer si;
 
@@ -426,6 +439,8 @@ always @(*) begin
                 entry_jump[ai]  <= 1'b0;
                 entry_pending[ai] <= 1'b0;
                 entry_system[ai]  <= 1'b0;
+                entry_csr[ai]     <= 1'b0;
+                entry_csr_payload[ai] <= 22'd0;
             end
         end
         else begin
@@ -438,6 +453,8 @@ always @(*) begin
                 entry_jump[tail_pointer]  <= allocation_jmp_0;
                 entry_pending[tail_pointer] <= allocation_pend_0;
                 entry_system[tail_pointer]  <= allocation_ecall_0 | allocation_ebreak_0 | allocation_illegal_0 | allocation_mret_0;
+                entry_csr[tail_pointer]     <= allocation_csr_0;
+                entry_csr_payload[tail_pointer] <= allocation_csr_payload_0;
                 entry_pc[tail_pointer]      <= allocation_pc_0;
             end
             if (allocation_en_1 && !full && !flush_control_rob) begin
@@ -448,6 +465,8 @@ always @(*) begin
                 entry_jump[allocation_index_1]  <= allocation_jmp_1;
                 entry_pending[allocation_index_1] <= allocation_pend_1;
                 entry_system[allocation_index_1]  <= allocation_ecall_1 | allocation_ebreak_1 | allocation_illegal_1 | allocation_mret_1;
+                entry_csr[allocation_index_1]     <= allocation_csr_1;
+                entry_csr_payload[allocation_index_1] <= allocation_csr_payload_1;
                 entry_pc[allocation_index_1]      <= allocation_pc_1;
             end
         end
@@ -544,11 +563,13 @@ always @(*) begin
         commit_we0_comb   = head_ok && (entry_destination_register[head_pointer] != 5'd0);
         commit_rd0_comb   = entry_destination_register[head_pointer];
         commit_phys0_comb = entry_phys[head_pointer];
-        commit_data0_comb = entry_data[head_pointer];
         commit_we1_comb   = head_next_ok && (entry_destination_register[head_next_pointer] != 5'd0);
         commit_rd1_comb   = entry_destination_register[head_next_pointer];
         commit_phys1_comb = entry_phys[head_next_pointer];
-        commit_data1_comb = entry_data[head_next_pointer];
+//CSR：队头这一项是 CSR ⇒ 载荷随提交口出去。1 宽就够 —— 同时至多一条 CSR 在飞
+//（idu2 的 csr_held 要求它发射时就是队头），同拍不可能有第二条在 head+1 上等。
+        commit_csr_comb         = head_ok && entry_csr[head_pointer];
+        commit_csr_payload_comb = entry_csr_payload[head_pointer];
 
 //★ 2026-11-04 真 PRF：冲刷时把【在册全部项】的物理号各展成 one-hot 再 OR，直接交给 rename 回收。
 //  kill_arc 已删（每次冲刷整表作废、没有"部分冲刷"），所以这里不需要按边界挑。
@@ -557,10 +578,6 @@ always @(*) begin
         for (si = 0; si < DEPTH; si = si + 1)
             if (entry_valid[si])
                 squash_phys_mask = squash_phys_mask | (64'd1 << entry_phys[si]);
-        commit_slot0_comb = head_pointer;
-        commit_gen0_comb  = entry_generation[head_pointer];
-        commit_slot1_comb = head_next_pointer;
-        commit_gen1_comb  = entry_generation[head_next_pointer];
     end
 
 //队头字段副本的装载：每个沿装【下一拍的队头】那一项（head_pointer_next 正是 head_pointer 在下一沿的值，
@@ -668,8 +685,9 @@ always @(*) begin
         end
     end
 
-//提交口打一拍：把"要不要写 / 写哪个 / 写什么"在提交拍算好、寄存，下一拍再写寄存器堆。
-//★ 为什么打：regfile 是变址写阵列，综合器表达不出 CE，只能合成 D_i = (we&&rd==i)?data:Q_i
+//提交口打一拍：把"要不要提交 / 提交哪个架构号 / 对应哪个物理号"在提交拍算好、寄存，
+//  下一拍再交给 rename 的提交口（arch_map 定格 + 物理号回收）。
+//★ 为什么打：arch_map 是变址写阵列，综合器表达不出 CE，只能合成 D_i = (we&&rd==i)?phys:Q_i
 //  ⇒ head_ok 里的中断/异常/分支判定锥会整条压在阵列的 D 引脚上。打一拍后长锥止于此。
 //★ 绝不能在 exception_valid_delayed / 冲刷拍清：head_ok 与 exception_valid_delayed 天然互斥（一个要 !entry_exception、一个要 entry_exception）；
 //  冲刷只作废比边界年轻的项，而打拍里那笔在边界之前 ⇒ 清了会丢一笔合法写。
@@ -677,30 +695,22 @@ always @(*) begin
         if (reset_registered) begin
             commit_write_enable_0   <= 1'b0;
             commit_destination_0   <= 5'd0;
-            commit_data0 <= 32'd0;
             commit_write_enable_1   <= 1'b0;
             commit_destination_1   <= 5'd0;
-            commit_data1 <= 32'd0;
-            commit_slot0 <= 4'd0;
-            commit_slot1 <= 4'd0;
-            commit_gen0  <= 1'b0;
-            commit_gen1  <= 1'b0;
             commit_phys0 <= 6'd0;
             commit_phys1 <= 6'd0;
+            commit_csr_valid <= 1'b0;
+            commit_csr_payload <= 22'd0;
         end
         else begin
             commit_write_enable_0   <= commit_we0_comb;
             commit_destination_0   <= commit_rd0_comb;
             commit_phys0 <= commit_phys0_comb;
-            commit_data0 <= commit_data0_comb;
             commit_write_enable_1   <= commit_we1_comb;
             commit_destination_1   <= commit_rd1_comb;
             commit_phys1 <= commit_phys1_comb;
-            commit_data1 <= commit_data1_comb;
-            commit_slot0 <= commit_slot0_comb;
-            commit_slot1 <= commit_slot1_comb;
-            commit_gen0  <= commit_gen0_comb;
-            commit_gen1  <= commit_gen1_comb;
+            commit_csr_valid   <= commit_csr_comb;
+            commit_csr_payload <= commit_csr_payload_comb;
         end
     end
 

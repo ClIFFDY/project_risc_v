@@ -44,6 +44,8 @@ module lsu(
     input dcache_hold,
 //dcache 这一拍收不收新请求（纯状态量，见 dcache.v 端口说明）
     input dcache_blocked,
+//dcache 的 B 口忙不忙（纯状态量）。排水判据用它，不用任何地址量。
+    input dcache_store_blocked,
     input load_ready_next,
 // P2/P3: only registered decisions: head_one_hot_registered = head one-hot, redirect_any = redirect outstanding.
 // No head pointer (that spread the ROB decision cone into this module's write enables).
@@ -53,11 +55,15 @@ module lsu(
 //★ 总线出口【一分为二】：dcache 独占一套内部总线，不和 AHB master（外设/定时器）抢同一组 out。
 //  dcache 口只走可缓存流量，外部口只走不可缓存流量。两支的地址/数据取同一个源寄存器，
 //  仲裁只落在两个 valid 上 —— "该发给谁"不再穿在 32 位地址路径上。
+//★ 2026-11-04：A 口只读（load），store 排水走下面的 store_* 独立口。
     output reg [31:0] dcache_address_out,
-    output reg [31:0] dcache_data_out,
-    output reg [3:0] dcache_byte_enable_out,
-    output reg dcache_we_out,
     output reg dcache_valid_out,
+//---- B 口：ELSQ 排空（可缓存 store）→ dcache 的第二个口 ----
+//  三根载荷全是 ELSQ 的寄存器；valid 由【寄存器量】决定（队头是 store 且已退休且 B 口不忙）。
+    output [31:0] store_address_out,
+    output [31:0] store_data_out,
+    output [3:0]  store_byte_enable_out,
+    output        store_valid_out,
     output reg [31:0] stage1_address_out,
     output reg [31:0] stage1_data_out,
     output reg [3:0] stage1_byte_enable_out,
@@ -179,9 +185,8 @@ module lsu(
 //★ 2026-10-31：排空那一笔的【寄存器出口】。原来它直接组合进 dcache_D，
 //  ROB 的退休判据（store_queue_a_ret）就一路打到 dcache 的 fill_tag/BRAM 地址/WE 上
 //  （实测 68/200 条最差路，源全是 u_rob/entry_valid_reg）。这里先锁一拍再进 dcache。
-    reg        drain_req_valid, drain_req_we, drain_req_nc;
-    reg [31:0] drain_req_address, drain_req_data;
-    reg [3:0]  drain_req_byte_enable;
+//★ 2026-11-04：这一段连同 drain_req_* 整个删掉 —— store 排水现在走 dcache 的 B 口，
+//  载荷就是 store_queue_a_* 那几个寄存器，不再需要为 A 口单独锁一份。
     reg stage1_kill, stage2_kill, stage1_ret, stage2_ret, stage1_cmt, stage2_cmt;
 //  级3（写回）：与 dcache 里锁住的那条是【同一条】—— 进级2 时已经发过请求，
 //               在这一级只等数据回来（ready_in），所以不需要再发、也不用带载荷。
@@ -239,6 +244,8 @@ module lsu(
     reg        elsq_return_generation;
 //★ load_go = "本拍有一笔读摆上总线"。控制网，打 max_fanout 反而把 SQ 写使能推深，已撤。
     reg        store_queue_a_ret, store_queue_b_ret_now, store_queue_a_drop, store_queue_b_drop, store_queue_drain, load_go;
+//★ 2026-11-04：一笔 store 从"排水起飞"到"dcache B 口办完"之间在册。队列项挂到办完才出队。
+    reg        store_inflight, store_finish;
 
     reg        retire_hit_now, store_queue_push_ready, store_queue_hit_stage1;
     reg        next_a_valid, next_b_valid, next_a_generation, next_b_generation, next_a_ready, next_b_ready;
@@ -332,10 +339,9 @@ module lsu(
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
         stage1_non_cacheable = ~((stage1_word[31:24] == 8'd0) & (stage1_word[23:13] == 11'h100));
         load_out     = (stage1_valid & stage1_sent & stage1_non_cacheable) | stage2_valid;
-//  drain_req_valid 在册：它占着 dcache 口的那一拍不许再发读（否则请求被挤掉、永不应答）
-//★ bus_hold 并进 blank_bus：它同时挡住 load 的发送（stage1_put）和 store 的排空
-//  （store_queue_drain）—— 两条上总线的路都在这里收口。
-        blank_bus  = bus_hold_in | miss | (load_out & ~ready_in) | (elsq_load_sent & ~ready_in) | drain_req_valid;
+//★ bus_hold 并进 blank_bus：它挡住 load 的发送（stage1_put）。
+//  2026-11-04 起 store 排水不再经过这里（它有自己的 B 口），所以这一句只管读。
+        blank_bus  = bus_hold_in | miss | (load_out & ~ready_in) | (elsq_load_sent & ~ready_in) | dcache_store_blocked;
 //★ 队列那条门放在【发送】不放【接收】：接收门多一项而 stage_free 没跟上 ⇒ idu2 照常弹出、
 //  本模块没接 ⇒ 指令静默蒸发。放在发送上只是"进得来、先别发"，下一拍自动重试。
 //★ 非对齐的条一律不许进 dcache / ELSQ：Q 端判出来就地作废，只走异常上报。
@@ -417,46 +423,18 @@ module lsu(
 //  排空那一笔取 ELSQ 的寄存器。两者天然互斥。
     always @(*) begin
         dcache_address_out     = 32'd0;
-        dcache_data_out        = 32'd0;
-        dcache_byte_enable_out = 4'd0;
-        dcache_we_out          = 1'b0;
         dcache_valid_out       = 1'b0;
-        if (drain_req_valid & ~dcache_blocked) begin
-            dcache_address_out     = drain_req_address;
-            dcache_data_out        = drain_req_data;
-            dcache_byte_enable_out = drain_req_byte_enable;
-            dcache_we_out          = drain_req_we;
-            dcache_valid_out       = ~drain_req_nc;
-        end
-        else if (load_go) begin
+        if (load_go) begin
             dcache_address_out     = stage1_word;         // ← Q 端加法器输出（字地址），当拍进 dcache_D
-            dcache_byte_enable_out = 4'b1111;
             dcache_valid_out       = 1'b1;
         end
     end
 
-//排空请求锁一拍（见 drain_req_* 的说明）
-    always @(posedge clk) begin
-        if (reset_registered) begin
-            drain_req_valid <= 1'b0;
-            drain_req_we    <= 1'b0;
-            drain_req_nc    <= 1'b0;
-            drain_req_address <= 32'd0;
-            drain_req_data    <= 32'd0;
-            drain_req_byte_enable <= 4'd0;
-        end
-        else begin
-//★ 挂住直到 dcache 真的收下：只打一拍会在"下一拍 dcache 忙"时被丢掉，那笔 store 就永远没了
-            drain_req_valid <= (drain_req_valid & dcache_blocked) | store_queue_drain;
-            if (store_queue_drain) begin
-                drain_req_we    <= 1'b1;
-                drain_req_nc    <= store_drain_non_cacheable;
-                drain_req_address <= store_queue_a_address;
-                drain_req_data    <= store_drain_data;
-                drain_req_byte_enable <= store_drain_byte_enable;
-            end
-        end
-    end
+//B 口（ELSQ 排空）的载荷：全是寄存器，直接连出去，不经过任何当拍的地址量。
+    assign store_address_out     = store_queue_a_address;
+    assign store_data_out        = store_drain_data;
+    assign store_byte_enable_out = store_drain_byte_enable;
+    assign store_valid_out       = store_queue_drain & ~store_drain_non_cacheable;
 
 //外部口（AHB master + tim_in）：仍然寄存 —— 两个源都是 ELSQ 的寄存器
     always @(posedge clk) begin
@@ -513,6 +491,15 @@ module lsu(
             load_nack_generation_registered <= load_wake_generation_registered;
         end
     end
+//==============================================================================
+//  一笔 store 的在途位：起飞 → dcache B 口办完
+//==============================================================================
+    always @(posedge clk) begin
+        if (reset_registered)      store_inflight <= 1'b0;
+        else if (store_queue_drain) store_inflight <= 1'b1;
+        else if (store_finish)      store_inflight <= 1'b0;
+    end
+
 //===============================================================
 // 时序：两级推进
 //===============================================================
@@ -636,16 +623,24 @@ module lsu(
         elsq_head_load   = store_queue_a_valid & ~store_queue_a_kind;
         elsq_load_go     = elsq_head_load & head_one_hot_registered[store_queue_a_index] & ~store_queue_a_sent
                          & ~elsq_return_hold & ~blank_bus & ~load_go & exec & ~flush_window;
-//排空 = 队头够资格 且 本拍给读路让位（读优先：读在等数据，store 等一下不亏）。
+//排空 = 队头够资格 且 dcache 的 B 口这一拍收得下。
+//★ 2026-11-04：不再让位给读。store 有自己的口，「读优先」这条仲裁连同
+//  `~blank_bus & ~load_go & ~elsq_load_go` 三项一起删掉 —— 那三项里裹着【当拍地址算出来的】
+//  窗口译码与同址比较，是那条 19 级链（地址和 → blank_bus → 排水 → idu2 的 CE）的入口。
+//  现在这一句里除了 exec/flush（都是 flag_bus 的寄存器位）全是 ELSQ 与 dcache 的状态位。
+//  ★ elsq_load_go 与它天然互斥（队头是 load 还是 store），不需要再显式排。
         store_queue_drain = store_queue_a_valid & store_queue_a_kind & store_queue_a_ret
-                          & ~blank_bus & ~load_go & ~elsq_load_go & exec & ~flush_window;
+                          & ~store_inflight & ~dcache_store_blocked & exec & ~flush_window;
+//★ 落地：B 口忙位撤销那一拍才算这笔 store 真的办完（缓存更新 + 写穿都可能被回填推迟）。
+//  ★ 队列项必须挂到这一拍才出队 —— 提前出队会让同址的年轻 load 抢在缓存更新前面读到旧值。
+        store_finish = store_inflight & ~dcache_store_blocked;
 //★ 外设 load 只能认定时器/外部的应答，绝不能认 ready_in（三源相或）：
 //  dcache 的应答会把 ELSQ 这条路拉起来 ⇒ 写回写进错的 ROB 项。
         elsq_load_answer = elsq_head_load & store_queue_a_sent & (ready_timer | ready_external);
 //  blank_bus 用的是「本拍队头那条读已经摆出去了」
         elsq_load_sent   = elsq_head_load & store_queue_a_sent;
 //---- 这一拍能塞几笔：pop 之后剩几格 ----
-        elsq_pop       = store_queue_a_drop | store_queue_drain | elsq_load_answer;
+        elsq_pop       = store_queue_a_drop | store_finish | elsq_load_answer;
         elsq_after_pop = {1'b0, store_queue_a_valid} + {1'b0, store_queue_b_valid} - {1'b0, elsq_pop};
         elsq_free      = 2'd2 - elsq_after_pop;
 //---- 写口1（更老）：stage1 Q 端的外设 load ----

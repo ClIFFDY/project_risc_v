@@ -8,7 +8,7 @@
 //     不再靠 (槽, 世代) 二元组的比较 —— 那个二元组只有 5 位，会撞。
 //
 // 端口账（FPGA 上每阵列只有 1 个写口，这是整份设计的约束来源）：
-//   读 6 个：lane0 的 a/b、lane1 的 a/b、访存流的 a/b，纯组合。
+//   读 7 个：lane0 的 a/b、lane1 的 a/b、访存流的 a/b、提交拍的 CSR 源，纯组合。
 //   写 4 个源：lane0 结果口、lane1 结果口、LOAD 返回级（晚）、LOAD s2（早）。
 //   bank = 物理号最低位（lane0 只从偶数号取、lane1 只从奇数号取）
 //     ⇒ lane0 结果和 lane1 结果天然落在不同 bank。
@@ -34,13 +34,16 @@ module prf #(
 )(
     input clk, rst,
 
-//---- 读口（6 个）----
+//---- 读口（7 个）----
     input  [PHYS_BITS-1:0] read_a_0_phys, read_b_0_phys,
     input  [PHYS_BITS-1:0] read_a_1_phys, read_b_1_phys,
     input  [PHYS_BITS-1:0] read_a_m_phys, read_b_m_phys,
+//★ 2026-11-04（CSR 步骤 C）：第 7 个读口 = 提交拍的 CSR 源操作数。地址是 ROB 提交口那级触发器。
+    input  [PHYS_BITS-1:0] read_c_phys,
     output [31:0] read_a_0_data, read_b_0_data,
     output [31:0] read_a_1_data, read_b_1_data,
     output [31:0] read_a_m_data, read_b_m_data,
+    output [31:0] read_c_data,
 
 //---- 写口 0：lane0 结果口（bank0）----
     input                 write_en_0, input write_live_0,
@@ -82,6 +85,7 @@ module prf #(
     wire [PHYS_BITS-2:0] b1_idx = read_b_1_phys[PHYS_BITS-1:1];
     wire [PHYS_BITS-2:0] am_idx = read_a_m_phys[PHYS_BITS-1:1];
     wire [PHYS_BITS-2:0] bm_idx = read_b_m_phys[PHYS_BITS-1:1];
+    wire [PHYS_BITS-2:0] cm_idx = read_c_phys[PHYS_BITS-1:1];
 
 //  ★ 函数体内读数组进不了敏感表（本仓踩过），所以读口一律写成 assign 逐项表达。
     assign read_a_0_data = read_a_0_phys[0] ? bank1_result[a0_idx] :
@@ -96,6 +100,8 @@ module prf #(
                            (bank0_version[am_idx] ? bank0_load[am_idx] : bank0_result[am_idx]);
     assign read_b_m_data = read_b_m_phys[0] ? bank1_result[bm_idx] :
                            (bank0_version[bm_idx] ? bank0_load[bm_idx] : bank0_result[bm_idx]);
+    assign read_c_data = read_c_phys[0] ? bank1_result[cm_idx] :
+                         (bank0_version[cm_idx] ? bank0_load[cm_idx] : bank0_result[cm_idx]);
 
 //写口使能：物理 0 是 x0，永远不写
     wire write_ok_0 = write_en_0 & write_live_0 & (|write_phys_0);
@@ -159,7 +165,7 @@ module prf #(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-//物理 0..31 就是复位后的架构映射，值全 0（与 regfile 复位同口径）
+//物理 0..31 就是复位后的架构映射，复位值全 0
             ready <= {{(PHYS_COUNT-32){1'b0}}, 32'hFFFFFFFF};
         end
         else if (flush) begin

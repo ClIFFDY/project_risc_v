@@ -71,12 +71,13 @@ module cont(
 //★ S3：改向判定现在由 ROB 在【提交口】给出（队头那条判错了的分支），边界就是队头。
 //  bju 的 br2/br3/jump_link_register_failure 不再直接引发冲刷 —— 它们只写进 ROB 项，等队头生效。
     input        redirect_in,
-//csr 写口与中断源
-    input        csr_write_enable,
-//真写使能（idu2 产）：csr_write_enable 只管"是条 CSR 指令"，锁不锁看这根
-    input        csr_write_action,
+//csr 读口（执行级）与提交口（写）与中断源
     input [11:0] csr_address,
-    input [31:0] csr_data_in,
+//★ 2026-11-04（CSR 步骤 C）：读-改-写搬出执行级，改为提交拍落地。这四根由 ROB 提交口给（各是一级触发器）。
+    input        csr_commit_valid,
+    input [11:0] csr_commit_address,
+    input [2:0]  csr_commit_function3,
+    input [31:0] csr_commit_source,
     input [31:0] pc_address_in,
     input        exti, timi, softi,
 //流水线状态（寄存输出）
@@ -453,8 +454,6 @@ module cont(
         .retire_step_in(rob_ret_step),
         .clk(clk),
         .rst(reset_registered),
-        .csr_write_enable(csr_write_enable),
-        .csr_write_action(csr_write_action),
         .flush_control_in(flag_bus[6:5]),
         .exc_irq_ret(exc_irq_ret_i),
         .exception_interrupt_return_ok(mret_valid),
@@ -470,7 +469,10 @@ module cont(
         .exception_retire_pc(rob_trap_pc),
         .exc_retire_tval(rob_trap_tval),
         .csr_address(csr_address),
-        .csr_data_in(csr_data_in),
+        .csr_commit_valid(csr_commit_valid),
+        .csr_commit_address(csr_commit_address),
+        .csr_commit_function3(csr_commit_function3),
+        .csr_commit_source(csr_commit_source),
         .pc_address_in(pc_address_in),
         .interrupt_request_timer(interrupt_request_timer),
         .jump_link_register_failure(1'b0),   // csr 在 S3 之后改用 flag_bus[5]（提交口改向），此口已无读者

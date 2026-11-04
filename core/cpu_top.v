@@ -129,6 +129,11 @@ module cpu_top #(
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
 //★ 2026-11-04 真 PRF：物理号与冲刷掩码
     wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
+//★ 2026-11-04（CSR 步骤 C）：CSR 随 ROB 项走、在提交拍落地。载荷 {写使能 1, 地址 12, funct3 3, 源 6}。
+    wire        alloc_csr_0, alloc_csr_1;
+    wire [21:0] alloc_csr_payload_0, alloc_csr_payload_1;
+    wire        commit_csr_valid;
+    wire [21:0] commit_csr_payload;
     wire [63:0] squash_phys_mask;
     wire [3:0]  alloc_index_0, alloc_index_1;
     wire        alloc_generation_0, alloc_generation_1;
@@ -188,7 +193,6 @@ module cpu_top #(
 
     wire [31:0] head_pc_rob;
     wire        head_valid_rob, issue_pop_0, issue_pop_1;
-    wire [31:0] rdata1, rdata2, rdata3, rdata4, rdata5, rdata6;
 //---- 访存专用流：idu1 的 LSU FIFO <-> idu2 ----
     wire [31:0] lsu_instruction_idu1, lsu_auxiliary_address_idu1, lsu_immediate_idu1;
     wire [4:0]  lsu_source_a_idu1, lsu_source_b_idu1, lsu_destination_register_idu1;
@@ -205,6 +209,8 @@ module cpu_top #(
     wire [5:0]  prf_read_a_0_phys, prf_read_b_0_phys, prf_read_a_1_phys, prf_read_b_1_phys;
     wire [5:0]  prf_read_a_m_phys, prf_read_b_m_phys;
     wire [31:0] prf_data_a_0, prf_data_b_0, prf_data_a_1, prf_data_b_1, prf_data_a_mem, prf_data_b_mem;
+//提交拍的 CSR 源（第 7 个读口，地址 = ROB 提交口吐出来的 rs1 物理号）
+    wire [31:0] prf_read_c_data;
 //---- PRF 写口（物理号由 rob 按槽查出来；live = 本项还有效且世代对得上）----
     wire [5:0]  prf_wb_phys_0, prf_wb_phys_1, prf_ld_phys_wb;
     wire        prf_wb_live_0, prf_wb_live_1, prf_ld_live_wb, prf_ld_early_live;
@@ -285,10 +291,8 @@ module cpu_top #(
 //==============================================================================
 // rob
 //==============================================================================
-    wire        commit_we0, commit_we1, commit_gen0, commit_gen1;
+    wire        commit_we0, commit_we1;
     wire [4:0]  commit_rd0, commit_rd1;
-    wire [3:0]  commit_slot0, commit_slot1;
-    wire [31:0] commit_data0, commit_data1;
     wire [3:0]  head_pointer;
     wire        rob_redir_valid, redir_registered_0, redir_registered_1, rob_redir_any;
     wire [31:0] rob_redir_pc;
@@ -331,9 +335,12 @@ module cpu_top #(
     wire [31:0] bus_address_lsu, bus_data_lsu, data_dcache, data_tim;
     wire [3:0]  bus_byte_enable_lsu;
     wire        bus_write_enable_lsu, bus_valid_lsu;
-    wire [31:0] dcache_address_lsu, dcache_data_lsu;
-    wire [3:0]  dcache_byte_enable_lsu;
-    wire        dcache_write_enable_lsu, dcache_valid_lsu;
+    wire [31:0] dcache_address_lsu;
+    wire        dcache_valid_lsu;
+//★ 2026-11-04：store 排水走 dcache 的 B 口（只写）。三根载荷都是 ELSQ 的寄存器。
+    wire [31:0] store_address_lsu, store_data_lsu;
+    wire [3:0]  store_byte_enable_lsu;
+    wire        store_valid_lsu, store_blocked_dcache;
     wire [31:0] mem_address_dcache, mem_wdata_dcache, mem_data_dtcm;
     wire [3:0]  mem_byte_enable_dcache;
     wire        mem_req_dcache, mem_write_enable_dcache, mem_valid_dtcm;
@@ -354,9 +361,23 @@ module cpu_top #(
 //  已删。bju_fetch_select 也随之无读者，连同 cont 的那个输出口一起删掉。
     reg         fetch_bpred;
     reg  [31:0] fetch_jump_link_register_target, fetch_jump_target;
-    reg         csr_write_enable_m, csr_write_action_m;
     reg  [11:0] csr_address_m;
-    reg  [31:0] csr_data_m;
+
+//==============================================================================
+//  CSR 提交口（2026-11-04，CSR 步骤 C）
+//  载荷全在这里解释，csr.v 只吃已经拆好的四根 —— 拆包是纯连线，不进任何锥。
+//  源：function3[2]=1 是立即数形式（rs1 字段即 zimm），取载荷里的源字段；
+//      否则是寄存器形式，源字段是 rs1 物理号，走 PRF 的第 7 个读口。
+//  csr_commit_write = "这条指令要写 CSR"：CSRRW/CSRRWI 恒写，CSRRS/CSRRC 及其立即数形式
+//      只有源非 0 才写（规范口径）。寄存器形式下 rs1=x0 ⇔ 物理号 0 ⇒ 源字段为 0 就是"不写"。
+//==============================================================================
+    wire        csr_commit_action      = commit_csr_payload[21];
+    wire [11:0] csr_commit_address     = commit_csr_payload[20:9];
+    wire [2:0]  csr_commit_function3   = commit_csr_payload[8:6];
+    wire [5:0]  csr_commit_source_field = commit_csr_payload[5:0];
+    wire        csr_commit_write       = commit_csr_valid & csr_commit_action;
+    wire [31:0] csr_commit_source      = csr_commit_function3[2] ? {27'd0, csr_commit_source_field[4:0]}
+                                                                 : prf_read_c_data;
 //训练包：1 深缓冲（2026-10-30）
 //★ 实测（tb_pred5，CoreMark 窗口 288,352 拍）：两 lane 同拍都有跳转载荷的拍 = 4,799，
 //  占判定总数 61,731 的 7.8%。单写口每拍只收一条 ⇒ 这 4,799 次训练整条丢掉，
@@ -432,11 +453,8 @@ module cpu_top #(
                            (train_sel == 2'd1) ? bju_pc_0     : bju_pc_1;
         fetch_target     = (train_sel == 2'd0) ? train_buf_target :
                            (train_sel == 2'd1) ? bju_target_0     : bju_target_1;
-//CSR 写口同理：两条同拍都是 CSR 指令时只落 lane0（并发 CSR 写不在本核口径内）
-        csr_write_enable_m  = csr_write_enable_0 | csr_write_enable_1;
-        csr_write_action_m = csr_write_action_0 | csr_write_action_1;
+//CSR 读口（执行级）：地址选本拍要发的那条（两条同拍都是 CSR 指令时只落 lane0，并发 CSR 写不在本核口径内）
         csr_address_m   = csr_write_enable_1 ? csr_address_1 : csr_address_0;
-        csr_data_m   = csr_write_enable_1 ? csr_result_alu_1 : csr_result_alu_0;
     end
 
 //★ 2026-10-31：原来这里有个 exception_pc_in_mux（lsu_lane ? aux1 : aux0）给访存非对齐当 pc。
@@ -601,6 +619,7 @@ module cpu_top #(
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
         .alloc_rd_0(alloc_destination_register_0),
         .alloc_phys_0(alloc_phys_0),
+        .alloc_csr_0(alloc_csr_0), .alloc_csr_payload_0(alloc_csr_payload_0),
         .dec_class_0(decoded_class_0), .dec_we_0(decoded_write_enable_0), .dec_rd_0(decoded_destination_register_0),
         .dec_is_st_0(decoded_is_store_0), .dec_mulop_0(decoded_mulop_0), .dec_lsf3_0(decoded_load_store_function3_0),
         .dec_func4_0(decoded_func4_0), .dec_csrf3_0(decoded_csr_function3_0),
@@ -629,6 +648,7 @@ module cpu_top #(
         .alloc_illegal_1(alloc_illegal_1), .alloc_mret_1(alloc_mret_1),
         .alloc_rd_1(alloc_destination_register_1),
         .alloc_phys_1(alloc_phys_1),
+        .alloc_csr_1(alloc_csr_1), .alloc_csr_payload_1(alloc_csr_payload_1),
         .dec_class_1(decoded_class_1), .dec_we_1(decoded_write_enable_1), .dec_rd_1(decoded_destination_register_1),
         .dec_is_st_1(decoded_is_store_1), .dec_mulop_1(decoded_mulop_1), .dec_lsf3_1(decoded_load_store_function3_1),
         .dec_func4_1(decoded_func4_1), .dec_csrf3_1(decoded_csr_function3_1),
@@ -740,6 +760,7 @@ module cpu_top #(
         .flush_inclusive_registered(flush_inclusive_registered), .flush_index_registered(flush_index_registered),
         .flush_pending(flush_pending),
         .trap_fire_registered(trap_fire), .head_one_hot_registered(head_one_hot_registered),
+        .csr_write_landing(csr_commit_write),
         .above(above_registered),
 //---- 单元就绪 / 访存危险 / load 早唤醒 ----
         .lsu_full(~carriage_free_lsu),
@@ -801,9 +822,11 @@ module cpu_top #(
         .read_a_0_phys(prf_read_a_0_phys), .read_b_0_phys(prf_read_b_0_phys),
         .read_a_1_phys(prf_read_a_1_phys), .read_b_1_phys(prf_read_b_1_phys),
         .read_a_m_phys(prf_read_a_m_phys), .read_b_m_phys(prf_read_b_m_phys),
+        .read_c_phys(csr_commit_source_field),
         .read_a_0_data(prf_data_a_0), .read_b_0_data(prf_data_b_0),
         .read_a_1_data(prf_data_a_1), .read_b_1_data(prf_data_b_1),
         .read_a_m_data(prf_data_a_mem), .read_b_m_data(prf_data_b_mem),
+        .read_c_data(prf_read_c_data),
 
         .write_en_0(result_port_0_enable), .write_live_0(prf_wb_live_0),
         .write_phys_0(prf_wb_phys_0),      .write_data_0(result_port_0_data),
@@ -966,9 +989,11 @@ module cpu_top #(
         .head_one_hot_registered(head_one_hot_registered), .redirect_any(rob_redir_any),
         
         .ready_dcache(load_ready_dcache), .ready_timer(ready_tim), .ready_external(bus_loaded_in),
-        .dcache_address_out(dcache_address_lsu), .dcache_data_out(dcache_data_lsu),
-        .dcache_byte_enable_out(dcache_byte_enable_lsu), .dcache_we_out(dcache_write_enable_lsu),
+        .dcache_address_out(dcache_address_lsu),
         .dcache_valid_out(dcache_valid_lsu),
+        .store_address_out(store_address_lsu), .store_data_out(store_data_lsu),
+        .store_byte_enable_out(store_byte_enable_lsu), .store_valid_out(store_valid_lsu),
+        .dcache_store_blocked(store_blocked_dcache),
         .stage1_address_out(bus_address_lsu), .stage1_data_out(bus_data_lsu),
         .stage1_byte_enable_out(bus_byte_enable_lsu), .stage1_we_out(bus_write_enable_lsu), .stage1_valid_out(bus_valid_lsu),
         .load_data_out(load_data_lsu), .loaded(), .load_write_enable(load_write_enable_lsu),
@@ -1007,6 +1032,8 @@ module cpu_top #(
         .allocation_illegal_1(alloc_illegal_1), .allocation_mret_1(alloc_mret_1),
         .allocation_index_0(alloc_index_0), .allocation_index_1(alloc_index_1),
         .allocation_generation_0(alloc_generation_0), .allocation_generation_1(alloc_generation_1),
+        .allocation_csr_0(alloc_csr_0), .allocation_csr_payload_0(alloc_csr_payload_0),
+        .allocation_csr_1(alloc_csr_1), .allocation_csr_payload_1(alloc_csr_payload_1),
         .allocation_pc_0(h0_address), .allocation_pc_1(h1_address),
         .head_pc_out(head_pc_rob), .head_valid_out(head_valid_rob),
 
@@ -1041,11 +1068,10 @@ module cpu_top #(
         .exception_selected_enable(excls_enable), .exception_selected_index(excls_index), .exception_selected_cause(excls_cause),
         .exception_selected_pc(excls_pc), .exception_selected_trap_value(excls_trap_value),
 
-        .commit_write_enable_0(commit_we0), .commit_destination_0(commit_rd0), .commit_data0(commit_data0),
-        .commit_slot0(commit_slot0), .commit_gen0(commit_gen0),
-        .commit_write_enable_1(commit_we1), .commit_destination_1(commit_rd1), .commit_data1(commit_data1),
-        .commit_slot1(commit_slot1), .commit_gen1(commit_gen1),
+        .commit_write_enable_0(commit_we0), .commit_destination_0(commit_rd0),
+        .commit_write_enable_1(commit_we1), .commit_destination_1(commit_rd1),
         .commit_phys0(commit_phys0), .commit_phys1(commit_phys1),
+        .commit_csr_valid(commit_csr_valid), .commit_csr_payload(commit_csr_payload),
         .squash_phys_mask(squash_phys_mask),
 //★ 真 PRF 的写口：物理号按槽查出来 + 存活判据
         .prf_wb_en_0(result_port_0_enable), .prf_wb_index_0(result_port_0_index), .prf_wb_generation_0(result_port_0_generation),
@@ -1066,27 +1092,10 @@ module cpu_top #(
     );
 
 //==============================================================================
-// 寄存器堆（两条提交写口）
-//★ 2026-11-04 真 PRF 落地后，这一份【已经没有读者】了：操作数全部从 u_prf 取，
-//  rdata1..6 不再接任何模块。留着只为"架构值另有一份可读副本"这个对照，
-//  综合会把它和 commit_data 那条广播一起裁掉（没有任何扇出）。
-//  真要收回这 1024 个触发器就把这个实例和 rdata* 一起删 —— 不影响功能。
+// 寄存器堆：真 PRF 落地后已删。
+//  操作数全部从 u_prf 取；架构值就是 PRF 里 arch_map 指着的那些号，提交口只更新 arch_map
+//  与空闲表。原先这份 32×32 的 regfile 没有读者，留着只是 1024 个触发器被综合裁掉。
 //==============================================================================
-    regfile u_regfile (
-        .clk(clk), .rst(rst),
-        .flag_bus(flag_bus),
-//顺序发射：读口每拍跟着地址刷新，"上一拍冻结"那一档不再存在
-        .stall_read_set_full(1'b0),
-//★ 读口地址来自【出队格 F 级】（不是 idu2 的 D）：寄存一拍之后正好与"这一条进 D"同拍到达，
-//  于是 rdata 与 D 里的指令对齐 —— 这就是 idu2 那边"base 与指令一起来"的口径。
-//  lane1 到底拿第二格 h1 还是队头 h0，由 idu1 本拍的装载决定（两条 lane 独立推进）。
-        .read_1(rs1_idu1_0), .read_2(rs2_idu1_0),
-        .read_3(rs1_idu1_1), .read_4(rs2_idu1_1),
-        .read_5(lsu_source_a_idu1), .read_6(lsu_source_b_idu1),
-        .write_enable_a(commit_we0), .destination_a(commit_rd0), .data_a(commit_data0),
-        .write_enable_b(commit_we1), .destination_b(commit_rd1), .data_b(commit_data1),
-        .read_1_data(rdata1), .read_2_data(rdata2), .read_3_data(rdata3), .read_4_data(rdata4), .read_5_data(rdata5), .read_6_data(rdata6)
-    );
 
 //==============================================================================
 // 控制 / CSR
@@ -1126,9 +1135,10 @@ module cpu_top #(
         .flush_incl_q(flush_inclusive_registered), .flush_con_exc_q(flush_con_exception_registered),
         .flush_pending(flush_pending),
         .jump_link(1'b0), .np_take(pc_take0 | pc_take1),
-        .csr_write_enable(csr_write_enable_m), .csr_write_action(csr_write_action_m),
+        .csr_address(csr_address_m),
+        .csr_commit_valid(csr_commit_write), .csr_commit_address(csr_commit_address),
+        .csr_commit_function3(csr_commit_function3), .csr_commit_source(csr_commit_source),
         .exti(exti), .timi(timer_interrupt), .softi(1'b0),
-        .csr_address(csr_address_m), .csr_data_in(csr_data_m),
         .pc_address_in(head_pc_rob),
         .interrupt_service_address_2(isr_addr2), .mcause(mcause), .csr_data_combinational(csr_data_combinational),
         .exception_interrupt_action(exception_interrupt_action), .exception_interrupt_processing(exception_interrupt_processing),
@@ -1152,9 +1162,11 @@ module cpu_top #(
 //==============================================================================
     dcache #(.DC_SETS_B(DC_SETS_B)) u_dcache (
         .clk(clk), .rst(rst),
-        .bus_address_in(dcache_address_lsu), .bus_data_in(dcache_data_lsu),
-        .bus_byte_enable_in(dcache_byte_enable_lsu), .bus_write_enable_in(dcache_write_enable_lsu),
+        .bus_address_in(dcache_address_lsu),
         .bus_valid_in(dcache_valid_lsu),
+        .store_valid_in(store_valid_lsu), .store_address_in(store_address_lsu),
+        .store_data_in(store_data_lsu), .store_byte_enable_in(store_byte_enable_lsu),
+        .store_blocked(store_blocked_dcache),
         .mem_data(mem_data_dtcm), .mem_valid(mem_valid_dtcm), .mem_ready(1'b1),
         .bus_data_out(data_dcache),
         .load_ready(load_ready_dcache), .busy(busy_dcache), .hold(hold_dcache), .request_blocked(request_blocked_dcache),

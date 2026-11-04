@@ -19,7 +19,7 @@
 //     T→T+1  ：锁操作数 a/b/op
 //     T+1    ：33×33 有符号乘法（组合，综合成 DSP48）
 //     T+1→T+2：锁乘积
-//     T+2    ：multiply_write_enable / multiply_loaded 拉高 → regfile 在 T+2→T+3 沿写（= lsu 的写沿）
+//     T+2    ：multiply_write_enable / multiply_loaded 拉高 → prf 在 T+2→T+3 沿写（= lsu 的写沿）
 //     T+3    ：hold（multiply_loaded 第二拍，对应 lsu 的 ld_hold）
 //   背靠背乘法 1 笔/拍（两级流水不冲突）。
 //
@@ -37,7 +37,7 @@
 //   乘法用【一个】33×33 有符号乘法器覆盖全部 4 条：把两个操作数按需扩展成 33 位
 //   （有符号补符号位、无符号补 0）再相乘，MUL 取低 32、MULH/MULHSU/MULHU 取高 32。
 //
-//   操作数由站选中项的终值供给（随出站载荷进来），不占用 regfile 的读口。
+//   操作数由站选中项的终值供给（随出站载荷进来），不占用 prf 的读口。
 //
 //   本文件内 always 块按【流水级数】排列（两条 ready 在最前）：
 //     两条 ready → 第一级（锁操作数）→ 第二级（锁乘积）→ 除法迭代 → 提交链/输出保持
@@ -472,10 +472,13 @@ module mdu(
 //  它的 ROB 项永远等不到 ⇒ 队头卡死。
 //两个独立结果口：乘法口（multiply_product_valid 那拍 + hold 第二拍）、除法口（divide_state_commit 那拍）。
 //结果口的 D 端：表项必须与"口亮起那一拍"的值同拍对齐
-//★ 乘法口是组合口（multiply_product_valid/multiply_product 直接出去），所以 D 端是【再前一沿】的乘积 —— 冻结拍要跟着保持。
+//★★ 2026-11-04：乘法口改成从【MDU 结果寄存器】出（multiply_product + 寄存后的 op 选择 + hold），
+//  不再用 DSP 参与算出来的组合乘积 multiply_product_intermediate。
+//  为什么：组合乘积一挂到结果口，DSP 那条链和 mdu 的选择信号就被拖进 prf 的写口和旁路网，
+//  实测 12.5ns 下 `−2.041 / 1691 端点`（改之前 `−0.744 / 242`），失败端点铺到 mdu/iffu/idu1/csr 四处。
+//  代价：乘法结果晚一拍 —— 现在乘法早口和晚口是同一份（都从 multiply_data_out 出）。
+//  早口的那几项在下面"乘法口"那个 always 块里跟着赋，避免跨块读。
     always @(*) begin
-        multiply_data_early = pipe_stall ? multiply_data_out
-                                : ((multiply_stage_operation[1:0] == 2'b00) ? multiply_product_intermediate[31:0] : multiply_product_intermediate[63:32]);
         divide_data_early = divide_state_commit_data;
 //身份 D 端：冻结拍那几个寄存器不装载，要跟着保持
 //★ 写使能【只取触发器】，不再乘 ~kill。kill 是 rob 的组合链（slot_above_head_registered → redirect_index → kill_arc），
@@ -483,14 +486,7 @@ module mdu(
 //★ 解耦之后错路那一笔最多多写【一拍】：写进的是它自己那个槽，而该槽的 valid 在它分配那一拍就被清成 0；
 //  重新分配至少还要 5 拍才到 idu2-D，到那时 valid 又被清一次 ⇒ 这一拍设起来的 valid 活不过下一次分配。
 //★ kill 本身不动：乘/除各级 valid 的清仍按年龄那个式子来，kill 只出现在寄存器的 D 端，不在这条路上。
-        if (pipe_stall) begin
-            multiply_write_enable_early = multiply_product_valid; multiply_index_early = multiply_stage_index_registered; multiply_generation_early = multiply_stage_generation_registered;
-            divide_write_enable_early = divide_state_commit_registered[2];
-        end
-        else begin
-            multiply_write_enable_early = multiply_stage_valid;  multiply_index_early = multiply_stage_index;   multiply_generation_early = multiply_stage_generation;
-            divide_write_enable_early = divide_state_commit_registered[1];
-        end
+        divide_write_enable_early = pipe_stall ? divide_state_commit_registered[2] : divide_state_commit_registered[1];
         divide_index_early = divide_state_commit_index;
         divide_generation_early = divide_state_commit_generation;
     end
@@ -518,6 +514,11 @@ module mdu(
             multiply_generation      = 1'b0;
             multiply_data_out = 32'd0;
         end
+//★ 2026-11-04：乘法早口就是晚口那一份（都从 MDU 结果寄存器出），不再有"早一拍"的组合乘积。
+        multiply_data_early       = multiply_data_out;
+        multiply_write_enable_early = multiply_write_enable;
+        multiply_index_early      = multiply_index;
+        multiply_generation_early = multiply_generation;
 //---- 除法口 ----
         divide_write_enable       = divide_state_commit;
         divide_loaded   = divide_state_commit;

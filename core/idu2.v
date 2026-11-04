@@ -9,12 +9,12 @@
 //   ★ 结构：每条 lane 一级 D→Q 寄存器。D = idu1 的 S 级输出，Q = 发射寄存器。
 //     Q 端组合算 issue_v 与全部字段，单元当拍收；D→Q 只在 Q 空 / Q 本拍发出时发生。
 //
-//   ★ 操作数在 Q 端组合选出，四档：立即数 → 结果口(idx+gen 命中) → rob 拉式 fwd 值 → rdata。
-//     rdata 这一档是"装 Q 那一拍由上一拍的 D.rs 预取"的值；装进 Q 之后地址改跟 Q 的 rs，
-//     于是它每拍被 regfile 刷新 —— 生产者在消费者等待期间提交时，只有这一档兜得住。
+//   ★ 操作数在 Q 端组合选出：立即数 → ALU0 前送 → ALU1 前送 → LOAD 前送 → prf。
+//     就绪 = queue_immediate | prf_ready[物理号] | 三条前送任一命中。物理号在进队那一拍就定死，
+//     不会因为 ROB 槽被复用而漂。
 //
-//   ★ 结果口是寄存值：生产者 T 拍发、口上 T+1 有效；rob 的 ent_wr 要到 T+2 才置起
-//     ⇒ 结果口这一档比 qry_ok 早一拍，两档都要。本条自己的结果最早下一拍才回来。
+//   ★ 结果口的相位：生产者 T 拍发、口上 T+1 有效，prf 在同一沿写、ready 下一拍才置起
+//     ⇒ 发出那一拍靠前送、之后靠 prf_ready，两段正好接上。本条自己的结果最早下一拍才回来。
 //
 //   ★ 前送只认已经发出去的指令的产物。now_* 是可选的"同拍 alu 结果"路径（独立数据路径），
 //     不接（恒 0）功能完全正确。
@@ -142,6 +142,10 @@ module idu2(
 // whether a memory op issues is decided by the LSU's own send gate.
     input [15:0] head_one_hot_registered,
     input [15:0] above,
+//★ 2026-11-04（CSR 步骤 C）：CSR 的写口搬到【提交拍】了 ⇒ 上一拍的写正在这一拍落地。
+//  本拍要是也放一条 CSR 出去，它的组合读口读到的还是落地前的旧值（实测：csrr 读回上一条写之前的值）。
+//  所以这一拍挡所有 CSR 的发射；CSR 本来就串行在队头，多等一拍对 IPC 没有可测影响。
+    input        csr_write_landing,
 //---- 单元就绪 ----
     input        lsu_full,
 //★ 在途 load 的目的寄存器（两个槽）：判"本条的操作数是不是正被 load 写"。
@@ -163,10 +167,7 @@ module idu2(
     input        mdu_mul_ok_0, mdu_div_ok_0, mdu_mul_ok_1, mdu_div_ok_1,
     input        bju_ok_0, bju_ok_1,
 
-//---- 寄存器堆读口（寄存读：地址本拍给、数据下一拍到）----
-//---- 寄存器堆读值 ----
-//★ 地址不在这里出：读口地址由 iffu 的出队格（F 级）直接给 regfile，寄存一拍，
-//  正好与"这一条进 D 级"同拍到达 ⇒ rdata 与 D 里的指令对齐。本模块只吃不驱动。
+//---- 读口在下面 PRF 那一组：地址 = Q 里的物理号，数据与就绪组合回来 ----
 
 //---- 出站 lane0 ----
     output reg        issue_valid_0,
@@ -543,8 +544,8 @@ module idu2(
 //  lane1 的 `csrrw t2,mtvec,t1`(0x21ac) 到 143 拍才发 ⇒ t3 读到 mtvec=0，`bne t3,t1` 判成跳，
 //  整条测试拐进 init_tramp 错路，后面每一条都挂死（本树 49/63 超时，基线 19/63）。
 //  CSR 指令本来就少，加到队头才发不影响 IPC；同拍只可能有一条到队头 ⇒ CSR 之间天然有序。
-        csr_held_0 = (queue_csr_address_0 != 12'd0) & (queue_csr_function3_0 != 3'd0) & ~head_one_hot_registered[queue_index_0];
-        csr_held_1 = (queue_csr_address_1 != 12'd0) & (queue_csr_function3_1 != 3'd0) & ~head_one_hot_registered[queue_index_1];
+        csr_held_0 = (queue_csr_address_0 != 12'd0) & (queue_csr_function3_0 != 3'd0) & (~head_one_hot_registered[queue_index_0] | csr_write_landing);
+        csr_held_1 = (queue_csr_address_1 != 12'd0) & (queue_csr_function3_1 != 3'd0) & (~head_one_hot_registered[queue_index_1] | csr_write_landing);
 //---- 访存专用流：唯一的入口门 ----
 //  它与 lsu.v 的 new_in_pre 逐项同门（~lsu_full = stage_free、~load_store_use_hit = ~lsu_hazard_mem、
 //  ~flush_window），少了任何一项就会"这边弹出、那边没收" ⇒ 载荷静默蒸发。
@@ -631,7 +632,10 @@ module idu2(
         csr_func3_0 = queue_csr_function3_0;
         csr_write_enable_0 = issue_valid_0 & queue_csr_write_enable_0;
         csr_write_action_0= issue_valid_0 & queue_csr_write_write_0;
-        csr_address_0  = issue_valid_0 ? queue_csr_address_0 : 12'd0;
+//★ 2026-11-04：地址不再乘 issue_valid。它是 csr.v 那个 12:1 case 的输入，乘进发射判据
+//  等于把 issue_valid 那条扇出 300+ 的网拖进 CSR 读写两侧的锥里。
+//  非 CSR 指令拿到的是"上一条 CSR 指令的地址"，读值没人用（写口由 csr_write_action 门控）。
+        csr_address_0  = queue_csr_address_0;
         auxiliary_address_0  = queue_auxiliary_0;
         off_mem_0   = queue_jump_value_0;
         beq_off_0   = queue_branch_flag_0   ? queue_jump_value_0 : 32'd0;
@@ -674,7 +678,7 @@ module idu2(
         csr_func3_1 = queue_csr_function3_1;
         csr_write_enable_1 = issue_valid_1 & queue_csr_write_enable_1;
         csr_write_action_1= issue_valid_1 & queue_csr_write_write_1;
-        csr_address_1  = issue_valid_1 ? queue_csr_address_1 : 12'd0;
+        csr_address_1  = queue_csr_address_1;   // 同 lane0：不乘 issue_valid，理由见上
         auxiliary_address_1  = queue_auxiliary_1;
         off_mem_1   = queue_jump_value_1;
         beq_off_1   = queue_branch_flag_1   ? queue_jump_value_1 : 32'd0;

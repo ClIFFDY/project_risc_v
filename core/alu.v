@@ -142,17 +142,12 @@ module alu(
 
 //SYSTEM类指令写 csr 的那份数据：★ 必须走【不锁的】输入 —— csr 的写口在发射那一拍落地，
 //相位一动就写到下一条头上去了。（写 rd 的那份在下面结果级里用锁后值。）
+//★ 2026-11-04：CSR 的「读-改-写」搬到 csr.v 里做（原来在这里用 cs_data 合成）。
+//  这里只把 rs1 原值透传出去，csr.v 用「读值 + rs1 + function3」自己算写入值。
+//  动机：cs_data 是 csr.v 那个 12:1 case 的输出，在这里再合成会让「读侧 case → 本锥 → CSR 写口」
+//  串成一整条链 —— 12.5ns 下最差那条路径就是它（route 占 78%，扇出在 issue_valid 上）。
     always @(*) begin
-        if (write_enable_in && cs_wr_en) begin
-            case (csr_function3)
-            CSRRW, CSRRWI: result_csr = source_a_data;
-            CSRRS, CSRRSI: result_csr = source_a_data | cs_data;
-            CSRRC, CSRSCI: result_csr = cs_data & ~source_a_data;
-            default: result_csr = cs_data;
-            endcase
-        end
-        else
-            result_csr = r2_data;
+        result_csr = source_a_data;
     end
 
 //---- 结果级（组合，锥只从操作数寄存器出发）----

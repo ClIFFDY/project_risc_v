@@ -22,15 +22,10 @@
 
 module csr(
     input clk, rst,
-    input csr_write_enable, exc_irq_ret, exti, timi, softi, exc_ecall, flush_control_exception,
+    input exc_irq_ret, exti, timi, softi, exc_ecall, flush_control_exception,
     input exception_mark_in,
 //站里至少有一个有效项：中断的 mepc/冲刷边界都取"站里最老有效项"，站空时那个号是陈旧槽
     input interrupt_head_valid_in,
-//★ 真写使能（idu2 产）：csrrw/rs/rc 里只有"rs1 字段非 0"才真锁存（规范 §Zicsr 的
-//  "写"定义）。csr_write_enable 是【双重身份】—— alu 靠它判"这是条 CSR 指令"把读值选进 rd，
-//  所以 csrr 也必须为 1；真正锁不锁由本线决定。原来靠"把 csr_address 清 0"来表达不写，
-//  但地址要同时供读口用，站式之后读口没有第二条地址通路了，必须把两件事拆成两根线。
-    input csr_write_action,
 //★ 资格版（cont 产）：mret 的使能恢复必须与 pc 侧的排队武装同一根线，
 //  否则会出现「跳到 mepc 但使能没恢复」的半生效。:215 的互斥仍用裸线（那是同拍不许受理中断）。
     input exception_interrupt_return_ok,
@@ -40,7 +35,13 @@ module csr(
 // P1: no head pointer. Only the retire step published by the ROB.
     input [1:0] retire_step_in,
     input [11:0] csr_address,
-    input [31:0] csr_data_in,
+//★ 2026-11-04（CSR 步骤 C）：写口搬出执行级，改成【提交拍】落地。地址 / funct3 / 源都由 ROB 项带来，
+//  提交那一拍各是一级触发器 ⇒ 「读侧 12:1 case → ALU 锥 → 写口」整条链从执行级消失。
+//  同时至多一条 CSR 在飞（idu2 的 csr_held 要求它发射时就是队头），所以提交拍读到的就是它的旧值。
+    input        csr_commit_valid,
+    input [11:0] csr_commit_address,
+    input [2:0]  csr_commit_function3,
+    input [31:0] csr_commit_source,  // 寄存器形式 = PRF 按 rs1 物理号读出；立即数形式 = {27'd0, zimm}
     input [31:0] pc_address_in,
 //异常【交付】口（来自 ROB 的 trap_fire）：故障项退到队头那一拍才拉，载荷是它自己那份。
 //检测那一拍（flush_control_exception）只负责挡中断，不锁 mepc/mcause/mtval —— 详见下方时序块里的注释。
@@ -61,22 +62,53 @@ module csr(
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_registered, mcycle_registered, minstret_registered, mscratch_registered, mtval_registered;
     reg [31:0] interrupt_return_address_1;
 
-//输入合流（按"上层不运算"下放至此）：冲刷闸门（指令写用）、中断闸门
-    reg exception_interrupt_gate, flush_window;
+//输入合流（按"上层不运算"下放至此）：中断闸门
+    reg exception_interrupt_gate;
     always @(*) begin
-        flush_window  = flush_control_exception | flush_control_in[1] | flush_control_in[0];
         exception_interrupt_gate = (interrupt_request_timer != 2'd0);
     end
 
-//即将锁存的写入值（与"意图写入值" csr_data_in 区分开）：
+//CSR 读表写两份（执行级一份、提交口一份），不是偷懒：
+//  ★ 本仓实测过，iverilog 的 @* 不把【函数体内读的信号】算进敏感表（见记忆
+//    iverilog-function-body-not-in-sensitivity）。写成 function 再在两个 always @(*) 里调用，
+//    那些 CSR 寄存器变化时两个读口都不会重算 ⇒ 仿真读到陈旧值。所以只能逐项展开。
+
+//读-改-写（提交拍）：function3[1:0] = 01 写 / 10 置位 / 11 清位（[2] 是立即数形式，二选一已在源上做过）
+    reg [31:0] csr_commit_read;
+    reg [31:0] csr_write_intent;
+    always @(*) begin
+        case (csr_commit_address)
+        12'h300: csr_commit_read = {19'd0, 2'b11, 3'd0, exception_interrupt_enable_post_registered, 3'd0, exception_interrupt_enable_registered, 3'd0};
+        12'h301: csr_commit_read = 32'h40001100;
+        12'h304: csr_commit_read = {20'd0, exception_external_interrupt_enable, 3'd0, exception_timer_interrupt_enable, 3'd0, exception_software_interrupt_enable, 3'd0};
+        12'h305: csr_commit_read = isr_addr_reg1;
+        12'h340: csr_commit_read = mscratch_registered;
+        12'h341: csr_commit_read = interrupt_return_address_1;
+        12'h342: csr_commit_read = mcause_registered;
+        12'h343: csr_commit_read = mtval_registered;
+        12'h344: csr_commit_read = {20'd0, exception_external_interrupt_pending, 3'd0, exception_timer_interrupt_pending, 3'd0, exception_software_interrupt_pending, 3'd0};
+        12'hB00: csr_commit_read = mcycle_registered;
+        12'hB02: csr_commit_read = minstret_registered;
+        12'hF14: csr_commit_read = 32'd0;
+        default: csr_commit_read = 32'd0;
+        endcase
+        case (csr_commit_function3[1:0])
+        2'b01: csr_write_intent = csr_commit_source;
+        2'b10: csr_write_intent = csr_commit_source | csr_commit_read;
+        2'b11: csr_write_intent = csr_commit_read & ~csr_commit_source;
+        default: csr_write_intent = csr_commit_read;
+        endcase
+    end
+
+//即将锁存的写入值（与"意图写入值" csr_write_intent 区分开）：
 //mtvec 的 MODE[1:0] 是 WARL，本核只实现 Direct ⇒ 写入时把低 2 位规范化为 0（BASE 保持 4 字节对齐）。
 //★ 写后读旁路必须用这个值：旁路前递的是"将要写入的值"，一 masking 就会前递未屏蔽的值
 //（与 misa 那处同类 —— 旁路前递的必须等于真正锁存的值）。
     reg [31:0] csr_write_value;
     always @(*) begin
-        csr_write_value = csr_data_in;
-        if (csr_address == 12'h305)
-            csr_write_value = {csr_data_in[31:2], 2'b00};
+        csr_write_value = csr_write_intent;
+        if (csr_commit_address == 12'h305)
+            csr_write_value = {csr_write_intent[31:2], 2'b00};
     end
 
     always @(posedge clk) begin
@@ -110,21 +142,22 @@ module csr(
             exception_software_interrupt_enable <= exception_software_interrupt_enable;
             exception_interrupt_process <= exception_interrupt_process;
 //根据不同的csr写地址写入不同的csr寄存器
-//★ 使能与地址由 alu 的寄存级给出（= 真的发出去过的那一组），故这里不再看停顿；只挡"发出后同拍被冲刷"。
-            if (csr_write_action && !flush_window) begin
-                case (csr_address)
+//★ 提交口：valid / 地址 / 值都是 ROB 打完拍的那一组 ⇒ 不看停顿、也不看当拍冲刷 ——
+//  这条指令在上一拍已经退休，它的写必须落地；同拍发生的任何冲刷都属于比它年轻的项。
+            if (csr_commit_valid) begin
+                case (csr_commit_address)
 //全局使能设定
                 12'h300: begin
-                    exception_interrupt_enable_registered <= csr_data_in[3];
-                    exception_interrupt_enable_post_registered <= csr_data_in[7];
+                    exception_interrupt_enable_registered <= csr_write_value[3];
+                    exception_interrupt_enable_post_registered <= csr_write_value[7];
                 end
 //三类型中断分别使能：规范位序 bit3=MSIE(软件)、bit7=MTIE(定时器)、bit11=MEIE(外部)
 //★ 本核原来把外部/软件写反了（eirq@3、sirq@11），与自家 mcause 的中断码（外部=11/定时器=7/
 //  软件=3，规范）自相矛盾 ⇒ 按规范对调。定时器那条本来就对。
                 12'h304: begin
-                    exception_external_interrupt_enable <= csr_data_in[11];
-                    exception_timer_interrupt_enable <= csr_data_in[7];
-                    exception_software_interrupt_enable <= csr_data_in[3];
+                    exception_external_interrupt_enable <= csr_write_value[11];
+                    exception_timer_interrupt_enable <= csr_write_value[7];
+                    exception_software_interrupt_enable <= csr_write_value[3];
                 end
 //isr跳转目标设定
                 12'h305: begin
@@ -132,23 +165,23 @@ module csr(
                     isr_addr_reg2 <= csr_write_value;
                 end
                 12'h340: begin
-                    mscratch_registered <= csr_data_in;
+                    mscratch_registered <= csr_write_value;
                 end
 //isr返回目标设定
                 12'h341: begin
-                    interrupt_return_address_1 <= {csr_data_in[31:2], 2'b00};
-                    interrupt_return_address_2 <= {csr_data_in[31:2], 2'b00};
+                    interrupt_return_address_1 <= {csr_write_value[31:2], 2'b00};
+                    interrupt_return_address_2 <= {csr_write_value[31:2], 2'b00};
                 end
                 12'h342: begin
 //中断/异常原因寄存器
-                    mcause_registered <= csr_data_in;
+                    mcause_registered <= csr_write_value;
                 end
                 12'h343: begin
-                    mtval_registered <= csr_data_in;
+                    mtval_registered <= csr_write_value;
                 end
                 12'h344: begin
 //软件中断挂起：按规范在 bit3（MSIP）；写 1 清挂起
-                    if (csr_data_in[3])
+                    if (csr_write_value[3])
                         exception_software_interrupt_pending <= 1'b0;
                 end
                 endcase
@@ -247,9 +280,8 @@ module csr(
         end
     end
 
-//给 alu 的组合读口：地址取本拍要发的 csr_address（与写地址同源）。不做写后读旁路 ——
-//站式之后每条 csr 指令各占一个发射拍，前一条的写在前一沿就已落进寄存器，本条组合读到
-//的就是它，不需要旁路；没有旁路也顺带修掉"读只读常量表（misa）读到写入值"那类问题。
+//给 alu 的组合读口：地址取本拍要发的 csr_address（= 发射拍那一条的地址）。不做写后读旁路 ——
+//每条 csr 指令各占一个发射拍，前一条的写在前一沿就已落进寄存器，本条组合读到的就是它。
     always @(*) begin
         case (csr_address)
         12'h300: csr_data_combinational = {19'd0, 2'b11, 3'd0, exception_interrupt_enable_post_registered, 3'd0, exception_interrupt_enable_registered, 3'd0};

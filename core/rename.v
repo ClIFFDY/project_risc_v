@@ -44,6 +44,9 @@ module rename #(
     input  [4:0]          lookup_a, lookup_b, lookup_c, lookup_d,
     output [PHYS_BITS-1:0] lookup_a_phys, lookup_b_phys, lookup_c_phys, lookup_d_phys,
 
+//---- 分配时被顶掉的那个映射（精确冲刷回滚用；rob 随项存）----
+    output [PHYS_BITS-1:0] old_phys_0, old_phys_1,
+
 //---- 提交口（rob 队头，口 A 更老；物理号跟着 ROB 项走）----
     input                 commit_we_a, input [4:0] commit_rd_a, input [PHYS_BITS-1:0] commit_phys_a,
     input                 commit_we_b, input [4:0] commit_rd_b, input [PHYS_BITS-1:0] commit_phys_b,
@@ -135,6 +138,12 @@ module rename #(
     assign lookup_b_phys = rat[lookup_b];
     assign lookup_c_phys = (bypass_0 & (alloc_rd_0 == lookup_c)) ? pick_0 : rat[lookup_c];
     assign lookup_d_phys = (bypass_0 & (alloc_rd_0 == lookup_d)) ? pick_0 : rat[lookup_d];
+
+//---- 分配时被顶掉的那个映射 ----
+//  = rat[rd] 在【本拍写之前】的值。lane1 要看见同拍 lane0 的写（同上面查找口的口径）：
+//  两条同写一个架构号时，lane1 的 old 就是 lane0 刚发出去的那个号。
+    assign old_phys_0 = rat[alloc_rd_0];
+    assign old_phys_1 = (alloc_ok_0 & (alloc_rd_0 == alloc_rd_1)) ? pick_0 : rat[alloc_rd_1];
 
 //---- 提交口要释放的旧号 ----
 //  `old = arch_map[rd]` 现读现用，不在 ROB 里另存 old_phys。
