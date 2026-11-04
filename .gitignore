@@ -4,3 +4,6 @@
 vivado*.jou
 vivado*.log
 .Xil/
+
+# 改 RTL 前的手工快照目录（不是设计文件）
+_backups/
