@@ -451,7 +451,13 @@ module dcache(
             end
 
 //---- B 口：收下 → one-shot 缓存更新 / 写穿 → 撤 busy ----
-            if (store_valid_in && !store_busy
+//★ 2026-11-05：回填期间不收 store。收下那拍捉的 tag 字还是【旧行】的（miss 时是 invalid ⇒
+//  store_hit=0），而写穿带着 ~read_drive 只能排在回填之后 ⇒ 回填先读到旧内存、把旧值整行写进
+//  阵列，这笔 store 又因为"没命中"不写阵列 ⇒ 那一行永久是旧值（实测 CoreMark 卡 core_list_init）。
+//  挡到回填结束再收，tag 已是新行 ⇒ 走命中那一路（阵列写 + 写穿），两条路都在。
+//  只在 stage==0 收不会引入顺序问题：stage==0 收下 ⇒ 下一拍 store_busy，写穿当拍就发
+//  （read_drive 这时还是 0），比同拍收下的 load 判 miss 进回填还早一拍。
+            if (store_valid_in && !store_busy && (stage == 1'b0) && !miss_q
                 && (store_address_in[31:24] == 8'd0) && (store_address_in[23:13] == 11'h100)) begin
                 store_busy        <= 1'b1;
                 store_cache_done  <= 1'b0;
@@ -499,7 +505,18 @@ module dcache(
 //★ request_blocked：纯状态量（A 口）。只有回填期间不收新读。
     assign request_blocked = (stage != 1'b0);
 //★ store_blocked：B 口忙。LSU 用它挡排水 —— 这是【寄存器】，排水判据里再没有地址量。
-    assign store_blocked = store_busy;
+//★ 2026-11-05：回填期间也算"B 口忙"，否则 store 会在回填中途被收下（收下那拍的 tag 还是旧行，
+//  store_hit=0 ⇒ 不写阵列），而写穿带着 ~read_drive 只能排在回填之后 ⇒ 回填先把旧值整行写进
+//  阵列、再没人纠正（实测 CoreMark 卡 core_list_init）。
+//  ★ 必须【并进 store_blocked】而不是只加在 B 口受理条件里：LSU 是"亮出排水 + 看忙位撤销"
+//    这套握手（store_inflight / store_finish = inflight & ~store_blocked），受理条件单方面
+//    拒收会让它把没送出去的 store 当成办完了 ⇒ 那笔 store 直接蒸发（实测随机差分 seed8 挂）。
+//  ★ 挡的只是【排水】，load 的发送本来就被 request_blocked 挡在回填之外。
+//  ★ miss_q 也要算进来：缺失判出来到 stage 置起之间隔着一拍，那一拍 stage 还是 0，
+//    只在 stage==0 收 store 会让它正好落在"回填下一拍就开始"的缝里 —— 收下当拍没事，
+//    写穿被下一拍起的 read_drive 压到回填结束，回填就已经把旧值读走了（实测 c=64152 收、
+//    c=64162 回填读、c=64163 才写穿，`lw x1,12(sp)` 读回 0）。
+    assign store_blocked = store_busy | (stage != 1'b0) | miss_q;
 
 //结果口就绪：命中那一路与 fill_end 那一路，都用寄存量出，D 脚路径整段消失。
     assign load_ready = (access_read_q & (access_hit_way0 | access_hit_way1)) | fill_end_q;

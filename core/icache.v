@@ -45,7 +45,7 @@ module icache(
     input clk, rst,
 //取指地址生成（原 itcm）
     input [31:0] pc_address_0, pc_address_1,
-    input exception_interrupt, exc_irq_ret, exc_ecall,
+    input exception_interrupt,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
     input       stall_pc_redirect_in,   // = stall_pc_redirect_in
@@ -385,7 +385,9 @@ module icache(
     always @(*) begin
 //★ 只有"这一拍换 pc"的场合才作废交付。跳转类（jal/br1/jalr）不再在此列：
 //  改向已由取指落点表提前一拍完成，这一拍读到的是目标那一对，不存在错路。
-        discard_output = (exception_interrupt | exc_irq_ret | exc_ecall | flush_control_exception | flush_pc_redirect);
+//★ 只有"这一拍换 pc"的场合才作废交付，来源只有三个：ROB 队头交付（陷阱）、提交口改向
+//  （分支/jalr 的 B、mret 的 A、陷阱/中断落地，都并进 flush_pc_redirect）、irq 受理。
+        discard_output = (exception_interrupt | flush_control_exception | flush_pc_redirect);
     end
 
 //★ 交付寄存器的装载条件 = "这一次读回来的那一对，下游【当拍】收得下"。

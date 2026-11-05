@@ -134,6 +134,8 @@ module idu2(
 //  "上一拍刚冲刷过"，用来补上这一拍的空档：错路指令还躺在 Q 里，若不管它，它会照常发射 ——
 //  最坏是错路 csrrw 在发射拍就把 CSR 锁存住（影子里的写污染 mscratch）。
     input        flush_control_rob_registered,
+//★ 2026-11-04 精确冲刷：按槽的击杀掩码（与上面同相：都比冲刷拍晚一拍）
+    input [15:0] flush_kill_mask_in,
     input        flush_pending,
     input        flush_inclusive_registered,
     input [3:0]  flush_index_registered,
@@ -317,8 +319,13 @@ module idu2(
 //  （弧是绝对槽号的集合，队头前进不改变它）。这样 head_ptr 不再扇进本模块。
 //★ 2026-10-31：击杀弧与 rob_flush_part 都是【常数】（rob.v：kill_arc[ka] 恒 1、flush_partial 恒 0），
 //  这条 16:1 查表在综合时早就被折掉了。这里直接在 RTL 上写死，读的人不用再追两层。
-        decode_kill_0 = kill_all;
-        decode_kill_1 = kill_all;
+//★ 2026-11-04 精确冲刷：冲刷杀谁改成【按本级的槽号查掩码】。比边界老的 D 级条目必须留住 ——
+//  一刀全杀会把它对应的 ROB 项变成孤儿（没人再发它，队头永远等不到完成，实测死锁）。
+//  陷阱（异常/中断）仍是整条管子作废，那一档的边界就是队头。
+        decode_kill_0 = trap_fire_registered |
+                        (flush_control_rob_registered & flush_kill_mask_in[index_in]);
+        decode_kill_1 = trap_fire_registered |
+                        (flush_control_rob_registered & flush_kill_mask_in[index_in_lane1]);
 //访存那一路的"进队"事件：go 里有 ~flush_window，所以进队拍 kill_all 与冲刷位都是 0 ⇒ 这两项恒 0，
 //留着是为了判据与两条 lane 逐条同形（将来若放开进队门也不会漏）。
         decode_dead_mem = 1'b0;
@@ -375,10 +382,16 @@ module idu2(
     assign prf_read_a_m_phys = queue_phys_a_mem;
     assign prf_read_b_m_phys = queue_phys_b_mem;
     reg kill_0, kill_1, kill_mem;
+//★ 2026-11-04 精确冲刷：击杀改成【按槽查掩码】。槽比边界年轻才死 —— 比分支更老的、
+//  还在排队没发的合法项必须留住（整窗那一档掩码全亮，与改动前逐字等价）。
+//  掩码是 rob 用当拍队头算好、寄存一拍送来的（绝对槽号的集合，队头前进不改变它）。
     always @(*) begin
-        kill_0 = queue_valid_0 & kill_all;
-        kill_1 = queue_valid_1 & kill_all;
-        kill_mem = queue_valid_mem & kill_all;
+        kill_0 = queue_valid_0 & (trap_fire_registered |
+                 (flush_control_rob_registered & flush_kill_mask_in[queue_index_0]));
+        kill_1 = queue_valid_1 & (trap_fire_registered |
+                 (flush_control_rob_registered & flush_kill_mask_in[queue_index_1]));
+        kill_mem = queue_valid_mem & (trap_fire_registered |
+                 (flush_control_rob_registered & flush_kill_mask_in[queue_index_mem]));
     end
 
 
@@ -607,8 +620,12 @@ module idu2(
 //  ⇒ 要让"推进只认操作数"成立，前提是 Q 至少 2 深（或者加一格交接寄存器）。
 //★ 2026-10-31：`stage_advance` 从 accept 挪到 load —— accept 只表达"Q 这拍会空出来"，
 //  "D 里到底有没有东西"是落盘的事（idu1 的 lane0_free 里 `~payload_valid_out_0` 已经覆盖）。
-        accept_0 = ~queue_valid_0 | issue_ok_0;
-        accept_1 = ~queue_valid_1 | issue_ok_1;
+//★ 2026-11-05：accept 还要再吃一层 `~flush_window & ~kill_pending` —— 直接取 issue_valid。
+//  issue_ok 只表达"这条本身能发"，冲刷窗口那几拍它照样是 1 而 issue_valid 是 0；
+//  此时放 D 进来会**覆盖掉 Q 里一条没发出的存活条目**，ROB 里那一项就成了孤儿
+//  （整窗冲刷掩盖了这一点：那时 Q 里那条本来就要被杀。精确冲刷之后它必须活下来）。
+        accept_0 = ~queue_valid_0 | issue_valid_0;
+        accept_1 = ~queue_valid_1 | issue_valid_1;
 //★ 落盘门只认【进来的这一条】自己死没死（decode_dead_* = dead_registered_*，冲刷那一沿
 //  由 decode_kill_* 置位）。accept 已经不带 flush/kill_pending 了，错路 D 就靠这一项丢掉拿。
         load_0 = stage_advance       & accept_0 & ~decode_dead_0;

@@ -62,7 +62,12 @@ module prf #(
     output reg [PHYS_COUNT-1:0] ready,          // 1 = 值的家已经填好，可以读
     input      [PHYS_COUNT-1:0] alloc_mask,     // 本拍分配出去的号
     input                       flush,
-    input      [PHYS_COUNT-1:0] flush_arch_mask // 冲刷后仍在用的号 = 架构映射那一组
+    input      [PHYS_COUNT-1:0] flush_arch_mask, // 冲刷后仍在用的号 = 架构映射那一组
+//★ 2026-11-04 精确冲刷：没被杀的在飞项占的物理号 —— 它们的就绪位【保住】，
+//  消费者不用重等。整窗那一档（异常/中断）恒 0 ⇒ 与改动前逐字等价。
+    input      [PHYS_COUNT-1:0] flush_survive_mask,
+//★ 2026-11-05：改向那条分支自己提交的那一拍 —— ROB 已经空了，就绪位直接回到架构映射那一组。
+    input                       restore
     );
 
     localparam integer BANK_DEPTH = PHYS_COUNT / 2;
@@ -170,7 +175,14 @@ module prf #(
         end
         else if (flush) begin
 //★ 冲刷拍也可能同时有一笔分配（alloc 用的门里没有 flush_window）⇒ 那一笔照样要清。
-            ready <= (flush_arch_mask | write_mask) & ~alloc_mask;
+//★ 精确改向：被杀号的 ready 必须落 0（号要回收，残留 ready 会让下一个住户被读走），
+//  但【没杀】的在飞项保持原样 —— 这正是精确冲刷的收益所在。
+            ready <= (flush_arch_mask | (ready & flush_survive_mask) | write_mask) & ~alloc_mask;
+        end
+        else if (restore) begin
+//★ 改向判定后分配一直冻到那条分支提交 ⇒ 这一拍 ROB 里只剩它自己，
+//  在飞的写都已经作废/落完 ⇒ 就绪位就等于架构映射那一组。
+            ready <= flush_arch_mask;
         end
         else begin
             ready <= (ready | write_mask) & ~alloc_mask;

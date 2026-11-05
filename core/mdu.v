@@ -55,6 +55,8 @@ module mdu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
+//★ 2026-11-04 精确冲刷：按槽的击杀掩码【当拍版】。比分支老的乘法/除法不杀，照样跑完。
+    input [15:0] flush_kill_mask_in,
 //本次冲刷的边界（cont 的 flush_idx：三种冲刷各取自己那条的号）：
 //入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
 //两条接收通道（乘法口 / 除法口）：站一拍只出一条 ⇒ 两套载荷同源，只有 valid 不同。
@@ -207,14 +209,12 @@ module mdu(
 // KILL-ARC: 判据改成查 rob 的击杀弧掩码（第 i 位 = 槽 i 比边界年轻）。
 //   `d_age <= flush_age`（不比我年轻）= `~kill_arc[divide_state_index]`，代入原式化简成下面这一行。
 //   吃当拍版：flush_window / flush_partial 都是当拍的。
-        divide_state_kill    = flush_window;
-//乘法两级：判据与除法【同一条】。冲刷在提交口发、队头即边界 ⇒ 在途的乘法一律比边界年轻，
-//  冲刷拍必须作废，与"必须照样提交"正好相反。
-//  带 `~kill_arc` 那一支：部分冲刷时，比边界老的乘法仍然要留着（否则它那一项永远等不到完成口）。
-//  带 `valid` 那一支：`multiply_stage_index` 只在 push 那一拍装载，复位后没有初值，
-//  不让它进 kill_arc 的索引，免得复位期走出 X。
-        multiply_stage1_kill = multiply_stage_valid & flush_window;
-        multiply_stage2_kill = multiply_product_valid & flush_window;
+//★ 2026-11-04 精确冲刷：判据里补上【按槽的击杀掩码】。
+//  精确改向只杀比分支年轻的项 ⇒ 比它老的除法 / 乘法必须继续跑完（否则它那一项永远等不到完成口）。
+//  整窗那一档掩码全亮，与改动前逐字等价。
+        divide_state_kill    = flush_window & flush_kill_mask_in[divide_state_index];
+        multiply_stage1_kill = multiply_stage_valid & flush_window & flush_kill_mask_in[multiply_stage_index];
+        multiply_stage2_kill = multiply_product_valid & flush_window & flush_kill_mask_in[multiply_stage_index_registered];
     end
 
 //组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）

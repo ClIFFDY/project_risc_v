@@ -71,6 +71,8 @@ module cont(
 //★ S3：改向判定现在由 ROB 在【提交口】给出（队头那条判错了的分支），边界就是队头。
 //  bju 的 br2/br3/jump_link_register_failure 不再直接引发冲刷 —— 它们只写进 ROB 项，等队头生效。
     input        redirect_in,
+//★ S5：A 域改向（判定拍 / mret）—— 只清前端 + 改 PC，不碰后端。B 域仍是上面的 redirect_in。
+    input        redirect_front_in,
 //csr 读口（执行级）与提交口（写）与中断源
     input [11:0] csr_address,
 //★ 2026-11-04（CSR 步骤 C）：读-改-写搬出执行级，改为提交拍落地。这四根由 ROB 提交口给（各是一级触发器）。
@@ -82,6 +84,10 @@ module cont(
     input        exti, timi, softi,
 //流水线状态（寄存输出）
     output reg [7:0] flag_bus,
+//★ S5：前端域冲刷 {异常, 中断, 改PC}。只给 pc / icache / idu1 的输入 lane。
+//  A（判定拍改向）只在这一份里；B（提交口清表）只在上面的 flag_bus 里。
+//  异常/中断两份都亮（它们本来就是 A+B 同拍）。mret 两份都亮（要改 PC，也要清表）。
+    output reg [2:0] flag_bus_front,
 //★ 给【执行单元】的寄存版（v2）。当拍版仍然服务 pc 重定向与前端停手（那两条必须同拍），
 //  mdu/alu/lsu 这些"错了也无副作用、由 ROB 的世代校验兜底"的单元改吃这一版：
 //  它们的 D 引脚原来挂着「rob 的 trap_fire/head_ok → flag_bus → 单元作废」这条跨模块锥。
@@ -119,12 +125,8 @@ module cont(
     output reg [3:0]  exception_selected_index,
     output reg [3:0]  exception_selected_cause,
     output reg [31:0] exception_selected_pc, exception_selected_trap_value,
-//mret 的资格版：同一根线既喂 pc 的排队武装、又喂 csr 的使能恢复（两者是同一次 mret 生效的两半）
-    output reg exception_interrupt_return_ok,
-// mret 搬到提交口：判定拍只报"哪一项是 mret"，队头那一拍由 ROB 拉 mret_valid 回来。
-    output reg        mret_mark,
-    output reg [3:0]  mret_index,
-    output reg [31:0] mret_target,
+// mret 搬到提交口：判定拍不再报标签（标签随分配从 idu1 的译码位进 ROB），
+//  队头那一拍由 ROB 拉 mret_valid 回来。落点也不从这里出 —— pc 直接用 csr 的 mepc 锁存器。
     input             mret_valid,
 //重定向登记（原 pc.v 的 redirect_kind 状态机搬来）：陷阱 / mret / 中断受理三种，
 //都要等 ROB 排空之后才落地；分支/jalr 的错路不走这里（pc 直接用 jp_tgt）。
@@ -161,6 +163,8 @@ module cont(
 
 //重定向登记与异常窗口
     reg [1:0] redirect_kind;
+//mret 的资格版：本拍有一条 mret 已经够资格。只在本模块内用（喂 csr 的 exc_irq_ret 闸门）。
+    reg exception_interrupt_return_ok;
     // redirect_index 已删：它只服务"中断受理记录的撤销判据"，而那条判据 = older(flush_index, 记录时的队头)。
     // 现在所有改向（分支 / 陷阱 / mret / 中断）都在 ROB 队头发起 ⇒ flush_index 恒 = 队头，
     // 而记录时的队头不可能比现在的队头更年轻 ⇒ older() 恒 0，这个寄存器与那支索引锥都是死的。
@@ -232,6 +236,9 @@ module cont(
 //  总线定义本身保持原样（八位一位不少、一位不换），只是第 0 位现在没有读者 —— 留着是为了
 //  "总线 = 八个源"这件事可读，不是因为它还有用。
         flush_control_rob = flush_control_jump | flush_control_interrupt | flush_control_exception;
+//★ S5 前端域：A（判定拍改向 / mret）单占一位；B 不进这一份 —— 提交口清表时前端正在
+//  往分配口送正确路径的指令，那批必须留着。
+        flag_bus_front = {flush_control_exception, flush_control_interrupt, redirect_front_in};
         if (flush_control_interrupt)
             flush_index = interrupt_head_index_in;
         else
@@ -244,6 +251,7 @@ module cont(
             flush_control_jump = 1'b0;
             flush_inclusive     = 1'b0;
             flag_bus = {1'b0, 1'b0, 1'b0, 1'b1, 4'd0};
+            flag_bus_front = 3'd0;
         end
     end
 
@@ -316,7 +324,7 @@ module cont(
         stall_pc_redirect = redirect_pending & ~rob_empty;
         redirect_go       = redirect_pending & rob_empty & ~reset_registered;
         redirect_target   = isr_addr2_i;   //只剩 1(陷阱) / 3(中断受理) 两档，落点都是 mtvec
-        flush_pc_redirect = redirect_go | (flush_control_jump & ~flush_control_exception);
+        flush_pc_redirect = redirect_go | (redirect_front_in & ~flush_control_exception);
     end
 
 //★ 撤回一条待交付的改向记录，判据只有一个：本方来了分支改向（redirect_in）。
@@ -462,7 +470,11 @@ module cont(
         .softi(softi),
         .exc_ecall(exc_ecall_i),
         .flush_control_exception(flush_control_exception),
-        .exception_mark_in(exc_mark),
+//★ 原来是 `.exception_mark_in(exc_mark)`，而 `exc_mark` 全树没有声明也没有驱动（隐式 1 位、恒 0）
+//  ⇒ 下面那段"关中断 + 置受理态"从来没执行过：陷阱入口不清 MIE、不搬 MPIE ⇒ 异常处理器全程可被
+//  中断打断，中断把 mepc/mcause 覆盖掉，处理器的 mepc+4 恢复就丢了（实测整个 body 重跑 / 死转）。
+//  接交付拍（rob_trap）的脉冲版：交付仍早于处理器第一条执行（PC 到 mtvec 要等 rob_empty）。
+        .exception_mark_in(flush_control_exception),
         .interrupt_head_valid_in(interrupt_head_valid),
         .exception_retire(rob_trap),
         .exception_retire_cause(rob_trap_cause),
@@ -496,12 +508,8 @@ module cont(
         interrupt_return_address_2 = iret_addr2_i;
     end
 
-//mret 标签出口：判定拍把"这一项是 mret"交给 ROB；落点由 mepc 在队头现读。
-    always @(*) begin
-        mret_mark = exception_interrupt_return_ok;
-        mret_index  = exc_irq_ret_q_0 ? bju_index_in_0 : bju_index_in_1;
-        mret_target  = iret_addr2_i;
-    end
+//mret 标签不再从这里出：它是 idu1 的译码位，随分配直接写进 ROB 项（rob: allocation_mret_*）。
+//  原来这里报的是 bju 判定级的 1 拍脉冲 + 槽号，会被同一窗口里别人的异常标志压掉（seed36）。
 
 //===============================================================
 // 序号与执行位

@@ -18,6 +18,8 @@ module exu (
     input  rst,
     input  [2:0] flush_control_in,      // = flag_bus[7:5]：{异常, 中断, 改向}
     input  [3:0] flush_index_in,        // ROB 冲刷边界（bju 用）
+//★ 2026-11-04 精确冲刷：按槽的击杀掩码（透传给 mdu：比分支老的乘除不杀）
+    input [15:0] flush_kill_mask_in,
 
 //--------------------------------------------------------------- 操作数与身份
     input        write_enable_in,
@@ -164,6 +166,7 @@ module exu (
     mdu u_mdu (
         .clk(clk), .rst(rst),
         .flush_control_in(flush_control_in),
+        .flush_kill_mask_in(flush_kill_mask_in),
         .multiply_go(multiply_go), .multiply_function10(multiply_function10), .multiply_destination(destination_in),
         .multiply_index_in(index_in), .multiply_generation_in(generation_in),
         .multiply_source_a(source_a_data), .mul_r2(r2_data),

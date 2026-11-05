@@ -51,10 +51,14 @@ module rename #(
     input                 commit_we_a, input [4:0] commit_rd_a, input [PHYS_BITS-1:0] commit_phys_a,
     input                 commit_we_b, input [4:0] commit_rd_b, input [PHYS_BITS-1:0] commit_phys_b,
 
-//---- 冲刷：在提交口发、队头即边界 ----
+//---- 冲刷 / 恢复：都在提交口发 ----
     input                 flush,
 //边界之上那些项的物理号各展成 one-hot 后 OR 起来（外面算好，这里只做归并）
     input  [PHYS_COUNT-1:0] squash_mask,
+//★ 2026-11-05 NaxRiscv 口径：改向一经判定就把分配冻住，rat 在冻住期间没人读
+//  ⇒ 回滚退化成"整片抄回 arch_map"，不需要按架构号挑最老被杀项。
+//  restore = 那条分支自己提交的那一拍：flush 和 restore 对这里做的事完全相同。
+    input                 restore,
 
 //---- 给 PRF 的就绪位用 ----
     output [PHYS_COUNT-1:0] alloc_onehot,        // 本拍分配出去的号
@@ -192,12 +196,15 @@ module rename #(
 //0..ARCH_COUNT-1 被架构映射占着，上面那些才是空闲池
             free_vector <= ~({{(PHYS_COUNT-ARCH_COUNT){1'b0}}, {ARCH_COUNT{1'b1}}});
         end
-        else if (flush) begin
+        else if (flush | restore) begin
 //一拍恢复：整片抄回 + 把在册的号收回来。
 //★ 冲刷拍【常常同时压着一笔打拍后的提交】：rob.v 明确写了"打拍里那笔在边界之前，清了会丢一笔合法写"。
 //  所以这里必须把提交也落下去 —— 恢复用的是【落完之后】的映射，否则会丢掉一笔合法写、
 //  而且那笔的物理号既不进 arch_map 也不在冲刷掩码里 ⇒ 漏号（实测真核里 arch_map 变得非一一映射）。
 //  同一个 rd 上 B（更年轻）赢。
+//★ 2026-11-05：改向判定后分配一直冻到那条分支提交（rob 的 redirect_stop_alloc），
+//  冻住期间没有任何新项来读 rat ⇒ 不再需要"按架构号挑最老被杀项"的扫描，整片抄回就是对的。
+//  restore 那一拍 ROB 里只剩那条分支自己。
             for (i = 0; i < ARCH_COUNT; i = i + 1) begin
                 if      (old_valid_b && (commit_rd_b == i)) rat[i] <= commit_phys_b;
                 else if (old_valid_a && (commit_rd_a == i)) rat[i] <= commit_phys_a;
@@ -205,6 +212,7 @@ module rename #(
             end
             if (old_valid_a) arch_map[commit_rd_a] <= commit_phys_a;
             if (old_valid_b) arch_map[commit_rd_b] <= commit_phys_b;
+//空闲表按构造写：架构映射占着的之外全可用。
             free_vector <= flush_free_mask;
         end
         else begin

@@ -18,13 +18,16 @@
 //     扫描必须提前一拍（见 rob.v 的相位说明）。
 //////////////////////////////////////////////////////////////////////////////////
 
-
 module idu1(
     input clk, rst,
 //★ 2026-10-31：不再接整根 flag_bus —— 只接本模块真正用到的三根。
 //  原来的 [2] pc_redirect 与 [0] bus_hold 与本级的推进无关（前者是取指侧的事，
 //  后者已挪进 lsu 的 blank_bus），留着只会让人以为它们还在这儿起作用。
-    input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
+    input [2:0] flush_control_in,   // 前端域 = {异常, 中断, 判定拍改向}：清输入 lane
+//★ S5：后端域 = flag_bus[7:5]（提交口清表 / 异常 / 中断）。只做两件事：
+//  rename / 空闲表回滚、挡住本拍的落盘与入队。**不清输入 lane** —— 提交口那一拍
+//  前端正在往分配口送正确路径的指令，那批必须留着。
+    input [2:0] flush_control_back_in,
     input       exec_in,            // = flag_bus[4]
     input       stall_rob_full_in,  // = flag_bus[3]
 //★ 冲刷的【寄存版】（cont 的 flush_pending，晚一拍）。只给访存 FIFO 的清零用：
@@ -32,6 +35,9 @@ module idu1(
 //  终点正是 lsu_queue_*_reg 的 R 脚。清零晚一拍无害 —— 冲刷拍进队门本来就关着，
 //  而冲刷之后 iffu 队头被清空、下一拍也不会有人进队。
     input       flush_pend,
+//★ 2026-11-04 精确冲刷：击杀掩码（与 lsu/mdu 同相，d1 那一拍）。持有 ROB 项的每一级都要按【槽号】查表，
+//  不能再"整条清空" —— 比边界老的那几条必须留住，否则 ROB 里那一项永远等不到完成（实测死锁）。
+    input [15:0] flush_kill_mask_in,
 //冲刷的年龄边界（与 idu2 的 kill 判据逐项同门）。输出级里挂着的那条【比冲刷点老】就不是错的，
 //必须留住 —— 见下面 keep_0/keep_1 那段。
     input [1:0]  store_pop,
@@ -188,6 +194,14 @@ module idu1(
 //★ 2026-11-04 真 PRF：提交项的物理号 + 冲刷掩码（在册全部项的物理号 one-hot OR）
     input  [5:0]  commit_phys0_in, commit_phys1_in,
     input  [63:0] squash_phys_mask_in,
+//★ 2026-11-04 精确冲刷：rat 回滚值（每架构号最老被杀项的 old_phys）+ 幸存在飞项掩码
+//★ 2026-11-05：前两个掩码已经不用（回滚改成"提交拍整片抄回 arch_map"），端口留着
+    input  [31:0]  squash_arch_hit_in,
+    input  [191:0] squash_arch_phys_in,
+    input  [31:0]  squash_survive_hit_in,
+    input          alloc_stop_in,
+    input          restore_in,
+    input  [63:0]  squash_survive_mask_in,
 //★ ROB 满：rename 的分配必须和 rob 的分配口【逐字同门】，否则发了号而 ROB 没接 ⇒ 漏号
     input         rob_full_in,
 //---- 队头（出队侧）----
@@ -202,16 +216,15 @@ module idu1(
 //★ 两条 lane 的载荷队列也各带两个源的物理号（idu2 的 D 级直接用）
     output reg [5:0]  phys_a_out_0, phys_b_out_0, phys_a_out_1, phys_b_out_1
     );
+
+//==============================================================================
+//  参数与声明区：本模块全部 localparam/parameter + reg/wire。
+//  Verilog 要求先声明后用，所以全放这里；正文只留逻辑。
+//==============================================================================
 //★宏化旋钮：2 = 双发（大核）、1 = 单发（小核）。
 //  LANES=1 时 alloc_lane1 恒 0 ⇒ iffu 每拍弹 1 条、h1 下一拍自己变队头，指令不丢；
 //  lane1 的载荷/单元随之变成死逻辑，综合自动裁掉。
     parameter integer LANES = 2;
-
-//复位就地打一拍：rst 由 rst_buf 单点扇出到全核，工具只能在布局阶段自己复制。每个模块各自打一拍，
-//寄存器就落在本模块旁边；全核都只打一拍，彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
-    reg reset_registered;
-    always @(posedge clk) reset_registered <= rst;
-
 //RV32I和Zicsr扩展的opcode集
     localparam OPCODE_OP_IMM = 7'b0010011;
     localparam OPCODE_OP     = 7'b0110011;
@@ -224,9 +237,7 @@ module idu1(
     localparam OPCODE_AUIPC  = 7'b0010111;
     localparam OPCODE_LUI    = 7'b0110111;
     localparam OPCODE_SYSTEM = 7'b1110011;
-
     localparam CLS_ALU = 2'd0, CLS_MUL = 2'd1, CLS_LSU = 2'd2, CLS_BJU = 2'd3;
-
 //bju 功能码：把"分支种类 / 跳转种类 / 四类异常"压成一个 4 位码，bju 只认这一个口。
 //★ 分支档用 bit3 当类标志、低 3 位就是 funct3 ⇒ bju 的比较 case 与原来逐字一致；
 //★ 非法编码覆盖一切（在 bjuf4 的译码里排第一）：非法分支 / 非法 jalr 一律不许再判。
@@ -238,43 +249,6 @@ module idu1(
     localparam BJU_EBREAK  = 4'd5;
     localparam BJU_ILLEGAL = 4'd6;
     localparam BJU_MRET    = 4'd7;
-
-//提取不同类型指令立即数的函数块
-    function [31:0] immB;
-        input [31:0] instruction;
-        immB = {{19{instruction[31]}}, instruction[31], instruction[7], instruction[30:25], instruction[11:8], 1'b0};
-    endfunction
-
-    function [31:0] immI;
-        input [31:0] instruction;
-        immI = {{20{instruction[31]}}, instruction[31:20]};
-    endfunction
-
-    function [31:0] immS;
-        input [31:0] instruction;
-        immS = {{20{instruction[31]}}, instruction[31:25], instruction[11:7]};
-    endfunction
-
-    function [31:0] immU;
-        input [31:0] instruction;
-        immU = {instruction[31:12], 12'd0};
-    endfunction
-
-    function [31:0] immJ;
-        input [31:0] instruction;
-        immJ = {{12{instruction[31]}}, instruction[19:12], instruction[20], instruction[30:21], 1'b0};
-    endfunction
-
-//flush_control_in / exec_in / stall_rob_full_in 合起来 = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
-//            stall_rob_full, stall_pc_redir,
-//            stall_icache_miss, stall_bus_hold}
-//控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】。
-    reg exec, flush_window;
-//★ 两条 lane 各自的"已发射"位。lane0/lane1 的发射彼此独立之后，"寄存器内容的消费"与"寄存器装载"
-//  不再同拍：lane0 先发出去、lane1 还要等它的操作数的那几拍里，lane0 的寄存器里躺着的仍是同一条
-//  指令 —— 没有这一对位，它会被每拍重新发一次（同一条指令重复进 ROB）。
-    reg lane0_free, lane1_free, go, load_lane0, load_lane1;
-
 //==============================================================================
 // 访存 FIFO：4 个标量（本仓惯例：数组元素在 always @(*) 里进不了敏感表）
 //   位域： [80:49] instruction  [48:17] pc  [16:13] rob 索引  [12] 世代
@@ -286,8 +260,27 @@ module idu1(
 //     被一条无关的提交清掉 ⇒ 尾声那条 `sw x28` 读到架构旧值 0）。
 //==============================================================================
     localparam integer LSU_QUEUE_WIDTH = 91;
+
+//复位就地打一拍：rst 由 rst_buf 单点扇出到全核，工具只能在布局阶段自己复制。每个模块各自打一拍，
+//寄存器就落在本模块旁边；全核都只打一拍，彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
+    reg reset_registered;
+//flush_control_in / exec_in / stall_rob_full_in 合起来 = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
+//            stall_rob_full, stall_pc_redir,
+//            stall_icache_miss, stall_bus_hold}
+//控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】。
+    reg exec, flush_window, flush_back_window;
+//★ 两条 lane 各自的"已发射"位。lane0/lane1 的发射彼此独立之后，"寄存器内容的消费"与"寄存器装载"
+//  不再同拍：lane0 先发出去、lane1 还要等它的操作数的那几拍里，lane0 的寄存器里躺着的仍是同一条
+//  指令 —— 没有这一对位，它会被每拍重新发一次（同一条指令重复进 ROB）。
+    reg lane0_free, lane1_free, go, load_lane0, load_lane1;
+//★ 声明必须在使用之前（Vivado 报 VRFC 10-3380；Verilator 不管）：这三根在分配判据（下面的
+//  alloc_lane0/1）里就用到了，而它们的赋值/例化口在文件末尾。
+    wire       rename_bank_empty_0, rename_bank_empty_1;
+    reg [4:0]  destination_decoded, destination_decoded_1;
+    reg [31:0] instruction_stage1, address_stage1, jump_link_register_stage1;
+    wire [5:0] lsu_push_phys_a, lsu_push_phys_b;
+    wire [5:0] lookup_a_phys, lookup_b_phys, lookup_c_phys, lookup_d_phys;
     reg [LSU_QUEUE_WIDTH-1:0] lsu_queue_0, lsu_queue_1, lsu_queue_2, lsu_queue_3;
-    (* max_fanout = 32 *) reg [2:0] lsu_queue_count;
     reg [LSU_QUEUE_WIDTH-1:0] lsu_entry;
     reg        lsu_push_0, lsu_push_1;
     reg [2:0]  lsu_room;
@@ -353,8 +346,124 @@ module idu1(
     reg [LSU_QUEUE_WIDTH-1:0] lsu_clear_0, lsu_clear_1, lsu_clear_2, lsu_clear_3;
     reg        lsu_tag_hit_0a, lsu_tag_hit_0b, lsu_tag_hit_1a, lsu_tag_hit_1b;
     reg        lsu_tag_hit_2a, lsu_tag_hit_2b, lsu_tag_hit_3a, lsu_tag_hit_3b;
+//★ lane1 这一拍拿 fifo 的哪一格：lane0 也在装 ⇒ 拿第二格；lane0 没装（在等操作数）⇒ 拿队头。
+//  所以 lane 编号不再代表程序序 —— 程序序由随指令带下去的 rob 索引保证，这里只按"装了几条"走指针。
+    reg [4:0]  source_a_stage1, source_b_stage1;
+    reg [4:0]  source_a_dec_0, source_b_dec_0, source_a_dec_1, source_b_dec_1;
+    reg [3:0]  index_stage1;
+    reg        branch_prediction_stage1, generation_stage1;
+//译码字段的组合解算：源是本级的输入（F 级的指令字），口径与原来那一段逐条一致。
+    reg [9:0]  function10_decoded;
+    reg [31:0] immediate_decoded;
+    reg        jump_decoded;
+    reg csr_is_access_dec, csr_exists_dec, csr_ro_dec, csr_wr_dec;
+    reg exc_illegal_dec, exception_jump_misalign_decoded;
+//入站分类 + 各类字段装配
+    reg [1:0]  class_decoded;
+    reg        write_enable_decoded, csr_write_enable_decoded, csr_write_commit_decoded;
+    reg [4:0]  destination_pick_decoded;
+    reg        is_store_decoded;
+    reg [2:0]  multiply_operation_decoded, load_store_function3_decoded, csr_function3_decoded;
+    reg [3:0]  function4_decoded;
+    reg [11:0] csr_address_decoded;
+    reg [31:0] jump_value_decoded;
+    reg        branch_flag_decoded, jump_link_flag_decoded, jump_link_register_flag_decoded;
+//非寄存器操作数的覆盖（立即数在这里并进操作数）
+    reg source_a_immediate_decoded, source_b_immediate_decoded;
+    reg [31:0] source_a_immediate_value_decoded, source_b_immediate_value_decoded;
+//异常标记（ecall/ebreak/mret）
+    reg exc_ecall_dec, exc_ebreak_dec, exc_irq_ret_dec;
+//bju 功能码（本级的唯一一个"这条指令在 bju 里算什么"的口）：
+//原来 bju 要分别吃 func4 / br_flag / jalr_flag / 四路异常五个口，其中 func4 与这四个
+//没有任何区分力（addi/beq/jalr 的 func4 都是 0000），"是不是分支"只能靠额外的类位。
+//这里一次译清：非法 > ecall > ebreak > mret > 分支（带 funct3）> jal（带非对齐）> jalr。
+//★ 非法排第一：非法分支/非法 jalr 的编码不许再当控制指令判，否则会一边报非法一边改向。
+    reg [3:0] branch_jump_function4_decoded;
+//lane1 的译码（与 lane0 一模，源换成 instruction_stage1 / address_stage1 / jump_link_register_stage1）
+    reg [9:0]  function10_decoded_1;
+    reg [31:0] immediate_decoded_1;
+    reg        jump_decoded_1;
+    reg csr_is_access_dec_1, csr_exists_dec_1, csr_ro_dec_1, csr_wr_dec_1;
+    reg exc_illegal_dec_1, exception_jump_misalign_decoded_1;
+    reg [1:0]  class_decoded_1;
+    reg        write_enable_decoded_1, csr_write_enable_decoded_1, csr_write_commit_decoded_1;
+    reg [4:0]  destination_pick_decoded_1;
+    reg        is_store_decoded_1;
+    reg [2:0]  multiply_operation_decoded_1, load_store_function3_decoded_1, csr_function3_decoded_1;
+    reg [3:0]  function4_decoded_1;
+    reg [11:0] csr_address_decoded_1;
+    reg [31:0] jump_value_decoded_1;
+    reg        branch_flag_decoded_1, jump_link_flag_decoded_1, jump_link_register_flag_decoded_1;
+    reg source_a_immediate_decoded_1, source_b_immediate_decoded_1;
+    reg [31:0] source_a_immediate_value_decoded_1, source_b_immediate_value_decoded_1;
+    reg exc_ecall_dec_1, exc_ebreak_dec_1, exc_irq_ret_dec_1;
+//bju 功能码（与 lane0 逐条同形）
+    reg [3:0] branch_jump_function4_decoded_1;
+//==============================================================================
+// 访存 FIFO 的队头译码 + 时序
+//==============================================================================
+//队头只做字段提取，不复制主译码的大 case：LOAD/STORE 的 rs1/rs2/rd/funct3 都在固定位上。
+    reg [31:0] lsu_head_instruction, lsu_head_pc;
+    reg [3:0]  lsu_head_index;
+    reg        lsu_head_generation;
+//★ 2026-11-04 真 PRF：进队条目带的是两个源的【物理号】，在进队这一拍由 rename 查出。
+//  查找口的驱动必须用【译码后的 rs】：LUI/AUIPC/JAL 这些没有 rs 的，
+//  instruction[19:15]/[24:20] 是立即数位段，裸切片会给自己认一个假号（实测 w11）。
+    wire [4:0]  lsu_push_source_a, lsu_push_source_b;
+    wire [4:0]  push1_source_a, push1_source_b;
+//★ 冲刷：按击杀掩码【截断】尾部，不再整条清（rob 的 flush_partial 恒 0 那一套已经不成立了）。
+//  击杀集合在程序序上是一段后缀，而本 FIFO 就是程序序 ⇒ 从第一项被杀的开始往后全丢，
+//  前面那几项（比边界老、ROB 里还在等）必须留住，否则它们的 ROB 项永远等不到完成。
+//  不动读指针；写指针对齐到"读指针 + 存活数"，维持 write = read + count 这个不变式。
+    reg [2:0]  lsu_flush_keep;
+    reg [1:0]  lsu_flush_slot;
+    reg [3:0]  lsu_flush_index;
+//==============================================================================
+// 真 PRF 的重命名表（2026-11-04）
+//   rat/arch_map/free_vector 都在 rename 里。这里只用它算两件事：
+//   ① 本条指令 rd 分到的物理号（交给 rob 随项存）
+//   ② rs1/rs2 翻译成的物理号（下一步替换 idu2 的 (槽,世代) 生产者表时用）
+//   分配点选在 idu1 的解码/分配拍 —— 和 rob 的槽分配是同一拍、同一条指令。
+//==============================================================================
+    wire [5:0] rename_phys_rd_0, rename_phys_rd_1;
+    wire [5:0] rename_phys_rs1_0, rename_phys_rs2_0;
+    wire [5:0] rename_phys_rs1_1, rename_phys_rs2_1;
+    wire       rename_stall_0, rename_stall_1;
+    wire [5:0] old_phys_0, old_phys_1;
+    wire [63:0] rename_alloc_onehot, rename_arch_next_onehot;
+
+    always @(posedge clk) reset_registered <= rst;
+
+//提取不同类型指令立即数的函数块
+    function [31:0] immB;
+        input [31:0] instruction;
+        immB = {{19{instruction[31]}}, instruction[31], instruction[7], instruction[30:25], instruction[11:8], 1'b0};
+    endfunction
+
+    function [31:0] immI;
+        input [31:0] instruction;
+        immI = {{20{instruction[31]}}, instruction[31:20]};
+    endfunction
+
+    function [31:0] immS;
+        input [31:0] instruction;
+        immS = {{20{instruction[31]}}, instruction[31:25], instruction[11:7]};
+    endfunction
+
+    function [31:0] immU;
+        input [31:0] instruction;
+        immU = {instruction[31:12], 12'd0};
+    endfunction
+
+    function [31:0] immJ;
+        input [31:0] instruction;
+        immJ = {{12{instruction[31]}}, instruction[19:12], instruction[20], instruction[30:21], 1'b0};
+    endfunction
+
+    (* max_fanout = 32 *) reg [2:0] lsu_queue_count;
     always @(*) begin
         flush_window = flush_control_in[2] | flush_control_in[1] | flush_control_in[0];
+        flush_back_window = flush_control_back_in[2] | flush_control_back_in[1] | flush_control_back_in[0];
 //★ 2026-10-31：只留 rob_full。
 //  · pc_redirect：改向本身就是一次冲刷，从 iffu 到队头这一段反正全杀，
 //    前端多取几条错路的没有任何代价 —— 它是取指侧的事，不属于本模块的推进。
@@ -403,14 +512,17 @@ module idu1(
 //  先读后写不收敛，本仓踩过。
 //★ 只看本地计数器：不许再依赖 idu2 当拍弹不弹（那会把 lsu 的 stage_free 拉进 iffu 的推进锥）
         lsu_room = 3'd4 - lsu_queue_count;
-        alloc_lane0 = go & instruction_valid_0 & (is_mem_0 ? (lsu_room != 3'd0) : lane0_free)
+//★ 2026-11-05：改向一经判定，分配冻结到那条分支提交。冻结住 alloc_lane0 就把
+//  ROB 分配 / 重命名 / 载荷落盘 / LSU 入队 / iffu 推进一起冻住（都挂在这一位上），
+//  所以冻住期间没有任何消费者读 rat ⇒ 回滚不需要按架构号的扫描。
+        alloc_lane0 = go & instruction_valid_0 & ~alloc_stop_in & (is_mem_0 ? (lsu_room != 3'd0) : lane0_free)
                     & ~(rename_bank_empty_0 & (destination_decoded != 5'd0));
 
 //★ `~flush_window` 挂在【落盘】上，不挂在推进上（2026-10-31）：
 //  冲刷拍照样从 iffu 弹（advance 不为 0，指针照走），但弹出来的那条【不进任何队列】——
 //  它本来就是错路的。ROB 的分配口自带 `!flush_control_rob`，所以这是全链一致的。
-        lane0_store = alloc_lane0 & ~is_mem_0 & ~flush_window;
-        lsu_push_0  = alloc_lane0 &  is_mem_0 & ~flush_window;
+        lane0_store = alloc_lane0 & ~is_mem_0 & ~flush_window & ~flush_back_window;
+        lsu_push_0  = alloc_lane0 &  is_mem_0 & ~flush_window & ~flush_back_window;
 //★ 2 深载荷的下一态判据（组合，只在本级寄存器上）：
 //  · head_after_pop = 出队（accept）之后头里还有没有东西 —— 影子有货就抬上来，所以还是"有"。
 //  · push           = 本拍真的要落一条进载荷（空格 addr==0 不算）。
@@ -426,11 +538,11 @@ module idu1(
         generation_pick  = alloc_lane0 ? generation_in_1 : generation_in_0;
         is_mem_1 = (instruction_pick[6:0] == OPCODE_LOAD) | (instruction_pick[6:0] == OPCODE_STORE);
         alloc_lane1 = (LANES == 1) ? 1'b0 :
-                      (go & (alloc_lane0 ? instruction_valid_1 : instruction_valid_0)
+                      (go & ~alloc_stop_in & (alloc_lane0 ? instruction_valid_1 : instruction_valid_0)
                           & (is_mem_1 ? 1'b0 : lane1_free))
                       & ~(rename_bank_empty_1 & (destination_decoded_1 != 5'd0));
 
-        lane1_store = alloc_lane1 & ~is_mem_1 & ~flush_window;
+        lane1_store = alloc_lane1 & ~is_mem_1 & ~flush_window & ~flush_back_window;
         lsu_push_1  = 1'b0;
 //给 fifo 的推进量 = 本拍真正消费了几格（0/1/2）：指针按它走，不是"成对就 +2"。
         advance = {1'b0, alloc_lane0} + {1'b0, alloc_lane1};
@@ -457,13 +569,6 @@ module idu1(
 //★ keep_0 / keep_1 已删（2026-10-31）：rob 的 flush_partial 恒 0、kill_arc 恒 1
 //  ⇒ 这两个量恒 0，冲刷拍两条 lane 一律清空，没有"留住比边界老的条目"这一档。
 
-//★ lane1 这一拍拿 fifo 的哪一格：lane0 也在装 ⇒ 拿第二格；lane0 没装（在等操作数）⇒ 拿队头。
-//  所以 lane 编号不再代表程序序 —— 程序序由随指令带下去的 rob 索引保证，这里只按"装了几条"走指针。
-    reg [31:0] instruction_stage1, address_stage1, jump_link_register_stage1;
-    reg [4:0]  source_a_stage1, source_b_stage1;
-    reg [4:0]  source_a_dec_0, source_b_dec_0, source_a_dec_1, source_b_dec_1;
-    reg [3:0]  index_stage1;
-    reg        branch_prediction_stage1, generation_stage1;
     always @(*) begin
         instruction_stage1 = alloc_lane0 ? instruction_in_1 : instruction_in_0;
         address_stage1 = alloc_lane0 ? address_in_1 : address_in_0;
@@ -482,11 +587,6 @@ module idu1(
         credit_stall_out = 1'b0;
     end
 
-//译码字段的组合解算：源是本级的输入（F 级的指令字），口径与原来那一段逐条一致。
-    reg [4:0]  destination_decoded;
-    reg [9:0]  function10_decoded;
-    reg [31:0] immediate_decoded;
-    reg        jump_decoded;
     always @(*) begin
         destination_decoded = 5'd0;
         function10_decoded = 10'd0;
@@ -581,7 +681,6 @@ module idu1(
         endcase
     end
 
-    reg csr_is_access_dec, csr_exists_dec, csr_ro_dec, csr_wr_dec;
     always @(*) begin
         csr_is_access_dec = (instruction_in_0[14:12] != 3'b000) && (instruction_in_0[14:12] != 3'b100);
 //★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
@@ -597,7 +696,6 @@ module idu1(
         endcase
     end
 
-    reg exc_illegal_dec, exception_jump_misalign_decoded;
     always @(*) begin
         exc_illegal_dec = 1'b0;
         exception_jump_misalign_decoded    = (instruction_in_0[6:0] == OPCODE_JAL) & instruction_in_0[21];
@@ -672,17 +770,6 @@ module idu1(
             endcase
         end
     end
-
-//入站分类 + 各类字段装配
-    reg [1:0]  class_decoded;
-    reg        write_enable_decoded, csr_write_enable_decoded, csr_write_commit_decoded;
-    reg [4:0]  destination_pick_decoded;
-    reg        is_store_decoded;
-    reg [2:0]  multiply_operation_decoded, load_store_function3_decoded, csr_function3_decoded;
-    reg [3:0]  function4_decoded;
-    reg [11:0] csr_address_decoded;
-    reg [31:0] jump_value_decoded;
-    reg        branch_flag_decoded, jump_link_flag_decoded, jump_link_register_flag_decoded;
 
     always @(*) begin
         class_decoded      = CLS_ALU;
@@ -786,9 +873,6 @@ module idu1(
         end
     end
 
-//非寄存器操作数的覆盖（立即数在这里并进操作数）
-    reg source_a_immediate_decoded, source_b_immediate_decoded;
-    reg [31:0] source_a_immediate_value_decoded, source_b_immediate_value_decoded;
     always @(*) begin
         source_a_immediate_decoded  = 1'b0;
         source_b_immediate_decoded  = 1'b0;
@@ -812,8 +896,6 @@ module idu1(
         endcase
     end
 
-//异常标记（ecall/ebreak/mret）
-    reg exc_ecall_dec, exc_ebreak_dec, exc_irq_ret_dec;
     always @(*) begin
         exc_ecall_dec   = (instruction_in_0[6:0] == OPCODE_SYSTEM) && (instruction_in_0[31:20] == 12'h000);
         exc_ebreak_dec  = (instruction_in_0[6:0] == OPCODE_SYSTEM) && (instruction_in_0[31:20] == 12'h001);
@@ -821,12 +903,6 @@ module idu1(
                         && (instruction_in_0[31:20] == 12'h302);
     end
 
-//bju 功能码（本级的唯一一个"这条指令在 bju 里算什么"的口）：
-//原来 bju 要分别吃 func4 / br_flag / jalr_flag / 四路异常五个口，其中 func4 与这四个
-//没有任何区分力（addi/beq/jalr 的 func4 都是 0000），"是不是分支"只能靠额外的类位。
-//这里一次译清：非法 > ecall > ebreak > mret > 分支（带 funct3）> jal（带非对齐）> jalr。
-//★ 非法排第一：非法分支/非法 jalr 的编码不许再当控制指令判，否则会一边报非法一边改向。
-    reg [3:0] branch_jump_function4_decoded;
     always @(*) begin
         branch_jump_function4_decoded = BJU_NONE;
         if (exc_illegal_dec)
@@ -864,11 +940,6 @@ module idu1(
                      ((instruction_in_0[6:0] == OPCODE_OP) && (instruction_in_0[31:25] == 7'b0000001));
     end
 
-//lane1 的译码（与 lane0 一模，源换成 instruction_stage1 / address_stage1 / jump_link_register_stage1）
-    reg [4:0]  destination_decoded_1;
-    reg [9:0]  function10_decoded_1;
-    reg [31:0] immediate_decoded_1;
-    reg        jump_decoded_1;
     always @(*) begin
         destination_decoded_1 = 5'd0;
         function10_decoded_1 = 10'd0;
@@ -921,7 +992,6 @@ module idu1(
         endcase
     end
 
-    reg csr_is_access_dec_1, csr_exists_dec_1, csr_ro_dec_1, csr_wr_dec_1;
     always @(*) begin
         csr_is_access_dec_1 = (instruction_stage1[14:12] != 3'b000) && (instruction_stage1[14:12] != 3'b100);
         csr_wr_dec_1        = (instruction_stage1[14:12] == 3'b001) | (instruction_stage1[14:12] == 3'b101) |
@@ -935,7 +1005,6 @@ module idu1(
         endcase
     end
 
-    reg exc_illegal_dec_1, exception_jump_misalign_decoded_1;
     always @(*) begin
         exc_illegal_dec_1 = 1'b0;
         exception_jump_misalign_decoded_1    = (instruction_stage1[6:0] == OPCODE_JAL) & instruction_stage1[21];
@@ -1011,15 +1080,6 @@ module idu1(
         end
     end
 
-    reg [1:0]  class_decoded_1;
-    reg        write_enable_decoded_1, csr_write_enable_decoded_1, csr_write_commit_decoded_1;
-    reg [4:0]  destination_pick_decoded_1;
-    reg        is_store_decoded_1;
-    reg [2:0]  multiply_operation_decoded_1, load_store_function3_decoded_1, csr_function3_decoded_1;
-    reg [3:0]  function4_decoded_1;
-    reg [11:0] csr_address_decoded_1;
-    reg [31:0] jump_value_decoded_1;
-    reg        branch_flag_decoded_1, jump_link_flag_decoded_1, jump_link_register_flag_decoded_1;
     always @(*) begin
         class_decoded_1      = CLS_ALU;
         write_enable_decoded_1         = 1'b0;
@@ -1119,8 +1179,6 @@ module idu1(
         end
     end
 
-    reg source_a_immediate_decoded_1, source_b_immediate_decoded_1;
-    reg [31:0] source_a_immediate_value_decoded_1, source_b_immediate_value_decoded_1;
     always @(*) begin
         source_a_immediate_decoded_1  = 1'b0;
         source_b_immediate_decoded_1  = 1'b0;
@@ -1144,7 +1202,6 @@ module idu1(
         endcase
     end
 
-    reg exc_ecall_dec_1, exc_ebreak_dec_1, exc_irq_ret_dec_1;
     always @(*) begin
         exc_ecall_dec_1   = (instruction_stage1[6:0] == OPCODE_SYSTEM) && (instruction_stage1[31:20] == 12'h000);
         exc_ebreak_dec_1  = (instruction_stage1[6:0] == OPCODE_SYSTEM) && (instruction_stage1[31:20] == 12'h001);
@@ -1152,8 +1209,6 @@ module idu1(
                         && (instruction_stage1[31:20] == 12'h302);
     end
 
-//bju 功能码（与 lane0 逐条同形）
-    reg [3:0] branch_jump_function4_decoded_1;
     always @(*) begin
         branch_jump_function4_decoded_1 = BJU_NONE;
         if (exc_illegal_dec_1)
@@ -1219,24 +1274,19 @@ module idu1(
                                  | (lane1_push & ~lane1_head_after_pop);
 //★ 冲刷清放【最后】：冲刷拍弹出来的那两条是错路的，必须被抹掉（后写者赢）。
 //  原来它是 else-if 链的最后一档，装载会赢过它 ⇒ `go` 一旦不吃 flush_window 就会漏进错路指令。
-            if (flush_pend) begin
+//★ 2026-11-04 精确冲刷：只有【被判死】的那条才清。击杀集合是程序序上的一段后缀，
+//  头死了影子必死；头活着而影子被杀 ⇒ 影子单独清（skid 那一块里做）。
+            if (flush_pend & flush_kill_mask_in[index_out_0]) begin
                 payload_valid_out_0  <= 1'b0;
                 payload_fresh_out_0  <= 1'b0;
             end
-            if (flush_pend) begin
+            if (flush_pend & flush_kill_mask_in[index_out_1]) begin
                 payload_valid_out_1  <= 1'b0;
                 payload_fresh_out_1  <= 1'b0;
             end
         end
     end
 
-//==============================================================================
-// 访存 FIFO 的队头译码 + 时序
-//==============================================================================
-//队头只做字段提取，不复制主译码的大 case：LOAD/STORE 的 rs1/rs2/rd/funct3 都在固定位上。
-    reg [31:0] lsu_head_instruction, lsu_head_pc;
-    reg [3:0]  lsu_head_index;
-    reg        lsu_head_generation;
     always @(*) begin
         lsu_head = lsu_read_pointer == 2'd0 ? lsu_queue_0 :
                    lsu_read_pointer == 2'd1 ? lsu_queue_1 :
@@ -1265,12 +1315,6 @@ module idu1(
     assign lsu_phys_a_out                = lsu_head[11:6];
     assign lsu_phys_b_out                = lsu_head[5:0];
 
-//★ 2026-11-04 真 PRF：进队条目带的是两个源的【物理号】，在进队这一拍由 rename 查出。
-//  查找口的驱动必须用【译码后的 rs】：LUI/AUIPC/JAL 这些没有 rs 的，
-//  instruction[19:15]/[24:20] 是立即数位段，裸切片会给自己认一个假号（实测 w11）。
-    wire [4:0]  lsu_push_source_a, lsu_push_source_b;
-    wire [4:0]  push1_source_a, push1_source_b;
-    wire [5:0]  lsu_push_phys_a, lsu_push_phys_b;
     assign lsu_push_source_a = source_a_dec_0;
     assign lsu_push_source_b = source_b_dec_0;
 //★ push1 = "lane1 这一拍收的那一条"，不一定是 h1：alloc_lane0=0 时 lane1 拿的是 h0。
@@ -1280,7 +1324,21 @@ module idu1(
     assign lsu_push_phys_a   = lookup_a_phys;
     assign lsu_push_phys_b   = lookup_b_phys;
 
-//★ 冲刷：整条 FIFO 直接清（rob 的 flush_partial 恒 0、kill_arc 恒 1）。
+    integer    lf;
+    always @(*) begin
+        lsu_flush_keep = 3'd0;
+        if (flush_pend) begin
+            for (lf = 0; lf < 4; lf = lf + 1) begin
+                lsu_flush_slot = lsu_read_pointer + lf[1:0];
+                lsu_flush_index = lsu_flush_slot == 2'd0 ? lsu_queue_0[16:13] :
+                                  lsu_flush_slot == 2'd1 ? lsu_queue_1[16:13] :
+                                  lsu_flush_slot == 2'd2 ? lsu_queue_2[16:13] : lsu_queue_3[16:13];
+                if ((lf[2:0] < lsu_queue_count) && !flush_kill_mask_in[lsu_flush_index])
+                    lsu_flush_keep = lf[2:0] + 3'd1;
+            end
+        end
+    end
+
 //★ 2026-11-04 真 PRF：条目里不再有"生产者 tag"要按提交清 —— 换成物理号之后，
 //  值在写回那一拍就进了 PRF，谁提交都不改它。这里只剩【进队覆盖】一条路径。
     always @(posedge clk) begin
@@ -1294,10 +1352,9 @@ module idu1(
             lsu_write_pointer <= 2'd0;
         end
         else if (flush_pend) begin
-//★ 清用【寄存版】冲刷（组合版会把 csr 中断锥拉进本组寄存器）。指针与计数回 0，数据格不动。
-            lsu_queue_count <= 3'd0;
-            lsu_read_pointer <= 2'd0;
-            lsu_write_pointer <= 2'd0;
+//★ 清用【寄存版】冲刷（组合版会把 csr 中断锥拉进本组寄存器）。数据格不动。
+            lsu_queue_count   <= lsu_flush_keep;
+            lsu_write_pointer <= lsu_read_pointer + lsu_flush_keep[1:0];
         end
         else begin
             lsu_clear_0 = lsu_queue_0;
@@ -1480,7 +1537,10 @@ module idu1(
             end
 //★ 冲刷清与原来同门（装载赢）：有效位在相邻那一块已经清掉，影子这里只要清 skid_valid ——
 //  数据留着没人读（头有效位=0 时下游一个字都不看，与原来留脏头的做法一致）。
-            if (flush_pend & ~lane0_store) skid_valid_0 <= 1'b0;
+//★ 精确冲刷：头死了（必连带影子）或影子自己被判死才清；头活着、影子活着就留着。
+            if (flush_pend & ~lane0_store &
+                (flush_kill_mask_in[index_out_0] | (skid_valid_0 & flush_kill_mask_in[skid_index_out_0])))
+                skid_valid_0 <= 1'b0;
         end
     end
 
@@ -1625,25 +1685,11 @@ module idu1(
             else begin
             end
 //★ 同 lane0：冲刷清与原来同门（装载赢），有效位在相邻那一块已清。
-            if (flush_pend & ~lane1_store) skid_valid_1 <= 1'b0;
+            if (flush_pend & ~lane1_store &
+                (flush_kill_mask_in[index_out_1] | (skid_valid_1 & flush_kill_mask_in[skid_index_out_1])))
+                skid_valid_1 <= 1'b0;
         end
     end
-
-//==============================================================================
-// 真 PRF 的重命名表（2026-11-04）
-//   rat/arch_map/free_vector 都在 rename 里。这里只用它算两件事：
-//   ① 本条指令 rd 分到的物理号（交给 rob 随项存）
-//   ② rs1/rs2 翻译成的物理号（下一步替换 idu2 的 (槽,世代) 生产者表时用）
-//   分配点选在 idu1 的解码/分配拍 —— 和 rob 的槽分配是同一拍、同一条指令。
-//==============================================================================
-    wire [5:0] rename_phys_rd_0, rename_phys_rd_1;
-    wire [5:0] rename_phys_rs1_0, rename_phys_rs2_0;
-    wire [5:0] rename_phys_rs1_1, rename_phys_rs2_1;
-    wire       rename_stall_0, rename_stall_1;
-    wire       rename_bank_empty_0, rename_bank_empty_1;
-    wire [5:0] lookup_a_phys, lookup_b_phys, lookup_c_phys, lookup_d_phys;
-    wire [5:0] old_phys_0, old_phys_1;
-    wire [63:0] rename_alloc_onehot, rename_arch_next_onehot;
 
     rename u_rename (
         .clk(clk), .rst(rst),
@@ -1662,8 +1708,9 @@ module idu1(
         .lookup_c_phys(lookup_c_phys), .lookup_d_phys(lookup_d_phys),
         .commit_we_a(write_enable_a_in), .commit_rd_a(commit_rd0_in), .commit_phys_a(commit_phys0_in),
         .commit_we_b(write_enable_b_in), .commit_rd_b(commit_rd1_in), .commit_phys_b(commit_phys1_in),
-        .flush(|flush_control_in),
+        .flush(|flush_control_in | |flush_control_back_in),
         .squash_mask(squash_phys_mask_in),
+        .restore(restore_in),
         .alloc_onehot(rename_alloc_onehot), .arch_next_onehot(rename_arch_next_onehot)
     );
 

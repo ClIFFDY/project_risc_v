@@ -97,7 +97,6 @@ module rob(
     output reg        allocation_generation_0,
     output reg        allocation_generation_1,
 
-
 //完成口：写口级处置完一笔就回报（落地 / 被杀 / 不写），data / gen 与 done / idx 同源同拍
     input        bju_judged,
     input [3:0]  bju_index,
@@ -162,6 +161,9 @@ module rob(
 //  晚一拍窗口已经动了，会把"部分冲刷"误判成"全冲" ⇒ 把比边界老的活项一起抹掉 ⇒ 死锁（实测）。
 //  要打拍的是【本模块 → idu2】那一跳：flush_partial_registered 是本模块当拍算好的判定，寄存一拍给 idu2 用。
     input        flush_control_rob,
+//★ S5：冲刷记录的寄存版（cont 的 flush_pending，晚一拍）。只喂"停分配"这一根 ——
+//  idu1 的载荷清零吃的是它，分配不停就会把同拍刚推进去的正确路径指令擦掉（实测 seed1）。
+    input        flush_pend_in,
 //异常标记口 ×3：lane0 / lane1 / lsu。
 //每条异常属于它自己那一项，各带各的槽号 ⇒ 三路同时到达也互不相干，本模块不做任何仲裁。
 //(cause,pc,tval) 随故障指令自己的项存下，退到队头才交付。
@@ -195,6 +197,34 @@ module rob(
 //★ 冲刷掩码：本拍在册的全部项物理号各展成 one-hot 后 OR 起来，直接给 rename 回收。
 //  kill_arc 已删 ⇒ 本设计每次冲刷都是整表作废，不需要按边界挑。
     output reg [63:0] squash_phys_mask,
+//★ 精确冲刷：这一拍【没被杀】的在飞项所占的物理号。
+//  rename 的空闲表照旧按构造写：free = ~(arch_next_mask | 幸存掩码)；
+//  prf 的就绪位照旧按构造写：ready = arch_next_mask | (ready & 幸存掩码) | 本拍写回。
+//  整窗那一档幸存掩码恒 0 ⇒ 两处都与改动前逐字等价。
+    output reg [63:0] squash_survive_mask,
+//★ 精确冲刷：击杀掩码打一拍广播给 idu2 / idu1 / lsu —— 消费端的击杀都比冲刷晚一拍。
+//  第 i 位 = 槽 i 这一拍要被作废。整窗那一档全亮（与改动前"全杀"逐字等价）。
+    output [15:0]     squash_kill_mask_registered,
+//  当拍版：lsu 的击杀与冲刷同拍（flush_commit 是组合的），吃这一份。
+    output [15:0]     squash_kill_mask,
+//★ 精确冲刷：每个架构号在【击杀集合】里最老那条的 old_phys（回滚 rat 用）。
+//  hit 位 = 该架构号有被杀项写过；phys = 那条项的 old_phys。没被杀到就保持 rat 现值。
+    output reg [31:0]  squash_arch_hit,
+    output reg [191:0] squash_arch_phys,
+//★ 精确冲刷：这个架构号有没有【幸存】在飞项写过。有 ⇒ rat 保持现值（它正指着那个幸存项）；
+//  没有 ⇒ rat 必须退回 arch_map（判定期同拍新分配出去的那个号没有 ROB 项，留着就是个死引用）。
+    output reg [31:0]  squash_survive_hit,
+//★ 判定拍改向【接住】的那一拍不许分配：本拍的 kill 掩码是用【拍前】的 entry_valid 算的，
+//  同拍新进来的项不在掩码里，会被当成幸存项、把尾指针算歪 ⇒ 指令变孤儿。
+//  与 flush_control_rob 那一拍的口径一致，只是早了一拍。
+//★ 2026-11-05 改成"改向一经判定就冻住分配，直到那条分支自己提交"（NaxRiscv 口径）：
+//  冻结期间不分配新项 ⇒ 重命名状态不会被任何新项读到，回滚就退化成"提交拍整片抄回 arch_map"，
+//  不需要按架构号挑最老被杀项的 32×16 扫描。
+    output             redirect_stop_alloc,
+//★ 冻结的收尾那一拍：队头这条带 pending 标记的项正在退休 ⇒ rename / prf 一拍恢复。
+//  ★ 必须和提交口【同相位】打一拍：提交口（commit_write_enable_0/…）是寄存的，
+//    恢复要用"落完这笔提交"的 arch_map，组合版会早一拍、漏掉分支自己那笔写（实测 seed1：x5 停在旧号）。
+    output             restore_valid,
 //★ 2026-11-04 真 PRF：三个写回口的物理号 + 存活判据。
 //  live = 本项还有效、且世代对得上 —— 冲刷之后在飞的结果还会落完，
 //  那些项的物理号可能已经被回收再分配，晚到的死写不许进阵列。
@@ -214,12 +244,13 @@ module rob(
 //  判定已经知道错路了，但要等它排到队头才杀；这个窗口里放出去的访存是错路的，
 //  而错路访存可能打到没有从设备的地址 → LSU 永远等应答（实测 CoreMark：错路 `lbu 1(x0)` 卡死整核）。
 //  挡住"新发"即可；已经在 s2/s3 的那几条会在提交口改向那一拍被 kill_arc 杀干净。
-// mret：与 bju 同一套（项内标签 + 队头改向），落点取 csr 的 mepc。
-    input        mret_mark,
-    input [3:0]  mret_index,
-    input [31:0] mret_tgt,
+// mret：与 bju 同一套（项内标签 + 队头改向）。标签随分配落地（allocation_mret_*），
+//  落点由 pc 直接取 csr 的 mepc。本模块只出 [这一笔是 mret 改向]。
     output reg        mret_valid_delayed,
     output reg        redirect_any,
+//★ S5：A 域事件（判定拍 / mret）—— 只改 PC + 清前端，不碰后端。
+    output reg        redirect_front_valid,
+//★ S5：B 域事件（边界走到提交口）—— 只清整表 + 后端，不碰前端。
     (* max_fanout = 32 *) output reg redirect_valid_delayed,
     output reg [31:0] redirect_target_delayed,
     output reg [3:0]  head_pointer,
@@ -266,14 +297,16 @@ module rob(
     output reg [31:0] exception_trap_value_delayed
     );
 
+//==============================================================================
+//  参数与声明区：本模块全部 localparam/parameter + reg/wire。
+//  Verilog 要求先声明后用，所以全放这里；正文只留逻辑。
+//==============================================================================
 parameter integer DEPTH = 16;   // ★宏化旋钮：16=大核 / 8=小核（必须是 2 的幂）
 localparam [3:0] DEPTH_MASK = DEPTH - 1;
+localparam integer ARCH_NUMBER = 32;   // RV32I 架构寄存器个数（rat 回滚按这个维度展开）
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核，各模块各自打一拍，彼此没有相位差。
 reg reset_registered;
-always @(posedge clk) reset_registered <= rst;
-
-
 //==============================================================================
 //  信号声明（Verilog 要求先声明后使用，三区的寄存器统一放在这里，按区归类）
 //==============================================================================
@@ -300,18 +333,12 @@ reg        entry_jump  [0:DEPTH-1];
 reg        entry_pending [0:DEPTH-1];
 reg        entry_system  [0:DEPTH-1];
 //★ 2026-11-04（CSR 步骤 C）：这一项是不是 CSR 指令，以及它的载荷（单独一组，理由见端口注释）。
-//  ★ 载荷阵列必须显式声明成分布式 RAM：落成触发器时每个 D 脚都是 `we ? payload : Q`，
-//    写使能里带着 entry_count 比较（!full），一根网扇到 22×16=352 个 D 脚 ⇒ 实测 top200 里
-//    166 条的终点是它，WNS 只剩 +0.054。
-//  ★ 而且它【不能进复位循环】：带复位的阵列推断不成 RAM（只加 ram_style 没用，dp3 实测
-//    WNS 一位没动、利用率逐字相同）。它只在 entry_csr==1 时被读，而 entry_csr 每次分配都写
-//    ⇒ 陈值永远不会被消费，不清是安全的。
+//  ★ 载荷原来是单独一组阵列。曾经试过把它做成分布式 RAM（`ram_style="distributed"` + 踢出复位循环），
+//    结果一位没省：本文件的 entry_* 全都是触发器，原因不是复位也不是 ram_style，而是**同一拍有两条写语句**
+//    （lane0 写 tail_pointer、lane1 写 allocation_index_1）—— 7 系列 LUTRAM 原语只有 1 个写口，
+//    综合器直接判 `8-4767 ... multiple writes via different ports` 后落回触发器。别再往这个方向试。
 reg        entry_csr     [0:DEPTH-1];
-(* ram_style = "distributed" *) reg [21:0] entry_csr_payload [0:DEPTH-1];
-integer ai;
-
-//重建口：物理槽序，静态下标（零 mux）
-
+reg [21:0] entry_csr_payload [0:DEPTH-1];
 //提交区
 reg [3:0]  head_next_pointer;
 // P4: cont only supplies the EXCEPTION boundary candidate. For a commit-port redirect
@@ -339,9 +366,16 @@ reg [5:0]  commit_phys0_comb, commit_phys1_comb;
 //CSR 提交口（打拍前）：队头这一项是 CSR 就吐载荷
 reg        commit_csr_comb;
 reg [21:0] commit_csr_payload_comb;
-integer ri;
-integer si;
-
+//★ 2026-11-05（S5）：改向拆成两个域，边界只在【在册】的这一份寄存器里，不按项挂标记。
+//  A = 判定拍：清前端 + 改 PC + 冻分配；B = 提交口：清整张表和它后面的后端。
+//  两张按项的阵列（"这条要改向" + 落点）都删了 —— 落点 A 那一拍就锁进 pending_target，
+//  提交口只需要知道"哪一项是边界"，一次 4 位比较就够。
+reg        flush_boundary_valid;
+reg [3:0]  flush_boundary_index;
+//★ 判定口的候选（组合）：两条 lane 各算一次年龄，取更老的；再和【在册边界】比一次。
+reg        judge_valid, judge_accept, judge_pick1;
+reg [3:0]  judge_index, judge_age;
+reg [31:0] judge_target;
 //项状态阵列（v / wr / ex / data / jdg）：唯一被三个区共写的对象，只能有一个 always 块
 //（在本区末尾）：分配建项 / 完成回填 / 退役清项 / 冲刷与陷阱清项。
 reg        entry_valid  [0:DEPTH-1];
@@ -353,14 +387,14 @@ reg [31:0] entry_data [0:DEPTH-1];
 //只服务"中断返回点"，所以只有队头那一项被读。
 reg [31:0] entry_pc   [0:DEPTH-1];
 reg        entry_judged  [0:DEPTH-1];
-reg        entry_redirect[0:DEPTH-1];
-//mret 标签：与 entry_redirect 并列的第二种【队头改向】，落点不由项携带（取 mepc）
+//mret 标签：第二种【队头改向】，落点不由项携带（取 mepc）
 reg        entry_mret [0:DEPTH-1];
 //head 拍判定出来的事件（组合）。下一沿变成对外的重定向事件 —— 冲刷从这排触发器出去。
-reg        mret_now, redirect_now, exc_now;
-reg [31:0] redirect_target_now;
+reg        mret_now, exc_now;
+//B 事件的边界随事件一起打一拍。
 //dly 里现在是否有事件（= 本拍正在冲刷）。它挡住队头写回和新的装载。
 wire       delayed_busy = redirect_valid_delayed | exception_valid_delayed;
+wire [15:0] flush_kill_mask_d1, flush_kill_mask_d2;
 reg [31:0] entry_target  [0:DEPTH-1];
 //★ S4：异常载荷【逐槽存】，不再是一份侧寄存器。
 //  侧寄存器只能记一条 ⇒ 窗口里第二条故障会把第一条盖掉（实测 seed1：mepc 记成后一条的），
@@ -370,14 +404,51 @@ reg [31:0] entry_target  [0:DEPTH-1];
 //   · entry_target ：只有判定口会写它，而判定口只写 entry_jump 的项；访存类故障项 entry_jump=0 ⇒ 存 tval；
 //               分支/跳转类故障（目标非对齐）entry_jump=1，但那一拍的 bju_tgt 就是那个坏目标 ⇒ 同值。
 reg [3:0]  entry_exc [0:DEPTH-1];
+//==============================================================================
+//  幸存者表 rb_* —— idu2 用它重建 pstat（冲刷后第 2 拍取用）
+//==============================================================================
+//★ 时相：本表是每拍都在的"当前在册项"，**不再是"冲刷那一拍的组合结果"**。
+//  冲刷在 F 沿已把 entry_valid/entry_written/entry_exception 按年龄清干净（见下面 entry_valid 写口那一段），
+//  所以 F 之后任何一拍读到的 entry_valid 就是幸存者本身 ⇒ 冲刷锥与这张表彻底脱钩。
+//  取用时刻由 idu2 的 reb_d2 决定（冲刷后第 2 拍），这里只管"报当前状态"。
+//★ 原来那段 flush_ok / flush_age / 16 项年龄比较的 kill 判据【整段删除】：
+//  它计算的事情时钟沿上已经做过了，留着只是把冲刷锥再拖一遍。
+//★ 只保留【窗口上界】age < entry_count 一项：它是"在册"的判据，兼管两件事 ——
+//  ① 陷阱交付（exception_valid_delayed）只回卷指针、不清 entry_valid；② 已退项在 head 之前，age 回绕成
+//  大数，必须靠它挡掉（否则会把已退休的写者当成活写者登记回去）。
+//==============================================================================
+//  提交区（head 端）：退役判据、冲刷、陷阱、提交口（写寄存器堆）
+//==============================================================================
+//退口判据 / 冲刷判据 / 状态输出
+//  可退 = 在册且已完成。exc 标记项不算可退：它不写寄存器堆，由 exception_valid_delayed 交上级；
+//  同拍标记（exc_en 正落在 head/head+1 上）必须【组合】就压掉退，否则会在 entry_exception 落盘前退掉。
+//★ S5：改向分两个域 —— A 在判定拍（清前端 + 改 PC + 冻分配），B 在提交口（清整表 + 后端）。
+//  判定口给的东西（bju_judged / bju_index / bju_redir / bju_tgt）都是 exu 的 *_registered，
+//  同拍同源 ⇒ 不需要再为边界打拍。
+//★ 异常/中断优先：队头是故障项时，本拍不放误预测改向（异常那条在程序序上更老，
+//  它的 mepc 必须取故障指令自己的 pc；被改向一掺就错）。分支的边界留在在册寄存器里，
+//  异常交付那一拍整表清空、边界一起撤。
+    wire head_is_exception = (entry_count != 4'd0) && entry_valid[head_pointer] && entry_exception[head_pointer];
+    wire [3:0] judge0_age = bju_index             - head_pointer;
+    wire [3:0] judge1_age = branch_unit_lane1_index - head_pointer;
+    reg        boundary_now;
 
+always @(posedge clk) reset_registered <= rst;
+
+integer ai;
+
+//重建口：物理槽序，静态下标（零 mux）
+
+integer ri;
+integer si;
+integer rp;
 
 //==============================================================================
 //  分配区（tail 端）：这一拍进几条、进到哪个槽、槽里写什么
 //==============================================================================
 //槽号与世代是组合输出的环位，作为载荷沿流水线传下去。
 //★ lane1 的落位取决于 lane0 这一拍分不分配（两条 lane 独立推进，可能只有 lane1 来）。
-    
+
 always @(*) begin
         allocation_index_0 = tail_pointer;
         allocation_index_1 = (tail_pointer + {3'b000, allocation_en_0}) & DEPTH_MASK;
@@ -412,6 +483,7 @@ always @(*) begin
             entry_count_next  = entry_count_next + 4'd1;
         end
         if (flush_control_rob) begin
+//★ 2026-11-05：改向 / 异常 / 中断都在提交口发，前端和整张 ROB 同一拍一起作废 ⇒ 恒为整窗。
             entry_count_next  = 4'd0;
             tail_pointer_next = head_pointer;
             tail_tag_next = entry_tag[head_pointer];
@@ -451,6 +523,7 @@ always @(*) begin
                 entry_pending[ai] <= 1'b0;
                 entry_system[ai]  <= 1'b0;
                 entry_csr[ai]     <= 1'b0;
+                entry_csr_payload[ai] <= 22'd0;
             end
         end
         else begin
@@ -484,26 +557,16 @@ always @(*) begin
         end
     end
 
+//S5 判定口的两条 lane（组合）：这一拍判定出来、真要改向的项。
+//  判据与旧结构逐项同门，只是把"判定过 && 要改向"两项换成当拍判定口给出的值。
+    wire judge0_ok = bju_judged & entry_jump[bju_index] & bju_redir &
+                     entry_valid[bju_index] & ~entry_exception[bju_index] &
+                     (entry_generation[bju_index] == bju_generation);
+    wire judge1_ok = branch_unit_lane1_judged & entry_jump[branch_unit_lane1_index] &
+                     branch_unit_lane1_redir &
+                     entry_valid[branch_unit_lane1_index] & ~entry_exception[branch_unit_lane1_index] &
+                     (entry_generation[branch_unit_lane1_index] == branch_unit_lane1_generation);
 
-
-//==============================================================================
-//  幸存者表 rb_* —— idu2 用它重建 pstat（冲刷后第 2 拍取用）
-//==============================================================================
-//★ 时相：本表是每拍都在的"当前在册项"，**不再是"冲刷那一拍的组合结果"**。
-//  冲刷在 F 沿已把 entry_valid/entry_written/entry_exception 按年龄清干净（见下面 entry_valid 写口那一段），
-//  所以 F 之后任何一拍读到的 entry_valid 就是幸存者本身 ⇒ 冲刷锥与这张表彻底脱钩。
-//  取用时刻由 idu2 的 reb_d2 决定（冲刷后第 2 拍），这里只管"报当前状态"。
-//★ 原来那段 flush_ok / flush_age / 16 项年龄比较的 kill 判据【整段删除】：
-//  它计算的事情时钟沿上已经做过了，留着只是把冲刷锥再拖一遍。
-//★ 只保留【窗口上界】age < entry_count 一项：它是"在册"的判据，兼管两件事 ——
-//  ① 陷阱交付（exception_valid_delayed）只回卷指针、不清 entry_valid；② 已退项在 head 之前，age 回绕成
-//  大数，必须靠它挡掉（否则会把已退休的写者当成活写者登记回去）。
-//==============================================================================
-//  提交区（head 端）：退役判据、冲刷、陷阱、提交口（写寄存器堆）
-//==============================================================================
-//退口判据 / 冲刷判据 / 状态输出
-//  可退 = 在册且已完成。exc 标记项不算可退：它不写寄存器堆，由 exception_valid_delayed 交上级；
-//  同拍标记（exc_en 正落在 head/head+1 上）必须【组合】就压掉退，否则会在 entry_exception 落盘前退掉。
     always @(*) begin
         head_next_pointer   = (head_pointer + 4'd1) & DEPTH_MASK;
 //★ 冲刷那一拍一律不退：退是组合的，而冲刷的清位要到边沿才生效 ⇒ 错路那条若正好在 head 上
@@ -514,18 +577,17 @@ always @(*) begin
 //  ★ 判定在 head 拍、事件在下一拍：本拍只允许"改向那条自己退休"，事件由下一拍的触发器出。
 //    冲刷那一拍（事件拍）一律不退 —— flush_any = flush_control_rob。
 //★ mret 与 bju 挤在同一个出口：两者都是"队头这一项自己要走、且要走的路不是顺序下一条"。
-//  落点不同 —— bju 的落点在项里（entry_target，判定拍就算完），mret 的落点在 csr（mepc），
-//  必须【队头现读】：更老的 csrw mepc 是头门控的，它在 mret 之前提交，所以队头这一拍读到的
-//  才是架构值；在判定拍锁进项就会读到旧值。
+//  落点不同 —— bju 的落点在项里（entry_target，判定拍就算完）；mret 的落点是 csr 的 mepc 锁存器，
+//  本模块不碰：它只报"这一笔改向是 mret"，pc 在事件那一拍直接取 mepc。
+//  ★ 相位刚好够：事件在队头+1 出，而 `csrw mepc` 的写也在那一沿落盘（提交口影子晚一拍）⇒ pc 采到的是新值。
         // ★ 判定直接读队头那一项（阵列）。写回在队头这一拍完成，冲刷事件只进 dly、下一拍才出。
         // ★ dly 非空时既不出新事件，也不许退休 —— 这一拍的队头是更年轻的错路项。
         flush_any = flush_control_rob | delayed_busy;
         mret_now  = (entry_count != 4'd0) && entry_valid[head_pointer] && entry_mret[head_pointer] &&
                     !entry_exception[head_pointer] && !flush_any;
-        redirect_now = mret_now | ((entry_count != 4'd0) && entry_valid[head_pointer] && entry_jump[head_pointer] &&
-                    entry_judged[head_pointer] && entry_redirect[head_pointer] && !entry_exception[head_pointer] && !flush_any);
         exc_now  = (entry_count != 4'd0) && entry_valid[head_pointer] && entry_exception[head_pointer] && !flush_any;
-        redirect_target_now = mret_now ? mret_tgt : entry_target[head_pointer];
+//★ S5：判定拍只出 A（清前端 + 改 PC + 冻分配），**不改队头退休** —— 边界那条要走到队头
+//  自己退休才发 B。所以这里不再有 redirect_now 这种东西。
 //★ 改向那一拍【要退】：队头就是那条分支、它是正确路径，改向/退休/杀后续是同一个事件。
 //  吃 flush_any 的话队头永远退不掉（这次冲刷是它自己发的）⇒ 自锁。
 //★ exc_gone 随部署删除：异常改成【按项标记】之后，标记落在 entry_exception[exc_index] 上，
@@ -538,12 +600,11 @@ always @(*) begin
                     !(exc1_en  && (exc1_index  == head_pointer))  &&
                     !(exception_selected_enable && (exception_selected_index == head_pointer))  &&
                     !flush_any;
-//★ head+1 要改向的项【不许同拍退休】：改向只看 head_pointer，2 宽退休会让它从 head+1 直接退掉、
-//  永远当不上队头 ⇒ 改向被静默吞掉（实测 CoreMark：slot12 的 ret 和第 11 条同拍退休，
-//  ret 的落点再也没生效，整核顺着 0x2794 的 epilogue 顺序跑进死路）。
-//  让它多等一拍、当上队头再改向；代价是每次错预测多一拍。
-        head_next_ok  = head_ok && !redirect_now && !exc_now &&
-                    !entry_redirect[head_next_pointer] && !entry_mret[head_next_pointer] &&
+//★ 边界那条【不许同拍从 head+1 一起退】：它当上队头、单独退休，下一拍才发 B。
+//  不然错路的后继会跟着它一起退掉、写进寄存器堆（实测 seed5：jal 后面那条 lui 提交了）。
+        head_next_ok  = head_ok && !mret_now && !exc_now &&
+                    !(flush_boundary_valid && (head_pointer == flush_boundary_index)) &&
+                    !entry_mret[head_next_pointer] &&
                     (entry_count >= 4'd2) && entry_valid[head_next_pointer] && entry_written[head_next_pointer] &&
                     (entry_judged[head_next_pointer] || (!entry_jump[head_next_pointer] && !entry_system[head_next_pointer])) &&
                     !entry_exception[head_next_pointer] &&
@@ -558,6 +619,24 @@ always @(*) begin
         ret1_v   = head_next_ok;
         ret1_index = head_next_pointer;
         ret1_generation = entry_generation[head_next_pointer];
+//------------------------------------------------------------------------------
+// S5 判定拍（A 域）：候选 = 这一拍判定出来、真要改向的分支项
+//  · 两条 lane 同拍判定取更老的：年轻的那条在错路上，会被这次改向带走（一次 4 位比较）。
+//  · 只认在册且世代对得上的项 —— 迟到判定不许改向。
+//  · 年龄 = 槽号 - 队头。在册窗口是连续的一段、跨度 ≤ DEPTH ⇒ 这个差就是名次，4 位减法够。
+//  · 和在册边界比一次：候选更老才受理 ⇒ 同时满足"新的不许压老的"和"老的可以顶掉新的"。
+//------------------------------------------------------------------------------
+        judge_pick1  = judge1_ok & (!judge0_ok | (judge1_age < judge0_age));
+        judge_index  = judge_pick1 ? branch_unit_lane1_index : bju_index;
+        judge_target = judge_pick1 ? branch_unit_lane1_tgt : bju_tgt;
+        judge_age    = judge_pick1 ? judge1_age : judge0_age;
+        judge_valid  = (judge0_ok | judge1_ok) & !head_is_exception & !flush_any;
+        judge_accept = judge_valid &
+                       (!flush_boundary_valid | (judge_age < (flush_boundary_index - head_pointer)));
+//B 事件：在册边界走到提交口。两条 lane 都认 —— 它从 head+1 退掉也照样发。
+        boundary_now = flush_boundary_valid &
+                       ((head_ok      & (head_pointer      == flush_boundary_index)) |
+                        (head_next_ok & (head_next_pointer == flush_boundary_index)));
 //★ 交付【不能】要求 entry_written：被 lsu 拒绝的访存非对齐故障指令永远等不到完成口，
 //  要 done 就既不退也不交付 ⇒ 整核死等。它排到队头就说明比它老的都退完了。
 
@@ -587,35 +666,73 @@ always @(*) begin
 //  kill_arc 已删（每次冲刷整表作废、没有"部分冲刷"），所以这里不需要按边界挑。
 //  没写回的项 entry_phys 恒 0，贡献的是 bit0（物理 0 = x0，rename 那边会掩掉）。
         squash_phys_mask = 64'd0;
+        squash_survive_mask = 64'd0;
         for (si = 0; si < DEPTH; si = si + 1)
-            if (entry_valid[si])
-                squash_phys_mask = squash_phys_mask | (64'd1 << entry_phys[si]);
+            if (entry_valid[si]) begin
+                if (flush_kill_mask_d1[si])
+                    squash_phys_mask = squash_phys_mask | (64'd1 << entry_phys[si]);
+                else
+                    squash_survive_mask = squash_survive_mask | (64'd1 << entry_phys[si]);
+            end
+
+//★ 2026-11-05 NaxRiscv 口径：rat 的回滚不再靠"挑最老被杀项的 old_phys"。
+//  改向一经判定就冻住分配（见 redirect_stop_alloc），被杀项的号直接回收，
+//  rat 在冻住期间不可能被任何新项读到 ⇒ 提交拍整片抄回 arch_map 就够。
+//  端口保留（rename 已经不接），恒 0。
+        squash_arch_hit  = 32'd0;
+        squash_arch_phys = 192'd0;
+//★ 幸存掩码照旧：prf 的 ready 要靠它保住没被杀的在飞项。
+//  survive_hit 是给 rat 用的，现在归零（同上）。
+        squash_survive_hit = 32'd0;
     end
 
 //队头字段副本的装载：每个沿装【下一拍的队头】那一项（head_pointer_next 正是 head_pointer 在下一沿的值，
 //两者必然同指一项）。纯读阵列 → 寄存器，锥止于触发器。
-//★ 改向/陷阱事件打一拍：head 那一拍只做判定，重定向信号和 PC 落点都从触发器出去。
+//★ 改向/陷阱事件打一拍：head 那一拍只做判定，重定向信号从触发器出去。
 //  这一拍也是改向那条自己退休的那一拍；下一拍全核冲刷（清空整表）。
+//★ mret 不带落点：mepc 是 csr 里的架构状态，不是指令自带的立即数 —— 由 pc 在事件那一拍
+//  直接取 csr 的 mepc 锁存器（cpu_top: fetch_jump_target）。本模块只报"这一笔是 mret 改向"
+//  （mret_valid_delayed），不再把它搬进 redirect_target_delayed。
     always @(posedge clk) begin
         if (reset_registered) begin
             redirect_valid_delayed <= 1'b0; mret_valid_delayed <= 1'b0; redirect_target_delayed <= 32'd0;
+            redirect_front_valid <= 1'b0;
             exception_valid_delayed <= 1'b0; exception_cause_delayed <= 4'd0; exception_pc_delayed <= 32'd0; exception_trap_value_delayed <= 32'd0;
         end
-        else if (!delayed_busy) begin
-            redirect_valid_delayed   <= redirect_now | mret_now;
-            mret_valid_delayed    <= mret_now;
-            exception_valid_delayed <= exc_now;
-            if (redirect_now | mret_now) redirect_target_delayed <= redirect_target_now;
-            if (exc_now) begin
-                exception_cause_delayed <= entry_exc [head_pointer];
-                exception_pc_delayed    <= entry_data[head_pointer];
-                exception_trap_value_delayed  <= entry_target [head_pointer];
+        else begin
+//A 域（判定拍 / mret）：改 PC + 清前端。**不吃 delayed_busy**：
+//  judge_accept 自己已经吃过 flush_any，再门一次会把刚受理的边界吞掉。
+            redirect_front_valid <= judge_accept | mret_now;
+            if (judge_accept)  redirect_target_delayed <= judge_target;
+            if (!delayed_busy) begin
+//B 域（提交口）：在册边界走到队列头 ⇒ 整表 + 后端一起作废。
+//★ mret 的 B 跟 A 同拍 —— 两把刀必须同拍，不然清表和改 PC 错开。
+                redirect_valid_delayed   <= boundary_now | mret_now;
+                mret_valid_delayed    <= mret_now;
+                exception_valid_delayed <= exc_now;
+                if (exc_now) begin
+                    exception_cause_delayed <= entry_exc [head_pointer];
+                    exception_pc_delayed    <= entry_data[head_pointer];
+                    exception_trap_value_delayed  <= entry_target [head_pointer];
+                end
+            end
+            else begin
+                redirect_valid_delayed   <= 1'b0;
+                mret_valid_delayed    <= 1'b0;
+                exception_valid_delayed <= 1'b0;
             end
         end
-        else begin
-            redirect_valid_delayed   <= 1'b0;
-            mret_valid_delayed    <= 1'b0;
-            exception_valid_delayed <= 1'b0;
+    end
+
+//在册边界：判定拍受理时锁下，提交口（以及异常/中断交付）那一拍撤掉。
+//  ★ 撤在 flush_control_rob：B / 异常 / 中断 三种都把整张表清了，边界自然不存在。
+//    同一拍来的新候选一律不受理（它比边界年轻，本来就在被杀的那一段里）。
+    always @(posedge clk) begin
+        if (reset_registered) flush_boundary_valid <= 1'b0;
+        else if (flush_control_rob) flush_boundary_valid <= 1'b0;
+        else if (judge_accept) begin
+            flush_boundary_valid <= 1'b1;
+            flush_boundary_index <= judge_index;
         end
     end
 
@@ -639,6 +756,19 @@ always @(*) begin
         end
     end
 
+//击杀掩码：第 i 位 = 槽 i 这一拍要被作废。
+//★ 2026-11-05：改向只在提交口发一次、前端和整张 ROB 一起作废 ⇒ 每一次冲刷都是整窗的，
+//  掩码恒全亮。原来那套「按边界挑严格更年轻的项」（16 个环上年龄比较 + alloc_slot_hot
+//  补同拍新分配的项）整块删掉 —— 它存在的唯一理由就是"判定拍提前杀"，而那一刀已经放弃。
+//  端口留着（lsu / mdu / exu / idu1 / idu2 / prf 的端口没动），综合折成常数。
+    assign flush_kill_mask_d1 = 16'hFFFF;
+    assign flush_kill_mask_d2 = 16'hFFFF;
+//★ S5：判定拍发 A 之后分配就冻住 —— 前端会一直取到正确路径、停在分配口。
+//  解冻在提交口那一拍之后：那一拍 flush_control_rob 本来就挡着分配，所以不会漏进错路项。
+    assign redirect_stop_alloc = flush_boundary_valid | flush_pend_in;
+    assign squash_kill_mask            = flush_kill_mask_d1;
+    assign squash_kill_mask_registered = flush_kill_mask_d2;
+
 //==============================================================================
 //  中断返回点：队头的指令地址（组合读）
 //  ★ 逐项列成 case，不写 entry_pc[head_pointer]：数组元素在 always @(*) 里进不了敏感表
@@ -650,17 +780,12 @@ always @(*) begin
         head_valid_out = entry_valid[head_pointer];
     end
 
-//★ 改向在册（寄存一拍）：窗口内任一在册项带 entry_redirect ⇒ 给 idu2 挡新的访存发射。
-//  挡"新发"就够：已在 s2/s3 的那几条会在提交口改向那一拍被 kill_arc 杀干净。
-    integer rq;
+//★ S5：改向在册（寄存一拍）给 idu2 挡新的访存发射。
+//  就是"边界在册"本身 + 事件那片 dly —— 16 项扫描整块删掉。
+//  挡"新发"就够：已在 s2/s3 的那几条会在提交口那一拍被击杀掩码杀干净。
     always @(posedge clk) begin
         if (reset_registered) redirect_any <= 1'b0;
-        else begin
-            redirect_any <= 1'b0;
-            for (rq = 0; rq < DEPTH; rq = rq + 1)
-                if (entry_valid[rq] && (entry_redirect[rq] || entry_mret[rq]) && ({1'b0, (rq[3:0] - head_pointer)} < entry_count))
-                    redirect_any <= 1'b1;
-        end
+        else                  redirect_any <= flush_boundary_valid | redirect_valid_delayed;
     end
 
     always @(posedge clk) begin
@@ -726,6 +851,10 @@ always @(*) begin
         end
     end
 
+//★ 2026-11-05：恢复脉冲已删。rename / prf 的状态回滚由冲刷那一拍自己做
+//  （rat <= arch_map、ready <= arch_next），和提交口同相位，不需要第二条通路。
+    assign restore_valid = 1'b0;
+
 //结果口的"接受条件"（与下面完成回填 entry_data 的判据逐字同门）
     always @(*) begin
         acc_alu_o  = alu_done  && entry_valid[alu_index]  && (entry_generation[alu_index]  == alu_generation);
@@ -751,7 +880,6 @@ always @(*) begin
                 entry_exc[ri] <= 4'd0;
                 entry_data[ri] <= 32'd0;
                 entry_judged[ri]  <= 1'b0;
-                entry_redirect[ri] <= 1'b0;
                 entry_mret[ri]  <= 1'b0;
             end
         end
@@ -774,16 +902,19 @@ always @(*) begin
                 entry_written[tail_pointer] <= 1'b0;
                 entry_exception[tail_pointer] <= 1'b0;
                 entry_judged[tail_pointer]  <= 1'b0;
-                entry_redirect[tail_pointer] <= 1'b0;
-                entry_mret[tail_pointer]  <= 1'b0;
+//★ mret 标签【随分配落地】：和 entry_jump/entry_system 同源，都是 idu1 对指令字的译码位，
+//  跟指令一起进项，不靠后面的边带脉冲补写。
+//  原来那条路是 cont 的 mret_mark/mret_index（bju 判定级 1 拍脉冲 + 槽号），实测会被同一窗口里
+//  别人的异常标志压掉 —— seed36 第二遍处理器：非法指令的 exc_illegal_q 正好盖住 mret 的唯一那拍
+//  ⇒ 标签丢了 ⇒ 那条 mret 当普通指令退休、PC 顺延到下一条，整段 body 重跑。
+                entry_mret[tail_pointer]  <= allocation_mret_0;
             end
             if (allocation_en_1 && !full && !flush_control_rob) begin
                 entry_valid[allocation_index_1]  <= 1'b1;
                 entry_written[allocation_index_1] <= 1'b0;
                 entry_exception[allocation_index_1] <= 1'b0;
                 entry_judged[allocation_index_1]  <= 1'b0;
-                entry_redirect[allocation_index_1] <= 1'b0;
-                entry_mret[allocation_index_1]  <= 1'b0;
+                entry_mret[allocation_index_1]  <= allocation_mret_1;
             end
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验必需：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（entry_valid 挡不住"新住户也 valid"）。
@@ -813,15 +944,15 @@ always @(*) begin
 //  跳转类额外记 redir / tgt。
             if (bju_judged && entry_valid[bju_index] && (entry_generation[bju_index] == bju_generation)) begin
                 entry_judged[bju_index] <= 1'b1;
+//★ S5：判定拍只写"落点"（提交口的 tval 还要它）；"这条要改向"不再按项记，
+//  边界只在 flush_boundary_* 一份里，年龄比较在判定口一次做完。
                 if (entry_jump[bju_index]) begin
-                    entry_redirect[bju_index] <= bju_redir;
                     entry_target  [bju_index] <= bju_tgt;
                 end
             end
             if (branch_unit_lane1_judged && entry_valid[branch_unit_lane1_index] && (entry_generation[branch_unit_lane1_index] == branch_unit_lane1_generation)) begin
                 entry_judged[branch_unit_lane1_index] <= 1'b1;
                 if (entry_jump[branch_unit_lane1_index]) begin
-                    entry_redirect[branch_unit_lane1_index] <= branch_unit_lane1_redir;
                     entry_target  [branch_unit_lane1_index] <= branch_unit_lane1_tgt;
                 end
             end
@@ -850,16 +981,14 @@ always @(*) begin
             if (acc_st_o) begin
                 entry_written[st_index] <= 1'b1;
             end
-//★ 改向必须是一发：不清的话下一拍队头还是它、redirect_valid_delayed 还拉 ⇒ 冲刷永远不退、队头永远退不掉。
-//  清掉之后下一拍 flush 已撤、head_ok 抬起 ⇒ 它正常退休（改向与退休分两拍做）。
-            if (redirect_valid_delayed) entry_redirect[head_pointer] <= 1'b0;
-            if (mret_valid_delayed)  entry_mret [head_pointer] <= 1'b0;
+//★ mret 必须是一发：不清的话事件还拉 ⇒ 冲刷永远不退、队头永远退不掉。
+//★ 清在【它自己那一槽】上（mret_now 那一拍 head_pointer 就是它）。吃寄存版的事件信号会清到
+//  邻居的槽上 —— 事件多压了一拍之后会清到后面两格，撞上一条真的 mret 就把它的改向吞掉。
+//  标签本身在【分配】那一沿就由 allocation_mret_* 写好了，这里只管一发清零。
+            if (mret_now) entry_mret [head_pointer] <= 1'b0;
 //★ 标记陷阱时必须【同时置 wr】：故障指令的写被 pd 挡掉、也不会再有任何单元回报它，
 //  只置 exc 不置 wr 它就退不掉 ⇒ ROB 排不空 ⇒ redir 等不到 rob_empty ⇒ 整核挂死。
 //★ S4：标记即写项。必须排在所有 acc_*/判定口之后（同一槽同一沿，后写者赢）。
-//★ mret 标签：与异常同一套（判定拍写项、队头生效）。表里那一项一定还在册 ——
-//  mret 不写 rd，但它的 entry_written 由发射拍置，且 entry_mret 只影响"队头要不要改向"，不影响可退。
-            if (mret_mark && entry_valid[mret_index]) entry_mret[mret_index] <= 1'b1;
             if (exc0_en && entry_valid[exc0_index]) begin
                 entry_exception  [exc0_index] <= 1'b1;
                 entry_written  [exc0_index] <= 1'b1;
@@ -883,14 +1012,14 @@ always @(*) begin
             end
             if (allocation_en_0 && !full && !flush_control_rob) entry_written[tail_pointer] <= 1'b0;
             if (allocation_en_1 && !full && !flush_control_rob) entry_written[allocation_index_1] <= 1'b0;
-//★ 冲刷 = 清空整表。改向那一条在【上一拍】已经退掉，此刻在册的项全都是更年轻的。
+//★ 冲刷 = 整窗作废（改向 / 异常 / 中断都在提交口发的同一笔，边界恒为队头）。
+//  ★ 冲刷拍分配口被 flush_control_rob 挡住，所以这里不会误清同拍新进来的项。
             if (flush_control_rob) begin
                 for (ri = 0; ri < DEPTH; ri = ri + 1) begin
                     entry_valid[ri]     <= 1'b0;
                     entry_written[ri]    <= 1'b0;
                     entry_exception[ri]    <= 1'b0;
                     entry_mret[ri]  <= 1'b0;
-                    entry_redirect[ri] <= 1'b0;
                 end
             end
 //陷阱交付拍：整条 ROB 作废。放在最后 ⇒ 它盖过同拍的一切（含"刚分配的那一项"）。

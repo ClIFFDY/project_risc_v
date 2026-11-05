@@ -13,6 +13,9 @@ module lsu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
+//★ 2026-11-04 精确冲刷：按槽的击杀掩码【当拍版】（本模块的击杀与冲刷同拍）。
+//  第 i 位 = 槽 i 这一拍要被作废；整窗那一档全亮。
+    input [15:0] flush_kill_mask_in,
     input       exec_in,            // = exec_in
 //★ 总线被按住（外部仲裁器占用）：只在本模块生效 —— 它就是"本拍不许发新交易"。
 //  2026-10-31 从 flag_bus[0]（停全前端）挪到这里：停前端是多余的，本模块自己等应答已经把
@@ -615,8 +618,11 @@ module lsu(
         store_queue_b_ret_now = store_queue_b_valid & (store_queue_b_ready | (ret0_valid & (ret0_index == store_queue_b_index) & (ret0_generation == store_queue_b_generation))
                                     | (ret1_valid & (ret1_index == store_queue_b_index) & (ret1_generation == store_queue_b_generation)));
 //★ 截断：比冲刷边界年轻的项直接丢（这条以后就是 S3 唯一的作废手段）
-        store_queue_a_drop = store_queue_a_valid & flush_commit & ~store_queue_a_ret;
-        store_queue_b_drop = store_queue_b_valid & flush_commit & ~store_queue_b_ret_now;
+//★ 2026-11-04 精确冲刷：按槽查击杀掩码 —— 比分支更老的、还在排队的 store/load 必须留住。
+//  整窗那一档（异常 / 中断）掩码全亮，与改动前逐字等价。
+//  ★ ELSQ 里已经摆上总线的 store 本来就不可撤回（~store_queue_a_ret 之外还有 inflight 挡着），这条不变。
+        store_queue_a_drop = store_queue_a_valid & flush_commit & ~store_queue_a_ret & flush_kill_mask_in[store_queue_a_index];
+        store_queue_b_drop = store_queue_b_valid & flush_commit & ~store_queue_b_ret_now & flush_kill_mask_in[store_queue_b_index];
 //本拍是不是一笔【读】摆上总线
         load_go  = load_send_go;
 //★ 外设 load 的资格取【在 ROB 队头】：应答回来才出队、才退休 ⇒ 不再需要错路遮挡。
@@ -654,7 +660,7 @@ module lsu(
         store_stage_ret   = store_stage_valid & (store_stage_cmt
                           | (ret0_valid & (ret0_index == store_stage_index) & (ret0_generation == store_stage_generation))
                           | (ret1_valid & (ret1_index == store_stage_index) & (ret1_generation == store_stage_generation)));
-        store_stage_drop  = store_stage_valid & ~store_stage_ret & flush_commit;
+        store_stage_drop  = store_stage_valid & ~store_stage_ret & flush_commit & flush_kill_mask_in[store_stage_index];
         store_stage_fault = store_stage_valid & store_stage_misalign;   // 非对齐：不进 ELSQ，只上报
         store_stage_push  = store_stage_valid & ~store_stage_drop & ~store_stage_fault & ~store_push_hold
                           & exec & ~flush_window & (elsq_free > {1'b0, load_push_queue});
@@ -891,8 +897,8 @@ module lsu(
                  (ret1_valid & (ret1_index == stage2_index) & (ret1_generation == stage2_generation));
 //★ 作废查 rob 的击杀弧掩码（第 i 位 = 槽 i 比边界年轻），一次 16:1 查表。
 //  ★ 必须吃当拍版：吃寄存版等于把丢弃晚一拍，错路请求可能先上了总线。
-        stage1_kill = stage1_valid & ~stage1_cmt & ~stage1_ret & flush_commit;
-        stage2_kill = stage2_valid & ~stage2_cmt & ~stage2_ret & flush_commit;
+        stage1_kill = stage1_valid & ~stage1_cmt & ~stage1_ret & flush_commit & flush_kill_mask_in[stage1_index];
+        stage2_kill = stage2_valid & ~stage2_cmt & ~stage2_ret & flush_commit & flush_kill_mask_in[stage2_index];
     end
 
 //访存非对齐故障：判定挪到 Q 端（地址要等加法器），伴生量（pc / 索引 / 读写标志 / 出错地址）

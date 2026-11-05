@@ -75,6 +75,8 @@ module cpu_top #(
 //  （flag_bus / flush_pc_redir 的声明也一并提前到这里 —— 它们由下面的 cont 例化驱动，
 //    提前的只是【名字】，不影响谁驱动。）
     wire [7:0]  flag_bus, flag_bus_registered;
+//★ S5：前端域冲刷 {异常, 中断, 改PC}——A（判定拍改向）只走这一份；B（提交口清表）只走 flag_bus。
+    wire [2:0]  flag_bus_front;
     wire        flush_pc_redir;
 //bju 判定延迟级的训练载荷（btb 的唯一学习源），bju_fe_sel 做年龄二选一
     reg  [1:0]  fetch_kind;
@@ -207,6 +209,17 @@ module cpu_top #(
     wire [5:0]  phys_a_out_0, phys_b_out_0, phys_a_out_1, phys_b_out_1;
     wire [5:0]  lsu_phys_a_idu1, lsu_phys_b_idu1;
     wire [63:0] alloc_onehot, arch_next_onehot, prf_ready;
+//★ 2026-11-04 精确冲刷：rat 回滚值 + 幸存在飞项掩码（都由 rob 当拍算好）
+    wire [31:0]  squash_arch_hit;
+    wire [191:0] squash_arch_phys;
+    wire [63:0]  squash_survive_mask;
+    wire [31:0]  squash_survive_hit;
+    wire         redirect_stop_alloc;
+    wire         redirect_restore;
+//★ 2026-11-04 精确冲刷：按槽的击杀掩码。当拍版给 lsu/mdu（它们与冲刷同拍杀），
+//  寄存版给 idu2（它晚一拍杀）。
+    wire [15:0]  squash_kill_mask;
+    wire [15:0]  squash_kill_mask_registered;
 //---- PRF 读口 ----
     wire [5:0]  prf_read_a_0_phys, prf_read_b_0_phys, prf_read_a_1_phys, prf_read_b_1_phys;
     wire [5:0]  prf_read_a_m_phys, prf_read_b_m_phys;
@@ -297,6 +310,8 @@ module cpu_top #(
     wire [4:0]  commit_rd0, commit_rd1;
     wire [3:0]  head_pointer;
     wire        rob_redir_valid, redir_registered_0, redir_registered_1, rob_redir_any;
+//★ S5：A 域改向（判定拍）—— 与 B 域（rob_redir_valid，提交口）分开两根。
+    wire        rob_redir_front;
     wire [31:0] rob_redir_pc;
     wire        rob_full, rob_empty, trap_fire;
     wire [15:0] above, above_registered, head_one_hot_registered;
@@ -318,10 +333,8 @@ module cpu_top #(
     wire [3:0]  exception_cause;
     wire [31:0] exception_pc, exception_trap_value;
     wire [3:0]  exception_index;
-    wire        redir_go, exception_interrupt_ret_ok;
-    wire        mret_mark, mret_valid;
-    wire [3:0]  mret_index;
-    wire [31:0] mret_target;
+    wire        redir_go;
+    wire        mret_valid;
     wire [31:0] redir_target;
     wire [31:0] isr_addr2, mcause, iret_addr2, csr_data_combinational;
     wire        exception_interrupt_action, exception_interrupt_processing, exception_interrupt;
@@ -437,7 +450,11 @@ module cpu_top #(
         fetch_bpred      = (train_sel == 2'd0) ? train_buf_bpred :
                            (train_sel == 2'd1) ? branch_prediction_taken_registered_0
                                                : branch_prediction_taken_registered_1;
-        fetch_jump_target     = rob_redir_pc;   // S3：改向落点来自 ROB 队头那一项
+//★ mret 的落点直接取 csr 的 mepc 锁存器，不经 ROB：mepc 是架构状态、不是指令自带的立即数，
+//  让 ROB 把它搬进 redirect_target_delayed 只是多一级寄存器、还错相位。
+//  相位正好：mret 在队头那一拍 mret_now=1，事件（mret_valid/redirect_*）在下一拍出；
+//  而 `csrw mepc`（更老、头门控）的写也在那一沿落盘 ⇒ 这里采到的就是新值。
+        fetch_jump_target     = mret_valid ? iret_addr2 : rob_redir_pc;   // S3：改向落点来自 ROB 队头那一项
 //训练载荷同一条指令的年龄选择：必须在同一拍整体走一侧，不能一个吃 lane0、一个吃 lane1
 //★★ 2026-10-29：训练包的选法与"前端回报包"分开。回报包按 branch_event（success/br_fail/jalr_fail/
 //   异常）选，训练包按【谁真的带训练载荷】选（bju_kind != 0）。
@@ -516,9 +533,8 @@ module cpu_top #(
     icache #(.IC_INDEX_B(IC_INDEX_B)) u_icache (
         .clk(clk), .rst(rst),
         .pc_address_0(pc_address_0), .pc_address_1(pc_address_1),
-        .exception_interrupt(exception_interrupt), .exc_irq_ret(exception_interrupt_ret_ok),
-        .exc_ecall(exception_ecall_0 | exception_ecall_1),
-        .flush_control_in(flag_bus[7:5]), .stall_pc_redirect_in(flag_bus[2]), .stall_icache_miss_in(flag_bus[1]),
+        .exception_interrupt(exception_interrupt),
+        .flush_control_in(flag_bus_front), .stall_pc_redirect_in(flag_bus[2]), .stall_icache_miss_in(flag_bus[1]),
         .mem_valid(mem_valid_icache), .mem_data(mem_data_icache),
         .flush_pc_redirect(flush_pc_redir),
         .fifo_full(full_iffu),
@@ -558,7 +574,7 @@ module cpu_top #(
 //==============================================================================
     iffu #(.DEPTH(IFFU_DEPTH)) u_iffu (
         .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
+        .flush_control_in(flag_bus_front), .exec_in(flag_bus[4]),
         .flush_pc_redirect(flush_pc_redir),
         .instruction_in_0(instruction_out_icache), .inst_in_1(instruction_next_icache),
         .instruction_valid_0(instruction_valid_icache), .inst_valid_1(instruction_valid_n_icache),
@@ -593,8 +609,12 @@ module cpu_top #(
 //==============================================================================
     idu1 #(.LANES(LANES)) u_idu1 (
         .clk(clk), .rst(rst),
-        .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]), .stall_rob_full_in(flag_bus[3]),
+        .flush_control_in(flag_bus_front), .flush_control_back_in(flag_bus[7:5]),
+        .exec_in(flag_bus[4]), .stall_rob_full_in(flag_bus[3]),
         .flush_pend(flush_pending),
+//★ 精确冲刷的击杀掩码：idu1 的清零吃【d2】那一版。flush_pending 是 flush_control_rob 再打一拍
+//  （T+2），而 d1 只在 T+1 有效 —— 接错相位会拿到"没改向时"的全亮默认值，等于又变回整窗清空。
+        .flush_kill_mask_in(squash_kill_mask_registered),
 //冲刷的年龄边界：输出级里挂着的那条比冲刷点老时不许清（见 idu1 里 keep_* 的注释）
 //本树没有保留站：弹出量由发射级的 issue_pop 计（credit 走 acc_in）
         .store_pop({1'b0, issue_pop_0} + {1'b0, issue_pop_1}),
@@ -667,6 +687,10 @@ module cpu_top #(
         .commit_rd0_in(commit_rd0), .commit_rd1_in(commit_rd1),
         .commit_phys0_in(commit_phys0), .commit_phys1_in(commit_phys1),
         .squash_phys_mask_in(squash_phys_mask),
+        .squash_arch_hit_in(squash_arch_hit), .squash_arch_phys_in(squash_arch_phys),
+        .squash_survive_mask_in(squash_survive_mask),
+        .squash_survive_hit_in(squash_survive_hit), .alloc_stop_in(redirect_stop_alloc),
+        .restore_in(redirect_restore),
         .rob_full_in(rob_full),
         .phys_a_out_0(phys_a_out_0), .phys_b_out_0(phys_b_out_0),
         .phys_a_out_1(phys_a_out_1), .phys_b_out_1(phys_b_out_1),
@@ -692,6 +716,7 @@ module cpu_top #(
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
         .flush_control_rob_registered(flush_con_rob_registered),
+        .flush_kill_mask_in(squash_kill_mask_registered),
         .stage_advance(lane_valid_0), .stage_advance_lane1(lane_valid_1),
 
         .rs1_in(rs1_idu1_0), .rs2_in(rs2_idu1_0),
@@ -842,7 +867,9 @@ module cpu_top #(
         .ready(prf_ready),
         .alloc_mask(alloc_onehot),
         .flush(|flag_bus[7:5]),
-        .flush_arch_mask(arch_next_onehot)
+        .flush_arch_mask(arch_next_onehot),
+        .flush_survive_mask(squash_survive_mask),
+        .restore(redirect_restore)
     );
 
 //==============================================================================
@@ -853,6 +880,7 @@ module cpu_top #(
     exu u_exu_0 (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .flush_index_in(flush_index),
+        .flush_kill_mask_in(squash_kill_mask),
 
         .write_enable_in(write_enable_0), .jal_flag(jump_link_flag_0), .jalr_flag(jump_link_register_flag_0),
         .cs_wr_en(csr_write_enable_0),
@@ -912,6 +940,7 @@ module cpu_top #(
     exu u_exu_1 (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .flush_index_in(flush_index),
+        .flush_kill_mask_in(squash_kill_mask),
 
         .write_enable_in(write_enable_1), .jal_flag(jump_link_flag_1), .jalr_flag(jump_link_register_flag_1),
         .cs_wr_en(csr_write_enable_1),
@@ -974,6 +1003,7 @@ module cpu_top #(
     lsu #(.ADDER_AT_D(ADDER_AT_D)) u_lsu (
         .clk(clk), .rst(rst),
         .flush_control_in(flag_bus[7:5]), .exec_in(flag_bus[4]),
+        .flush_kill_mask_in(squash_kill_mask),
 //★ 总线被按住只在 LSU 内部生效（2026-10-31）：不再经 flag_bus[0] 去停整个前端。
         .bus_hold_in(bus_hold_in),
         .payload_go(lsu_valid),
@@ -1044,7 +1074,8 @@ module cpu_top #(
         .bju_redir(redir_registered_0), .bju_tgt(jump_target_0),
         .branch_unit_lane1_redir(redir_registered_1), .branch_unit_lane1_tgt(jump_target_1),
         .redirect_valid_delayed(rob_redir_valid), .redirect_target_delayed(rob_redir_pc), .redirect_any(rob_redir_any),
-        .mret_mark(mret_mark), .mret_index(mret_index), .mret_tgt(mret_target), .mret_valid_delayed(mret_valid),
+        .redirect_front_valid(rob_redir_front),
+        .mret_valid_delayed(mret_valid),
         .branch_unit_lane1_judged(judged_1), .branch_unit_lane1_index(bju_index_registered_1), .branch_unit_lane1_generation(generation_registered_1),
         .alu_done(write_enable_alu_0), .alu_index(index_alu_0), .alu_data(source_index_alu_0), .alu_generation(generation_alu_0),
         .alu_lane1_done(write_enable_alu_1), .alu_lane1_index(index_alu_1), .alu_lane1_data(source_index_alu_1), .alu_lane1_generation(generation_alu_1),
@@ -1062,7 +1093,7 @@ module cpu_top #(
         .issue_enable_0(issue_valid_0), .issue_index_0(issue_index_0), .issue_generation_0(issue_generation_0),
         .issue_enable_1(issue_valid_1), .issue_index_1(issue_index_1), .issue_generation_1(issue_generation_1),
 
-        .flush_control_rob(flush_con_rob),
+        .flush_control_rob(flush_con_rob), .flush_pend_in(flush_pending),
         
         .exc0_en(exc0_enable), .exc0_index(exc0_index), .exc0_cause(exc0_cause),
         .exc0_pc(exc0_pc), .exc0_tval(exc0_trap_value),
@@ -1076,6 +1107,11 @@ module cpu_top #(
         .commit_phys0(commit_phys0), .commit_phys1(commit_phys1),
         .commit_csr_valid(commit_csr_valid), .commit_csr_payload(commit_csr_payload),
         .squash_phys_mask(squash_phys_mask),
+        .squash_arch_hit(squash_arch_hit), .squash_arch_phys(squash_arch_phys),
+        .squash_survive_mask(squash_survive_mask),
+        .squash_survive_hit(squash_survive_hit), .redirect_stop_alloc(redirect_stop_alloc),
+        .restore_valid(redirect_restore),
+        .squash_kill_mask(squash_kill_mask), .squash_kill_mask_registered(squash_kill_mask_registered),
 //★ 真 PRF 的写口：物理号按槽查出来 + 存活判据
         .prf_wb_en_0(result_port_0_enable), .prf_wb_index_0(result_port_0_index), .prf_wb_generation_0(result_port_0_generation),
         .prf_wb_en_1(result_port_1_enable), .prf_wb_index_1(result_port_1_index), .prf_wb_generation_1(result_port_1_generation),
@@ -1106,8 +1142,7 @@ module cpu_top #(
     cont u_cont (
         .clk(clk), .rst(rst),
         .jalr_fail_0(jump_link_register_fail_0), .jalr_fail_1(jump_link_register_fail_1),
-        .br2(br2), .br3(br3),
-        .redirect_in(rob_redir_valid),
+        .redirect_in(rob_redir_valid), .redirect_front_in(rob_redir_front),
         .success_0(success_0), .success_1(success_1),
         .br_fail_0(branch_fail_0), .br_fail_1(branch_fail_1),
         .exc_tgt_mis_0(exception_target_misalign_0), .exc_tgt_mis_1(exception_target_misalign_1),
@@ -1146,7 +1181,7 @@ module cpu_top #(
         .interrupt_service_address_2(isr_addr2), .mcause(mcause), .csr_data_combinational(csr_data_combinational),
         .exception_interrupt_action(exception_interrupt_action), .exception_interrupt_processing(exception_interrupt_processing),
         .exc_irq(exception_interrupt), .interrupt_return_address_2(iret_addr2),
-        .flag_bus(flag_bus),
+        .flag_bus(flag_bus), .flag_bus_front(flag_bus_front),
         .flush_control_exception(flush_con_exception),
         .exc0_en(exc0_enable), .exc0_index(exc0_index), .exc0_cause(exc0_cause),
         .exc0_pc(exc0_pc), .exc0_tval(exc0_trap_value),
@@ -1154,8 +1189,7 @@ module cpu_top #(
         .exc1_pc(exc1_pc), .exc1_tval(exc1_trap_value),
         .exception_selected_enable(excls_enable), .exception_selected_index(excls_index), .exception_selected_cause(excls_cause),
         .exception_selected_pc(excls_pc), .exception_selected_trap_value(excls_trap_value),
-        .exception_interrupt_return_ok(exception_interrupt_ret_ok),
-        .mret_mark(mret_mark), .mret_index(mret_index), .mret_target(mret_target), .mret_valid(mret_valid),
+        .mret_valid(mret_valid),
         .redirect_go(redir_go), .redirect_target(redir_target),
         .flush_pc_redirect(flush_pc_redir)
     );
