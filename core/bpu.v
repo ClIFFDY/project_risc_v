@@ -2,7 +2,7 @@
 //////////////////////////////////////////////////////////////////////////////////
 // Module Name: bpu
 // Description:
-//   前端预测器。两张表，一份学习源，两个读口。
+//   前端预测器。两张表，一份学习源，**四个读口**（2026-11-08 起：取指改 16B 块，一拍问 4 条）。
 //
 //     BHT  : 方向 —— 这条条件分支跳不跳（2 位饱和）。只服务 btb_take 的判据。
 //     BTB  : 落点 —— 一条【指令】一项，给出它跳到的绝对地址。
@@ -12,15 +12,19 @@
 //     - 落点表吃 taken 的一切跳转（条件分支 / jal / jalr），存的是【事实】不是预测；
 //     前端不译 br/jal/jalr：iffu 一旦自己译，它译的就是"会被自己改内容"的那个交付口，成环。
 //
-//   ★ 读口吃 pc 的两个取指地址，**addr0 的跳转优先级 > addr1**，仲裁在本模块内做完
-//     （btb_take_0/1 恒互斥）⇒ pc 只看到"跳不跳 + 跳到哪"，不必再拼一次仲裁。
+//   ★ 读口吃【一个 16 字节块里的四个取指地址】pc_addr_0..3，**序号小的优先级高**，仲裁在本模块内做完
+//     （btb_take_0..3 恒至多一位为 1）⇒ pc 只看到"跳不跳 + 跳到哪"，不必再拼一次仲裁。
 //
 //   ★ 本模块与 icache 的【组合数据通路】零交互。
 //
-//   ★ 两张阵列都要能例化成 BRAM：
+//   ★ 所有阵列都要能例化成 BRAM/LUTRAM：
 //     - 每张表【只有一条写语句】（两条不同地址的语句会被推成多端口 ⇒ 掉进 LUTRAM）；
 //     - 读全部寄存一拍（同步读）；
-//     - 落点表备两份阵列（一个写口 + 两条 lane 的读口，一个 BRAM 只有两个口）；
+//     - 阵列按下表复制份数，因为一个存储器只有两个读口：
+//         bht         2 份（4 个读口）      LUTRAM
+//         btb 落点    4 份（4 个读口）      BRAM
+//         btb tag     2 份（4 个读口）      LUTRAM
+//         循环两张各  2 份（4 个读口）      LUTRAM
 //     - 复位只清输出寄存器，阵列走 initial（Xilinx BRAM 没有复位脚）。
 //
 //   ★★ 2026-10-29 索引重做（三条一起改，缺一条都留着老错）：
@@ -37,13 +41,18 @@
 //        但落点对 branch/jal 是 pc+imm（译码出来的，与错路无关），方向表的 taken 才是数据算的。
 //        实测被 redir_pending 挡掉的训练只占 1~3%，而它把 0x1508 这类"每次都判错的 jal"
 //        永久锁在门外（自己判错 ⇒ 自己的改向一直挂着 ⇒ 自己永远训不上）。放开，用实测背书。
+//
+//   ★★ 2026-11-08 四读口：索引仍然按【一条指令】（pc[B+1:2]），**不改成按块索引**。
+//     理由是 tag/valid 的精度：按块索引要四份子条目 + 块级 tag，替换粒度从"一条指令"变成
+//     "一个 16B 块"，四条分支共用一次替换。按指令索引 + 四个读口是等价的读带宽，
+//     换掉的是阵列份数（BHT/tag 2 份、落点 4 份），精度一点没丢。
 //////////////////////////////////////////////////////////////////////////////////
 
 
 module bpu(
     input clk, rst,
 //★★ 唯一前进判据（icache 出）。输出寄存器（落点表那一级）只在这一拍换内容。
-//  它和 icache 的 R0 是同一个沿、同一个使能、同一个 pc_addr ⇒ 两边描述的永远是同一对（不变量 I1）。
+//  它和 icache 的 R0 是同一个沿、同一个使能、同一个 pc_addr ⇒ 两边描述的永远是同一块（不变量 I1）。
     input        advance,
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -57,19 +66,20 @@ module bpu(
     input [31:0] branch_unit_pc, bju_tgt,
 //它进流水线时随指令记下的预测（用来出 branch_stage2/branch_stage3）
     input        branch_prediction_taken_in,
-//★ 老口 redir_pending（ROB 的在册改向）2026-10-29 整个删掉：训练门不再看它。
-//  理由见文件头 ③：它把"自己判错 ⇒ 自己永远训不上"锁死了，而实测它只挡掉 1~3% 的训练。
 
 //──────────────────────────────────────────────────────────────────────────────
-// 读口：pc 这一拍要取的两个地址（addr0 优先级 > addr1）
+// 读口：这一拍要取的【一个 16B 块里的四个地址】（addr0 优先级最高）
 //──────────────────────────────────────────────────────────────────────────────
-    input [31:0] pc_addr_0, pc_addr_1,
+    input [31:0] pc_addr_0, pc_addr_1, pc_addr_2, pc_addr_3,
+//块内起始偏移：比它老的那几条（序号 < fetch_offset）不参与仲裁、也不计数。
+//  改向落在块中间时，它们属于【改向之前】的流，把它们算进来会挑到一个已经过时的落点。
+    input [1:0]  fetch_offset,
 
 //──────────────────────────────────────────────────────────────────────────────
-// 给 pc：落点（btb_take_0/1 恒互斥）
+// 给 pc：落点（btb_take_0..3 恒至多一位为 1）
 //──────────────────────────────────────────────────────────────────────────────
-    output reg        btb_take_0, btb_take_1,
-    output reg [31:0] btb_target_0,  btb_target_1,
+    output reg        btb_take_0, btb_take_1, btb_take_2, btb_take_3,
+    output reg [31:0] btb_target_0,  btb_target_1, btb_target_2, btb_target_3,
 
 //──────────────────────────────────────────────────────────────────────────────
 // 给 cont / csr：判定口（"预测错没错"）
@@ -93,9 +103,6 @@ module bpu(
         training_target    = (branch_unit_kind != 2'd0) & branch_unit_taken;
     end
 
-//★ 2026-10-29：两条写门都不再看 redir_pending（老门只在注释里留个来由）。
-//  实测：被它挡掉的训练 226~1018 次/窗口（占训练总量 1~3%），而它挡住的 0x1508（312 次）
-//  是"100% 判错的 jal 永远学不会"—— 自己判错 ⇒ 自己挂着改向 ⇒ 自己永远被挡 ⇒ 永远判错。
     wire training_ok = training_target;
     wire bht_ok      =  is_branch;
 
@@ -119,27 +126,69 @@ module bpu(
     localparam BTB_D  = (1 << BTB_B);
     localparam BTB_TW = 20 - BTB_B;   // 索引+tag 覆盖 pc[21:2]，索引窄了 tag 就自动变宽
 
-    wire [BHT_B-1:0] bht_index_0 = pc_addr_0[BHT_B+1:2]
-                                 ^ {pc_addr_0[BHT_B+BHT_H+1:BHT_B+2], {(BHT_B-BHT_H){1'b0}}};
-    wire [BHT_B-1:0] bht_index_1 = pc_addr_1[BHT_B+1:2]
-                                 ^ {pc_addr_1[BHT_B+BHT_H+1:BHT_B+2], {(BHT_B-BHT_H){1'b0}}};
-    wire [BHT_B-1:0] bht_index_w = branch_unit_pc[BHT_B+1:2]
-                                 ^ {branch_unit_pc[BHT_B+BHT_H+1:BHT_B+2], {(BHT_B-BHT_H){1'b0}}};
+//==============================================================================
+//  方向表（2026-11-09 换）：每 PC 局部历史 + 模式计数器
+//    ① lht —— 每 PC 一条 8 位局部历史，索引 pc[9:2]（折 pc[13:10]）
+//    ② pht —— 2 位饱和计数器，索引 {pc[5:2], lht[7:0]}（2^12 项）
+//  离线比过（CoreMark 分支迹，条件分支 243993 条）：
+//      PC 索引 bimodal 2048 项（原方案）      判错 24567  10.07%
+//      局部历史 8 位 + 4 位 PC（2^12 模式表） 判错 17055   6.98%   面积 480 LUT  ← 本方案
+//  ★ 尺寸是用户拍的：pht 2^14 占地不接受，砍到 lht 2^8 / pht 2^12。
+//  读写同口径：都用【指令自己的地址】（不是 pc+4 —— 加 4 会把训练落到下一格）。
+//==============================================================================
+    parameter integer LH_B  = 8;        // ★宏化旋钮：局部历史表索引位宽 ⇒ 256 项
+    localparam LH_H  = 4;               // 折进索引的高位个数（pc[LH_B+3:LH_B+2]）
+    localparam LH_W  = 8;               // 每 PC 的局部历史位宽
+    localparam LH_D  = (1 << LH_B);
+    localparam PHT_PC_W = 4;            // 模式表里 PC 只占 4 位（pc[5:2]）
+    localparam PHT_B = PHT_PC_W + LH_W; // 12 ⇒ 4096 项
+    localparam PHT_D = (32'd1 << PHT_B);
 
-//==============================================================================
-//  方向表 BHT：只回答"这条分支跳不跳"。
-//  读写同口径：都用【指令自己的地址】（不是 pc+4 —— 加 4 会给 4 mod 8 的分支向 bit3 进位，
-//  训练落到下一格，自己那格永远停在弱不跳，这类分支每执行一次错一次）。
-//==============================================================================
-//★ 组合读（分布式 RAM）：方向位必须和【当拍】那个地址对上。寄存读晚一拍，
-//  而晚的这一拍正好是"pred 要随指令进流水线"的那一拍 —— 相位从这一级就开始错。
-    (* ram_style = "distributed" *) reg [1:0] bht [0:BHT_D-1];
-    wire [1:0] bht_registered_0 = bht[bht_index_0];
-    wire [1:0] bht_registered_1 = bht[bht_index_1];
+    wire [LH_B-1:0] lh_index_0 = pc_addr_0[LH_B+1:2]
+                               ^ {pc_addr_0[LH_B+LH_H+1:LH_B+2], {(LH_B-LH_H){1'b0}}};
+    wire [LH_B-1:0] lh_index_1 = pc_addr_1[LH_B+1:2]
+                               ^ {pc_addr_1[LH_B+LH_H+1:LH_B+2], {(LH_B-LH_H){1'b0}}};
+    wire [LH_B-1:0] lh_index_2 = pc_addr_2[LH_B+1:2]
+                               ^ {pc_addr_2[LH_B+LH_H+1:LH_B+2], {(LH_B-LH_H){1'b0}}};
+    wire [LH_B-1:0] lh_index_3 = pc_addr_3[LH_B+1:2]
+                               ^ {pc_addr_3[LH_B+LH_H+1:LH_B+2], {(LH_B-LH_H){1'b0}}};
+    wire [LH_B-1:0] lh_index_w = branch_unit_pc[LH_B+1:2]
+                               ^ {branch_unit_pc[LH_B+LH_H+1:LH_B+2], {(LH_B-LH_H){1'b0}}};
+
+//★ 组合读（分布式 RAM）：方向位必须和【当拍】那个地址对上。
+//★ 一个分布式 RAM 只有两个读口：两张表各有 5 个读地址（lane0/1/2/3 + 训练侧）⇒ 各三份阵列：
+//  a 读 lane0/1，b 读 lane2/3，c 读训练侧（写口自带的那次读改写也走 c）。
+    (* ram_style = "distributed" *) reg [LH_W-1:0] lht_a [0:LH_D-1];
+    (* ram_style = "distributed" *) reg [LH_W-1:0] lht_b [0:LH_D-1];
+    (* ram_style = "distributed" *) reg [LH_W-1:0] lht_c [0:LH_D-1];
+    (* ram_style = "distributed" *) reg [1:0]      pht_a [0:PHT_D-1];
+    (* ram_style = "distributed" *) reg [1:0]      pht_b [0:PHT_D-1];
+    (* ram_style = "distributed" *) reg [1:0]      pht_c [0:PHT_D-1];
+
+    wire [LH_W-1:0] lhist_0 = lht_a[lh_index_0];
+    wire [LH_W-1:0] lhist_1 = lht_a[lh_index_1];
+    wire [LH_W-1:0] lhist_2 = lht_b[lh_index_2];
+    wire [LH_W-1:0] lhist_3 = lht_b[lh_index_3];
+
+    wire [PHT_B-1:0] pht_index_0 = {pc_addr_0[PHT_PC_W+1:2], lhist_0};
+    wire [PHT_B-1:0] pht_index_1 = {pc_addr_1[PHT_PC_W+1:2], lhist_1};
+    wire [PHT_B-1:0] pht_index_2 = {pc_addr_2[PHT_PC_W+1:2], lhist_2};
+    wire [PHT_B-1:0] pht_index_3 = {pc_addr_3[PHT_PC_W+1:2], lhist_3};
+
+    wire [1:0] bht_registered_0 = pht_a[pht_index_0];
+    wire [1:0] bht_registered_1 = pht_a[pht_index_1];
+    wire [1:0] bht_registered_2 = pht_b[pht_index_2];
+    wire [1:0] bht_registered_3 = pht_b[pht_index_3];
     integer i;
+
+//训练侧：读回这条 PC 的局部历史，拼出模式表的读写索引（同一条写语句里读改写）
+    wire [LH_W-1:0]  lhist_w     = lht_c[lh_index_w];
+    wire [PHT_B-1:0] pht_index_w = {branch_unit_pc[PHT_PC_W+1:2], lhist_w};
 
     wire bht_direction_0 = (bht_registered_0 > 2'd1);
     wire bht_direction_1 = (bht_registered_1 > 2'd1);
+    wire bht_direction_2 = (bht_registered_2 > 2'd1);
+    wire bht_direction_3 = (bht_registered_3 > 2'd1);
 
 //==============================================================================
 //  落点表 BTB：一条【指令】一项。两张阵列分开，各自进自己能进的存储：
@@ -151,7 +200,7 @@ module bpu(
 //     命中就得到 Q 端才比 —— 整个预测比地址晚一拍，前端所有相位（记录/改向/错路标记）
 //     都得靠寄存器去追这一拍。tag 单独拿出来只有 11 位宽，2048 项 = 22Kb，LUTRAM 装得下，
 //     命中在地址那一拍就算完。
-//  ★ 按指令、不按 pair：改向落点常是 4 mod 8，取指对会跨两条 pair（实测 seed111：
+//  ★ 按指令、不按 pair：改向落点常是 4 mod 8，取指块会跨两条 pair（实测 seed111：
 //    交付对 (0x66c,0x670)，按 [13:3] 查到的是 0x668 那条 pair 的落点 ⇒ jal 被拉回它自己的
 //    地址、原地打转）。按指令索引就没有"对齐"这回事。
 //  ★ 必须带 valid：低地址的 tag 恰好是 0，和阵列复位值撞上 ⇒ 不加这一位就"处处命中、落点 0"。
@@ -165,22 +214,37 @@ module bpu(
                                   ^ {pc_addr_0[BTB_B+BTB_H+1:BTB_B+2], {(BTB_B-BTB_H){1'b0}}};
     wire [BTB_B-1:0]  btb_index_1 = pc_addr_1[BTB_B+1:2]
                                   ^ {pc_addr_1[BTB_B+BTB_H+1:BTB_B+2], {(BTB_B-BTB_H){1'b0}}};
+    wire [BTB_B-1:0]  btb_index_2 = pc_addr_2[BTB_B+1:2]
+                                  ^ {pc_addr_2[BTB_B+BTB_H+1:BTB_B+2], {(BTB_B-BTB_H){1'b0}}};
+    wire [BTB_B-1:0]  btb_index_3 = pc_addr_3[BTB_B+1:2]
+                                  ^ {pc_addr_3[BTB_B+BTB_H+1:BTB_B+2], {(BTB_B-BTB_H){1'b0}}};
     wire [BTB_B-1:0]  btb_index_w = branch_unit_pc[BTB_B+1:2]
                                   ^ {branch_unit_pc[BTB_B+BTB_H+1:BTB_B+2], {(BTB_B-BTB_H){1'b0}}};
     wire [BTB_TW-1:0] btb_tag_0 = pc_addr_0[BTB_B+BTB_TW+1:BTB_B+2];
     wire [BTB_TW-1:0] btb_tag_1 = pc_addr_1[BTB_B+BTB_TW+1:BTB_B+2];
+    wire [BTB_TW-1:0] btb_tag_2 = pc_addr_2[BTB_B+BTB_TW+1:BTB_B+2];
+    wire [BTB_TW-1:0] btb_tag_3 = pc_addr_3[BTB_B+BTB_TW+1:BTB_B+2];
     wire [BTB_TW-1:0] btb_tag_w = branch_unit_pc[BTB_B+BTB_TW+1:BTB_B+2];
 
 //tag 表：{is_jump, tag[8:0], valid}（valid 在 bit0 —— 与写端口逐位对齐，改一侧必须改两侧）
-    (* ram_style = "distributed" *) reg [BTB_TW+1:0] btb_target_registered [0:BTB_D-1];
-    wire [BTB_TW+1:0] btb_tag_queue_0 = btb_target_registered[btb_index_0];
-    wire [BTB_TW+1:0] btb_tag_queue_1 = btb_target_registered[btb_index_1];
+//★ 3 份阵列：a 读 lane0/1，b 读 lane2/3，c 读训练侧。
+    (* ram_style = "distributed" *) reg [BTB_TW+1:0] btb_tag_tab_a [0:BTB_D-1];
+    (* ram_style = "distributed" *) reg [BTB_TW+1:0] btb_tag_tab_b [0:BTB_D-1];
+    (* ram_style = "distributed" *) reg [BTB_TW+1:0] btb_tag_tab_c [0:BTB_D-1];
+    wire [BTB_TW+1:0] btb_tag_queue_0 = btb_tag_tab_a[btb_index_0];
+    wire [BTB_TW+1:0] btb_tag_queue_1 = btb_tag_tab_a[btb_index_1];
+    wire [BTB_TW+1:0] btb_tag_queue_2 = btb_tag_tab_b[btb_index_2];
+    wire [BTB_TW+1:0] btb_tag_queue_3 = btb_tag_tab_b[btb_index_3];
     wire btb_hit_0 = btb_tag_queue_0[0] & (btb_tag_queue_0[BTB_TW:1] == btb_tag_0);
     wire btb_hit_1 = btb_tag_queue_1[0] & (btb_tag_queue_1[BTB_TW:1] == btb_tag_1);
+    wire btb_hit_2 = btb_tag_queue_2[0] & (btb_tag_queue_2[BTB_TW:1] == btb_tag_2);
+    wire btb_hit_3 = btb_tag_queue_3[0] & (btb_tag_queue_3[BTB_TW:1] == btb_tag_3);
 
-//落点表：一个写口 + 两个读口 ⇒ 两份阵列（BRAM 只有两个口）
+//落点表：一个写口 + 四个读口 ⇒ 四份阵列（BRAM 只有两个口，读口不复用）
     (* ram_style = "block" *) reg [31:0] btb_target_ram_0 [0:BTB_D-1];
     (* ram_style = "block" *) reg [31:0] btb_target_ram_1 [0:BTB_D-1];
+    (* ram_style = "block" *) reg [31:0] btb_target_ram_2 [0:BTB_D-1];
+    (* ram_style = "block" *) reg [31:0] btb_target_ram_3 [0:BTB_D-1];
 
 //==============================================================================
 //  ★ 循环预测器 v2（2026-10-29）：只治计数循环的【出口】。
@@ -199,7 +263,7 @@ module bpu(
 //    loop_count_tab {valid, exit_pred, tag[7:0], count[5:0]} —— 取指侧写；判定侧（出口复位）优先
 //  ★ 取指侧只在【新的一次取指】上计数（pc_addr 与上一拍不同）。停顿/背压时同一地址会被问很多拍，
 //    不判这个就会一拍拍地重复加。
-//  ★ 只有【真正驱动这次取指】的那条 lane 计数：lane0 预测跳了，lane1 那条根本不在取指流里。
+//  ★ 只有【真正驱动这次取指】的那条 lane 计数：前面的 lane 预测跳了，后面那条根本不在取指流里。
 //  ★ 出口预测错了（记了 exit_pred，判定却是 taken）⇒ 直接撤掉整条（trip=0、conf=0）。
 //    没有这一条，一个错 trip 会每隔 trip 趟再错一次，越错越多。
 //  ★ 只有条件分支进这张表：jal/jalr 没有"跳 N 趟然后不跳"这回事。
@@ -213,29 +277,49 @@ module bpu(
 
     wire [LOOP_B-1:0]  lindex_0 = pc_addr_0[LOOP_B+1:2];
     wire [LOOP_B-1:0]  lindex_1 = pc_addr_1[LOOP_B+1:2];
+    wire [LOOP_B-1:0]  lindex_2 = pc_addr_2[LOOP_B+1:2];
+    wire [LOOP_B-1:0]  lindex_3 = pc_addr_3[LOOP_B+1:2];
     wire [LOOP_B-1:0]  lindex_w = branch_unit_pc[LOOP_B+1:2];
     wire [LOOP_TW-1:0] ltag_0 = pc_addr_0[LOOP_B+LOOP_TW+1:LOOP_B+2];
     wire [LOOP_TW-1:0] ltag_1 = pc_addr_1[LOOP_B+LOOP_TW+1:LOOP_B+2];
+    wire [LOOP_TW-1:0] ltag_2 = pc_addr_2[LOOP_B+LOOP_TW+1:LOOP_B+2];
+    wire [LOOP_TW-1:0] ltag_3 = pc_addr_3[LOOP_B+LOOP_TW+1:LOOP_B+2];
     wire [LOOP_TW-1:0] ltag_w = branch_unit_pc[LOOP_B+LOOP_TW+1:LOOP_B+2];
 
-    (* ram_style = "distributed" *) reg [META_W-1:0] loop_meta_tab  [0:LOOP_D-1];
-    (* ram_style = "distributed" *) reg [CNT_W-1:0]  loop_count_tab [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [META_W-1:0] loop_meta_tab_a  [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [META_W-1:0] loop_meta_tab_b  [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [META_W-1:0] loop_meta_tab_c  [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [CNT_W-1:0]  loop_count_tab_a [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [CNT_W-1:0]  loop_count_tab_b [0:LOOP_D-1];
+    (* ram_style = "distributed" *) reg [CNT_W-1:0]  loop_count_tab_c [0:LOOP_D-1];
 
 //────────────────────────── 取指侧：判出口 ──────────────────────────
-    wire [META_W-1:0] lmeta_0 = loop_meta_tab[lindex_0];
-    wire [META_W-1:0] lmeta_1 = loop_meta_tab[lindex_1];
-    wire [CNT_W-1:0]  lcnt_0  = loop_count_tab[lindex_0];
-    wire [CNT_W-1:0]  lcnt_1  = loop_count_tab[lindex_1];
+    wire [META_W-1:0] lmeta_0 = loop_meta_tab_a[lindex_0];
+    wire [META_W-1:0] lmeta_1 = loop_meta_tab_a[lindex_1];
+    wire [META_W-1:0] lmeta_2 = loop_meta_tab_b[lindex_2];
+    wire [META_W-1:0] lmeta_3 = loop_meta_tab_b[lindex_3];
+    wire [CNT_W-1:0]  lcnt_0  = loop_count_tab_a[lindex_0];
+    wire [CNT_W-1:0]  lcnt_1  = loop_count_tab_a[lindex_1];
+    wire [CNT_W-1:0]  lcnt_2  = loop_count_tab_b[lindex_2];
+    wire [CNT_W-1:0]  lcnt_3  = loop_count_tab_b[lindex_3];
 
     wire meta_hit_0 = lmeta_0[META_W-1] & (lmeta_0[META_W-4 -: LOOP_TW] == ltag_0);
     wire meta_hit_1 = lmeta_1[META_W-1] & (lmeta_1[META_W-4 -: LOOP_TW] == ltag_1);
+    wire meta_hit_2 = lmeta_2[META_W-1] & (lmeta_2[META_W-4 -: LOOP_TW] == ltag_2);
+    wire meta_hit_3 = lmeta_3[META_W-1] & (lmeta_3[META_W-4 -: LOOP_TW] == ltag_3);
     wire cnt_hit_0  = lcnt_0[CNT_W-1] & (lcnt_0[CNT_W-3 -: LOOP_TW] == ltag_0);
     wire cnt_hit_1  = lcnt_1[CNT_W-1] & (lcnt_1[CNT_W-3 -: LOOP_TW] == ltag_1);
+    wire cnt_hit_2  = lcnt_2[CNT_W-1] & (lcnt_2[CNT_W-3 -: LOOP_TW] == ltag_2);
+    wire cnt_hit_3  = lcnt_3[CNT_W-1] & (lcnt_3[CNT_W-3 -: LOOP_TW] == ltag_3);
 
     wire [LOOP_CN-1:0] trip_0 = lmeta_0[LOOP_CN-1:0];
     wire [LOOP_CN-1:0] trip_1 = lmeta_1[LOOP_CN-1:0];
+    wire [LOOP_CN-1:0] trip_2 = lmeta_2[LOOP_CN-1:0];
+    wire [LOOP_CN-1:0] trip_3 = lmeta_3[LOOP_CN-1:0];
     wire [LOOP_CN-1:0] lcnt_val_0 = lcnt_0[LOOP_CN-1:0];
     wire [LOOP_CN-1:0] lcnt_val_1 = lcnt_1[LOOP_CN-1:0];
+    wire [LOOP_CN-1:0] lcnt_val_2 = lcnt_2[LOOP_CN-1:0];
+    wire [LOOP_CN-1:0] lcnt_val_3 = lcnt_3[LOOP_CN-1:0];
 
     wire loop_exit_0 = meta_hit_0 & (lmeta_0[META_W-2:META_W-3] >= 2'd2)
                      & (trip_0 > {{(LOOP_CN-2){1'b0}}, 2'd1})
@@ -243,33 +327,72 @@ module bpu(
     wire loop_exit_1 = meta_hit_1 & (lmeta_1[META_W-2:META_W-3] >= 2'd2)
                      & (trip_1 > {{(LOOP_CN-2){1'b0}}, 2'd1})
                      & cnt_hit_1 & (lcnt_val_1 == trip_1);
+    wire loop_exit_2 = meta_hit_2 & (lmeta_2[META_W-2:META_W-3] >= 2'd2)
+                     & (trip_2 > {{(LOOP_CN-2){1'b0}}, 2'd1})
+                     & cnt_hit_2 & (lcnt_val_2 == trip_2);
+    wire loop_exit_3 = meta_hit_3 & (lmeta_3[META_W-2:META_W-3] >= 2'd2)
+                     & (trip_3 > {{(LOOP_CN-2){1'b0}}, 2'd1})
+                     & cnt_hit_3 & (lcnt_val_3 == trip_3);
 
-//────────────────── 取指侧：数这一趟（一条写口，lane0 优先）──────────────────
+//────────────────── 取指侧：数这一趟（一条写口，序号小的 lane 优先）──────────────────
 //"新的一次取指"：地址变了才算一次。停顿期间同一地址会被问很多拍。
-    reg [31:0] fetch_pc_prev_0, fetch_pc_prev_1;
+    reg [31:0] fetch_pc_prev_0, fetch_pc_prev_1, fetch_pc_prev_2, fetch_pc_prev_3;
     wire fetch_new_0 = (pc_addr_0 != fetch_pc_prev_0);
     wire fetch_new_1 = (pc_addr_1 != fetch_pc_prev_1);
+    wire fetch_new_2 = (pc_addr_2 != fetch_pc_prev_2);
+    wire fetch_new_3 = (pc_addr_3 != fetch_pc_prev_3);
 
-    wire lane0_take_now = btb_hit_0 & (btb_tag_queue_0[BTB_TW+1] | (bht_direction_0 & ~loop_exit_0));
-    wire lane0_count = fetch_new_0 & meta_hit_0;
-    wire lane1_count = fetch_new_1 & meta_hit_1 & ~lane0_take_now & ~lane0_count;
+    wire lane_enable_0 = (fetch_offset <= 2'd0);
+    wire lane_enable_1 = (fetch_offset <= 2'd1);
+    wire lane_enable_2 = (fetch_offset <= 2'd2);
+    wire lane_enable_3 = 1'b1;
 
-    wire [LOOP_B-1:0]  count_wr_index = lane0_count ? lindex_0 : lindex_1;
-    wire [LOOP_TW-1:0] count_wr_tag   = lane0_count ? ltag_0   : ltag_1;
-    wire               count_wr_exit  = lane0_count ? loop_exit_0 : loop_exit_1;
-    wire [LOOP_CN-1:0] count_wr_value = lane0_count
-                                      ? ((loop_exit_0 | (lcnt_val_0 == {LOOP_CN{1'b1}})) ? {LOOP_CN{1'b0}}
-                                                                                        : lcnt_val_0 + 1'b1)
-                                      : ((loop_exit_1 | (lcnt_val_1 == {LOOP_CN{1'b1}})) ? {LOOP_CN{1'b0}}
-                                                                                        : lcnt_val_1 + 1'b1);
+    wire lane0_take_now = lane_enable_0 & btb_hit_0 & (btb_tag_queue_0[BTB_TW+1] | (bht_direction_0 & ~loop_exit_0));
+    wire lane1_take_now = lane_enable_1 & btb_hit_1 & (btb_tag_queue_1[BTB_TW+1] | (bht_direction_1 & ~loop_exit_1));
+    wire lane2_take_now = lane_enable_2 & btb_hit_2 & (btb_tag_queue_2[BTB_TW+1] | (bht_direction_2 & ~loop_exit_2));
+    wire lane3_take_now = lane_enable_3 & btb_hit_3 & (btb_tag_queue_3[BTB_TW+1] | (bht_direction_3 & ~loop_exit_3));
+
+    wire lane0_count = lane_enable_0 & fetch_new_0 & meta_hit_0;
+    wire lane1_count = lane_enable_1 & fetch_new_1 & meta_hit_1 & ~lane0_take_now & ~lane0_count;
+    wire lane2_count = lane_enable_2 & fetch_new_2 & meta_hit_2 & ~(lane0_take_now | lane1_take_now)
+                                          & ~(lane0_count | lane1_count);
+    wire lane3_count = lane_enable_3 & fetch_new_3 & meta_hit_3 & ~(lane0_take_now | lane1_take_now | lane2_take_now)
+                                          & ~(lane0_count | lane1_count | lane2_count);
+
+    reg [LOOP_B-1:0]  count_wr_index;
+    reg [LOOP_TW-1:0] count_wr_tag;
+    reg               count_wr_exit;
+    reg [LOOP_CN-1:0] count_wr_value;
+    reg [LOOP_CN-1:0] count_wr_val_src;
+
+    always @(*) begin
+        count_wr_index = lindex_0;
+        count_wr_tag   = ltag_0;
+        count_wr_exit  = loop_exit_0;
+        count_wr_val_src = lcnt_val_0;
+        if      (lane1_count) begin
+            count_wr_index = lindex_1; count_wr_tag = ltag_1;
+            count_wr_exit = loop_exit_1; count_wr_val_src = lcnt_val_1;
+        end
+        else if (lane2_count) begin
+            count_wr_index = lindex_2; count_wr_tag = ltag_2;
+            count_wr_exit = loop_exit_2; count_wr_val_src = lcnt_val_2;
+        end
+        else if (lane3_count) begin
+            count_wr_index = lindex_3; count_wr_tag = ltag_3;
+            count_wr_exit = loop_exit_3; count_wr_val_src = lcnt_val_3;
+        end
+        count_wr_value = (count_wr_exit | (count_wr_val_src == {LOOP_CN{1'b1}}))
+                       ? {LOOP_CN{1'b0}} : (count_wr_val_src + 1'b1);
+    end
 
 //────────────────────────── 判定侧：记趟数 ──────────────────────────
-    wire [META_W-1:0] lmeta_w = loop_meta_tab[lindex_w];
+    wire [META_W-1:0] lmeta_w = loop_meta_tab_c[lindex_w];
     wire meta_hit_w = lmeta_w[META_W-1] & (lmeta_w[META_W-4 -: LOOP_TW] == ltag_w);
     wire [LOOP_CN-1:0] trip_w = meta_hit_w ? lmeta_w[LOOP_CN-1:0] : {LOOP_CN{1'b0}};
     wire [1:0]         conf_w = meta_hit_w ? lmeta_w[META_W-2:META_W-3] : 2'd0;
 
-    wire [CNT_W-1:0]  lcnt_w  = loop_count_tab[lindex_w];
+    wire [CNT_W-1:0]  lcnt_w  = loop_count_tab_c[lindex_w];
     wire cnt_hit_w = lcnt_w[CNT_W-1] & (lcnt_w[CNT_W-3 -: LOOP_TW] == ltag_w);
     wire [LOOP_CN-1:0] cnt_w  = cnt_hit_w ? lcnt_w[LOOP_CN-1:0] : {LOOP_CN{1'b0}};
     wire exit_pred_w = cnt_hit_w & lcnt_w[CNT_W-2];
@@ -302,40 +425,53 @@ module bpu(
     integer loop_bi;
     initial begin
         for (loop_bi = 0; loop_bi < LOOP_D; loop_bi = loop_bi + 1) begin
-            loop_meta_tab[loop_bi]  = {META_W{1'b0}};
-            loop_count_tab[loop_bi] = {CNT_W{1'b0}};
+            loop_meta_tab_a[loop_bi]  = {META_W{1'b0}};
+            loop_meta_tab_b[loop_bi]  = {META_W{1'b0}};
+            loop_meta_tab_c[loop_bi]  = {META_W{1'b0}};
+            loop_count_tab_a[loop_bi] = {CNT_W{1'b0}};
+            loop_count_tab_b[loop_bi] = {CNT_W{1'b0}};
+            loop_count_tab_c[loop_bi] = {CNT_W{1'b0}};
         end
     end
 
-//★ addr0 优先级 > addr1：lane0 预测跳了，lane1 就在错路上，它的预测一律作废。
+//★ 序号小的优先：第 i 条预测跳了，后面几条就在错路上，它们的预测一律作废。
 //  仲裁在这里做完（不再让 pc 拼第二遍）—— pc 只看到"跳不跳 + 跳到哪"。
 //★ 循环预测器只压在【条件分支的方向】上：jal/jalr 照旧只看 BTB 的 is_jump；
 //  条件分支在"这一趟是出口"时把 taken 压成 not-taken。
-    wire take_candidate_0 = btb_hit_0 & (btb_tag_queue_0[BTB_TW+1] | (bht_direction_0 & ~loop_exit_0));
-    wire take_candidate_1 = btb_hit_1 & (btb_tag_queue_1[BTB_TW+1] | (bht_direction_1 & ~loop_exit_1)) & ~take_candidate_0;
-
+    wire take_candidate_0 = lane_enable_0 & btb_hit_0 & (btb_tag_queue_0[BTB_TW+1] | (bht_direction_0 & ~loop_exit_0));
+    wire take_candidate_1 = lane_enable_1 & btb_hit_1 & (btb_tag_queue_1[BTB_TW+1] | (bht_direction_1 & ~loop_exit_1)) & ~take_candidate_0;
+    wire take_candidate_2 = lane_enable_2 & btb_hit_2 & (btb_tag_queue_2[BTB_TW+1] | (bht_direction_2 & ~loop_exit_2)) & ~take_candidate_0 & ~take_candidate_1;
+    wire take_candidate_3 = lane_enable_3 & btb_hit_3 & (btb_tag_queue_3[BTB_TW+1] | (bht_direction_3 & ~loop_exit_3)) & ~take_candidate_0 & ~take_candidate_1 & ~take_candidate_2;
 
 
 //Q 端：判好的 pred 与寄存好的落点【同一沿、同一个地址】⇒ 天然配对
     always @(posedge clk) begin
         if (reset_registered) begin
-            btb_take_0 <= 1'b0; btb_take_1 <= 1'b0;
-            btb_target_0  <= 32'd0; btb_target_1 <= 32'd0;
+            btb_take_0 <= 1'b0; btb_take_1 <= 1'b0; btb_take_2 <= 1'b0; btb_take_3 <= 1'b0;
+            btb_target_0 <= 32'd0; btb_target_1 <= 32'd0; btb_target_2 <= 32'd0; btb_target_3 <= 32'd0;
         end
         else if (advance) begin
             btb_take_0 <= take_candidate_0;
             btb_take_1 <= take_candidate_1;
-            btb_target_0  <= btb_target_ram_0[btb_index_0];
-            btb_target_1  <= btb_target_ram_1[btb_index_1];
+            btb_take_2 <= take_candidate_2;
+            btb_take_3 <= take_candidate_3;
+            btb_target_0 <= btb_target_ram_0[btb_index_0];
+            btb_target_1 <= btb_target_ram_1[btb_index_1];
+            btb_target_2 <= btb_target_ram_2[btb_index_2];
+            btb_target_3 <= btb_target_ram_3[btb_index_3];
         end
     end
 
     integer bi;
     initial begin
         for (bi = 0; bi < BTB_D; bi = bi + 1) begin
-            btb_target_registered[bi] = {(BTB_TW+2){1'b0}};
+            btb_tag_tab_a[bi] = {(BTB_TW+2){1'b0}};
+            btb_tag_tab_b[bi] = {(BTB_TW+2){1'b0}};
+            btb_tag_tab_c[bi] = {(BTB_TW+2){1'b0}};
             btb_target_ram_0[bi] = 32'd0;
             btb_target_ram_1[bi] = 32'd0;
+            btb_target_ram_2[bi] = 32'd0;
+            btb_target_ram_3[bi] = 32'd0;
         end
     end
 
@@ -345,39 +481,75 @@ module bpu(
 //★ 阵列不参与复位：在 always 里整表回到初值 = 每个触发器带同步复位，LUTRAM 就推不出来
 //  （模块头那一条"复位只清输出寄存器、阵列走 initial"说的就是这个）。初值放到 initial 里。
     initial begin
-        for (i = 0; i < BHT_D; i = i + 1)
-            bht[i] = 2'd1;                       // 弱不跳转
+        for (i = 0; i < LH_D; i = i + 1) begin
+            lht_a[i] = {LH_W{1'b0}};             // 局部历史初值全 0
+            lht_b[i] = {LH_W{1'b0}};
+            lht_c[i] = {LH_W{1'b0}};
+        end
+        for (i = 0; i < PHT_D; i = i + 1) begin
+            pht_a[i] = 2'd1;                     // 弱不跳转
+            pht_b[i] = 2'd1;
+            pht_c[i] = 2'd1;
+        end
     end
 
     always @(posedge clk) begin
         if (!reset_registered) begin
-//方向表：按指令自己的地址加减（晚一拍更新不改变正确性）
+//局部历史表：按指令自己的地址把真实方向移入（晚一拍更新不改变正确性）。
+//  这条写和下面的模式表读改写用的是【同一份旧历史】，训练与取指口径一致。
+            if (bht_ok) begin
+                lht_a[lh_index_w] <= {lhist_w[LH_W-2:0], branch_unit_taken};
+                lht_b[lh_index_w] <= {lhist_w[LH_W-2:0], branch_unit_taken};
+                lht_c[lh_index_w] <= {lhist_w[LH_W-2:0], branch_unit_taken};
+            end
+//模式表：2 位饱和计数器，同一条语句写三份阵列。
             if (bht_ok & branch_unit_taken) begin
-                if (bht[bht_index_w] < 2'd3)
-                    bht[bht_index_w] <= bht[bht_index_w] + 2'd1;
+                if (pht_c[pht_index_w] < 2'd3) begin
+                    pht_a[pht_index_w] <= pht_c[pht_index_w] + 2'd1;
+                    pht_b[pht_index_w] <= pht_c[pht_index_w] + 2'd1;
+                    pht_c[pht_index_w] <= pht_c[pht_index_w] + 2'd1;
+                end
             end
             else if (bht_ok & ~branch_unit_taken) begin
-                if (bht[bht_index_w] > 2'd0)
-                    bht[bht_index_w] <= bht[bht_index_w] - 2'd1;
+                if (pht_c[pht_index_w] > 2'd0) begin
+                    pht_a[pht_index_w] <= pht_c[pht_index_w] - 2'd1;
+                    pht_b[pht_index_w] <= pht_c[pht_index_w] - 2'd1;
+                    pht_c[pht_index_w] <= pht_c[pht_index_w] - 2'd1;
+                end
             end
 //tag 表：{is_jump, tag[8:0], valid} —— 布局与读端逐位对齐（valid 在 bit0）
             if (training_ok) begin
-                btb_target_registered[btb_index_w] <= {(is_jump_link | is_jump_link_register), btb_tag_w, 1'b1};
+                btb_tag_tab_a[btb_index_w] <= {(is_jump_link | is_jump_link_register), btb_tag_w, 1'b1};
+                btb_tag_tab_b[btb_index_w] <= {(is_jump_link | is_jump_link_register), btb_tag_w, 1'b1};
+                btb_tag_tab_c[btb_index_w] <= {(is_jump_link | is_jump_link_register), btb_tag_w, 1'b1};
                 btb_target_ram_0[btb_index_w] <= bju_tgt;
                 btb_target_ram_1[btb_index_w] <= bju_tgt;
+                btb_target_ram_2[btb_index_w] <= bju_tgt;
+                btb_target_ram_3[btb_index_w] <= bju_tgt;
             end
 //循环表：一条写语句、一个写口（读改写都在这一条里 ⇒ 分布式 RAM 推得出来）
 //循环表 v2：两张表各一条写语句（各一个写口），否则推不成分布式 RAM。
 //  meta 只在【条件分支判定】那一拍写；count 在取指侧写，判定侧的"出口复位"优先。
-            if (loop_wrong_exit | loop_exit_now)
-                loop_meta_tab[lindex_w] <= {1'b1, meta_conf_next, ltag_w, meta_trip_next};
-            if (loop_exit_now)
-                loop_count_tab[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
-            else if (lane0_count | lane1_count)
-                loop_count_tab[count_wr_index] <= {1'b1, count_wr_exit, count_wr_tag, count_wr_value};
+            if (loop_wrong_exit | loop_exit_now) begin
+                loop_meta_tab_a[lindex_w] <= {1'b1, meta_conf_next, ltag_w, meta_trip_next};
+                loop_meta_tab_b[lindex_w] <= {1'b1, meta_conf_next, ltag_w, meta_trip_next};
+                loop_meta_tab_c[lindex_w] <= {1'b1, meta_conf_next, ltag_w, meta_trip_next};
+            end
+            if (loop_exit_now) begin
+                loop_count_tab_a[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
+                loop_count_tab_b[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
+                loop_count_tab_c[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
+            end
+            else if (lane0_count | lane1_count | lane2_count | lane3_count) begin
+                loop_count_tab_a[count_wr_index] <= {1'b1, count_wr_exit, count_wr_tag, count_wr_value};
+                loop_count_tab_b[count_wr_index] <= {1'b1, count_wr_exit, count_wr_tag, count_wr_value};
+                loop_count_tab_c[count_wr_index] <= {1'b1, count_wr_exit, count_wr_tag, count_wr_value};
+            end
 //"上一拍被问的地址"，用来判"这是不是新的一次取指"
             fetch_pc_prev_0 <= pc_addr_0;
             fetch_pc_prev_1 <= pc_addr_1;
+            fetch_pc_prev_2 <= pc_addr_2;
+            fetch_pc_prev_3 <= pc_addr_3;
         end
     end
 

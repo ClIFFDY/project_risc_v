@@ -12,10 +12,11 @@
 module lsu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
-    input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
-//★ 2026-11-04 精确冲刷：按槽的击杀掩码【当拍版】（本模块的击杀与冲刷同拍）。
-//  第 i 位 = 槽 i 这一拍要被作废；整窗那一档全亮。
-    input [15:0] flush_kill_mask_in,
+    input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
+    input        exc_kill,           // 异常交付（rob 的 trap_fire）
+    input        irq_kill,           // 中断受理（clint 自己判的）
+//★ 2026-11-08：击杀掩码端口已摘。改向只在提交口发一次 ⇒ 每次冲刷都是整窗的，
+//  原来按槽查表等价于常数 1；本模块只需"这一拍有没有冲刷"（flush_commit / flush_window）。
     input       exec_in,            // = exec_in
 //★ 总线被按住（外部仲裁器占用）：只在本模块生效 —— 它就是"本拍不许发新交易"。
 //  2026-10-31 从 flag_bus[0]（停全前端）挪到这里：停前端是多余的，本模块自己等应答已经把
@@ -28,11 +29,8 @@ module lsu(
     input payload_go,
     input [6:0] opcode,
     input [9:0] function10,
-//前送命中判据：消费者自己的 rs1/rs2（站项里的源寄存器号），本模块结果口这一拍供的值是不是它要的。
-//★ 判据用的是【载荷里锁存的】槽号，不用当拍扫描：两者必须与消费者同一拍，扫描会差一拍。
-    input [4:0] destination_in, r1_post, r2_post,
 //ROB 索引载荷：与其它载荷同使能锁存，回填时用它写进 ROB 自己那一项
-    input [3:0]  idx_in,
+    input [4:0]  idx_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
     input        gen_in,
 //本条指令的操作数（站选中项的终值，访存地址与 store 数据都从这里算）
@@ -52,7 +50,7 @@ module lsu(
     input load_ready_next,
 // P2/P3: only registered decisions: head_one_hot_registered = head one-hot, redirect_any = redirect outstanding.
 // No head pointer (that spread the ROB decision cone into this module's write enables).
-    input [15:0] head_one_hot_registered,
+    input [31:0] head_one_hot_registered,
     input        redirect_any,
     input ready_dcache, ready_timer, ready_external,
 //★ 总线出口【一分为二】：dcache 独占一套内部总线，不和 AHB master（外设/定时器）抢同一组 out。
@@ -77,41 +75,35 @@ module lsu(
     (* max_fanout = 8 *) output reg [31:0] load_data_early,
 //身份的 D 端（下一沿 return_valid/return_index/return_generation 会装载的值）：早唤醒用
     output reg        load_write_enable_early,
-    output reg [3:0]  ld_index_e,
+    output reg [4:0]  ld_index_e,
     output reg        ld_generation_e,
     (* max_fanout = 8 *) output reg loaded,
 //本拍写回有效（与 loaded 同拍）
     output reg load_write_enable,
-//★ 只报"两节车厢有没有空位"，与呈现的是哪条指令无关（idu2: lsu_full = ~stage_free）。
+//★ 只报"两节车厢有没有空位"，与呈现的是哪条指令无关（isq: lsu_full = ~stage_free）。
 //  故意不含 mem_op / is_store / full / hit —— 它们是当拍载荷的量，会与发射级仲裁成零延时环。
 //  "队列满"只挡发送，不挡接收：收进来先躺在 s1，回压是寄存一拍的。
     output reg  stage_free,
     output reg        load_wake_registered,
-    output reg [3:0]  load_wake_index_registered,
+    output reg [4:0]  load_wake_index_registered,
     output reg        load_wake_generation_registered,
     output reg        load_nack_registered,
-    output reg [3:0]  load_nack_index_registered,
+    output reg [4:0]  load_nack_index_registered,
     output reg        load_nack_generation_registered,
-    (* max_fanout = 8 *) output reg [4:0] destination_load,
-//★ 在途 load 的目的寄存器（两个槽）：给发射级判"我要发的这条的操作数是不是正被 load 写"。
-//  只在入口判不够 —— 发射级不知道就会提前放条，本模块拒收而 idu2 已出队 ⇒ 指令静默蒸发（预存 bug）。
-//  只把寄存过的 rd 报出去，比较放到 idu2 用站项自己的源寄存器做，因此不成组合环。
-    output reg        load_hazard_valid_0, output reg [4:0] load_hazard_rd_0,
-    output reg        load_hazard_valid_1, output reg [4:0] load_hazard_rd_1,
 //本条写回记录的 ROB 索引（与数据逐支同步；消费者自己拿去比源寄存器号）
-    (* max_fanout = 8 *) output reg [3:0]  ld_index,
+    (* max_fanout = 8 *) output reg [4:0]  ld_index,
     (* max_fanout = 8 *) output reg        ld_generation,
 //ROB 的"本拍退休"回报（0/1 两条）：见下面 stage1_cmt 的注释
-    input        ret0_valid, input [3:0] ret0_index, input ret0_generation,
-    input        ret1_valid, input [3:0] ret1_index, input ret1_generation,
+    input        ret0_valid, input [4:0] ret0_index, input ret0_generation,
+    input        ret1_valid, input [4:0] ret1_index, input ret1_generation,
 //store 完成口：进 SQ 那一拍回报（让 ROB 把 ent_wr 置起）。没有它，store 只能靠"发出即可退"
     output reg        store_done,
-    output reg [3:0]  store_index_out,
+    output reg [4:0]  store_index_out,
     output reg        store_generation_out,
     output reg exception_load_store_misalign_out, exception_load_store_store_out,
     output reg [31:0] exception_load_store_address_out,
 //故障指令【自己的】ROB 索引（与故障同拍寄存）：故障晚一拍到 cont，那时 issue_index 已是下一条
-    (* max_fanout = 32 *) output reg [3:0] exception_load_store_index_out,
+    (* max_fanout = 32 *) output reg [4:0] exception_load_store_index_out,
 //故障指令【自己的】pc（与故障同拍寄存，理由同上）。
 //★ 2026-10-31：原来 cont 拿前端的 auxiliary_address 延迟一拍再减 4 当 mepc，前提是
 //  "报故障那一拍 aux 正好是故障指令 +4"。前端一停就完全不成立 —— mt11：故障在 0x30，
@@ -138,9 +130,9 @@ module lsu(
 //入队与总线选通都挂在同一个 flush_window 上，所以冲刷项必须是全集 —— 漏一项该来路的错路请求就照样上总线。
     reg exec, flush_window, flush_con_exc, flush_con_irq, flush_con_jump, flush_commit;
     always @(*) begin
-        flush_con_exc = flush_control_in[2];
-        flush_con_irq = flush_control_in[1];
-        flush_con_jump = flush_control_in[0];
+        flush_con_exc = exc_kill;
+        flush_con_irq = irq_kill;
+        flush_con_jump = redir_backend_0;
         flush_window = flush_con_exc | flush_con_irq | flush_con_jump;
         flush_commit = flush_con_exc | flush_con_irq | flush_con_jump;
         exec    = exec_in;
@@ -168,8 +160,7 @@ module lsu(
 //级1（发送）：load 专用。miss 当拍照进、等回填完再发；常态进级那拍就发。stage1_sent 记"发过没有"。
     reg        stage1_valid, stage1_sent;
     reg        stage1_faulted;      // 非对齐已经报过了（一拍脉冲，别重复报）
-    reg [4:0]  stage1_rd;
-    reg [3:0]  stage1_index;
+    reg [4:0]  stage1_index;
     reg        stage1_generation;
     reg [2:0]  stage1_size;
     reg [31:0] stage1_base, stage1_imm, stage1_pc;
@@ -181,7 +172,7 @@ module lsu(
 //  它挡住自己的只有"ELSQ 没位 / 更老的外设 load 还没进队"，与总线无关。
     reg        store_stage_valid, store_stage_cmt, store_stage_faulted;
     reg [31:0] store_stage_base, store_stage_imm, store_stage_write_data, store_stage_pc;
-    reg [3:0]  store_stage_index;
+    reg [4:0]  store_stage_index;
     reg        store_stage_generation;
     reg [2:0]  store_stage_size;
     reg        store_stage_misalign;
@@ -194,16 +185,17 @@ module lsu(
 //  级3（写回）：与 dcache 里锁住的那条是【同一条】—— 进级2 时已经发过请求，
 //               在这一级只等数据回来（ready_in），所以不需要再发、也不用带载荷。
     reg        stage2_valid;      // 级3 只装 load（store 已经在 ELSQ 里了）
-    reg [4:0]  stage2_rd;
-    reg [3:0]  stage2_index;
+    reg [4:0]  stage2_index;
     reg        stage2_generation;
     (* max_fanout = 8 *) reg [2:0] stage2_size;
     reg [1:0]  stage2_off;
+//★ 2026-11-06：级3 这一格可能是"没上 dcache、数据从 SQ 的整字 store 拿的"。
+    reg        stage2_forward;
+    reg [31:0] stage2_forward_data;
 
 //返回级：rdata 进寄存器，字节/符号扩展在它的 D 端做
     reg        return_valid;
-    reg [4:0]  return_destination;
-    reg [3:0]  return_index;
+    reg [4:0]  return_index;
     reg        return_generation;
     reg [31:0] return_data;
     reg [31:0] load_data_current;   // 返回级 D 端
@@ -221,7 +213,7 @@ module lsu(
 //==============================================================================
     reg        store_queue_a_valid, store_queue_b_valid;
     reg [31:0] store_queue_a_address, store_queue_a_write_data, store_queue_b_address, store_queue_b_write_data;
-    reg [3:0]  store_queue_a_index, store_queue_b_index;
+    reg [4:0]  store_queue_a_index, store_queue_b_index;
     reg        store_queue_a_generation, store_queue_b_generation;
 //kind：1 = store，0 = 外设 load（只有外设 load 才允许 kind=0 进队）。
     reg        store_queue_a_kind, store_queue_b_kind;
@@ -243,7 +235,7 @@ module lsu(
 //★ ELSQ 外设 load 的返回口保持格：返回口一拍只送一笔，dcache 与 ELSQ 应答同拍时存这里。
     reg        elsq_return_hold;
     reg [31:0] elsq_return_data;
-    reg [3:0]  elsq_return_index;
+    reg [4:0]  elsq_return_index;
     reg        elsq_return_generation;
 //★ load_go = "本拍有一笔读摆上总线"。控制网，打 max_fanout 反而把 SQ 写使能推深，已撤。
     reg        store_queue_a_ret, store_queue_b_ret_now, store_queue_a_drop, store_queue_b_drop, store_queue_drain, load_go;
@@ -251,19 +243,22 @@ module lsu(
     reg        store_inflight, store_finish;
 
     reg        retire_hit_now, store_queue_push_ready, store_queue_hit_stage1;
+//st→ld 前送：级1 的 load 同址命中 SQ 里一笔【整字】store ⇒ 直接拿它的数据，不等它排空
+    reg        store_forward_a, store_forward_b, store_forward_hit;
+    reg [31:0] store_forward_word, store_forward_data;
     reg        next_a_valid, next_b_valid, next_a_generation, next_b_generation, next_a_ready, next_b_ready;
     reg        next_a_sent, next_b_sent;
     reg        next_a_kind, next_b_kind;
     reg [2:0]  next_a_size, next_b_size;
     reg [1:0]  next_a_offset, next_b_offset;
     reg [31:0] next_a_address, next_a_write_data, next_b_address, next_b_write_data;
-    reg [3:0]  next_a_index, next_b_index;
+    reg [4:0]  next_a_index, next_b_index;
     reg stage1_non_cacheable;
     reg stage2_done, stage2_ok, stage1_move, stage1_leave, stage1_ok, stage1_put_go;
     reg load_room, store_room;
     reg load_send_go, stage1_sent_go;
     reg load_out, blank_bus, stage1_put;
-    reg load_store_use_hit, miss;
+    reg miss;
     reg [31:0] stage1_sum, store_stage_sum, stage1_word, store_stage_word, store_write_data;
     reg size_bad_now;
 
@@ -335,17 +330,36 @@ module lsu(
 //  dcache_D 组合化后 hold 里含"当拍请求造成的 miss" ⇒
 //  load_go→请求→read_request→busy→hold→miss→blank_bus→load_go 成环（实测 delta 震荡）。
         miss     = dcache_blocked;
-        stage2_done  = stage2_valid & ready_in;
+        stage2_done  = stage2_valid & (ready_in | stage2_forward);
         stage2_ok    = ~stage2_valid | stage2_done;
 //空总线（blank）：miss 在跑，或在途那笔读还没被应答（含级2 刚摆上、下一拍才进级3 的那笔）⇒ 不摆。
 //★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
         stage1_non_cacheable = ~((stage1_word[31:24] == 8'd0) & (stage1_word[23:13] == 11'h100));
-        load_out     = (stage1_valid & stage1_sent & stage1_non_cacheable) | stage2_valid;
+//★ st→ld 前送：级1 这条 load 的【字地址】命中 SQ 里一笔【整字】store ⇒ 数据现成
+//  （store 写满了整字，这条 load 要的字节全在里面），不必等它排空、更不必再去 dcache 读。
+//  只认 size==3'd2（sw）：sb/sh 没写满整字。试过按字节区间算覆盖（sb→lb、sh→lh 也前送），
+//  CoreMark 上只多认出 16 拍、一拍没省，却要多摆 6 个比较器在地址加法后面 —— 不做。
+//  两条 SQ 项都命中时取年轻的 B。SQ 里的项一定比级1 这条老（同一条顺序流水进来的）。
+        store_forward_a = store_queue_a_valid & store_queue_a_kind & (store_queue_a_size == 3'd2)
+                        & (store_queue_a_address == stage1_word);
+        store_forward_b = store_queue_b_valid & store_queue_b_kind & (store_queue_b_size == 3'd2)
+                        & (store_queue_b_address == stage1_word);
+        store_forward_hit = stage1_valid & ~stage1_sent & ~stage1_misalign & (store_forward_a | store_forward_b);
+        store_forward_word = store_forward_b ? store_queue_b_write_data : store_queue_a_write_data;
+//按这条 load 的宽度/偏移从那个整字里切（与级3 的 load_data_current 逐位同形）
+        case (stage1_size)
+            3'b000: store_forward_data = {{24{store_forward_word[8*stage1_sum[1:0] + 7]}}, store_forward_word[8*stage1_sum[1:0] +: 8]};
+            3'b001: store_forward_data = {{16{store_forward_word[16*stage1_sum[1] + 15]}}, store_forward_word[16*stage1_sum[1] +: 16]};
+            3'b100: store_forward_data = {24'd0, store_forward_word[8*stage1_sum[1:0] +: 8]};
+            3'b101: store_forward_data = {16'd0, store_forward_word[16*stage1_sum[1] +: 16]};
+            default: store_forward_data = store_forward_word;
+        endcase
+        load_out     = (stage1_valid & stage1_sent & stage1_non_cacheable) | (stage2_valid & ~stage2_forward);
 //★ bus_hold 并进 blank_bus：它挡住 load 的发送（stage1_put）。
 //  2026-11-04 起 store 排水不再经过这里（它有自己的 B 口），所以这一句只管读。
         blank_bus  = bus_hold_in | miss | (load_out & ~ready_in) | (elsq_load_sent & ~ready_in) | dcache_store_blocked;
-//★ 队列那条门放在【发送】不放【接收】：接收门多一项而 stage_free 没跟上 ⇒ idu2 照常弹出、
+//★ 队列那条门放在【发送】不放【接收】：接收门多一项而 stage_free 没跟上 ⇒ isq 照常弹出、
 //  本模块没接 ⇒ 指令静默蒸发。放在发送上只是"进得来、先别发"，下一拍自动重试。
 //★ 非对齐的条一律不许进 dcache / ELSQ：Q 端判出来就地作废，只走异常上报。
         stage1_put     = stage1_valid & ~stage1_sent & ~blank_bus & ~stage1_misalign
@@ -355,7 +369,7 @@ module lsu(
         load_send_go   = stage1_put_go & stage2_ok;
         stage1_sent_go = load_send_go | load_push_queue;
 //★★ 这几条必须写在 load_send_go / load_push_queue 之后！（踩过：应答到了，指令下一拍才进 stage2）
-        stage1_move  = stage1_valid & (stage1_sent | load_send_go) & stage2_ok;
+        stage1_move  = stage1_valid & (stage1_sent | load_send_go | store_forward_hit) & stage2_ok;
         stage1_leave = stage1_move | load_push_queue
                      | (stage1_valid & stage1_misalign);       // 故障条就地作废、让出格
         stage1_ok    = ~stage1_valid | stage1_leave;
@@ -364,33 +378,13 @@ module lsu(
 //入口门只看本拍推进（payload_go）；自己那三条（haz/unload/full）不算，否则成组合环。
 //★ 不要加 stall_rob_full / stall_pc_redir：重定向要等 ROB 排空，而队头访存正被它挡在门外 ⇒ 死锁。
 //★ 冲刷窗口内一条都不许进：外设访问已在 commit，冲刷拍没有"必须放行"的合法条。
-        new_in_pre = mem_op & ~size_bad_now & ~flush_window & ~load_store_use_hit & payload_go;
+        new_in_pre = mem_op & ~size_bad_now & ~flush_window & payload_go;
         new_in     = new_in_pre;
 //入口不看 miss：miss 当拍也进级锁操作数，只有发送等 miss 落下。
         new_go     = load_room & store_room;
 //★ 按 opcode 分流：一条指令只会走其中一条
         take_load  = new_in & new_go & ~is_store;
         take_store = new_in & new_go &  is_store;
-    end
-
-//冒险同时扫两个槽：s1 里没发的、s2 里没被应答的 load，它们的 rd 都要比（x0 不算）。
-//★ s2 的判据取 stage2_valid & ~stage2_done：store 进 s2 即 done 自动排除；被应答那拍不再算在途。
-    always @(*) begin
-        load_store_use_hit = 1'b0;
-        if (stage1_valid && stage1_rd != 5'd0) begin
-            if (r1_post != 5'd0 && (stage1_rd == r1_post))
-                load_store_use_hit = 1'b1;
-            if (r2_post != 5'd0 && (stage1_rd == r2_post))
-                load_store_use_hit = 1'b1;
-        end
-//★ s3 那一项【保持 stage2_valid & ~stage2_done 原样】：本信号同时是 `new_in_pre` 的一部分，而非对齐故障
-//  判据 AND 在 `new_in_pre` 上 —— 改它的形状会让非对齐 load 不再报故障。
-        if (stage2_valid && ~stage2_done && stage2_rd != 5'd0) begin
-            if (r1_post != 5'd0 && (stage2_rd == r1_post))
-                load_store_use_hit = 1'b1;
-            if (r2_post != 5'd0 && (stage2_rd == r2_post))
-                load_store_use_hit = 1'b1;
-        end
     end
 
 //排空那一笔该发给谁：dcache 认的地址范围 = (addr[31:24]==0 && addr[23:13]==11'h100)。
@@ -510,6 +504,8 @@ module lsu(
         if (reset_registered) begin
             stage1_valid <= 1'b0;
             stage2_valid <= 1'b0;
+            stage2_forward <= 1'b0;
+            stage2_forward_data <= 32'd0;
 //★ 这些必须复位：sent → load_out → blank_bus → stage1_put → sent 是一个自维持的 X 环。
             stage1_sent <= 1'b0;
             stage1_faulted <= 1'b0;
@@ -518,7 +514,6 @@ module lsu(
             stage1_imm  <= 32'd0;
             stage1_pc   <= 32'd0;
             stage1_index <= 4'd0;
-            stage1_rd <= 5'd0;
             stage1_generation <= 1'b0;
             stage1_size <= 3'd0;
             stage1_cmt <= 1'b0;
@@ -529,12 +524,13 @@ module lsu(
 //  s1 里活着的那条正好前移进来，块尾独立的 kill 会把它一起抹掉 ⇒ 永不写回、卡队头 ⇒ 自锁。
             if (stage1_move) begin                                          // 级2 → 级3（请求已摆过）
                 stage2_valid <= ~stage1_kill;                                       // 来的是错路就不许落进级3
-                stage2_rd <= stage1_rd;
                 stage2_size <= stage1_size;
                 stage2_off <= stage1_sum[1:0];
                 stage2_index <= stage1_index;
                 stage2_generation <= stage1_generation;
                 stage2_cmt <= stage1_cmt | stage1_ret;
+                stage2_forward <= store_forward_hit;
+                stage2_forward_data <= store_forward_data;
                 stage1_valid <= 1'b0;
             end
             else if (stage2_done | stage2_kill) begin                           // 级3 走掉 / 被冲刷作废
@@ -544,7 +540,6 @@ module lsu(
                 stage1_sent <= 1'b1;  // 真的弄出去了（读上 dcache 口 / 进了 ELSQ）
             if (take_load) begin                                        // 本条是 load：进 loadQ
                 stage1_valid <= 1'b1;
-                stage1_rd <= destination_in;
                 stage1_size <= function10[2:0];
 //★ 只锁两个加数，地址由 Q 端加法器现算
                 stage1_base <= stage1_base_next;
@@ -621,8 +616,8 @@ module lsu(
 //★ 2026-11-04 精确冲刷：按槽查击杀掩码 —— 比分支更老的、还在排队的 store/load 必须留住。
 //  整窗那一档（异常 / 中断）掩码全亮，与改动前逐字等价。
 //  ★ ELSQ 里已经摆上总线的 store 本来就不可撤回（~store_queue_a_ret 之外还有 inflight 挡着），这条不变。
-        store_queue_a_drop = store_queue_a_valid & flush_commit & ~store_queue_a_ret & flush_kill_mask_in[store_queue_a_index];
-        store_queue_b_drop = store_queue_b_valid & flush_commit & ~store_queue_b_ret_now & flush_kill_mask_in[store_queue_b_index];
+        store_queue_a_drop = store_queue_a_valid & flush_commit & ~store_queue_a_ret;
+        store_queue_b_drop = store_queue_b_valid & flush_commit & ~store_queue_b_ret_now;
 //本拍是不是一笔【读】摆上总线
         load_go  = load_send_go;
 //★ 外设 load 的资格取【在 ROB 队头】：应答回来才出队、才退休 ⇒ 不再需要错路遮挡。
@@ -632,7 +627,7 @@ module lsu(
 //排空 = 队头够资格 且 dcache 的 B 口这一拍收得下。
 //★ 2026-11-04：不再让位给读。store 有自己的口，「读优先」这条仲裁连同
 //  `~blank_bus & ~load_go & ~elsq_load_go` 三项一起删掉 —— 那三项里裹着【当拍地址算出来的】
-//  窗口译码与同址比较，是那条 19 级链（地址和 → blank_bus → 排水 → idu2 的 CE）的入口。
+//  窗口译码与同址比较，是那条 19 级链（地址和 → blank_bus → 排水 → isq 的 CE）的入口。
 //  现在这一句里除了 exec/flush（都是 flag_bus 的寄存器位）全是 ELSQ 与 dcache 的状态位。
 //  ★ elsq_load_go 与它天然互斥（队头是 load 还是 store），不需要再显式排。
         store_queue_drain = store_queue_a_valid & store_queue_a_kind & store_queue_a_ret
@@ -660,7 +655,7 @@ module lsu(
         store_stage_ret   = store_stage_valid & (store_stage_cmt
                           | (ret0_valid & (ret0_index == store_stage_index) & (ret0_generation == store_stage_generation))
                           | (ret1_valid & (ret1_index == store_stage_index) & (ret1_generation == store_stage_generation)));
-        store_stage_drop  = store_stage_valid & ~store_stage_ret & flush_commit & flush_kill_mask_in[store_stage_index];
+        store_stage_drop  = store_stage_valid & ~store_stage_ret & flush_commit;
         store_stage_fault = store_stage_valid & store_stage_misalign;   // 非对齐：不进 ELSQ，只上报
         store_stage_push  = store_stage_valid & ~store_stage_drop & ~store_stage_fault & ~store_push_hold
                           & exec & ~flush_window & (elsq_free > {1'b0, load_push_queue});
@@ -777,7 +772,8 @@ module lsu(
 // 写回 / 提交
 //===============================================================
     always @(*) begin
-        case (stage2_size)
+        if (stage2_forward) load_data_current = stage2_forward_data;
+        else case (stage2_size)
             3'b000: load_data_current = {{24{bus_data_in[8*stage2_off + 7]}}, bus_data_in[8*stage2_off +: 8]};
             3'b001: load_data_current = {{16{bus_data_in[16*stage2_off[1] + 15]}}, bus_data_in[16*stage2_off[1] +: 16]};
             3'b010: load_data_current = bus_data_in;
@@ -799,22 +795,12 @@ module lsu(
         endcase
     end
 
-//★ 在途 load 的 rd 报给发射级。s2 用 stage2_valid 代替 ~stage2_done：
-//  done 里带 ready_in（跨模块组合量），放进来会把应答通路挂到发射门上（偏保守只多等一拍）。
-//★ 两条槽现在都只装 load（store 走 store_stage），所以不用再判 kind。
-    always @(*) begin
-        load_hazard_valid_0 = stage1_valid & (stage1_rd != 5'd0);
-        load_hazard_rd_0    = stage1_rd;
-        load_hazard_valid_1 = stage2_valid & (stage2_rd != 5'd0);
-        load_hazard_rd_1    = stage2_rd;
-    end
-
 //★ 返回级：应答那一拍把数据（已做字节/符号扩展）连同身份锁下，下一拍广播 ——
 //  这一级把 dcache 的 BRAM clock-to-out 从消费者锥上摘掉，对外口全从这个寄存器的 Q 端出。
 //★ 2026-10-30 修：dcache 与 ELSQ 外设 load 可能【同拍】应答。原来 D 端按 elsq 优先 ⇒
 //  dcache 那笔写回被静默吞掉 ⇒ ROB 项 entry_written 永为 0 ⇒ 死锁（看着像后面的 mul 卡死）。
 //  修法：撞拍时把 ELSQ 这笔抓进一格保持寄存器。一格够用（ELSQ 同时只一笔在途，且 go 已挡在 hold 满时）。
-    assign stage2_answer = stage2_valid & ready_in;
+    assign stage2_answer = stage2_valid & (ready_in | stage2_forward);
 //ELSQ 那一笔的交付：必须等返回口空（这一拍既没有级3 应答、也没有新的 ELSQ 应答）
     assign elsq_return_deliver = elsq_return_hold & ~stage2_answer & ~elsq_load_answer;
 
@@ -824,7 +810,7 @@ module lsu(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            return_valid <= 1'b0; return_destination <= 5'd0; return_index <= 4'd0; return_generation <= 1'b0; return_data <= 32'd0;
+            return_valid <= 1'b0; return_index <= 4'd0; return_generation <= 1'b0; return_data <= 32'd0;
             elsq_return_hold <= 1'b0; elsq_return_data <= 32'd0;
             elsq_return_index <= 4'd0; elsq_return_generation <= 1'b0;
         end
@@ -842,19 +828,16 @@ module lsu(
             end
 
             if (elsq_return_deliver) begin
-                return_destination   <= 5'd0;
                 return_index  <= elsq_return_index;
                 return_generation  <= elsq_return_generation;
                 return_data <= elsq_return_data;
             end
             else if (stage2_answer) begin
-                return_destination   <= stage2_rd;
                 return_index  <= stage2_index;
                 return_generation  <= stage2_generation;
                 return_data <= load_data_current;
             end
             else if (elsq_load_answer) begin
-                return_destination   <= 5'd0;
                 return_index  <= store_queue_a_index;
                 return_generation  <= store_queue_a_generation;
                 return_data <= elsq_load_data;
@@ -866,17 +849,17 @@ module lsu(
     always @(*) begin
         loaded      = return_valid;
         load_write_enable       = return_valid;
-        destination_load     = return_valid ? return_destination  : 5'd0;
+
         load_data_out = return_data;
 //★ 早唤醒口只属于 s2 那条路：外设 load 走返回级，拉进来索引/数据会对不上 ⇒ 往值表写垃圾。
         load_data_early   = load_answer ? load_data_current : return_data;
-        load_write_enable_early     = (stage2_valid & ready_in);
+        load_write_enable_early     = (stage2_valid & (ready_in | stage2_forward));
         ld_index_e    = stage2_index;
         ld_generation_e    = stage2_generation;
         ld_index      = return_valid ? return_index : 4'd0;
         ld_generation      = return_valid ? return_generation : 1'b0;
     end
-//★ stage_free 是喂给发射级的入口门（idu2: lsu_full = ~stage_free），必须与 new_in_pre 逐项同门。
+//★ stage_free 是喂给发射级的入口门（isq: lsu_full = ~stage_free），必须与 new_in_pre 逐项同门。
 //  漏一项就是：请求照发 → 级1 不收 → 载荷静默蒸发 ⇒ 整核自锁。
 //★ 取【两条流都有位】而不是"按 opcode 挑一条"：stage_free 一旦依赖 opcode，
 //  就变成"当拍载荷决定广播门"，这正是本仓反复踩的零延时环。代价只是 store_stage 被占时
@@ -897,8 +880,8 @@ module lsu(
                  (ret1_valid & (ret1_index == stage2_index) & (ret1_generation == stage2_generation));
 //★ 作废查 rob 的击杀弧掩码（第 i 位 = 槽 i 比边界年轻），一次 16:1 查表。
 //  ★ 必须吃当拍版：吃寄存版等于把丢弃晚一拍，错路请求可能先上了总线。
-        stage1_kill = stage1_valid & ~stage1_cmt & ~stage1_ret & flush_commit & flush_kill_mask_in[stage1_index];
-        stage2_kill = stage2_valid & ~stage2_cmt & ~stage2_ret & flush_commit & flush_kill_mask_in[stage2_index];
+        stage1_kill = stage1_valid & ~stage1_cmt & ~stage1_ret & flush_commit;
+        stage2_kill = stage2_valid & ~stage2_cmt & ~stage2_ret & flush_commit;
     end
 
 //访存非对齐故障：判定挪到 Q 端（地址要等加法器），伴生量（pc / 索引 / 读写标志 / 出错地址）

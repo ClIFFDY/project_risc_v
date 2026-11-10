@@ -54,9 +54,11 @@
 module mdu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
-    input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
-//★ 2026-11-04 精确冲刷：按槽的击杀掩码【当拍版】。比分支老的乘法/除法不杀，照样跑完。
-    input [15:0] flush_kill_mask_in,
+    input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
+    input        exc_kill,           // 异常交付（rob 的 trap_fire）
+    input        irq_kill,           // 中断受理（clint 自己判的）
+//★ 2026-11-08：击杀掩码端口已摘。每次冲刷都是整窗的（改向只在提交口发一次），
+//  所以"冲刷拍在跑的那条乘/除要作废"就等于判 flush_window。
 //本次冲刷的边界（cont 的 flush_idx：三种冲刷各取自己那条的号）：
 //入口门按它判"本拍站在载荷上的这条，是边界自己、还是比边界更年轻的错路条"。
 //两条接收通道（乘法口 / 除法口）：站一拍只出一条 ⇒ 两套载荷同源，只有 valid 不同。
@@ -64,14 +66,12 @@ module mdu(
 //  "站撤项"与"本模块收下"永远同拍，任何一条都不会被静默丢掉（本次改造的核心）。
     input        multiply_go,
     input [9:0]  multiply_function10,
-    input [4:0]  multiply_destination,
-    input [3:0]  multiply_index_in,
+    input [4:0]  multiply_index_in,
     input        multiply_generation_in,
     input [31:0] multiply_source_a, mul_r2,
     input        divide_go,
     input [9:0]  divide_function10,
-    input [4:0]  divide_destination,
-    input [3:0]  divide_index_in,
+    input [4:0]  divide_index_in,
     input        divide_generation_in,
     input [31:0] divide_source_a, div_r2,
     (* max_fanout = 8 *) output reg [31:0] multiply_data_out,
@@ -81,32 +81,35 @@ module mdu(
     output reg [31:0] divide_data_early,
 //身份的 D 端（下一沿口上 valid 与 *_idx/_gen 会装载的值）：早唤醒用
     output reg        multiply_write_enable_early,
-    output reg [3:0]  multiply_index_early,
+    output reg [4:0]  multiply_index_early,
     output reg        multiply_generation_early,
     output reg        divide_write_enable_early,
-    output reg [3:0]  divide_index_early,
+    output reg [4:0]  divide_index_early,
     output reg        divide_generation_early,
+//★ 2026-11-06 提前唤醒：除法这一笔的号先一拍报出去（写口是 done+3，源唤醒是 done+2，这里是 done+1）。
+//  站里靠它把消费者提前一拍抓进选优级 fifo。索引在 done 那拍还停在 divide_state_index 上
+//  （done 期间 divide_ready 挡住新除法，不会被盖），所以直接锁一拍即可。
+    output reg        divide_wake_early,
+    output reg [4:0]  divide_wake_index_early,
     (* max_fanout = 8 *) output reg multiply_loaded, multiply_write_enable,
 //本模块这一拍供的是哪一项的 rd（与 multiply_index/multiply_generation 逐支同步，供消费者比源寄存器号）
-    (* max_fanout = 8 *) output reg [4:0] rd_mul,
 //本条写回记录带的 ROB 索引（跟着数据走，写回口用它定位自己那一项）
-    output reg [3:0]  multiply_index,
+    output reg [4:0]  multiply_index,
     (* max_fanout = 8 *) output reg        multiply_generation,
 //除法独立结果口：不再与乘法共用一口，两者同拍各自报自己的
     (* max_fanout = 8 *) output reg [31:0] divide_data_out,
     (* max_fanout = 8 *) output reg        divide_loaded, divide_write_enable,
-    (* max_fanout = 8 *) output reg [4:0]  rd_div,
-    output reg [3:0]  divide_index,
+    output reg [4:0]  divide_index,
     (* max_fanout = 8 *) output reg        divide_generation,
 //两条 ready 回站：只由本模块寄存器状态 + 本拍的总线占用位决定（不含被选指令、不含对方通道）⇒ 不闭零延时环。
 //站侧按站项自己的算子门控（乘法项看 multiply_ready、除法项看 divide_ready），门控式与本模块的接收式逐字相同。
     output reg multiply_ready,
     output reg divide_ready,
     output reg        multiply_wake_registered,
-    output reg [3:0]  multiply_wake_index_registered,
+    output reg [4:0]  multiply_wake_index_registered,
     output reg        multiply_wake_generation_registered,
     output reg        multiply_nack_registered,
-    output reg [3:0]  multiply_nack_index_registered,
+    output reg [4:0]  multiply_nack_index_registered,
     output reg        multiply_nack_generation_registered
     );
 
@@ -133,8 +136,8 @@ module mdu(
     reg       divide_state_kill;
     reg       multiply_stage1_kill, multiply_stage2_kill;
     always @(*) begin
-        flush_control_exception = flush_control_in[2];
-        flush_window = flush_control_exception | flush_control_in[1] | flush_control_in[0];
+        flush_control_exception = exc_kill;
+        flush_window = flush_control_exception | irq_kill | redir_backend_0;
     end
 
 //冻结信号合流（本模块是消费者，或运算在这里做）：
@@ -153,15 +156,13 @@ module mdu(
 //寄存器声明（按级分组）
 //乘法：第一级锁操作数 / 第二级锁乘积
     reg [31:0] multiply_stage_a, multiply_stage_b;
-    reg [4:0]  multiply_stage_destination;
-    reg [3:0]  multiply_stage_index;
+    reg [4:0]  multiply_stage_index;
     reg        multiply_stage_generation;
     reg [2:0]  multiply_stage_operation;
     reg        multiply_stage_valid;
 
     reg [63:0] multiply_product;
-    reg [4:0]  multiply_stage_destination_registered;
-    reg [3:0]  multiply_stage_index_registered;
+    reg [4:0]  multiply_stage_index_registered;
     reg        multiply_stage_generation_registered;
     reg [2:0]  multiply_stage_operation_registered;
     (* max_fanout = 8 *)
@@ -176,8 +177,7 @@ module mdu(
     reg        divide_state_zero;            // 除数为 0
     reg        divide_state_overflow;             // INT_MIN / -1
     reg        divide_state_sign_b;
-    reg [4:0]  divide_state_destination;
-    reg [3:0]  divide_state_index;
+    reg [4:0]  divide_state_index;
     reg        divide_state_generation;
     reg [4:0]  divide_state_count;
     reg        divide_state_busy;
@@ -193,14 +193,12 @@ module mdu(
 //若除法在 divide_state_done 当拍就写，同 rd 时晚写的 ALU 指令会盖掉除法结果。
 //按流水级数对齐，除法写口落在 divide_state_done+3（即 divide_state_commit_registered[2]）。
     reg [2:0]  divide_state_commit_registered;
-    reg [4:0]  divide_state_commit_destination;
-    reg [3:0]  divide_state_commit_index;
+    reg [4:0]  divide_state_commit_index;
     reg        divide_state_commit_generation;
     reg [31:0] divide_state_commit_data;
 
 //输出保持
-    reg [4:0]  hold_rd;
-    reg [3:0]  index_hold;
+    reg [4:0]  index_hold;
     reg        generation_hold;
     reg [31:0] hold_data;
     reg        hold;
@@ -212,9 +210,9 @@ module mdu(
 //★ 2026-11-04 精确冲刷：判据里补上【按槽的击杀掩码】。
 //  精确改向只杀比分支年轻的项 ⇒ 比它老的除法 / 乘法必须继续跑完（否则它那一项永远等不到完成口）。
 //  整窗那一档掩码全亮，与改动前逐字等价。
-        divide_state_kill    = flush_window & flush_kill_mask_in[divide_state_index];
-        multiply_stage1_kill = multiply_stage_valid & flush_window & flush_kill_mask_in[multiply_stage_index];
-        multiply_stage2_kill = multiply_product_valid & flush_window & flush_kill_mask_in[multiply_stage_index_registered];
+        divide_state_kill    = flush_window;
+        multiply_stage1_kill = multiply_stage_valid & flush_window;
+        multiply_stage2_kill = multiply_product_valid & flush_window;
     end
 
 //组合逻辑（全部行为描述：reg + always @(*) 阻塞赋值）
@@ -228,6 +226,27 @@ module mdu(
     reg        divide_state_commit, divide_state_pending;
 
 //===============================================================
+// 除法接受缓冲（1 格）
+//★ 2026-11-08：除法口改成"收下再说"。原来 divide_ready 要把 FSM 的 issued/busy/done
+//  和提交延迟链的空闲一起拉回站侧，站侧又拿它去门控选优 —— 一条跨模块、
+//  四项的组合路径插在 16 项的选优锥里。现在口上只判"缓冲空不空"：
+//  来的时候 FSM 正忙（或结果还在提交链上）就存在这里，等 FSM 空了再发起。
+//  ★ FSM 空闲且缓冲空时仍然【直通发起】，所以正常情况一拍都不多等。
+//  ★ 冲刷（divide_state_kill）连缓冲一起清：错路那一笔不发、不占缓冲。
+//===============================================================
+    reg        divide_buffer_valid;
+    reg [4:0]  divide_buffer_index;
+    reg        divide_buffer_generation;
+    reg [9:0]  divide_buffer_function10;
+    reg [31:0] divide_buffer_source_a, divide_buffer_r2;
+
+    reg        divide_fsm_idle, divide_start, divide_buffer_push;
+    reg [4:0]  divide_start_index;
+    reg        divide_start_generation;
+    reg [9:0]  divide_start_function10;
+    reg [31:0] divide_start_source_a, divide_start_r2;
+
+//===============================================================
 // 两条 ready（回站的门控）—— 只由本模块寄存器状态 + 本拍总线占用位决定
 //===============================================================
 //乘法口：两级流水只要不被冻结就收（站一拍只出一条，容量天然够）。
@@ -235,8 +254,45 @@ module mdu(
 //  推进 multiply_stage_valid 那一拍会把冻着的那条冲掉 —— "收了就必须推进"是这条契约的另一半。
     always @(*) begin
         multiply_ready = ~pipe_stall;
-//除法口：FSM 空闲 + 提交链空 ⇒ 收下当拍就能发起（除法执行拍数不变：发起不晚于接收那一拍）
-        divide_ready = ~divide_state_issued & ~divide_state_busy & ~divide_state_done & ~divide_state_pending & ~pipe_stall;
+//除法口：只看接受缓冲空不空（见上面的块注释）。
+        divide_ready = ~divide_buffer_valid & ~pipe_stall;
+    end
+
+//发起 / 存缓冲：FSM 真能起的判据还是原来那四项，只是不再拿去门控站侧。
+    always @(*) begin
+        divide_fsm_idle = ~divide_state_issued & ~divide_state_busy & ~divide_state_done & ~divide_state_pending & ~pipe_stall;
+//缓冲里有货 ⇒ 一起来就发起；缓冲空 ⇒ 这一拍来的这一笔直接发起（直通，不加拍数）。
+        divide_start      = divide_buffer_valid ? divide_fsm_idle
+                                                : (divide_go & divide_ready & divide_fsm_idle);
+//收下的那一笔这一拍发起不了 ⇒ 进缓冲。缓冲满（valid）时 divide_ready 已经是 0，不会覆盖。
+        divide_buffer_push = divide_go & divide_ready & ~divide_fsm_idle;
+    end
+
+//发起那一拍用的操作数：优先取缓冲里的那一笔，直通时用口上的。
+    always @(*) begin
+        divide_start_index      = divide_buffer_valid ? divide_buffer_index      : divide_index_in;
+        divide_start_generation = divide_buffer_valid ? divide_buffer_generation : divide_generation_in;
+        divide_start_function10 = divide_buffer_valid ? divide_buffer_function10 : divide_function10;
+        divide_start_source_a   = divide_buffer_valid ? divide_buffer_source_a   : divide_source_a;
+        divide_start_r2         = divide_buffer_valid ? divide_buffer_r2         : div_r2;
+    end
+
+//缓冲的装 / 清：被 FSM 取走就清，冲刷也清（错路那一笔不发、不占缓冲）。
+    always @(posedge clk) begin
+        if (reset_registered | divide_state_kill) begin
+            divide_buffer_valid <= 1'b0;
+        end
+        else if (divide_start) begin
+            divide_buffer_valid <= 1'b0;
+        end
+        else if (divide_buffer_push) begin
+            divide_buffer_valid      <= 1'b1;
+            divide_buffer_index      <= divide_index_in;
+            divide_buffer_generation <= divide_generation_in;
+            divide_buffer_function10 <= divide_function10;
+            divide_buffer_source_a   <= divide_source_a;
+            divide_buffer_r2         <= div_r2;
+        end
     end
 
 //第一级：锁操作数。判据与 lsu 的入级门（new_in/new_put）同形。
@@ -254,7 +310,6 @@ module mdu(
             multiply_stage_valid <= 1'b0;
             multiply_stage_a <= 32'd0;
             multiply_stage_b <= 32'd0;
-            multiply_stage_destination <= 5'd0;
             multiply_stage_operation <= 3'd0;
         end
         else if (multiply_stage1_kill) begin
@@ -265,7 +320,6 @@ module mdu(
             if (multiply_push) begin
                 multiply_stage_a  <= multiply_source_a;
                 multiply_stage_b  <= mul_r2;
-                multiply_stage_destination <= multiply_destination;
                 multiply_stage_index <= multiply_index_in;
                 multiply_stage_generation <= multiply_generation_in;
                 multiply_stage_operation <= multiply_function10[2:0];
@@ -293,7 +347,6 @@ module mdu(
         if (reset_registered) begin
             multiply_product_valid <= 1'b0;
             multiply_product <= 64'd0;
-            multiply_stage_destination_registered <= 5'd0;
             multiply_stage_operation_registered <= 3'd0;
         end
         else if (multiply_stage2_kill) begin
@@ -302,7 +355,6 @@ module mdu(
         else if (!pipe_stall) begin
             multiply_product_valid   <= multiply_stage_valid;
             multiply_product    <= multiply_product_intermediate[63:0];
-            multiply_stage_destination_registered <= multiply_stage_destination;
             multiply_stage_index_registered <= multiply_stage_index;
             multiply_stage_generation_registered <= multiply_stage_generation;
             multiply_stage_operation_registered <= multiply_stage_operation;
@@ -335,7 +387,6 @@ module mdu(
             divide_state_dividend <= 32'd0;
             divide_state_a <= 32'd0;
             divide_state_b <= 32'd0;
-            divide_state_destination <= 5'd0;
             divide_state_remainder <= 1'b0;
             divide_state_negative_registered <= 1'b0;
             divide_state_negative_result <= 1'b0;
@@ -373,24 +424,22 @@ module mdu(
                 divide_state_negative_result <= divide_state_sign && divide_state_dividend[31] && (divide_state_b != 32'd0);
             end
         end
-//★ 发起条件 = divide_go & divide_ready：divide_ready 已经排掉 FSM 忙、提交链未空与 pipe_stall，
-//  发起侧不再另加判据。★ 判据与回给站的 divide_ready 逐字同源：站侧门控 = divide_ready
-//  ⇒ 站撤项那一拍必定在这里发起，不会出现"发出去了、没接住"（老树靠"除法冻在门口等"
-//  保证，站式之后那条前提没有了）。
-        else if (divide_go && divide_ready) begin
+//★ 发起条件 = divide_start：缓冲里有货就发起它，缓冲空就发起这一拍口上的那一笔。
+//  站侧门控（divide_ready = 缓冲空）与接收式（收下就进缓冲或直通发起）同源 ⇒
+//  站撤项那一拍必定被收下，不会出现"发出去了、没接住"。
+        else if (divide_start) begin
 //发起：有符号类先取绝对值，收尾再按符号还原。
 //divide_state_issued 保证一条 div 只发起一次；否则算完后会无限重复发起、放行判据永远落不下去。
 //★ 操作数与符号位必须在【发起那一拍】从除法口锁下来：divide_state_count==0 那个收尾判据在发起晚一拍执行，
 //  那时端口上已经是别的指令了（站一拍只摆一条），现场读会取到别人的编码。
-            divide_state_destination     <= divide_destination;
-            divide_state_index    <= divide_index_in;
-            divide_state_generation    <= divide_generation_in;
-            divide_state_remainder    <= divide_function10[1];
-            divide_state_sign    <= (divide_function10[0] == 1'b0);
-            divide_state_dividend    <= divide_source_a;
-            divide_state_sign_b <= div_r2[31];
-            divide_state_a     <= ((divide_function10[0] == 1'b0) && divide_source_a[31]) ? (~divide_source_a + 32'd1) : divide_source_a;
-            divide_state_b     <= ((divide_function10[0] == 1'b0) && div_r2[31]) ? (~div_r2 + 32'd1) : div_r2;
+            divide_state_index    <= divide_start_index;
+            divide_state_generation    <= divide_start_generation;
+            divide_state_remainder    <= divide_start_function10[1];
+            divide_state_sign    <= (divide_start_function10[0] == 1'b0);
+            divide_state_dividend    <= divide_start_source_a;
+            divide_state_sign_b <= divide_start_r2[31];
+            divide_state_a     <= ((divide_start_function10[0] == 1'b0) && divide_start_source_a[31]) ? (~divide_start_source_a + 32'd1) : divide_start_source_a;
+            divide_state_b     <= ((divide_start_function10[0] == 1'b0) && divide_start_r2[31]) ? (~divide_start_r2 + 32'd1) : divide_start_r2;
             divide_state_remainder_partial <= 32'd0;
             divide_state_quotient_partial <= 32'd0;
             divide_state_count   <= 5'd0;
@@ -425,6 +474,18 @@ module mdu(
         end
     end
 
+//提前唤醒那一拍：done 之后的第一拍
+    always @(posedge clk) begin
+        if (reset_registered | divide_state_kill) begin
+            divide_wake_early <= 1'b0;
+            divide_wake_index_early <= 4'd0;
+        end
+        else begin
+            divide_wake_early <= divide_state_done;
+            if (divide_state_done) divide_wake_index_early <= divide_state_index;
+        end
+    end
+
 //===============================================================
 // 提交链（divide_state_done+3 写口）与输出保持
 //===============================================================
@@ -437,12 +498,11 @@ module mdu(
         if (reset_registered) begin
             divide_state_commit_registered <= 3'd0;
 //载荷也要复位：D 端（divide_data_early）每拍都往外送，不复位就会把 X 灌进前送表
-            divide_state_commit_destination <= 5'd0; divide_state_commit_index <= 4'd0; divide_state_commit_generation <= 1'b0; divide_state_commit_data <= 32'd0;
+            divide_state_commit_index <= 4'd0; divide_state_commit_generation <= 1'b0; divide_state_commit_data <= 32'd0;
         end
         else if (!pipe_stall) begin
             divide_state_commit_registered <= {divide_state_commit_registered[1:0], divide_state_done};
             if (divide_state_done) begin
-                divide_state_commit_destination   <= divide_state_destination;
                 divide_state_commit_index  <= divide_state_index;
                 divide_state_commit_generation  <= divide_state_generation;
                 divide_state_commit_data <= divide_state_result;
@@ -456,7 +516,6 @@ module mdu(
         else if (!pipe_stall) begin
             hold <= multiply_product_valid;
             if (multiply_product_valid) begin
-                hold_rd   <= multiply_stage_destination_registered;
                 index_hold  <= multiply_stage_index_registered;
                 generation_hold  <= multiply_stage_generation_registered;
                 hold_data <= multiply_select ? multiply_product[31:0] : multiply_product[63:32];
@@ -475,7 +534,7 @@ module mdu(
 //★★ 2026-11-04：乘法口改成从【MDU 结果寄存器】出（multiply_product + 寄存后的 op 选择 + hold），
 //  不再用 DSP 参与算出来的组合乘积 multiply_product_intermediate。
 //  为什么：组合乘积一挂到结果口，DSP 那条链和 mdu 的选择信号就被拖进 prf 的写口和旁路网，
-//  实测 12.5ns 下 `−2.041 / 1691 端点`（改之前 `−0.744 / 242`），失败端点铺到 mdu/iffu/idu1/csr 四处。
+//  实测 12.5ns 下 `−2.041 / 1691 端点`（改之前 `−0.744 / 242`），失败端点铺到 mdu/iffu/idu/csr 四处。
 //  代价：乘法结果晚一拍 —— 现在乘法早口和晚口是同一份（都从 multiply_data_out 出）。
 //  早口的那几项在下面"乘法口"那个 always 块里跟着赋，避免跨块读。
     always @(*) begin
@@ -484,7 +543,7 @@ module mdu(
 //★ 写使能【只取触发器】，不再乘 ~kill。kill 是 rob 的组合链（slot_above_head_registered → redirect_index → kill_arc），
 //  乘进 we 就等于把它拉进值阵列每个 entry D 端那个 5 口优先级 mux —— 实测最差路 16 级、78% 是布线。
 //★ 解耦之后错路那一笔最多多写【一拍】：写进的是它自己那个槽，而该槽的 valid 在它分配那一拍就被清成 0；
-//  重新分配至少还要 5 拍才到 idu2-D，到那时 valid 又被清一次 ⇒ 这一拍设起来的 valid 活不过下一次分配。
+//  重新分配至少还要 5 拍才到 isq-D，到那时 valid 又被清一次 ⇒ 这一拍设起来的 valid 活不过下一次分配。
 //★ kill 本身不动：乘/除各级 valid 的清仍按年龄那个式子来，kill 只出现在寄存器的 D 端，不在这条路上。
         divide_write_enable_early = pipe_stall ? divide_state_commit_registered[2] : divide_state_commit_registered[1];
         divide_index_early = divide_state_commit_index;
@@ -497,19 +556,16 @@ module mdu(
         multiply_write_enable     = multiply_product_valid;
         multiply_loaded = multiply_product_valid | hold;
         if (multiply_product_valid) begin
-            rd_mul       = multiply_stage_destination_registered;
             multiply_index      = multiply_stage_index_registered;
             multiply_generation      = multiply_stage_generation_registered;
             multiply_data_out = multiply_select ? multiply_product[31:0] : multiply_product[63:32];
         end
         else if (hold) begin
-            rd_mul       = hold_rd;
             multiply_index      = index_hold;
             multiply_generation      = generation_hold;
             multiply_data_out = hold_data;
         end
         else begin
-            rd_mul       = 5'd0;
             multiply_index      = 4'd0;
             multiply_generation      = 1'b0;
             multiply_data_out = 32'd0;
@@ -522,7 +578,6 @@ module mdu(
 //---- 除法口 ----
         divide_write_enable       = divide_state_commit;
         divide_loaded   = divide_state_commit;
-        rd_div       = divide_state_commit_destination;
         divide_index      = divide_state_commit_index;
         divide_generation      = divide_state_commit_generation;
         divide_data_out = divide_state_commit_data;

@@ -2,30 +2,28 @@
 //////////////////////////////////////////////////////////////////////////////////
 // Module Name: iffu
 // Description:
-//   夹在 icache 与 idu1 之间的取指队列（单发射版）。
+//   夹在 icache 与 idu 之间的取指队列。
 //
-//   条目只存"队列取消不了的携带量"：指令字 + 地址 + 分支预测位 + jalr 预测目标 +
-//   两个源寄存器号（107 位，深度 8）。rd / func10 / imm 是纯函数，一律不在队里存。
+//   条目只存"队列取消不了的携带量"：指令字 + 地址 + 分支预测位 + jalr 预测目标（97 位）。
+//   rd / func10 / imm 是纯函数，一律不在队里存。
+//
+//   ★ 2026-11-08：icache 一拍交付【16 字节块 = 4 条】。本模块一次最多收 4 条：
+//     - block_offset 之前的那几条【不进队】（改向落在块中间时，它们是改向前的老指令）；
+//     - 块内第一条被预测跳的分支之后的那几条也不进队（它们是错路）；
+//     - 所以一次真正推进的条数是 1..4，写指针按它走。
 //
 //   两个推进门分开：
-//     fetch_request = exec & ~flush_window & ~full                                    （取指侧：收一条）
-//     advance                                                               （读侧，idu1 给）
-//   ★ 取指侧只有一根流控：full。不 full 就收一条，空泡（指令字全 0）就地丢掉、不写队列。
+//     fetch_request = exec & ~flush_window & ~full     （取指侧：收一块）
+//     advance                                          （读侧，idu 给，0/1/2）
+//   ★ 取指侧只有一根流控：full。不 full 就收一块，空泡（指令字全 0）就地丢掉、不写队列。
 //     icache 那边的契约是"每拍都往口上放一样东西 —— 新指令或 NOP；只有 full 的时候保持"，
 //     所以不会出现同一条真指令连摆几拍、被重复收下的情形。
-//   ★ 因此这里不需要 take_en/deliv_v 那套握手，也不需要"上一拍那条指令"的锁存。
 //
-//   队头是组合读：空队列时压成空泡（不做"本拍写入旁路"），它只作出队格 h0 的 D 端。
-//   ★ 旁路"队空时队头直接是本拍写进去的那条"曾经在，实测是时序墙：它把
-//     icache 的 BRAM 输出一路组合送到 rob 的 ent_h2 D 端（11.0ns / 9 级 / 67% 布线），
-//     一去掉失败端点 293→6、WNS -1.175→-0.377，代价只有 +1.3% 拍数。
-//   出队格 h0 是本级的【唯一】输出寄存器：rob 的分配口/入队扫描口与 idu1 的译码输入
-//   都取它的 Q 端 —— 同一条指令的数据在一拍上同时发给 rob 与 idu1。ROB 号不再随本级的
-//   内容锁存（由 rob 直接发 idu1 的输出级），所以出队格里不存号、也无 nh0_* 那一组
-//   组合的队头输出。
+//   队头是组合读：空队列时压成空泡（不做"本拍写入旁路"）。它只作出队格 h0 的 D 端。
+//   出队格 h0/h1 是本级的【唯一】输出寄存器：rob 的分配口/入队扫描口与 idu 的译码输入
+//   都取它们的 Q 端 —— 同一条指令的数据在一拍上同时发给 rob 与 idu。
 //
-//   取指侧的改向信息【不在这里产生】：br/jal/jalr 的落点由 bju 判定、由 bpu 的表给出，
-//   本模块只在"表刚改向、而那一槽已经被顺延取走"时把那一对整个作废（下面那一次 mux）。
+//   取指侧的改向信息【不在这里产生】：br/jal/jalr 的落点由 bju 判定、由 bpu 的表给出。
 //   在 iffu 里译码会成环：它当拍的输入会被它自己的输出改内容。
 //////////////////////////////////////////////////////////////////////////////////
 
@@ -33,33 +31,41 @@
 module iffu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
-    input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
+    input        redir_frontend,     // 前端重定向（rob 判定拍出的那根）
+    input        exc_kill,           // 异常交付（rob 的 trap_fire）
+    input        irq_kill,           // 中断受理（clint 自己判的）
     input       exec_in,            // = exec_in
 //取指重定向（pc.v 的 redir_go 落地那拍）：整队作废
-    input        flush_pc_redirect,
-//icache 交付口：两条 lane 各一条，有效位为 0 时在本模块前端挡成空泡
-    input [31:0] instruction_in_0, inst_in_1,
-    input        instruction_valid_0, inst_valid_1,
-//pc 这一拍是不是按 lane0 的落点改了向（= 交付的这一对里 lane1 在错路上）
-    input        lane0_take,
-//★ 错路作废（边带，与这一对指令同生共死 —— 由 cpu_top 在交付拍锁存，
-//  队满把这批按住时它也一起被按住，所以队满的那几拍之后仍然描述的是同一对）：
-//    slot_replay = 这一对整体作废（上一对被预测改向 ⇒ 这一对是顺延取回来的错路）
+    input        redirect_go,            // 陷阱/mret/中断落地这一拍
+//icache 交付口：一块 4 条，每条自带有效位（已含"块内偏移之前不算"）
+    input [31:0] instruction_0, instruction_1, instruction_2, instruction_3,
+    input        inst_valid_0, inst_valid_1, inst_valid_2, inst_valid_3,
+//块内起始偏移：和四条指令同一个寄存器组交付。写指针的落点要减掉它。
+    input [1:0]  block_offset,
+//★ 错路作废（边带，与这一块指令同生共死 —— 由 cpu_top 在交付拍锁存，
+//  队满把这批按住时它也一起被按住，所以队满的那几拍之后仍然描述的是同一块）：
+//    slot_replay = 这一块整体作废（上一块被预测改向 ⇒ 这一块是顺延取回来的错路）
     input        slot_replay,
-//随指令携带的量：两条 lane 各一份 —— 地址（架构 PC 口径，原样存）、预测"跳"位、jalr 预测目标
-    input [31:0] push_address_0, push_addr_1,
-    input        push_branch_prediction_0, push_br_pred_1,
-    input [31:0] push_jump_link_register_prediction_0, push_jalr_pred_1,
-//读侧：本拍出队格换不换内容（= idu1 的推进条件，与它逐字同形）
-    input [1:0]  advance,
-//出队格：本级的唯一输出寄存器，rob 与 idu1 都在它的 Q 端取数
+//随指令携带的量：一块四份 —— 地址（架构 PC 口径，原样存）、预测"跳"位、jalr 预测目标
+    input [31:0] push_address_0, push_address_1, push_address_2, push_address_3,
+    input        push_branch_prediction_0, push_branch_prediction_1,
+    input        push_branch_prediction_2, push_branch_prediction_3,
+    input [31:0] push_jump_link_register_prediction_0, push_jump_link_register_prediction_1,
+    input [31:0] push_jump_link_register_prediction_2, push_jump_link_register_prediction_3,
+//读侧：本拍出队格换不换内容（= idu 的推进条件，与它逐字同形）
+//★ 2026-11-09：2 位 → 3 位（分配口 2 宽 → 3 宽，见 docs/SPEC_alloc3.md）
+    input [2:0]  advance,
+//出队格：本级的唯一输出寄存器，rob 与 idu 都在它的 Q 端取数
     output reg [31:0] half0_instruction, half0_address, half0_jump_link_register_prediction,
     output reg        half0_branch_prediction,
     output reg [31:0] half1_instruction, half1_address, half1_jump_link_register_prediction,
     output reg        half1_branch_prediction,
-//出队格的有效位（与本格其它字段同沿寄存）。★ 必须给 idu1：advance 是本级的"弹几条"请求，
-//  这里按有效条数截断；idu1 若不知道 h1 有没有，就会把空白格也装进 lane1 ⇒ 同一条被取两次。
-    output reg        half0_valid, half1_valid,
+//★ 2026-11-09：第三个出队口（分配口 3 宽）
+    output reg [31:0] half2_instruction, half2_address, half2_jump_link_register_prediction,
+    output reg        half2_branch_prediction,
+//出队格的有效位（与本格其它字段同沿寄存）。★ 必须给 idu：advance 是本级的"弹几条"请求，
+//  这里按有效条数截断；idu 若不知道 h1 有没有，就会把空白格也装进 lane1 ⇒ 同一条被取两次。
+    output reg        half0_valid, half1_valid, half2_valid,
 //取指侧停：本拍放不下，icache 与 pc 的推进被它按住
     output reg        full
     );
@@ -71,103 +77,129 @@ module iffu(
 //flag_bus 逐位还原（口径与各消费者一致：冲刷压停顿）
     reg flush_control_exception, flush_control_interrupt, flush_control_jump, exec;
     reg flush_window, fetch_request;
-    reg fetch_nop_0, fetch_nop_1, fetch_pair, push_lane0, push_lane1, lane0_redirect, lane1_valid;
     reg [31:0] instruction_effective_0, instruction_effective_1;
+    reg [31:0] instruction_effective_2, instruction_effective_3;
+    reg        lane_valid_0, lane_valid_1, lane_valid_2, lane_valid_3;
     always @(*) begin
-        flush_control_exception     = flush_control_in[2];
-        flush_control_interrupt     = flush_control_in[1];
-        flush_control_jump    = flush_control_in[0];
+        flush_control_exception     = exc_kill;
+        flush_control_interrupt     = irq_kill;
+        flush_control_jump    = redir_frontend;
         exec              = exec_in;
         flush_window = flush_control_exception | flush_control_interrupt | flush_control_jump;
         fetch_request = exec & ~flush_window & ~full;
     end
 
-    always @(*) begin
-        fetch_nop_0 = ~|instruction_effective_0;
-        fetch_nop_1 = ~|instruction_effective_1;
-        fetch_pair = lane1_valid & ~lane0_redirect;
-        push_lane0 = fetch_request & ~fetch_nop_0;
-        push_lane1 = fetch_request & fetch_pair & ~fetch_nop_1;
-    end
-
-//RV32I 里与源寄存器号有关的 opcode（改向那些已经不在本模块了）
-    localparam OPCODE_OP     = 7'b0110011;
-    localparam OPCODE_OP_IMM = 7'b0010011;
-    localparam OPCODE_JAL    = 7'b1101111;
-    localparam OPCODE_JALR   = 7'b1100111;
-    localparam OPCODE_BRANCH = 7'b1100011;
-    localparam OPCODE_LOAD   = 7'b0000011;
-    localparam OPCODE_STORE  = 7'b0100011;
-    localparam OPCODE_SYSTEM = 7'b1110011;
-
 //==============================================================================
 //  错路作废（本模块唯一一处"改交付内容"的地方）
-//    pc 按落点表改向的那一拍，取指槽已经按顺延地址发出去了（地址寄存器改不动），
-//    所以下一拍交付的这一对是【错路】，整对作废（白取一对，功能正确）。
 //    ★ slot_replay 是【随指令走】的边带，由 cpu_top 在交付拍锁存，这里直接用：
-//      队满把这批按住时边带一起被按住，所以「按住几拍再放行」之后它描述的仍是同一对。
-//      在这里自己寄存一拍是不行的 —— 那会把队满时的作废标记错位到下一对上去。
+//      队满把这批按住时边带一起被按住，所以「按住几拍再放行」之后它描述的仍是同一块。
+//      在这里自己寄存一拍是不行的 —— 那会把队满时的作废标记错位到下一块上去。
 //==============================================================================
+//★ 块内截断：第一条被预测跳的分支之后的那几条是错路，不许进队。
+//  ★ 只在【本块有效窗口】里找（inst_valid_i 已含 block_offset），
+//    否则改向点到块中间时，前面那条老分支的预测会把整块都截掉。
+//★ 空泡（指令字全 0）不进队：icache 每拍口上都放东西，"没有指令"就是全 0。
+//  这一条是原来的 fetch_nop_*，删了它 0 字会当真指令推进去、译成非法指令去陷入
+//  （rand seed1 末尾跑出程序区后 pc 飞到 0x85710）。
+    reg word_ok_0, word_ok_1, word_ok_2, word_ok_3;
+    always @(*) begin
+        word_ok_0 = inst_valid_0 & (|instruction_0);
+        word_ok_1 = inst_valid_1 & (|instruction_1);
+        word_ok_2 = inst_valid_2 & (|instruction_2);
+        word_ok_3 = inst_valid_3 & (|instruction_3);
+    end
+
+    reg [1:0] first_take_index;
+    always @(*) begin
+        if      (word_ok_0 & push_branch_prediction_0) first_take_index = 2'd0;
+        else if (word_ok_1 & push_branch_prediction_1) first_take_index = 2'd1;
+        else if (word_ok_2 & push_branch_prediction_2) first_take_index = 2'd2;
+        else                                           first_take_index = 2'd3;
+    end
+
+    reg push_ok_0, push_ok_1, push_ok_2, push_ok_3;
+    always @(*) begin
+        push_ok_0 = word_ok_0 & (2'd0 <= first_take_index);
+        push_ok_1 = word_ok_1 & (2'd1 <= first_take_index);
+        push_ok_2 = word_ok_2 & (2'd2 <= first_take_index);
+        push_ok_3 = word_ok_3 & (2'd3 <= first_take_index);
+    end
+
     always @(*) begin
         if (slot_replay) begin
             instruction_effective_0 = 32'd0;
             instruction_effective_1 = 32'd0;
-            lane1_valid = 1'b0;
+            instruction_effective_2 = 32'd0;
+            instruction_effective_3 = 32'd0;
+            lane_valid_0 = 1'b0;
+            lane_valid_1 = 1'b0;
+            lane_valid_2 = 1'b0;
+            lane_valid_3 = 1'b0;
         end
         else begin
-            instruction_effective_0 = instruction_valid_0 ? instruction_in_0 : 32'd0;
-            instruction_effective_1 = inst_valid_1 ? inst_in_1 : 32'd0;
-            lane1_valid = inst_valid_1;
+            instruction_effective_0 = push_ok_0 ? instruction_0 : 32'd0;
+            instruction_effective_1 = push_ok_1 ? instruction_1 : 32'd0;
+            instruction_effective_2 = push_ok_2 ? instruction_2 : 32'd0;
+            instruction_effective_3 = push_ok_3 ? instruction_3 : 32'd0;
+            lane_valid_0 = push_ok_0;
+            lane_valid_1 = push_ok_1;
+            lane_valid_2 = push_ok_2;
+            lane_valid_3 = push_ok_3;
         end
     end
 
-//★ lane0_redirect 就是 pc 这一拍【实际照做】的那一位，不再自己拼"译码是分支 & 预测跳"——
-//  拼出来的第二份预测只要和 pc 的那份不一致，lane1 就会在错路上被放进来、或者对的那条被挡掉。
-    always @(*) begin
-        lane0_redirect = lane0_take;
-    end
+//★ 源寄存器号（rs1/rs2）的译码已搬到 idu（2026-10-31）。
 
-//★ 源寄存器号（rs1/rs2）的译码已搬到 idu1（2026-10-31）。
-//  原来这里对 instruction_effective 做一遍 opcode case，把一个 5 位结果拼进 107 位队列包；
-//  而 idu1 对同一个指令字本来就有自己的 opcode case（decode 块）⇒ 同一份译码做了两遍，
-//  并且压在【队列写数据】的锥上。搬走之后本级的写口只剩拼接，队列包 107 → 97 位。
-//  slot_replay 的作废不用补偿：本模块在推入【前】就把 instruction_effective 清 0，
-//  队列里存的那条本来就是 0 ⇒ idu1 解出来的 rs 自然是 0。
-
-    parameter integer DEPTH = 8;   // ★宏化旋钮：8=大核 / 4=小核
-    localparam integer IDX_W = (DEPTH == 8) ? 3 : (DEPTH == 4) ? 2 : 3;
+    parameter integer DEPTH = 16;  // ★宏化旋钮：16=大核 / 8=小核（块 4 宽，深度按 4 的倍数取）
+    localparam integer PTR_W = (DEPTH == 32) ? 6 : (DEPTH == 16) ? 5 : (DEPTH == 8) ? 4 : 3;
+    localparam integer IDX_W = PTR_W - 1;
 
 //       [96:65] inst   [64:33] addr   [32] br_pred   [31:0] jalr_pred
-    reg [96:0] queue_data [0:DEPTH-1];
-    reg [3:0]  write_pointer, read_pointer;
-    reg [3:0]  slot_index;
-    reg [3:0]  count_in_use;
-    reg [1:0]  pop;
-    reg [96:0] push_lane0_data, push_lane1_data, stage0_data, stage1_data;
-    reg         stage0_valid, stage1_valid;
+//★ 4 宽取指后本阵列有【4 个写口】（每条 lane 一个 always 块）。Vivado 推不出 BRAM 时
+//  不会退回触发器，而是直接报 `Synth 8-2913 Unsupported Dual Port Block-RAM template`
+//  把综合打死（2026-11-08 远端实测）。必须显式钉成触发器。
+    (* ram_style = "registers" *) reg [96:0] queue_data [0:DEPTH-1];
+    reg [PTR_W-1:0] write_pointer, read_pointer;
+    reg [PTR_W-1:0] slot_index;
+    reg [PTR_W-1:0] count_in_use;
+    reg [PTR_W-1:0] room_available;
+    reg [PTR_W-1:0] block_instruction_count;
+    reg [PTR_W-1:0] slot_0, slot_1, slot_2, slot_3;
+    reg [2:0]  pop;
+    reg [96:0] push_data_0, push_data_1, push_data_2, push_data_3, stage0_data, stage1_data, stage2_data;
+    reg         stage0_valid, stage1_valid, stage2_valid;
     reg [31:0]  next_instruction, next_address, next_jump_link_register_prediction;
     reg [31:0]  next_lane1_instruction, next_lane1_address, next_lane1_jump_link_register_prediction;
     reg         next_branch_prediction, next_lane1_branch_prediction;
-    reg        write_back_0, write_back_1, clear;
+    reg [31:0]  next_lane2_instruction, next_lane2_address, next_lane2_jump_link_register_prediction;
+    reg         next_lane2_branch_prediction;
+    reg        write_back_0, write_back_1, write_back_2, write_back_3, clear;
 
-//写入的那一条（布局见上）。addr 是"指令地址 + 4"口径的 aux_addr，原样存。
+//写入的那几条（布局见上）。addr 是"指令地址 + 4"口径的 aux_addr，原样存。
     always @(*) begin
-        push_lane0_data = {instruction_effective_0, push_address_0, push_branch_prediction_0, push_jump_link_register_prediction_0};
-        push_lane1_data = {instruction_effective_1, push_addr_1, push_br_pred_1, push_jalr_pred_1};
+        push_data_0 = {instruction_effective_0, push_address_0, push_branch_prediction_0, push_jump_link_register_prediction_0};
+        push_data_1 = {instruction_effective_1, push_address_1, push_branch_prediction_1, push_jump_link_register_prediction_1};
+        push_data_2 = {instruction_effective_2, push_address_2, push_branch_prediction_2, push_jump_link_register_prediction_2};
+        push_data_3 = {instruction_effective_3, push_address_3, push_branch_prediction_3, push_jump_link_register_prediction_3};
     end
 
     always @(*) begin
+//★ 占用按 PTR_W 位算，不能取低 IDX_W 位：DEPTH 本身必须可表示。
+//  取低 IDX_W 位时"满 DEPTH 条"会读成 0（D=8 时 8 的低 3 位 = 0）⇒ 满队看着是空队 ⇒
+//  继续猛推、覆盖还没交付的指令。IFFU_DEPTH=8 下 rand seed1 当场复现（wp=8 rp=0 读成 0）。
         count_in_use  = write_pointer - read_pointer;
+//★ 本拍还能收几条，并且永远留一格不进（上界 DEPTH-1）：
+//  一旦让 wp 追平 rp，"满"和"空"就没法用指针比较区分了（stage0_valid 正是靠它）。
+//  不变量：count_in_use <= DEPTH-1 由下面的 room_available 逐拍保证。
+        room_available = (DEPTH - 1) - count_in_use;
     end
 
 //full 是整条前端唯一的流控：它一出来，pc 不推进、icache 保持输出、本队不收。
-//拉起在 7：成对推要两格，6 的时候再推一对正好到 8，7 就放不下了。
-//放下在 4：迟滞，免得在 6/7 之间来回抖。
-//拉起这一支必须是【组合】的（按当拍 count_in_use），寄存版会晚一拍，7 那一拍还能再推一对就溢出了；
-//只有"保持到 4 才放"这一支用寄存器。
+//★ 一次最多收 4 条 ⇒ 拉起这一支必须是【组合】的（按当拍 room_available），寄存版会晚一拍就溢出了。
     reg full_registered, full_norm;
     always @(*) begin
-        full_norm = (count_in_use >= (DEPTH-1)) | (full_registered & (count_in_use > (DEPTH-2)));
+        full_norm = (room_available < block_instruction_count) |
+                    (full_registered & (~|room_available));
         full      = full_norm;
     end
     always @(posedge clk) begin
@@ -176,73 +208,99 @@ module iffu(
     end
 
     always @(*) begin
-        clear = flush_window | flush_pc_redirect;
+        clear = flush_window | redirect_go;
     end
 
-//★ 曾在这里加过一层"同一地址不许连推两次"的去重（lp_a/lp_v），用来压住 icache 重放
-//  （miss 期间输出寄存器保持 ⇒ 同一个包被再推一次）。那层东西【必须撤掉】：
-//  正确的预测跳转（bne 回边）**不产生冲刷**，而循环的回边目标往往
-//  就是刚刚推过的地址 ⇒ 去重把合法的重取也一并压掉，整核在回边处自锁
-//  （实测 WEIRD seed5：pc 卡在回边后的顺延地址、iffu 空、icache 口上有 NOP、rd_go=0）。
-//  重放的根子在别处（half0_valid/half1_valid 与装载门修掉之后，默认档与 WEIRD 档都不再需要它）。
     always @(*) begin
-        write_back_0 = fetch_request & push_lane0;
-        write_back_1 = fetch_request & push_lane1;
+//本块实际要收的条数（lane_valid 是前缀向量，求和即可）。
+        block_instruction_count = {{(PTR_W-1){1'b0}}, lane_valid_0}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_1}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_2}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_3};
     end
 
-//写口
+    always @(*) begin
+//★ 整块要么全收、要么一条不收：pc/icache 每拍推进一整块，收一半就等于把块尾那几条扔了。
+//  所以容量判据按【本块条数】算，不做逐条削。
+        write_back_0 = fetch_request & lane_valid_0;
+        write_back_1 = fetch_request & lane_valid_1;
+        write_back_2 = fetch_request & lane_valid_2;
+        write_back_3 = fetch_request & lane_valid_3;
+//★ 落点按【已推入的条数】压紧，不按 lane 序号：块内可能既有 block_offset 之前的、
+//  也可能中间夹着空泡（指令字全 0 不推），留洞会让出队格读到没写过的格子。
+//  lane_valid_* 已经吸收了 block_offset（inst_valid_* 里就带），所以这里只数前缀。
+        slot_0 = write_pointer;
+        slot_1 = write_pointer + {{(PTR_W-1){1'b0}}, lane_valid_0};
+        slot_2 = write_pointer + {{(PTR_W-1){1'b0}}, lane_valid_0}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_1};
+        slot_3 = write_pointer + {{(PTR_W-1){1'b0}}, lane_valid_0}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_1}
+                                + {{(PTR_W-1){1'b0}}, lane_valid_2};
+    end
+
+//写口：一个 always、每格一条语句。
+//★ 不能写成"每条 lane 一个 always 块"：那样同一 bit 会被四个块各驱动一次，综合出来是
+//  四个寄存器并联到同一根网 ⇒ `DRC MDRV-1 Multiple Driver Nets`（2026-11-08 远端实测，
+//  queue_data[0][0] 有 4 个驱动）。按格索引、单条赋值，才是寄存器堆该有的形状。
+//  （isq.v 的发射站阵列也是这个写法。）
+    integer queue_index;
     always @(posedge clk) begin
-        if (write_back_0)
-            queue_data[write_pointer[IDX_W-1:0]] <= push_lane0_data;
-        else if (write_back_1)
-            queue_data[write_pointer[IDX_W-1:0]] <= push_lane1_data;
-        if (write_back_0 & write_back_1)
-            queue_data[write_pointer[IDX_W-1:0] + 1'd1] <= push_lane1_data;
+        for (queue_index = 0; queue_index < DEPTH; queue_index = queue_index + 1) begin
+            if      (write_back_0 & (slot_0[IDX_W-1:0] == queue_index[IDX_W-1:0]))
+                queue_data[queue_index] <= push_data_0;
+            else if (write_back_1 & (slot_1[IDX_W-1:0] == queue_index[IDX_W-1:0]))
+                queue_data[queue_index] <= push_data_1;
+            else if (write_back_2 & (slot_2[IDX_W-1:0] == queue_index[IDX_W-1:0]))
+                queue_data[queue_index] <= push_data_2;
+            else if (write_back_3 & (slot_3[IDX_W-1:0] == queue_index[IDX_W-1:0]))
+                queue_data[queue_index] <= push_data_3;
+        end
     end
 
 //写指针
     always @(posedge clk) begin
         if (reset_registered) begin
-            write_pointer <= 4'd0;
+            write_pointer <= {PTR_W{1'b0}};
         end
         else if (clear) begin
             write_pointer <= read_pointer;
         end
-        else if (write_back_0) begin
-            write_pointer <= write_pointer + (write_back_1 ? 4'd2 : 4'd1);
-        end
-        else if (write_back_1) begin
-            write_pointer <= write_pointer + 4'd1;
+        else begin
+            write_pointer <= write_pointer
+                           + {{(PTR_W-1){1'b0}}, write_back_0}
+                           + {{(PTR_W-1){1'b0}}, write_back_1}
+                           + {{(PTR_W-1){1'b0}}, write_back_2}
+                           + {{(PTR_W-1){1'b0}}, write_back_3};
         end
     end
 
 //本拍实际弹几条 = min(下一级的请求, 消费者手上真正有效的条数)。
-//advance 是 idu1 按自己的 free 算出来的【请求】（0/1/2），不是保证：队里没有那么多就给多少。
+//advance 是 idu 按自己的 free 算出来的【请求】（0/1/2/3），不是保证：队里没有那么多就给多少。
     always @(*) begin
-//★ 2026-10-31：[H[2J[3J 从 pop 的判据里摘掉 —— 冲刷不该管"弹不弹"。
-//  冲刷拍弹出来的条目一律作废（各寄存器块末尾的冲刷清后写者赢），指针照常走。
-        if (!exec | ~half0_valid)  pop = 2'd0;
-        else if (advance == 2'd0) pop = 2'd0;
-        else if (!half1_valid)           pop = 2'd1;
+        if (!exec | ~half0_valid)  pop = 3'd0;
+        else if (advance == 3'd0) pop = 3'd0;
+        else if (!half1_valid)           pop = 3'd1;
+        else if (advance == 3'd1) pop = 3'd1;
+        else if (!half2_valid)           pop = 3'd2;
         else                      pop = advance;
     end
 
-//读指针：清队时不动（那些条目由 write_pointer 作废）；正常按实际弹出的条数（0/1/2）走
+//读指针：清队时不动（那些条目由 write_pointer 作废）；正常按实际弹出的条数（0..3）走
     always @(posedge clk) begin
         if (reset_registered) begin
-            read_pointer <= 4'd0;
+            read_pointer <= {PTR_W{1'b0}};
         end
         else if (clear) begin
             read_pointer <= read_pointer;
         end
         else begin
-            read_pointer <= read_pointer + {2'b00, pop};
+            read_pointer <= read_pointer + {{(PTR_W-3){1'b0}}, pop};
         end
     end
 
 //出队格的装载源 = 弹完之后的新队头
     always @(*) begin
-        slot_index = read_pointer + {2'b00, pop};
+        slot_index = read_pointer + {{(PTR_W-3){1'b0}}, pop};
     end
 
 //不在册时整条压 0：不让陈旧值/X 走到译码、冒险比较和下游载荷里。
@@ -250,8 +308,6 @@ module iffu(
 //  这一拍刚写进来的那一格还不是新数据 —— 拿它当有效会把陈旧值交付出去。
     always @(*) begin
         stage0_data = queue_data[slot_index[IDX_W-1:0]];
-//★ 同上：stage*_valid 不再吃 clear。reason：clear 是"整队作废"，不是"本拍没有"。
-//  留在这里等于把冲刷网又接回 idu1 的推进锥（valid → alloc_lane → advance）。
         stage0_valid  = ~reset_registered & (slot_index != write_pointer);
         next_instruction      = 32'd0;
         next_address      = 32'd0;
@@ -266,8 +322,9 @@ module iffu(
     end
 
     always @(*) begin
-        stage1_data = queue_data[slot_index[IDX_W-1:0] + 1'd1];
-        stage1_valid  = ~reset_registered & (slot_index != write_pointer) & ((slot_index + 4'd1) != write_pointer);
+        stage1_data = queue_data[slot_index[IDX_W-1:0] + 1'b1];
+        stage1_valid  = ~reset_registered & (slot_index != write_pointer)
+                                     & ((slot_index + 1'b1) != write_pointer);
         next_lane1_instruction      = 32'd0;
         next_lane1_address      = 32'd0;
         next_lane1_branch_prediction   = 1'b0;
@@ -282,6 +339,23 @@ module iffu(
 
 //出队格的装载：换新 / 保持 / 清。保持条件与下一级的推进条件同门（advance 就是下一级给的）。
 //装载源取本级组合读出的队头（不在册时已压成 0）。
+    always @(*) begin
+        stage2_data = queue_data[slot_index[IDX_W-1:0] + 2'd2];
+        stage2_valid  = ~reset_registered & (slot_index != write_pointer)
+                                     & ((slot_index + 1'b1) != write_pointer)
+                                     & ((slot_index + 2'd2) != write_pointer);
+        next_lane2_instruction      = 32'd0;
+        next_lane2_address      = 32'd0;
+        next_lane2_branch_prediction   = 1'b0;
+        next_lane2_jump_link_register_prediction = 32'd0;
+        if (stage2_valid) begin
+            next_lane2_instruction      = stage2_data[96:65];
+            next_lane2_address      = stage2_data[64:33];
+            next_lane2_branch_prediction   = stage2_data[32];
+            next_lane2_jump_link_register_prediction = stage2_data[31:0];
+        end
+    end
+
     always @(posedge clk) begin
         if (reset_registered) begin
             half0_instruction <= 32'd0;
@@ -332,6 +406,33 @@ module iffu(
                 half1_branch_prediction <= next_lane1_branch_prediction;
                 half1_jump_link_register_prediction <= next_lane1_jump_link_register_prediction;
                 half1_valid <= stage1_valid;
+            end
+        end
+    end
+
+//★ 2026-11-09：第三个出队口，与前两个逐字同形（队头 +2）
+    always @(posedge clk) begin
+        if (reset_registered) begin
+            half2_instruction <= 32'd0;
+            half2_address <= 32'd0;
+            half2_branch_prediction <= 1'b0;
+            half2_jump_link_register_prediction <= 32'd0;
+            half2_valid <= 1'b0;
+        end
+        else if (exec) begin
+            if (flush_window) begin
+                half2_instruction <= 32'd0;
+                half2_address <= 32'd0;
+                half2_branch_prediction <= 1'b0;
+                half2_jump_link_register_prediction <= 32'd0;
+                half2_valid <= 1'b0;
+            end
+            else begin
+                half2_instruction <= next_lane2_instruction;
+                half2_address <= next_lane2_address;
+                half2_branch_prediction <= next_lane2_branch_prediction;
+                half2_jump_link_register_prediction <= next_lane2_jump_link_register_prediction;
+                half2_valid <= stage2_valid;
             end
         end
     end

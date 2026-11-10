@@ -26,10 +26,13 @@
 module bju(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
-    input [2:0] flush_control_in,   // = flag_bus[7:5]：{异常, 中断, 改向}
+    input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
+    input        redir_backend_1,   // 同一笔的寄存版，晚一拍
+    input        exc_kill,           // 异常交付（rob 的 trap_fire）
+    input        irq_kill,           // 中断受理（clint 自己判的）
 //判定源：与 alu 的输入同源（发射级选中项的寄存器输出 = 前送后的操作数）
     input [31:0] source_a_data_in, source_b_data_in,
-//本条指令在 bju 里算什么：idu1 一次译好的 4 位功能码（分支档带 funct3 / jal / jalr / 四类异常）。
+//本条指令在 bju 里算什么：idu 一次译好的 4 位功能码（分支档带 funct3 / jal / jalr / 四类异常）。
 //★ 不再分开吃 func4 + br_flag + jalr_flag + 四路异常：func4 对 addi/beq/jalr 是同一个值（都是 0000），
 //  单靠它分不出"这条是不是分支"，类信息本来就必须另给；这里把"类"和"种类"合成一个码。
 //  分支档 = {1'b1, funct3} ⇒ 判定级的比较 case 与原来逐字一致。
@@ -38,14 +41,15 @@ module bju(
     input        branch_prediction_taken_in,
 //判定输入级的装载门：原来本模块自己从 flag_bus 拼。lane0 每条出站指令都过本级（判定 + 异常通道），
 //lane1 只有分支类过（只做判定）⇒ 装载门 ≈ issue_v
+
     input        advance_in,
 //异常源（ecall/ebreak/illegal/mret/jal 非对齐）也在 branch_unit_function4_in 里，与操作数同沿锁进判定输入级。
 //它们天然比载荷晚一拍出，正好与"更老那条的寄存版冲刷"【同拍配对】——
-//  本拍出的是 X_m 的异常，本拍 flush_control_in[0]/exception_target_misalign 出的是 X_{m-1} 的冲刷，
+//  本拍出的是 X_m 的异常，本拍 irq_kill/exception_target_misalign 出的是 X_{m-1} 的冲刷，
 //  于是消费端用现成的 ~flush_older 就盖住了影子槽，不再需要组合的前置冲刷。
 //本拍冲刷的边界（cont 给的 ROB 号）与队头：两者一起判"本拍正在判的这条还算不算活着"
-    input [3:0]  flush_index_in,
-    input [3:0]  index_in,
+    input [4:0]  flush_index_in,
+    input [4:0]  index_in,
     input        generation_in,
 //判定结果与跳转落点（寄存一拍后有效）
     output reg        success, branch_failure, jump_link_register_failure,
@@ -61,8 +65,8 @@ module bju(
 //本拍被判那条指令的 ROB 索引：judged_index 是判定输入级那一条（cont 用它给异常项选号），
 //index_registered 是判定打一拍后的版本（冲刷边界必须用【寄存后的】这个号：
 //ROB 的冲刷只作废【比它更年轻】的项，比它老、还在途的 load/mul 必须留下）
-    output reg [3:0]  judged_index,
-    output reg [3:0]  index_registered,
+    output reg [4:0]  judged_index,
+    output reg [4:0]  index_registered,
     output reg        judged_registered,
 //★ S3：这条判定要不要改向（分支判错 / jalr 落点算错）。与 judged_registered 同沿寄存、随判定写进 ROB 项；
 //  真正的改向要等它排到队头才发生。
@@ -83,7 +87,7 @@ module bju(
 //  不能用输入级的 judged_pc_plus4（它每拍都装，冲刷拍里已经是下一条的地址 ⇒ mepc 会错 4）
     output reg [31:0] exception_pc_registered,
     output reg [31:0] exception_pc_judged,
-//判定【输入级】那一条自己带的异常（与 idu2 的 bju_in_flight 同拍、描述同一条）：ecall/ebreak/illegal/mret。
+//判定【输入级】那一条自己带的异常（与 isq 的 bju_in_flight 同拍、描述同一条）：ecall/ebreak/illegal/mret。
 //★ 必须从【输入寄存级】出、不能从延迟寄存级出：从延迟级出就与"更老那条的寄存版冲刷"错开两拍，
 //  消费端的 ~flush_older 盖不住影子槽（那正是当初要组合前置冲刷的原因）。
     output reg        exception_ecall_judged, exception_ebreak_judged, exception_illegal_judged, exception_interrupt_return_judged,
@@ -92,7 +96,7 @@ module bju(
     output reg        exception_ecall_registered, exception_ebreak_registered, exception_illegal_registered, exception_interrupt_return_registered
     );
 
-//功能码（与 idu1 的译码逐值对应，两边必须同时改）
+//功能码（与 idu 的译码逐值对应，两边必须同时改）
 //★ 分支档 bit3 = 1、低 3 位就是 funct3；其余各占一个值，互斥。
     localparam BJU_NONE    = 4'd0;
     localparam BJU_JAL     = 4'd1;
@@ -112,19 +116,19 @@ module bju(
     reg flush_window;
 
 //本拍正在判的那条【比冲刷源更老】⇒ 它是活的，本拍的判定必须留下。
-//  年龄口径与 ROB/idu2 逐字一致：先按 4 位截断做差，再扩到 5 位比较（队头随拍推进）。
+//  年龄口径与 ROB/isq 逐字一致：先按 4 位截断做差，再扩到 5 位比较（队头随拍推进）。
 //  ★ 年龄【小 = 老】（队头是最老的）⇒ 更老判据是 ag_j < ag_f；冲刷的作废判据反过来是 ag > ag_f。
 //★ 判据对【三种冲刷】一律生效：异常冲刷也得看边界年龄。实测 WEIRD seed40：回跳循环里 `bne`
 //  （更老，在 lane1 判定）与它影子里的非法指令（更年轻，在 lane0 被标异常）落在【同一拍】⇒
 //  flush_con_exc 把更老那条 bne 刚算出的 br3 清成 0 ⇒ 本该怎么都不跳的循环一直跳下去
 //  （x30 从 5 数到 −95 还在跳）。异常边界是那条非法指令自己的号，比判定这条年轻 ⇒
-//  判据与跳转冲刷逐字同一条，只是别再只看 flush_control_in[0]。
+//  判据与跳转冲刷逐字同一条，只是别再只看 irq_kill。
 
 //判定输入寄存级：把"这一拍要判的那条指令"整个寄存一级
     reg [31:0] judged_source_a_data, judged_source_b_data, judged_pc_plus4, judged_branch_offset, judged_jump_link_register_predicted_target, judged_jump_link_target;
     reg [3:0]  judged_function4;
     reg        judged_branch_prediction;
-    reg        judged_generation, advance_delayed;
+    reg        judged_generation, advance_delayed, kill_all_delayed;
 
 //功能码译码（输入级寄存器输出 ⇒ 组合出来直接给判定级用）
     reg        is_branch, is_jump_link, is_jump_link_register, exception_jump_link_misalign;
@@ -147,7 +151,7 @@ module bju(
 //判定延迟拍只关心"本拍是不是冲刷拍"。
 //★ flush_con_exc 已经是精确版（不再含组合的前置冲刷项）⇒ 直接取 [7]。
     always @(*) begin
-        flush_window = flush_control_in[2] | flush_control_in[1] | flush_control_in[0];
+        flush_window = exc_kill | irq_kill | redir_backend_0;
     end
 
 //===============================================================
@@ -191,7 +195,7 @@ module bju(
             judged_index <= 4'd0;
             judged_generation <= 1'b0;
         end
-        else if (advance_in) begin
+        else if (advance_in & ~(redir_backend_1 | exc_kill)) begin
             judged_source_a_data <= source_a_data_in;
             judged_source_b_data <= source_b_data_in;
             judged_pc_plus4 <= pc_plus4_in;
@@ -205,7 +209,7 @@ module bju(
         end
     end
 
-//判定输入级那一条自己的种类 / PC（与 idu2 的 bju_in_flight 同拍、描述同一条）。
+//判定输入级那一条自己的种类 / PC（与 isq 的 bju_in_flight 同拍、描述同一条）。
 //组合给出即可（源是寄存器）：cont 在"更老那条的寄存版冲刷"那一拍拿到它们，
 //用现成的 ~flush_older 就把影子槽盖住了。种类也进这一级（与操作数/控制位同生共死）——
 //这是"过 bju"的核心：它们比载荷晚一拍出，正好与【更老那条】的寄存版冲刷同拍。
@@ -295,12 +299,12 @@ module bju(
 //两者相加正好是 B+immB；br3 的落点就是 judged_pc_plus4（落空的后继）。
 //★ 这个落点寄存器还**兼任"异常目标"的载荷**：命中指令地址非对齐时，规范要求 mtval = 出错的目标地址，
 //  而 br 的目标恰好就是这个加法、jalr 的目标恰好就是 jump_link_register_target_now ⇒ 直接复用，不加加法器。
-//  非对齐拍 exc 会压掉 jump 重定向（pc.v 的 flush_jump_w = flush_control_in[0] & ~flush_control_in[2]）⇒ 那一拍它只被 mtval 消费。
+//  非对齐拍 exc 会压掉 jump 重定向（pc.v 的 flush_jump_w = irq_kill & ~flush_control_in[2]）⇒ 那一拍它只被 mtval 消费。
 //  jal 的目标【不在流水里】（载荷只带分支偏移）⇒ 由上游发射单元就地解 immJ 算好后
 //  单铺一路载荷送进来（jal_tgt_in），同样是进这个落点寄存器、同样零额外寄存器。
 //早一拍的那道遮挡不由本模块给：判定结果寄存后只覆盖到写回一级，而错路指令在冲刷生效前
 //还会停留两拍（前一条落前置拍、后一条落寄存拍），那两拍里它已经会去动 FIFO 指针、
-//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu 因此在入口多挡一拍，挡位由 idu2 的 bju_in_flight 给。
+//拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu 因此在入口多挡一拍，挡位由 isq 的 bju_in_flight 给。
 //★ 进本级的操作数不受任何 stall 门控：装载那一拍 stall 位全 0（adv）⇒ 拿到的就是最终值 ⇒
 //  判定、当拍异常标记一律照常出，不再挂 hazard 门。
     always @(*) begin
@@ -395,6 +399,29 @@ module bju(
 //停顿拍不清：操作数被冻住时判定值不变。
     always @(posedge clk) begin
         if (reset_registered) begin
+            success <= 1'b0;
+            judged_registered <= 1'b0;
+            generation_registered <= 1'b0;
+            branch_failure <= 1'b0;
+            jump_link_register_failure <= 1'b0;
+            exception_target_misalign <= 1'b0;
+            jump_target <= 32'd0;
+            jump_link_register_target_registered <= 32'd0;
+            index_registered <= 4'd0;
+            branch_pc_index <= 9'd0;
+            branch_pc_registered   <= 32'd0;
+            jump_link_register_target_valid_registered <= 1'b0;
+            branch_prediction_taken_registered <= 1'b0;
+            exception_pc_registered <= 32'd0;
+            redirect_registered  <= 1'b0;
+            branch_unit_kind  <= 2'd0;
+            branch_unit_taken <= 1'b0;
+            branch_unit_pc    <= 32'd0;
+            branch_unit_target   <= 32'd0;
+            exception_ecall_registered <= 1'b0; exception_ebreak_registered <= 1'b0;
+            exception_illegal_registered <= 1'b0; exception_interrupt_return_registered <= 1'b0;
+        end
+        else if (kill_all_delayed) begin
             success <= 1'b0;
             judged_registered <= 1'b0;
             generation_registered <= 1'b0;
