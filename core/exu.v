@@ -7,7 +7,7 @@
 //
 // 端口口径：一律按"语义名"引出，lane 号留在 cpu_top 的例化处（`.语义名(实际线名)`），
 //   所以顶层两根 lane 的接线是同一份、逐行对称的。
-//   不带 lane 语义的公共输入只有 clk / rst / flush_control_in / flush_index_in。
+//   不带 lane 语义的公共输入只有 clk / rst / 三条冲刷源 / flush_index_in。
 //
 // 本层不做的事：
 //   · 不做操作数旁路裁决——`source_a_data` / `r2_data` 是 isq 已经算好的最终值；
@@ -19,7 +19,6 @@ module exu (
 
     input  redir_backend_0,             // 后端重定向（rob 队头那一拍出的那根）
     input  redir_backend_1,             // 同一笔的寄存版，晚一拍
-    input  exc_kill,                    // 异常交付（rob 的 trap_fire）
     input  irq_kill,                    // 中断受理（clint 自己判的）
     input  [4:0] flush_index_in,        // ROB 冲刷边界（bju 用）
 
@@ -169,7 +168,7 @@ module exu (
 //==============================================================================
     mdu u_mdu (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .exc_kill(exc_kill), .irq_kill(irq_kill),
+        .redir_backend_0(redir_backend_0), .irq_kill(irq_kill),
         .multiply_go(multiply_go), .multiply_function10(multiply_function10),
         .multiply_index_in(index_in), .multiply_generation_in(generation_in),
         .multiply_source_a(source_a_data), .mul_r2(r2_data),
@@ -194,7 +193,7 @@ module exu (
 //==============================================================================
     bju u_bju (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .exc_kill(exc_kill), .irq_kill(irq_kill),
+        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .irq_kill(irq_kill),
         .source_a_data_in(source_a_data), .source_b_data_in(r2_data),
         .branch_unit_function4_in(branch_unit_function4_in),
         .pc_plus4_in(auxiliary_address_in), .br_off_in(beq_offset_in),

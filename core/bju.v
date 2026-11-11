@@ -28,7 +28,6 @@ module bju(
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
     input        redir_backend_1,   // 同一笔的寄存版，晚一拍
-    input        exc_kill,           // 异常交付（rob 的 trap_fire）
     input        irq_kill,           // 中断受理（clint 自己判的）
 //判定源：与 alu 的输入同源（发射级选中项的寄存器输出 = 前送后的操作数）
     input [31:0] source_a_data_in, source_b_data_in,
@@ -120,7 +119,7 @@ module bju(
 //  ★ 年龄【小 = 老】（队头是最老的）⇒ 更老判据是 ag_j < ag_f；冲刷的作废判据反过来是 ag > ag_f。
 //★ 判据对【三种冲刷】一律生效：异常冲刷也得看边界年龄。实测 WEIRD seed40：回跳循环里 `bne`
 //  （更老，在 lane1 判定）与它影子里的非法指令（更年轻，在 lane0 被标异常）落在【同一拍】⇒
-//  flush_con_exc 把更老那条 bne 刚算出的 br3 清成 0 ⇒ 本该怎么都不跳的循环一直跳下去
+//  redir_backend_0 把更老那条 bne 刚算出的 br3 清成 0 ⇒ 本该怎么都不跳的循环一直跳下去
 //  （x30 从 5 数到 −95 还在跳）。异常边界是那条非法指令自己的号，比判定这条年轻 ⇒
 //  判据与跳转冲刷逐字同一条，只是别再只看 irq_kill。
 
@@ -145,13 +144,9 @@ module bju(
 //===============================================================
 // 控制位译码（本模块最前的逻辑块）
 //===============================================================
-//flag_bus = {flush_con_exc, flush_con_irq, flush_con_jump, exec,
-//            stall_rob_full, stall_pc_redir,
-//            stall_icache_miss, stall_bus_hold}
 //判定延迟拍只关心"本拍是不是冲刷拍"。
-//★ flush_con_exc 已经是精确版（不再含组合的前置冲刷项）⇒ 直接取 [7]。
     always @(*) begin
-        flush_window = exc_kill | irq_kill | redir_backend_0;
+        flush_window = irq_kill | redir_backend_0;
     end
 
 //===============================================================
@@ -195,7 +190,7 @@ module bju(
             judged_index <= 4'd0;
             judged_generation <= 1'b0;
         end
-        else if (advance_in & ~(redir_backend_1 | exc_kill)) begin
+        else if (advance_in & ~redir_backend_1) begin
             judged_source_a_data <= source_a_data_in;
             judged_source_b_data <= source_b_data_in;
             judged_pc_plus4 <= pc_plus4_in;
@@ -299,7 +294,7 @@ module bju(
 //两者相加正好是 B+immB；br3 的落点就是 judged_pc_plus4（落空的后继）。
 //★ 这个落点寄存器还**兼任"异常目标"的载荷**：命中指令地址非对齐时，规范要求 mtval = 出错的目标地址，
 //  而 br 的目标恰好就是这个加法、jalr 的目标恰好就是 jump_link_register_target_now ⇒ 直接复用，不加加法器。
-//  非对齐拍 exc 会压掉 jump 重定向（pc.v 的 flush_jump_w = irq_kill & ~flush_control_in[2]）⇒ 那一拍它只被 mtval 消费。
+//  非对齐拍 exc 的落点按 cause 选成 mtvec（cpu_top 的 fetch_jump_target）⇒ 这一拍它只被 mtval 消费。
 //  jal 的目标【不在流水里】（载荷只带分支偏移）⇒ 由上游发射单元就地解 immJ 算好后
 //  单铺一路载荷送进来（jal_tgt_in），同样是进这个落点寄存器、同样零额外寄存器。
 //早一拍的那道遮挡不由本模块给：判定结果寄存后只覆盖到写回一级，而错路指令在冲刷生效前

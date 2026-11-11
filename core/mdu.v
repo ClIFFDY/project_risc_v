@@ -55,7 +55,6 @@ module mdu(
     input clk, rst,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
-    input        exc_kill,           // 异常交付（rob 的 trap_fire）
     input        irq_kill,           // 中断受理（clint 自己判的）
 //★ 2026-11-08：击杀掩码端口已摘。每次冲刷都是整窗的（改向只在提交口发一次），
 //  所以"冲刷拍在跑的那条乘/除要作废"就等于判 flush_window。
@@ -121,23 +120,18 @@ module mdu(
 
 
 //控制位译码（与流水级无关，放本模块最前）
-//flag_bus = {flush_control_exception, flush_con_irq, flush_con_jump, exec,
-//            stall_rob_full, stall_pc_redir,
-//            stall_icache_miss, stall_bus_hold}
-//本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），不用流水线使能，故只取三条冲刷位。
+//本模块的推进由自己的 stall/pipe_stall 把关（乘除在途语义），不用流水线使能，故只取三条冲刷源。
 //本模块的冲刷窗口与别的模块同宽：除法 FSM 的作废（divide_state_kill）与 divide_state_done 的清零都挂在这个 flush_window 上。
 //★ 2026-10-28 删除了一条已经不成立的旧前提。原文写的是「乘法第二级 / divide_state_commit_registered / hold
 //  有意不吃冲刷（它们冲刷拍握的一定比分支更老）」—— 那是【bju 一拍出冲刷】时代的规矩。
-//  现在冲刷在【提交口】发（cont.v:223 `flush_control_jump = redirect_in;`，
-//  rob.v:519 的 `redirect_now` 判的是 `entry_valid[head_pointer]`）⇒ **队头就是边界**，
+//  现在冲刷在【提交口】发（clint 的 redir_backend_0，rob 判的是队头那一项）⇒ **队头就是边界**，
 //  在途的每一条都比冲刷点【更年轻】，不存在"更老所以必须照样提交"这一档。
 //  乘法两级因此改成按年龄作废（见 multiply_stage1_kill / multiply_stage2_kill）。
-    reg flush_window, flush_control_exception;
+    reg flush_window;
     reg       divide_state_kill;
     reg       multiply_stage1_kill, multiply_stage2_kill;
     always @(*) begin
-        flush_control_exception = exc_kill;
-        flush_window = flush_control_exception | irq_kill | redir_backend_0;
+        flush_window = irq_kill | redir_backend_0;
     end
 
 //冻结信号合流（本模块是消费者，或运算在这里做）：

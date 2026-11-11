@@ -42,49 +42,36 @@
 //                → 回填状态机。
 //
 //////////////////////////////////////////////////////////////////////////////////
-
-
 module icache(
     input clk, rst,
 //取指地址生成（原 itcm）。pc_address_0 = 【下一条要执行的指令】的地址（可能不是 16B 对齐）。
 //  块基址与块内偏移都由它现算：{pc_address_0[31:4], 2'b00} 与 pc_address_0[3:2]。
     input [31:0] pc_address_0,
-    input exception_interrupt,
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input        redir_frontend,     // 前端重定向（rob 判定拍出的那根）
-    input        exc_kill,           // 异常交付（rob 的 trap_fire）
     input        irq_kill,           // 中断受理（clint 自己判的）
-    input       stall_icache_miss_in,   // = stall_icache_miss_in
-//★ 随地址一起进流水线的预测：pc 这一拍【照做】的落点表预测（pc_take / btb_tgt 的组合输出）。
-//  相位：pc_address_0(c-1) 就是本拍 R0 里那一块，而落点表的组合输出也按 pc_address_0(c-1) 算
-//  ⇒ 在【交付寄存器装载的那一个沿】，`pc_take` 与 R0 里的那一块说的是同一条指令。
-//  所以它跟指令字一样，在同一个 always 块里、用同一个 deliv_load 装进交付寄存器 ——
-//  不是"另外再打一拍对齐"，而是**本来就是同一位**。
-    input        pc_take_0, pc_take_1, pc_take_2, pc_take_3,
-    input [31:0] btb_target_0, btb_target_1, btb_target_2, btb_target_3,
+//★ 落点表输出（bpu 已仲裁成 one hot）：take 时取指地址直接吃落点，覆盖 pc_address_0；
+//  这几位同时随指令进交付寄存器，当"这一块被预测跳"的凭证。
+    input        btb_take_0, btb_take_1,
+    input [31:0] btb_target_0, btb_target_1,
 //回填应答（接核内 itcm）
     input mem_valid,
     input [31:0] mem_data,
-//本拍 pc 落到重定向目标（pc.v 的 redir_go，源名 flush_pc_redirect）：挡掉"跳转前那次取指"的陈旧交付
-    input redirect_go,               // 陷阱/mret/中断落地这一拍
 //取指队列满（iffu 的 full）：本拍放不下，交付寄存器保持、不再推进
     input fifo_full,
-
-//取指输出：一拍一块 4 条
-    output reg [31:0] instruction_0, instruction_1, instruction_2, instruction_3,
-//与四条指令同拍交付的地址：与数据走同一级寄存，每条指令自带自己的地址，
+//取指输出：一拍一块 2 条
+    output reg [31:0] instruction_0, instruction_1,
+//与两条指令同拍交付的地址：与数据走同一级寄存，每条指令自带自己的地址，
 //下游不再需要"拍数"或"基准+4"来推它是哪一条。
-    output reg [31:0] instruction_address_0, instruction_address_1, instruction_address_2, instruction_address_3,
+    output reg [31:0] instruction_address_0, instruction_address_1,
 //★ 与这一块指令【同一个寄存器组、同一个装载门】交付的预测：
 //   prediction_taken_*  = 这一条被预测跳（取指当时 pc 照做的那一位）
 //   prediction_jump_target_* = 那一位对应的预测落点（没预测跳 ⇒ 0）
 //  取指队列条目里的 br_pred / jalr_pred 就是这两位，原样存。
-    output reg        prediction_taken_0, prediction_taken_1, prediction_taken_2, prediction_taken_3,
+    output reg        prediction_taken_0, prediction_taken_1,
     output reg [31:0] prediction_jump_target_0, prediction_jump_target_1,
-    output reg [31:0] prediction_jump_target_2, prediction_jump_target_3,
-
 //每条自己的有效位 = 块有效 & (序号 >= block_offset)。第 0 条可能就是块内第 2/3 条。
-    output reg instruction_valid_0, instruction_valid_1, instruction_valid_2, instruction_valid_3,
+    output reg instruction_valid_0, instruction_valid_1,
 //块内起始偏移（随指令同沿交付）：改向落在块中间时，比它老的几条不许出去。
     output reg [1:0] block_offset,
 //busy = 本模块自己的停顿源（stall_icache_miss），也是给 idu 的垃圾指令守卫。
@@ -94,21 +81,13 @@ module icache(
 //busy 是寄存的、要到下一拍才起来，pc 若在检测拍照常推进就会走过被丢的那一块，
 //回填完 fill_ok 又按"当前 pc"取数 ⇒ 补的是下一块，被丢的那一块永远补不回来。
     output reg icache_miss,
-//★★ 唯一前进判据：整个取指级（pc / R0 / 交付口 / 落点表输出寄存器）这一拍前进一格。
-//  只在本模块算一次，四组寄存器全吃它 ⇒ 指令与随它的预测（dpred/djpred）结构上不可能差拍。
-//  ★ 不许把它寄存一拍：寄存 = 相位错，四组立刻错开。
-    output reg       advance,
-//★ R0 那一组的两个状态位（与 btb_* 同一沿、同一块，不另打拍）：
-//  r0_valid  = 这一块有效；r0_wrong_path = 这一块是【预测跳之后顺延取回来的错路】。
-    output reg       r0_valid, r0_wrong_path,
-//★ 这一块是错路（与指令同组同门的位）。iffu 的 slot_rep 直接吃它。
+//★ 这一块是错路（与指令同组同门的位）。iffu 的 slot_replay 直接吃它。
     output reg       deliver_wrong_path,
 //回填请求（接核内 itcm）
     output reg mem_req, mem_write_enable,
     output reg [31:0] mem_address, mem_write_data,
     output reg [3:0] mem_byte_enable
     );
-
 //★★ 2026-11-01：容量参数（唯一旋钮）。改 IC_INDEX_B 就是"tag 加一位"：
 //  行大小 IC_WORD_B 不变（32 字 = 128B），组数翻倍，地址三段的位段全部自动跟随。
 //  位段来源：fetch_word_index = pc >>> 2，所以
@@ -125,29 +104,20 @@ module icache(
     localparam integer IC_TAGW   = IC_TAG_B + 1;                       // tag 阵列字宽
     localparam integer IC_FOLD   = 32 - IC_INDEX_B - IC_WORD_B - 2;    // tag 的有效位（拼回 pc 用）
     localparam integer IC_WG_B   = IC_WORD_B - 2;                      // 块内字号（16B = 4 字）⇒ 块号位宽
-    localparam integer IC_ADDR_B = 1 + IC_INDEX_B + IC_WG_B;           // {way, index, block_group}
+//★ 2026-11-11 时序：半选位 block_offset[1] 必须进【地址】，不能留在数据端做 2:1 mux。
+//  旧写法 instruction_0 <= block_offset_q[1] ? iram_word2[ra] : iram_word0[ra] 让四份阵列的
+//  输出寄存器合不进 BRAM，综合判 Infeasible ram_style="block" 后静默退 LUTRAM
+//  （4×2,688 个 LUT6，read_address 每 bit 扇出 8,193、造 256 份副本，整条 u_icache→u_icache 族）。
+    localparam integer IC_HALF_B = 1;                                  // 8B 块在 16B 行内的半选位
+    localparam integer IC_ADDR_B = 1 + IC_INDEX_B + IC_WG_B + IC_HALF_B;// {way, index, block_group, half}
     localparam integer IC_WORDS  = IC_SETS << (IC_WORD_B + 1);         // iram 字数 = 2 路 × 组数 × 行字数
-    localparam integer IC_ROWS   = IC_WORDS >> 2;                      // 每份阵列的行数（4 字一行）
+    localparam integer IC_ROWS   = IC_WORDS >> 1;                      // 每份阵列的行数（每份装 8B 块的一侧）
     localparam [IC_WORD_B-1:0] IC_WORD_LAST = {IC_WORD_B{1'b1}};       // 行内末字号
-
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg reset_registered;
     always @(posedge clk) reset_registered <= rst;
-
-//flag_bus = {flush_control_exception, flush_control_interrupt, flush_control_jump, exec,
-//            stall_rob_full, stall_pc_redirect,
-//            stall_icache_miss, stall_bus_hold}
-    reg flush_control_exception, flush_control_interrupt, flush_control_jump;
-    reg flush_window;
-    always @(*) begin
-        flush_control_exception  = exc_kill;
-        flush_control_interrupt  = irq_kill;
-        flush_control_jump = redir_frontend;
-        flush_window = flush_control_exception | flush_control_interrupt | flush_control_jump;
-    end
-
 //寄存器（按级分组）
 //第 0 级：本拍组合
     (* max_fanout = 32 *) reg [31:0] fetch_word_index_0;
@@ -155,11 +125,8 @@ module icache(
     (* max_fanout = 32 *) reg [IC_INDEX_B-1:0] index_0;
     (* max_fanout = 32 *) reg [IC_WORD_B-1:0] word_0;
     reg [1:0] hit_way_0;
-    reg hit_select_0;
     reg hit_0;
     (* max_fanout = 32 *) reg [IC_ADDR_B-1:0] read_address;
-    reg read_enable;
-    reg cache_hit;
 //第 1 级：由 Q 端字段拼回来的取指地址（pc = tag[IC_FOLD-1:0] & idx & word & 2'b00）
     reg [31:0] fetch_address_0;
 //第 0R 级：tag 阵列 Q 端。整组同一个沿、同一套条件，一位都不能单独打拍。
@@ -168,27 +135,28 @@ module icache(
     reg [IC_INDEX_B-1:0]  index_registered_0;
     reg [IC_WORD_B-1:0]  word_q0;
     reg [1:0] block_offset_q;
+//这一块算不算数：冲刷拍清 0，装载拍置 1，背压拍保持。
+//  它不管命中、不管地址；只回答"R0 里这一块现在作不作数"（缺失判据与交付有效位都吃它）。
+    reg r0_valid;
     reg write_enable;
     reg [IC_ADDR_B-1:0] write_address;
-
 //阵列与状态机
 //tag 阵列存 {valid, tag}：最高位就是有效位，命中判据退化成【一次 20 位比较】。
 //原来 valid 是另一份 128 位向量、再和 tag 比完的结果相与，多一级 LUT、多一条 128:1 选择。
     (* ram_style = "distributed" *) reg [IC_TAGW-1:0] way1_tag [0:IC_SETS-1];
     (* ram_style = "distributed" *) reg [IC_TAGW-1:0] way2_tag [0:IC_SETS-1];
-//★ 四份阵列：一个地址并行读出块内 4 个字（低位两 bit 是块内字号，不进地址）。
-    (* ram_style = "block" *) reg [31:0] iram_word0 [0:IC_ROWS-1];
-    (* ram_style = "block" *) reg [31:0] iram_word1 [0:IC_ROWS-1];
-    (* ram_style = "block" *) reg [31:0] iram_word2 [0:IC_ROWS-1];
-    (* ram_style = "block" *) reg [31:0] iram_word3 [0:IC_ROWS-1];
+//★ 两份阵列，按【8B 块内的高/低字】分（不是按 16B 行内第几字）：
+//  iram_word_low 装 word0/word2（pc[2]=0），iram_word_high 装 word1/word3（pc[2]=1）。
+//  行里哪一半（pc[3]）进地址，于是读侧退化成 instruction_0 <= iram_word_low[read_address]，
+//  一份阵列一个读口一个写口、数据端没有 mux —— 这才是 BRAM 能认的形状。
+    (* ram_style = "block" *) reg [31:0] iram_word_low  [0:IC_ROWS-1];
+    (* ram_style = "block" *) reg [31:0] iram_word_high [0:IC_ROWS-1];
     reg [IC_SETS-1:0] lru;
-
 //★★ 2026-10-27：自举 bootloader 与 way0 一路一起删除，见文件头。
 //way1_tag/way2_tag 现在就是【两路】：way1_tag = way0（`fill_way/hit_way` 里编号 0），way2_tag = way1（编号 1）。
 //  编号沿用旧名不改，只在读写处按 0/1 使用 —— 别再从名字推断"第几路"。
 //reset_period_flag 只保留给测试台做起跑对齐（全仓 114 个 tb 写 `wait(!reset_period_flag)`）：现在它【只表示复位期】。
     reg reset_period_flag;
-
     reg stage;
     reg fill_end;
 //★ 回填收尾之后的那一拍（fill_end 打一拍）。见下面 freeze / icache_miss / busy / FSM 起点四处。
@@ -197,7 +165,6 @@ module icache(
     reg [31:0] fill_addr;
     reg [IC_TAG_B-1:0] fill_tag;
     (* max_fanout = 32 *) reg [IC_INDEX_B-1:0] fill_index;
-
 //★ 回填替换路：只依赖【寄存好的 fill_index】，不依赖缺失检测那一拍的任何东西。
     wire [IC_TAGW-1:0] fill_tag_way1 = way1_tag[fill_index];
     wire [IC_TAGW-1:0] fill_tag_way2 = way2_tag[fill_index];
@@ -205,9 +172,7 @@ module icache(
     wire fill_way = (!fill_tag_way1[IC_TAG_B]) ? 1'b0 :
                     (!fill_tag_way2[IC_TAG_B]) ? 1'b1 :
                     lru[fill_index];
-
     integer i;
-
 //阵列初值：未写过的格位最高位是 0，与 {1'b1, tag} 永不相等 ⇒ 天然不命中。
 //不用复位沿：复位会给 2x128x20 位各长一根复位线，撑爆 slice 打包（原注释的同一笔账）。
     initial begin
@@ -216,37 +181,29 @@ module icache(
             way2_tag[i] = {IC_TAGW{1'b0}};
         end
     end
-
 //===============================================================
 // 第 0 级：本拍组合（取指地址 + 命中判定与缺失锁）
 //===============================================================
 //取指地址：块基址 = pc & ~15，然后 >>> 2。块内偏移不进地址（它只在交付口用）。
+//★ 预测跳那一拍 pc 已经在口上送了落点（pc.v 里的 mux），本模块不再自己选。
     always @(*) begin
 //★ 块基址的字索引 = (pc & ~15) >>> 2 = pc[31:4] << 2 = {pc[31:4], 2'b00}。
 //  2026-11-08 踩过一次：多写了一个 >>> 2 ⇒ 得到的是【块号】不是字索引，
 //  相邻四个块全落在同一条阵列地址上，读回来的是同一份 4 条指令（rand seed1 当场复现）。
         fetch_word_index_0 = {pc_address_0[31:4], 2'b00};
     end
-
-//写口：回填写（唯一一条写语句、唯一地址表达式）。
-//★ 写四份阵列里的一份：块内字号 = fill_count[1:0]。四条 case 写的是四个不同阵列，
-//  每个阵列仍然只有一条写语句（综合各推一个写口，不会溶成触发器）。
+//写口：回填写（每份阵列唯一一条写语句、唯一地址表达式）。
+//★ 块内字号 = fill_count[1:0]：[0] 选高/低字阵列（决定"写哪一份"），[1] 选 16B 行的哪一半（进地址）。
     always @(*) begin
         write_enable   = (stage == 1'b1) & ~fill_end & mem_valid;
-        write_address = {fill_way, fill_index, fill_count[IC_WORD_B-1:2]};
+        write_address = {fill_way, fill_index, fill_count[IC_WORD_B-1:2], fill_count[1]};
     end
-
     always @(posedge clk) begin
         if (write_enable) begin
-            case (fill_count[1:0])
-                2'd0: iram_word0[write_address] <= mem_data;
-                2'd1: iram_word1[write_address] <= mem_data;
-                2'd2: iram_word2[write_address] <= mem_data;
-                default: iram_word3[write_address] <= mem_data;
-            endcase
+            if (fill_count[0]) iram_word_high[write_address] <= mem_data;
+            else               iram_word_low [write_address] <= mem_data;
         end
     end
-
     always @(*) begin
         tag_0  = fetch_word_index_0[31:IC_WORD_B+IC_INDEX_B];
         index_0  = fetch_word_index_0[IC_WORD_B+IC_INDEX_B-1:IC_WORD_B];
@@ -257,19 +214,7 @@ module icache(
         mem_write_data = 32'd0;
         mem_byte_enable = 4'd0;
     end
-
 //第 0R 级：tag 阵列 Q 端打一拍。这一刀切在【阵列读之后、比较之前】。
-    always @(*) begin
-        if (flush_control_exception)           advance = 1'b0;   // 陷阱交付这一拍
-        else if (flush_control_interrupt)      advance = 1'b0;   // 中断受理这一拍
-        else if (redir_frontend | redirect_go) advance = 1'b0;   // 前端改向 / 陷阱落地这一拍
-        else if (fifo_full)          advance = 1'b0;   // 取指队列满：口上这一块收不下
-        else if (busy)               advance = 1'b0;   // 回填中
-        else if (icache_miss)        advance = 1'b0;   // 这一块不在 cache 里 ⇒ 原样重放
-        else                         advance = 1'b1;
-    end
-
-    wire flush_all = flush_control_exception | flush_control_interrupt | redir_frontend | redirect_go;
     always @(posedge clk) begin
         if (reset_registered) begin
             fetch_tag_registered_0 <= 0;
@@ -278,26 +223,11 @@ module icache(
             index_registered_0  <= 0;
             word_q0 <= 0;
             block_offset_q <= 2'd0;
-            r0_valid    <= 1'b0;    r0_wrong_path   <= 1'b0;
+            r0_valid <= 1'b0;
         end
-        else if (advance) begin
-            fetch_tag_registered_0 <= tag_0;
-            way1_tag_registered_0 <= way1_tag[index_0];
-            way2_tag_registered_0 <= way2_tag[index_0];
-            index_registered_0  <= index_0;
-            word_q0 <= word_0;
-            block_offset_q <= pc_address_0[3:2];
-            r0_valid    <= 1'b1;
-//★ 错路位与地址同沿装进同一组：预测跳之后顺延取回来的那一块，就是这一位 = 1 的那一块。
-//  它替代原来的 tk_drop（上拍刚按表改过向）—— 由位本身带着走，不靠拍数推断，
-//  冻结/重放时跟着同一块一起保持。
-            r0_wrong_path   <= pc_take_0 | pc_take_1 | pc_take_2 | pc_take_3;
-        end
-        else if (flush_all) begin
-//★ 顺序：advance > flush_all > fill_done。flush_all 必须优先于 fill_done —— 两者同拍时若先做
-//  阵列重读，r0_valid 不会被清 ⇒ 下一拍把改向前那一块当成有效交付出去（错路指令进队列）。
-            r0_valid  <= 1'b0;
-            r0_wrong_path <= 1'b0;
+        else if (irq_kill | redir_frontend) begin
+// 冲刷：这一块不要了 —— 地址字段无所谓，作废就靠这一位。
+            r0_valid <= 1'b0;
         end
         else if (fill_done) begin
 //★ 唯一例外：tag 是在 fill_end 那一沿才写进阵列的，同一沿 R0 读回的是【写之前】的值
@@ -305,131 +235,119 @@ module icache(
 //  ★ 地址字段一个都不能换：R0 里压着的就是缺失那一块，重放要的是同一个 tag 再比一次。
             way1_tag_registered_0 <= way1_tag[index_registered_0];
             way2_tag_registered_0 <= way2_tag[index_registered_0];
+            r0_valid <= r0_valid;
+        end
+        else if (~(icache_miss | fifo_full | busy)) begin
+            fetch_tag_registered_0 <= tag_0;
+            way1_tag_registered_0 <= way1_tag[index_0];
+            way2_tag_registered_0 <= way2_tag[index_0];
+            index_registered_0  <= index_0;
+            word_q0 <= word_0;
+//★ 2026-11-11 取指回 2 宽：块 = 8B。[1] 选 16B 行的哪一半，[0] 是块内偏移（交给 iffu）。
+            block_offset_q <= pc_address_0[3:2];
+            r0_valid <= 1'b1;
+        end
+        else begin
+// 背压：地址不动，整组保持。
+            fetch_tag_registered_0 <= fetch_tag_registered_0;
+            way1_tag_registered_0 <= way1_tag_registered_0;
+            way2_tag_registered_0 <= way2_tag_registered_0;
+            index_registered_0  <= index_registered_0;
+            word_q0 <= word_q0;
+            r0_valid <= r0_valid;
         end
     end
-
 //第 1 级：拼回取指地址、比较、选 way、出 iram 地址。两路对称：路号直接由命中项给出。
     always @(*) begin
         fetch_address_0 = {fetch_tag_registered_0[IC_FOLD-1:0], index_registered_0,
                            word_q0[IC_WORD_B-1:2], 4'd0};
         hit_way_0[0] = (way1_tag_registered_0 == {1'b1, fetch_tag_registered_0});
         hit_way_0[1] = (way2_tag_registered_0 == {1'b1, fetch_tag_registered_0});
-        hit_0 = hit_way_0[0] | hit_way_0[1];
 //★ 16B 块恒在一条行内 ⇒ 命中判定只有一次（老版本是两个字各比一次、两个都要中）。
-        cache_hit = hit_0;
-        hit_select_0 = hit_way_0[1];   // 0 = way0(way1_tag)，1 = way1(way2_tag)
-        read_enable    = r0_valid;
-        read_address  = {hit_select_0, index_registered_0, word_q0[IC_WORD_B-1:2]};
+        hit_0 = hit_way_0[0] | hit_way_0[1];
+// 命中路号直接进 iram 地址：0 = way0(way1_tag)，1 = way1(way2_tag)
+//★ 半选位 block_offset_q[1]（= pc[3]）进地址：这决定读 16B 行的前半还是后半。
+        read_address  = {hit_way_0[1], index_registered_0, word_q0[IC_WORD_B-1:2], block_offset_q[1]};
     end
-
 //缺失检测拍（组合直送 pc，不走 flag_bus）：与 busy 的第三个加项逐字同门。
     always @(*) begin
-        icache_miss = read_enable & ~cache_hit;
+        icache_miss = r0_valid & ~hit_0;
     end
-
-    reg discard_output;
-    always @(*) begin
-//★ 只有"这一拍换 pc"的场合才作废交付。跳转类（jal/br1/jalr）不再在此列：
-//  改向已由取指落点表提前一拍完成，这一拍读到的是目标那一块，不存在错路。
-        discard_output = (exception_interrupt | flush_control_exception | redir_frontend | redirect_go);
+//★ 冲刷之后那一拍交付出来的块是改向前那条流的残块（改向那一拍 R0 里还压着它），
+//  标成错路交给 iffu 丢掉（rand seed1：0x2d0）。
+    reg flush_bubble;
+    always @(posedge clk) begin
+        if (reset_registered)       flush_bubble <= 1'b0;
+        else                        flush_bubble <= (irq_kill | redir_frontend);
     end
-
 //★ 交付寄存器：四条指令 + 四个地址 + 四份预测 + 块内偏移，一个沿、一个门。
+//  冲刷（irq_kill / redir_frontend）：整组清；
+//  队满：整组保持；缺失/回填：出 NOP；其余：装这一块。
     always @(posedge clk) begin
         if (reset_registered) begin
             instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_2 <= 32'd0; instruction_3 <= 32'd0;
             instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            instruction_address_2 <= 32'd0; instruction_address_3 <= 32'd0;
             prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_taken_2 <= 1'b0; prediction_taken_3 <= 1'b0;
             prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            prediction_jump_target_2 <= 32'd0; prediction_jump_target_3 <= 32'd0;
             instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
-            instruction_valid_2 <= 1'b0; instruction_valid_3 <= 1'b0;
+            deliver_wrong_path <= 1'b0;
             block_offset <= 2'd0;
-            deliver_wrong_path <= 1'b0;
         end
-        else if (discard_output) begin
+        else if (irq_kill | redir_frontend) begin
             instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_2 <= 32'd0; instruction_3 <= 32'd0;
             instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            instruction_address_2 <= 32'd0; instruction_address_3 <= 32'd0;
             prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_taken_2 <= 1'b0; prediction_taken_3 <= 1'b0;
             prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            prediction_jump_target_2 <= 32'd0; prediction_jump_target_3 <= 32'd0;
             instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
-            instruction_valid_2 <= 1'b0; instruction_valid_3 <= 1'b0;
             deliver_wrong_path <= 1'b0;
         end
-        else if (advance) begin
-            instruction_0 <= iram_word0[read_address];
-            instruction_1 <= iram_word1[read_address];
-            instruction_2 <= iram_word2[read_address];
-            instruction_3 <= iram_word3[read_address];
-            instruction_address_0 <= fetch_address_0;
-            instruction_address_1 <= fetch_address_0 + 32'd4;
-            instruction_address_2 <= fetch_address_0 + 32'd8;
-            instruction_address_3 <= fetch_address_0 + 32'd12;
+        else if (~(icache_miss | fifo_full | busy)) begin
+//★ 只交当前 8B 块的那两个字：半选已经压在 read_address 里（见上），这里就是两条裸读。
+            instruction_0 <= iram_word_low[read_address];
+            instruction_1 <= iram_word_high[read_address];
+            instruction_address_0 <= fetch_address_0 + (block_offset_q[1] ? 32'd8 : 32'd0);
+            instruction_address_1 <= fetch_address_0 + (block_offset_q[1] ? 32'd8 : 32'd0) + 32'd4;
 //★ 预测就是这一块指令的延长位：同一个沿、同一个门、同一个地址。
-            prediction_taken_0  <= pc_take_0;
-            prediction_taken_1  <= pc_take_1;
-            prediction_taken_2  <= pc_take_2;
-            prediction_taken_3  <= pc_take_3;
-            prediction_jump_target_0 <= pc_take_0 ? btb_target_0 : 32'd0;
-            prediction_jump_target_1 <= pc_take_1 ? btb_target_1 : 32'd0;
-            prediction_jump_target_2 <= pc_take_2 ? btb_target_2 : 32'd0;
-            prediction_jump_target_3 <= pc_take_3 ? btb_target_3 : 32'd0;
+            prediction_taken_0  <= btb_take_0;
+            prediction_taken_1  <= btb_take_1;
+            prediction_jump_target_0 <= btb_take_0 ? btb_target_0 : 32'd0;
+            prediction_jump_target_1 <= btb_take_1 ? btb_target_1 : 32'd0;
 //★ 块内起始偏移：比它老的几条永远不出去。
 //  ★ 用 block_offset_q（随 R0 那一块锁进来的偏移），不是当拍的 pc_address_0 ——
 //    当拍 pc 已经是下一块了，用它会错一整块。
-            block_offset <= block_offset_q;
-            instruction_valid_0 <= read_enable & hit_0 & (block_offset_q <= 2'd0);
-            instruction_valid_1 <= read_enable & hit_0 & (block_offset_q <= 2'd1);
-            instruction_valid_2 <= read_enable & hit_0 & (block_offset_q <= 2'd2);
-            instruction_valid_3 <= read_enable & hit_0;
-            deliver_wrong_path      <= r0_wrong_path;
+            block_offset <= {1'b0, block_offset_q[0]};
+            instruction_valid_0 <= r0_valid & hit_0 & (block_offset_q[0] == 1'b0);
+            instruction_valid_1 <= r0_valid & hit_0;
+            deliver_wrong_path <= flush_bubble;
         end
 //交付口的契约：每拍都放一样东西 —— 新指令，或者 NOP。唯一保持的场合是队满（收不走就别换）。
         else if (fifo_full) begin
             instruction_0 <= instruction_0; instruction_1 <= instruction_1;
-            instruction_2 <= instruction_2; instruction_3 <= instruction_3;
             instruction_address_0 <= instruction_address_0; instruction_address_1 <= instruction_address_1;
-            instruction_address_2 <= instruction_address_2; instruction_address_3 <= instruction_address_3;
             prediction_taken_0 <= prediction_taken_0; prediction_taken_1 <= prediction_taken_1;
-            prediction_taken_2 <= prediction_taken_2; prediction_taken_3 <= prediction_taken_3;
             prediction_jump_target_0 <= prediction_jump_target_0; prediction_jump_target_1 <= prediction_jump_target_1;
-            prediction_jump_target_2 <= prediction_jump_target_2; prediction_jump_target_3 <= prediction_jump_target_3;
             instruction_valid_0 <= instruction_valid_0; instruction_valid_1 <= instruction_valid_1;
-            instruction_valid_2 <= instruction_valid_2; instruction_valid_3 <= instruction_valid_3;
-            block_offset <= block_offset;
             deliver_wrong_path <= deliver_wrong_path;
+            block_offset <= block_offset;
         end
         else begin
+// 缺失 / 回填中：这一拍没有有效块，出 NOP。
             instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_2 <= 32'd0; instruction_3 <= 32'd0;
             instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            instruction_address_2 <= 32'd0; instruction_address_3 <= 32'd0;
             prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_taken_2 <= 1'b0; prediction_taken_3 <= 1'b0;
             prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            prediction_jump_target_2 <= 32'd0; prediction_jump_target_3 <= 32'd0;
             instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
-            instruction_valid_2 <= 1'b0; instruction_valid_3 <= 1'b0;
             deliver_wrong_path <= 1'b0;
         end
     end
-
 //===============================================================
 // 回填状态机（四份阵列的 port B 全是回填写，不再与取指读抢口）
 //===============================================================
 //fill_way ∈ {0,1}：两路对称，没效优先，否则按 LRU（`lru[idx]` 就是"下次换哪一路"）。
     always @(posedge clk) begin
         if (reset_registered) reset_period_flag <= 1'b1;
-        else       reset_period_flag <= 1'b0;
+        else reset_period_flag <= 1'b0;
     end
-
     always @(posedge clk) begin
         if (reset_registered) begin
             stage <= 1'b0;
@@ -476,13 +394,11 @@ module icache(
             end
         end
     end
-
 //★ 回填收尾之后的一拍（见上面 r0 重读）。
     always @(posedge clk) begin
         if (reset_registered) fill_done <= 1'b0;
         else       fill_done <= fill_end;
     end
-
     always @(posedge clk) begin
         if (reset_registered)
             busy <= 1'b1;
@@ -490,7 +406,6 @@ module icache(
             busy <= (stage == 1'b1)
                   | (icache_miss & ~fill_done);
     end
-
 //===============================================================
 // 参数自检（综合时整块丢弃；仿真时恒生效）
 //===============================================================
@@ -498,9 +413,9 @@ module icache(
     initial begin
         if ((IC_TAGW   != IC_TAG_B + 1) ||
             (IC_TAG_B  != IC_FOLD + 2) ||
-            (IC_ADDR_B != 1 + IC_INDEX_B + IC_WG_B) ||
+            (IC_ADDR_B != 1 + IC_INDEX_B + IC_WG_B + IC_HALF_B) ||
             (IC_WORDS  != (2 << (IC_INDEX_B + IC_WORD_B))) ||
-            (IC_ROWS   != (IC_WORDS >> 2)) ||
+            (IC_ROWS   != (IC_WORDS >> 1)) ||
             (IC_WG_B   != IC_WORD_B - 2) ||
             (IC_WORD_B + IC_INDEX_B >= 32)) begin
             $display("ICACHE_CFG_FAIL: sets=%0d word_b=%0d tag_b=%0d tagw=%0d fold=%0d addr_b=%0d words=%0d",
@@ -512,5 +427,4 @@ module icache(
                      IC_SETS, (1 << IC_WORD_B), (IC_WORDS * 4) / 1024, IC_TAG_B, IC_FOLD);
     end
 // synthesis translate_on
-
 endmodule

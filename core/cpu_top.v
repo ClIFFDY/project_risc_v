@@ -25,10 +25,10 @@ module cpu_top #(
     parameter integer ROB_DEPTH         = 32,   // 32 / 16（必须是 2 的幂）
     parameter integer IFFU_DEPTH        = 16,   // 16 / 8（取指改 16B 块后按 4 的倍数取）
     parameter integer VALUE_TABLE_DEPTH = 32,   // 必须 = ROB_DEPTH
-    parameter integer IC_INDEX_B        = 8,    // 8 = 64KB / 7 = 32KB
+    parameter integer IC_INDEX_B        = 6,    // 8 = 64KB / 7 = 32KB / 6 = 16KB
     parameter integer BHT_B             = 11,   // 11 / 9
     parameter integer BTB_B             = 11,   // 11 / 9
-    parameter integer DC_SETS_B         = 9,   // 8 = 16KB / 7 = 8KB
+    parameter integer DC_SETS_B         = 8,   // 9 = 32KB / 8 = 16KB / 7 = 8KB
     parameter integer ITCM_AW           = 14,  // 14 = 64KB / 13 = 32KB
     parameter integer ADDER_AT_D        = 0     // 1 = 访存地址加法搬到 D 端
 ) (
@@ -46,22 +46,19 @@ module cpu_top #(
     wire [31:0] pc_address_0;
 //★ 2026-11-08：取指改 16B 块。给 bpu 的是这一块里四个地址（块基址 +0/4/8/12），
 //  给 icache 的仍然是【下一条要执行】的指令地址；块内偏移用来把比它老的那几条挡在仲裁外。
-    wire [31:0] pc_block_0, pc_block_1, pc_block_2, pc_block_3;
+    wire [31:0] pc_block_0, pc_block_1;
     wire [1:0]  pc_offset;
 //测试台接口：几乎每个 tb 都用 dut.address_pc 当"取指 PC 活动窗口"的判据（这是原 pc 模块的 pc_addr 口，
 //  双 lane 改造后改成了 pc_address_0/pc_address_1）。这里只做一次别名，不进任何逻辑；综合时无人读会被自动裁掉。
     wire [31:0] address_pc = pc_address_0;
-    reg  [31:0] current_address_0, current_address_1, current_address_2, current_address_3;
-    wire [31:0] instruction_0_icache, instruction_1_icache, instruction_2_icache, instruction_3_icache;
-    wire [31:0] instruction_addr0_icache, instruction_addr1_icache, instruction_addr2_icache, instruction_addr3_icache;
-    wire        instruction_valid0_icache, instruction_valid1_icache, instruction_valid2_icache, instruction_valid3_icache;
+    reg  [31:0] current_address_0, current_address_1;
+    wire [31:0] instruction_0_icache, instruction_1_icache;
+    wire [31:0] instruction_addr0_icache, instruction_addr1_icache;
+    wire        instruction_valid0_icache, instruction_valid1_icache;
+    wire        dpred0_icache, dpred1_icache;
+    wire [31:0] djpred0_icache, djpred1_icache;
     wire [1:0]  block_offset_icache;
-    wire        icache_miss_icache, busy_icache;
-//★ 取指级的四根公共量（全部由 icache 一处产生 / 持有）：
-//  adv        = 这一拍整个取指级前进一格（pc / R0 / 交付 / 落点表输出 全吃它）
-//  r0_v/r0_wp = R0 那一对有效 / 是错路（pc 的 tk_ok = r0_v & ~r0_wp）
-//  dwp        = 交付口这一对是错路（iffu 的 slot_rep 直接吃）
-    wire        advance_icache, r0_valid_icache, r0_wrong_path_icache, deliver_wrong_path_icache;
+    wire        icache_miss_icache, busy_icache, deliver_wrong_path_icache;
     wire [31:0] mem_address_icache, mem_wdata_icache, mem_data_icache;
     wire [3:0]  mem_byte_enable_icache;
     wire        mem_req_icache, mem_write_enable_icache, mem_valid_icache;
@@ -72,17 +69,15 @@ module cpu_top #(
 //★ BTB（落点表）输出：与【交付口】同拍到齐（都吃同一根 pc_addr、都寄存一拍）。
 //  btb_take_0/1 已在 bpu 内部按 addr0 优先级仲裁过，恒互斥；btb_tgt 同时就是这条 jalr 的
 //  "预测落点"（跟指令进队列、交给 bju 比对）。
-    wire        btb_take_0, btb_take_1, btb_take_2, btb_take_3;
-    wire [31:0] btb_target_0, btb_target_1, btb_target_2, btb_target_3;
+    wire        btb_take_0, btb_take_1;
+    wire [31:0] btb_target_0, btb_target_1;
 //pc 这一拍实际照做的那一位 = 落点表命中 且 上一拍真读了。记录进队列的"预测跳"就是它，
 //由 pc 自己出，保证"照做的"和"记账的"结构上是同一根线。
-    wire        pc_take0, pc_take1, pc_take2, pc_take3;
 
 //前端"这一拍有冲刷发生"（交付/边带都要按它作废）。★ 提前声明：边带两级都要清。
-//  （flag_bus / flush_pc_redir 的声明也一并提前到这里 —— 它们由下面的 cont 例化驱动，
-//    提前的只是【名字】，不影响谁驱动。）
-    wire        exc_kill, irq_kill;
-    wire        flush_pc_redir;
+//  （这几根由下面的 clint / rob 例化驱动，提前的只是【名字】，不影响谁驱动。）
+    wire        irq_kill;
+    wire [1:0]  redir_cause;                 // 与 redir_frontend / redir_backend_0 同拍：0=分支 1=陷阱 2=mret
 //bju 判定延迟级的训练载荷（btb 的唯一学习源），bju_fe_sel 做年龄二选一
     reg  [1:0]  fetch_kind;
     reg         fetch_taken;
@@ -106,7 +101,7 @@ module cpu_top #(
 //    （实测：CoreMark 在 _start 处取指停摆 4488 拍、第 53 个字符就错）。
 //  ★★ 冲刷必须把它们清掉：冲刷之后 pc 是【组合旁路】到落点的，下一对交付就是从落点取回来的
 //    真指令 —— 而"上一对是错路"的标记还挂在寄存器里的话，会把这一对好指令整对扔掉。
-//  （这两个寄存器放在下面 cont 的 flag_bus / flush_pc_redir 声明之后，见「前端：取指地址」段。）
+//  （这两个寄存器放在下面前端信号声明之后，见「前端：取指地址」段。）
 
     wire [31:0] h0_instruction, h0_address, h0_jump_link_register_prediction, h1_instruction, h1_address, h1_jump_link_register_prediction;
     wire        h0_valid, h1_valid;
@@ -121,8 +116,6 @@ module cpu_top #(
 //  原来为什么错：pr0 打一拍、pr_l 再打一拍，而 iffu 吃的 pr_l 在同一个沿上采的是
 //  pr0 的【旧值】⇒ 记录的是【上一对】的预测（实测 CoreMark：pc 按落点表跳了，
 //  队列条目里 br_pred 却是 0 ⇒ bju 的 br3 永不发 ⇒ bne 该退出不退出，死循环）。
-    wire        dpred0_icache, dpred1_icache, dpred2_icache, dpred3_icache;
-    wire [31:0] djpred0_icache, djpred1_icache, djpred2_icache, djpred3_icache;
 //==============================================================================
 // 译码级（idu）→ 分配
 //==============================================================================
@@ -138,6 +131,7 @@ module cpu_top #(
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
 //★ 2026-11-04 真 PRF：物理号与冲刷掩码
     wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
+    wire [31:0] alloc_pc_1;
 //精确冲刷第 1 步：分配时顶掉的旧映射（随 ROB 项存，将来回滚 rat 用；现在没有读者）
 //★ 2026-11-04（CSR 步骤 C）：CSR 随 ROB 项走、在提交拍落地。载荷 {写使能 1, 地址 12, funct3 3, 源 6}。
     wire        alloc_csr_0, alloc_csr_1;
@@ -225,12 +219,17 @@ module cpu_top #(
     assign divide_wake_valid = divide_wake_valid_0 | divide_wake_valid_1;
     assign divide_wake_phys  = divide_wake_valid_0 ? divide_wake_phys_0 : divide_wake_phys_1;
     wire [63:0] alloc_onehot, arch_next_onehot;
+// idu ↔ rename（rename 在顶层例化）
+    wire [5:0]  phys_rd_0, phys_rd_1, phys_rd_2, phys_rd_3;
+    wire [5:0]  lookup_a_phys, lookup_b_phys, lookup_c_phys;
+    wire [5:0]  lookup_d_phys, lookup_e_phys, lookup_f_phys;
+    wire        bank_empty_0, bank_empty_1, bank_empty_2, bank_empty_3;
+    wire        bank_low_even, bank_low_odd;
 //★ 2026-11-04 精确冲刷：rat 回滚值 + 幸存在飞项掩码（都由 rob 当拍算好）
     wire [31:0]  squash_arch_hit;
     wire [191:0] squash_arch_phys;
     wire [31:0]  squash_survive_hit;
     wire         redirect_stop_alloc;
-    wire         redirect_restore;
 //★ 2026-11-04 精确冲刷：按槽的击杀掩码。当拍版给 lsu/mdu（它们与冲刷同拍杀），
 //  寄存版给 isq（它晚一拍杀）。
 //---- PRF 读口 ----
@@ -282,6 +281,12 @@ module cpu_top #(
     wire        generation_alu_early_0, generation_alu_early_1;
     wire [31:0] load_data_early_lsu;
     wire        load_write_enable_early_lsu, load_generation_early_lsu;
+//★ 2026-11-11：load_write_enable_lsu 原来声明在下面（这里先用）⇒ Vivado 报 8-6901。
+//  声明一律上移，和全文件一致。
+    wire        load_generation_lsu, load_write_enable_lsu, carriage_free_lsu;
+//★ 返回级这一笔 load 真的落进 PRF（= prf 的 write_ok_2）。站的 LOAD 前送与唤醒都用它，
+//  与 load_data_lsu 同一级；早写口（s2）只留给 PRF 自己，不再参与唤醒/旁路。
+    wire        load_write_return = load_write_enable_lsu & prf_ld_live_wb & (|prf_ld_phys_wb);
     wire [4:0]  load_index_early_lsu;
     wire [4:0]  index_alu_0, index_alu_1;
     wire        generation_alu_0, generation_alu_1, write_enable_alu_0, write_enable_alu_1;
@@ -301,7 +306,6 @@ module cpu_top #(
 
     wire [31:0] load_data_lsu;
     wire [4:0]  load_index_lsu;
-    wire        load_generation_lsu, load_write_enable_lsu, carriage_free_lsu;
     wire        store_done_lsu; wire [4:0] store_index_lsu; wire store_generation_lsu;
 
 // 两条 mdu 的结果口在 isq 侧只有一条（早唤醒用；rob 侧两条都有）
@@ -350,7 +354,7 @@ module cpu_top #(
 
     wire        rob_redir_front;
     wire [31:0] rob_redir_pc;
-    wire        rob_full, rob_empty, trap_fire;
+    wire        rob_full, rob_empty;
 //保留站空位：isq → idu 的分配门（每条 lane 各自一条）
     wire        station_room_0_valid, station_room_1_valid;
     wire [31:0] above, head_one_hot_registered;
@@ -358,23 +362,17 @@ module cpu_top #(
     wire [4:0]  occupancy_rob;
     wire        rob_room_2 = (occupancy_rob <= (ROB_DEPTH - 3));
     wire [3:0]  trap_cause;
-    wire [31:0] trap_pc, trap_trap_value;
+    wire [31:0] trap_pc, trap_value;
 
 //==============================================================================
 // cont / csr
 //==============================================================================
     wire [4:0]  flush_index;
-//冲刷记录的寄存版（cont 出口打一拍）：ROB / idu / isq 吃这一版，pc / flag_bus / bju / lsu / mdu
-//仍吃当拍版 —— 前三个是"当拍必须改向/必须停手"，bju 的 keep_judge 判的就是冲刷这一拍，
-//lsu 的丢弃必须比 ROB 更早（宁严勿松）。
     wire [3:0]  exception_cause;
     wire [31:0] exception_pc, exception_trap_value;
     wire [4:0]  exception_index;
-    wire        redir_go;
     wire        mret_valid;
-    wire [31:0] redir_target;
     wire [31:0] isr_addr2, mcause, iret_addr2, csr_data_combinational;
-    wire        exception_interrupt_action, exception_interrupt_processing, exception_interrupt;
     wire [4:0]  exception_ldst_index_lsu;
     wire [31:0] exception_ldst_address_lsu, exception_ldst_pc_lsu;
     wire        exception_ldst_misalign_lsu, exception_ldst_store_lsu;
@@ -487,11 +485,11 @@ module cpu_top #(
         fetch_bpred      = (train_sel == 2'd0) ? train_buf_bpred :
                            (train_sel == 2'd1) ? branch_prediction_taken_registered_0
                                                : branch_prediction_taken_registered_1;
-//★ mret 的落点直接取 csr 的 mepc 锁存器，不经 ROB：mepc 是架构状态、不是指令自带的立即数，
-//  让 ROB 把它搬进 kill_redirect_target 只是多一级寄存器、还错相位。
-//  相位正好：mret 在队头那一拍 mret_now=1，事件（mret_valid/redirect_*）在下一拍出；
-//  而 `csrw mepc`（更老、头门控）的写也在那一沿落盘 ⇒ 这里采到的就是新值。
-        fetch_jump_target     = mret_valid ? iret_addr2 : rob_redir_pc;   // S3：改向落点来自 ROB 队头那一项
+//★ 落点按 redir_cause 选（A 域那一拍，三根 rob 信号同拍）：
+//  分支 = 随项存的落点（rob_redir_pc）；mret = csr 的 mepc；陷阱 = csr 的 mtvec。
+//  mret 的 mepc 直接从 csr 取：让 ROB 把它搬进 kill_redirect_target 只是多一级寄存器、还错相位。
+        fetch_jump_target     = (redir_cause == 2'd2) ? iret_addr2 :
+                                (redir_cause == 2'd1) ? isr_addr2  : rob_redir_pc;
 //训练载荷同一条指令的年龄选择：必须在同一拍整体走一侧，不能一个吃 lane0、一个吃 lane1
 //★★ 2026-10-29：训练包的选法与"前端回报包"分开。回报包按 branch_event（success/br_fail/jalr_fail/
 //   异常）选，训练包按【谁真的带训练载荷】选（bju_kind != 0）。
@@ -531,23 +529,17 @@ module cpu_top #(
 
     pc u_pc (
         .clk(clk), .rst(rst),
-//★ pc 只吃：一根 adv + 两根改向量 + R0 的两个状态位。
-//  不再自己解 flag_bus，也不再合成第二份"走不走"（全核只有 icache 的 adv 一份）。
-        .advance(advance_icache),
-        .redir_frontend(redir_frontend), .exc_kill(exc_kill),
-        .r0_valid(r0_valid_icache), .r0_wrong_path(r0_wrong_path_icache),
+//★ pc 只吃：两根背压 + 两根改向量 + R0 的两个状态位。
+//  不再自己解冲刷/停顿位，也不吃 icache 合成的 advance。
+        .icache_miss(icache_miss_icache), .fifo_full(full_iffu), .busy(busy_icache),
+        .redir_frontend(redir_frontend),
         .btb_take_0(btb_take_0), .btb_target_0(btb_target_0),
         .btb_take_1(btb_take_1), .btb_target_1(btb_target_1),
-        .btb_take_2(btb_take_2), .btb_target_2(btb_target_2),
-        .btb_take_3(btb_take_3), .btb_target_3(btb_target_3),
         .jump_target(fetch_jump_target),
-        .redirect_go(redir_go),
-        .redir_target(redir_target),
+        .irq_kill(irq_kill), .irq_target(isr_addr2),
         .pc_address_0(pc_address_0),
         .pc_block_0(pc_block_0), .pc_block_1(pc_block_1),
-        .pc_block_2(pc_block_2), .pc_block_3(pc_block_3),
-        .pc_offset(pc_offset),
-        .pc_take0(pc_take0), .pc_take1(pc_take1), .pc_take2(pc_take2), .pc_take3(pc_take3)
+        .pc_offset(pc_offset)
     );
 
 //==============================================================================
@@ -555,7 +547,7 @@ module cpu_top #(
 //==============================================================================
     bpu #(.BHT_B(BHT_B), .BTB_B(BTB_B)) u_bpu (
         .clk(clk), .rst(rst),
-        .advance(advance_icache),
+        .redir_frontend(redir_frontend), .irq_kill(irq_kill), .icache_miss(icache_miss_icache), .fifo_full(full_iffu), .busy(busy_icache),
 //学习源只有 bju 一家：它同时知道"这是哪种跳转""它自己去哪""它自己的地址"
         .branch_unit_kind(fetch_kind), .branch_unit_taken(fetch_taken),
         .branch_unit_pc(fetch_pc), .bju_tgt(fetch_target),
@@ -563,13 +555,10 @@ module cpu_top #(
 //训练门不再看 ROB 的在册改向（见 bpu.v 文件头 ③）
 //读口：pc 的两个取指地址（addr0 优先级 > addr1，仲裁在 bpu 内做完）
         .pc_addr_0(pc_block_0), .pc_addr_1(pc_block_1),
-        .pc_addr_2(pc_block_2), .pc_addr_3(pc_block_3),
         .fetch_offset(pc_offset),
 //给 pc：落点
         .btb_take_0(btb_take_0), .btb_take_1(btb_take_1),
-        .btb_take_2(btb_take_2), .btb_take_3(btb_take_3),
         .btb_target_0(btb_target_0),   .btb_target_1(btb_target_1),
-        .btb_target_2(btb_target_2),   .btb_target_3(btb_target_3),
         .branch_stage2(br2), .branch_stage3(br3)
     );
 
@@ -579,30 +568,22 @@ module cpu_top #(
     icache #(.IC_INDEX_B(IC_INDEX_B)) u_icache (
         .clk(clk), .rst(rst),
         .pc_address_0(pc_address_0),
-        .exception_interrupt(exception_interrupt),
-        .redir_frontend(redir_frontend), .exc_kill(exc_kill), .irq_kill(irq_kill), .stall_icache_miss_in(busy_icache),
+        .redir_frontend(redir_frontend), .irq_kill(irq_kill),
         .mem_valid(mem_valid_icache), .mem_data(mem_data_icache),
-        .redirect_go(flush_pc_redir),
         .fifo_full(full_iffu),
         .instruction_0(instruction_0_icache), .instruction_1(instruction_1_icache),
-        .instruction_2(instruction_2_icache), .instruction_3(instruction_3_icache),
         .instruction_address_0(instruction_addr0_icache), .instruction_address_1(instruction_addr1_icache),
-        .instruction_address_2(instruction_addr2_icache), .instruction_address_3(instruction_addr3_icache),
 //★ 预测随地址进 icache、随指令出 icache（就是这一对指令的延长位，不是另打一拍的旁路）
-        .pc_take_0(pc_take0), .pc_take_1(pc_take1), .pc_take_2(pc_take2), .pc_take_3(pc_take3),
+        .btb_take_0(btb_take_0), .btb_take_1(btb_take_1),
         .btb_target_0(btb_target_0), .btb_target_1(btb_target_1),
-        .btb_target_2(btb_target_2), .btb_target_3(btb_target_3),
+
         .prediction_taken_0(dpred0_icache), .prediction_taken_1(dpred1_icache),
-        .prediction_taken_2(dpred2_icache), .prediction_taken_3(dpred3_icache),
         .prediction_jump_target_0(djpred0_icache), .prediction_jump_target_1(djpred1_icache),
-        .prediction_jump_target_2(djpred2_icache), .prediction_jump_target_3(djpred3_icache),
         .instruction_valid_0(instruction_valid0_icache), .instruction_valid_1(instruction_valid1_icache),
-        .instruction_valid_2(instruction_valid2_icache), .instruction_valid_3(instruction_valid3_icache),
         .block_offset(block_offset_icache),
         .busy(busy_icache),
         .icache_miss(icache_miss_icache),
-        .advance(advance_icache),
-        .r0_valid(r0_valid_icache), .r0_wrong_path(r0_wrong_path_icache), .deliver_wrong_path(deliver_wrong_path_icache),
+        .deliver_wrong_path(deliver_wrong_path_icache),
         .mem_req(mem_req_icache), .mem_write_enable(mem_write_enable_icache),
         .mem_address(mem_address_icache), .mem_write_data(mem_wdata_icache), .mem_byte_enable(mem_byte_enable_icache)
     );
@@ -620,8 +601,6 @@ module cpu_top #(
     always @(*) begin
         current_address_0 = instruction_addr0_icache;
         current_address_1 = instruction_addr1_icache;
-        current_address_2 = instruction_addr2_icache;
-        current_address_3 = instruction_addr3_icache;
     end
 
 //==============================================================================
@@ -629,33 +608,26 @@ module cpu_top #(
 //==============================================================================
     iffu #(.DEPTH(IFFU_DEPTH)) u_iffu (
         .clk(clk), .rst(rst),
-        .redir_frontend(redir_frontend), .exc_kill(exc_kill), .irq_kill(irq_kill), .exec_in(1'b1),
-        .redirect_go(flush_pc_redir),
+        .redir_frontend(redir_frontend), .irq_kill(irq_kill), .exec_in(1'b1),
         .instruction_0(instruction_0_icache), .instruction_1(instruction_1_icache),
-        .instruction_2(instruction_2_icache), .instruction_3(instruction_3_icache),
         .inst_valid_0(instruction_valid0_icache), .inst_valid_1(instruction_valid1_icache),
-        .inst_valid_2(instruction_valid2_icache), .inst_valid_3(instruction_valid3_icache),
         .block_offset(block_offset_icache),
+        .slot_replay(deliver_wrong_path_icache),
 //★ 必须和 push_br_pred_0 用同一个值：队满被按住的那几拍 pc_take0 是 0（那拍没有改向动作），
 //  但那条分支【当时】确实跳了 —— 用现采的值会让 lane1（错路那条）被放进来（实测 +400 条/千轮）。
 //  pr_l* 就是"随这一对指令走的那一份"，按住时它跟着一起按住。
 //块内截断现在由 iffu 自己按 push_branch_prediction_* 算，不再需要单独一根 lane0_take。
 //★ 错路作废：icache 交付组里的 dwp 直接给 —— 它与指令同一个寄存器、同一个门，天然带地址。
 //  顶层那套 pair_drop + pair_waddr（另建寄存器 + 地址判据）整段删掉了。
-        .slot_replay(deliver_wrong_path_icache),
 //★ 队列里存的地址是**"指令自己地址 + 4"**（全核 aux_addr 口径：jal/link/异常 pc 都靠它，
 //  分支立即数在 idu 里已经预减过 4）。icache 交付的是指令自己的地址 ⇒ 进队前在这里 +4。
         .push_address_0(current_address_0 + 32'd4), .push_address_1(current_address_1 + 32'd4),
-        .push_address_2(current_address_2 + 32'd4), .push_address_3(current_address_3 + 32'd4),
 //★ 随指令记进队列的"预测跳"必须就是 pc 这一拍【实际照做】的那一个。
 //  两份预测不一致的后果：表里没条目时 pc 顺下去、指令却被标成"预测跳"，真跳过时
 //  br2 判"预测对了" ⇒ 永不改向 ⇒ 整核一路顺序跑（实测：3000 拍里一次改向都没有）。
         .push_branch_prediction_0(dpred0_icache), .push_branch_prediction_1(dpred1_icache),
-        .push_branch_prediction_2(dpred2_icache), .push_branch_prediction_3(dpred3_icache),
         .push_jump_link_register_prediction_0(djpred0_icache),
         .push_jump_link_register_prediction_1(djpred1_icache),
-        .push_jump_link_register_prediction_2(djpred2_icache),
-        .push_jump_link_register_prediction_3(djpred3_icache),
         .advance(advance_idu),
         .half0_instruction(h0_instruction), .half0_address(h0_address), .half0_jump_link_register_prediction(h0_jump_link_register_prediction),
         .half0_branch_prediction(h0_branch_prediction),
@@ -670,20 +642,20 @@ module cpu_top #(
 //==============================================================================
 // 译码级
 //==============================================================================
-    idu #(.LANES(LANES)) u_idu (
+    rename u_rename (
         .clk(clk), .rst(rst),
-        .redir_frontend(redir_frontend), .redir_backend_0(redir_backend_0), .exc_kill(exc_kill), .irq_kill(irq_kill),
+        .redir_frontend(redir_frontend), .redir_backend_0(redir_backend_0), .irq_kill(irq_kill),
         .exec_in(1'b1), .stall_rob_full_in(rob_full),
-        .flush_pend(redir_backend_1),
-//★ 精确冲刷的击杀掩码：idu 的清零吃【d2】那一版。flush_pending 是 flush_control_rob 再打一拍
-//  （T+2），而 d1 只在 T+1 有效 —— 接错相位会拿到"没改向时"的全亮默认值，等于又变回整窗清空。
+        .redir_backend_1(redir_backend_1),
+//★ idu 访存 FIFO 的清零吃 redir_backend_1（B 域再打一拍，相对 A 是 T+2）。
+//  d1 只在 T+1 有效 —— 接错相位会拿到"没改向时"的全亮默认值，等于又变回整窗清空。
 //冲刷的年龄边界：输出级里挂着的那条比冲刷点老时不许清（见 idu 里 keep_* 的注释）
 //本树没有保留站：弹出量由发射级的 issue_pop 计（credit 走 acc_in）
         .store_pop({1'b0, issue_pop_0} + {1'b0, issue_pop_1}),
         .store_flush_pop(4'd0),
-        .credit_stall_out(credit_stall_idu),
+        .credit_stall_out(),
         .advance(advance_idu),
-        .lane0_load_o(lane0_load),
+        .lane0_load_o(),
 
         .instruction_in_0(h0_instruction), .address_in_0(h0_address), .instruction_valid_0(h0_valid),
         .branch_prediction_in_0(h0_branch_prediction), .jump_link_register_prediction_in_0(h0_jump_link_register_prediction),
@@ -692,11 +664,11 @@ module cpu_top #(
         .ready1_in_0(1'b1), .ready2_in_0(1'b1),
         .accept_in_0(accept_0),
         .station_room_0_valid(station_room_0_valid),
-        .lane_valid_0(lane_valid_0),
-        .instruction_out_0(instruction_out_0), .auxiliary_address_out_0(auxiliary_address_out_0),
-        .branch_prediction_taken_out_0(branch_prediction_taken_out_0),
-        .source_a_out_0(rs1_idu_0), .source_b_out_0(rs2_idu_0),
-        .index_out_0(index_out_0), .generation_out_0(generation_out_0),
+        .lane_valid_0(),
+        .instruction_out_0(), .auxiliary_address_out_0(),
+        .branch_prediction_taken_out_0(),
+        .source_a_out_0(), .source_b_out_0(),
+        .index_out_0(), .generation_out_0(),
         .payload_valid_out_0(),
         .alloc_en_0(alloc_enable_0), .alloc_we_0(alloc_write_enable_0),
         .alloc_jmp_0(alloc_jmp_0), .alloc_pend_0(alloc_pending_0),
@@ -704,17 +676,17 @@ module cpu_top #(
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
         .alloc_rd_0(alloc_destination_register_0),
         .alloc_csr_0(alloc_csr_0),
-        .alloc_phys_0(alloc_phys_0),
-        .dec_class_0(decoded_class_0), .dec_we_0(decoded_write_enable_0), .dec_rd_0(decoded_destination_register_0),
-        .dec_is_st_0(decoded_is_store_0), .dec_mulop_0(decoded_mulop_0), .dec_lsf3_0(decoded_load_store_function3_0),
-        .dec_func4_0(decoded_func4_0), .dec_csrf3_0(decoded_csr_function3_0),
-        .dec_csrw_en_0(decoded_csr_write_enable_0),
-        .dec_csrw_wr_0(decoded_csr_write_write_0), .dec_csra_0(decoded_csr_address_0),
-        .dec_jval_0(decoded_jump_value_0), .dec_brf_0(decoded_branch_flag_0),
-        .dec_jalf_0(decoded_jump_link_flag_0), .dec_jalfr_0(decoded_jump_link_register_flag_0),
-        .dec_bjuf4_0(decoded_bjuf4_0),
-        .dec_r1_imm_0(decoded_r1_immediate_0), .dec_r2_imm_0(decoded_r2_immediate_0),
-        .dec_r1_immv_0(decoded_r1_immediate_value_0), .dec_r2_immv_0(decoded_r2_immediate_value_0),
+        .alloc_phys_0(alloc_phys_0), .alloc_pc_1(alloc_pc_1),
+        .dec_class_0(), .dec_we_0(), .dec_rd_0(),
+        .dec_is_st_0(), .dec_mulop_0(), .dec_lsf3_0(),
+        .dec_func4_0(), .dec_csrf3_0(),
+        .dec_csrw_en_0(),
+        .dec_csrw_wr_0(), .dec_csra_0(),
+        .dec_jval_0(), .dec_brf_0(),
+        .dec_jalf_0(), .dec_jalfr_0(),
+        .dec_bjuf4_0(),
+        .dec_r1_imm_0(), .dec_r2_imm_0(),
+        .dec_r1_immv_0(), .dec_r2_immv_0(),
 
         .instruction_in_1(h1_instruction), .address_in_1(h1_address), .instruction_valid_1(h1_valid),
         .branch_prediction_in_1(h1_branch_prediction), .jump_link_register_prediction_in_1(h1_jump_link_register_prediction),
@@ -725,11 +697,11 @@ module cpu_top #(
         .ready1_in_1(1'b1), .ready2_in_1(1'b1),
         .accept_in_1(accept_1),
         .station_room_1_valid(station_room_1_valid),
-        .lane_valid_1(lane_valid_1),
-        .instruction_out_1(instruction_out_1), .auxiliary_address_out_1(auxiliary_address_out_1),
-        .branch_prediction_taken_out_1(branch_prediction_taken_out_1),
-        .source_a_out_1(rs1_idu_1), .source_b_out_1(rs2_idu_1),
-        .index_out_1(index_out_1), .generation_out_1(generation_out_1),
+        .lane_valid_1(),
+        .instruction_out_1(), .auxiliary_address_out_1(),
+        .branch_prediction_taken_out_1(),
+        .source_a_out_1(), .source_b_out_1(),
+        .index_out_1(), .generation_out_1(),
         .payload_valid_out_1(),
         .alloc_en_1(alloc_enable_1), .alloc_we_1(alloc_write_enable_1),
         .alloc_jmp_1(alloc_jmp_1), .alloc_pend_1(alloc_pending_1),
@@ -746,30 +718,141 @@ module cpu_top #(
         .alloc_csr_2(alloc_csr_2),
         .alloc_phys_2(alloc_phys_2),
         .alloc_owner_0(alloc_owner_0), .alloc_owner_1(alloc_owner_1), .alloc_owner_2(alloc_owner_2),
-        .dec_class_1(decoded_class_1), .dec_we_1(decoded_write_enable_1), .dec_rd_1(decoded_destination_register_1),
-        .dec_is_st_1(decoded_is_store_1), .dec_mulop_1(decoded_mulop_1), .dec_lsf3_1(decoded_load_store_function3_1),
-        .dec_func4_1(decoded_func4_1), .dec_csrf3_1(decoded_csr_function3_1),
-        .dec_csrw_en_1(decoded_csr_write_enable_1),
-        .dec_csrw_wr_1(decoded_csr_write_write_1), .dec_csra_1(decoded_csr_address_1),
-        .dec_jval_1(decoded_jump_value_1), .dec_brf_1(decoded_branch_flag_1),
-        .dec_jalf_1(decoded_jump_link_flag_1), .dec_jalfr_1(decoded_jump_link_register_flag_1),
-        .dec_bjuf4_1(decoded_bjuf4_1),
-        .dec_r1_imm_1(decoded_r1_immediate_1), .dec_r2_imm_1(decoded_r2_immediate_1),
-        .dec_r1_immv_1(decoded_r1_immediate_value_1), .dec_r2_immv_1(decoded_r2_immediate_value_1),
+        .dec_class_1(), .dec_we_1(), .dec_rd_1(),
+        .dec_is_st_1(), .dec_mulop_1(), .dec_lsf3_1(),
+        .dec_func4_1(), .dec_csrf3_1(),
+        .dec_csrw_en_1(),
+        .dec_csrw_wr_1(), .dec_csra_1(),
+        .dec_jval_1(), .dec_brf_1(),
+        .dec_jalf_1(), .dec_jalfr_1(),
+        .dec_bjuf4_1(),
+        .dec_r1_imm_1(), .dec_r2_imm_1(),
+        .dec_r1_immv_1(), .dec_r2_immv_1(),
         .lsu_pop_in(lsu_pop_isq),
-        .payload_fresh_out_0(payload_fresh_0), .payload_fresh_out_1(payload_fresh_1),
+        .dsq_room(dsq_room),
+        .push0_valid(push0_valid), .push0_data(push0_data),
+        .push1_valid(push1_valid), .push1_data(push1_data),
+        .push2_valid(push2_valid), .push2_data(push2_data),
+        .payload_fresh_out_0(), .payload_fresh_out_1(),
         .write_enable_a_in(commit_we0), .write_enable_b_in(commit_we1),
         .commit_rd0_in(commit_rd0), .commit_rd1_in(commit_rd1),
         .commit_phys0_in(commit_phys0), .commit_phys1_in(commit_phys1),
         .squash_arch_hit_in(squash_arch_hit), .squash_arch_phys_in(squash_arch_phys),
         .squash_survive_hit_in(squash_survive_hit), .alloc_stop_in(redirect_stop_alloc),
-        .restore_in(redirect_restore),
         .rob_full_in(rob_full), .rob_room_2_in(rob_room_2),
-        .phys_a_out_0(phys_a_out_0), .phys_b_out_0(phys_b_out_0),
-        .phys_a_out_1(phys_a_out_1), .phys_b_out_1(phys_b_out_1),
-        .phys_d_out_0(phys_d_out_0), .phys_d_out_1(phys_d_out_1),
-        .alloc_onehot_0(alloc_onehot), .arch_next_onehot_0(arch_next_onehot),
-        .lsu_instruction_out(lsu_instruction_idu),
+        .phys_a_out_0(), .phys_b_out_0(),
+        .phys_a_out_1(), .phys_b_out_1(),
+        .phys_d_out_0(), .phys_d_out_1(),
+        .alloc_onehot_0(), .arch_next_onehot_0(),
+        .lsu_instruction_out(),
+        .lsu_auxiliary_address_out(),
+        .lsu_immediate_out(),
+        .lsu_source_a_out(), .lsu_source_b_out(),
+        .lsu_destination_register_out(),
+        .lsu_load_store_function3_out(),
+        .lsu_is_store_out(),
+        .lsu_write_enable_out(),
+        .lsu_index_out(),
+        .lsu_generation_out(),
+        .lsu_valid_out(),
+        .lsu_phys_a_out(), .lsu_phys_b_out(),
+        .lsu_phys_d_out(),
+//---- 与 rename 的口（rename 在本层例化，位置是 iffu 出队寄存器与 idu 的 S 级寄存器之间）----
+
+
+
+
+
+
+
+
+
+
+
+
+
+        .phys_rd_0(phys_rd_0), .phys_rd_1(phys_rd_1),
+        .phys_rd_2(phys_rd_2), .phys_rd_3(phys_rd_3),
+        .lookup_a_phys(lookup_a_phys), .lookup_b_phys(lookup_b_phys),
+        .lookup_c_phys(lookup_c_phys), .lookup_d_phys(lookup_d_phys),
+        .lookup_e_phys(lookup_e_phys), .lookup_f_phys(lookup_f_phys),
+        .bank_empty_0(bank_empty_0), .bank_empty_1(bank_empty_1),
+        .bank_empty_2(bank_empty_2), .bank_empty_3(bank_empty_3),
+        .bank_low_even(bank_low_even), .bank_low_odd(bank_low_odd),
+        .alloc_onehot(alloc_onehot), .arch_next_onehot(arch_next_onehot)
+    );
+
+//==============================================================================
+// 发射级
+//==============================================================================
+//==============================================================================
+// 分配队列 dsq：rename（译码+改名+分配） → 队列 → idu（分 lane + 推站）
+//   入口条目身份已定死（物理号 / ROB 槽 / 类别），出口按类取最老。
+//   iffu 的背压只看 dsq 的剩余空间，分配结论不再穿回前端。
+//==============================================================================
+    wire [1:0]  dsq_room;
+    wire        push0_valid, push1_valid, push2_valid;
+    wire [132:0] push0_data, push1_data, push2_data;
+    wire        dq0_valid, dq1_valid, dqm_valid;
+    wire [132:0] dq0_data, dq1_data, dqm_data;
+    wire        dq0_pop, dq1_pop, dqm_pop;
+
+    dsq #(.PW(133)) u_dsq (
+        .clk(clk), .rst(rst), .flush(irq_kill | redir_backend_0),
+        .push0_valid(push0_valid), .push0_data(push0_data),
+        .push1_valid(push1_valid), .push1_data(push1_data),
+        .push2_valid(push2_valid), .push2_data(push2_data),
+        .room(dsq_room),
+        .lane0_valid(dq0_valid), .lane0_data(dq0_data), .lane0_pop(dq0_pop),
+        .lane1_valid(dq1_valid), .lane1_data(dq1_data), .lane1_pop(dq1_pop),
+        .mem_valid(dqm_valid),   .mem_data(dqm_data),   .mem_pop(dqm_pop)
+    );
+
+    idu u_idu (
+        .clk(clk), .rst(rst),
+        .redir_frontend(redir_frontend), .redir_backend_0(redir_backend_0),
+        .redir_backend_1(redir_backend_1), .irq_kill(irq_kill),
+        .exec_in(1'b1),
+        .store_pop({1'b0, issue_pop_0} + {1'b0, issue_pop_1}),
+        .store_flush_pop(4'd0),
+        .dq0_valid(dq0_valid), .dq0_data(dq0_data), .dq0_pop(dq0_pop),
+        .dq1_valid(dq1_valid), .dq1_data(dq1_data), .dq1_pop(dq1_pop),
+        .dqm_valid(dqm_valid), .dqm_data(dqm_data), .dqm_pop(dqm_pop),
+        .accept_in_0(accept_0), .accept_in_1(accept_1),
+        .lane_valid_0(lane_valid_0), .lane_valid_1(lane_valid_1),
+        .instruction_out_0(instruction_out_0), .auxiliary_address_out_0(auxiliary_address_out_0),
+        .branch_prediction_taken_out_0(branch_prediction_taken_out_0),
+        .source_a_out_0(rs1_idu_0), .source_b_out_0(rs2_idu_0),
+        .index_out_0(index_out_0), .generation_out_0(generation_out_0),
+        .phys_a_out_0(phys_a_out_0), .phys_b_out_0(phys_b_out_0), .phys_d_out_0(phys_d_out_0),
+        .payload_valid_out_0(), .payload_fresh_out_0(payload_fresh_0),
+        .dec_class_0(decoded_class_0), .dec_we_0(decoded_write_enable_0),
+        .dec_rd_0(decoded_destination_register_0), .dec_is_st_0(decoded_is_store_0),
+        .dec_mulop_0(decoded_mulop_0), .dec_lsf3_0(decoded_load_store_function3_0),
+        .dec_func4_0(decoded_func4_0), .dec_csrf3_0(decoded_csr_function3_0),
+        .dec_csrw_en_0(decoded_csr_write_enable_0), .dec_csrw_wr_0(decoded_csr_write_write_0),
+        .dec_csra_0(decoded_csr_address_0), .dec_jval_0(decoded_jump_value_0),
+        .dec_brf_0(decoded_branch_flag_0), .dec_jalf_0(decoded_jump_link_flag_0),
+        .dec_jalfr_0(decoded_jump_link_register_flag_0), .dec_bjuf4_0(decoded_bjuf4_0),
+        .dec_r1_imm_0(decoded_r1_immediate_0), .dec_r2_imm_0(decoded_r2_immediate_0),
+        .dec_r1_immv_0(decoded_r1_immediate_value_0), .dec_r2_immv_0(decoded_r2_immediate_value_0),
+        .instruction_out_1(instruction_out_1), .auxiliary_address_out_1(auxiliary_address_out_1),
+        .branch_prediction_taken_out_1(branch_prediction_taken_out_1),
+        .source_a_out_1(rs1_idu_1), .source_b_out_1(rs2_idu_1),
+        .index_out_1(index_out_1), .generation_out_1(generation_out_1),
+        .phys_a_out_1(phys_a_out_1), .phys_b_out_1(phys_b_out_1), .phys_d_out_1(phys_d_out_1),
+        .payload_valid_out_1(), .payload_fresh_out_1(payload_fresh_1),
+        .dec_class_1(decoded_class_1), .dec_we_1(decoded_write_enable_1),
+        .dec_rd_1(decoded_destination_register_1), .dec_is_st_1(decoded_is_store_1),
+        .dec_mulop_1(decoded_mulop_1), .dec_lsf3_1(decoded_load_store_function3_1),
+        .dec_func4_1(decoded_func4_1), .dec_csrf3_1(decoded_csr_function3_1),
+        .dec_csrw_en_1(decoded_csr_write_enable_1), .dec_csrw_wr_1(decoded_csr_write_write_1),
+        .dec_csra_1(decoded_csr_address_1), .dec_jval_1(decoded_jump_value_1),
+        .dec_brf_1(decoded_branch_flag_1), .dec_jalf_1(decoded_jump_link_flag_1),
+        .dec_jalfr_1(decoded_jump_link_register_flag_1), .dec_bjuf4_1(decoded_bjuf4_1),
+        .dec_r1_imm_1(decoded_r1_immediate_1), .dec_r2_imm_1(decoded_r2_immediate_1),
+        .dec_r1_immv_1(decoded_r1_immediate_value_1), .dec_r2_immv_1(decoded_r2_immediate_value_1),
+        .lsu_pop_in(lsu_pop_isq),
         .lsu_auxiliary_address_out(lsu_auxiliary_address_idu),
         .lsu_immediate_out(lsu_immediate_idu),
         .lsu_source_a_out(lsu_source_a_idu), .lsu_source_b_out(lsu_source_b_idu),
@@ -783,13 +866,9 @@ module cpu_top #(
         .lsu_phys_a_out(lsu_phys_a_idu), .lsu_phys_b_out(lsu_phys_b_idu),
         .lsu_phys_d_out(lsu_phys_d_idu)
     );
-
-//==============================================================================
-// 发射级
-//==============================================================================
     isq u_isq (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .exc_kill(exc_kill), .irq_kill(irq_kill),
+        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .irq_kill(irq_kill),
         
         .stage_advance(lane_valid_0), .stage_advance_lane1(lane_valid_1),
 
@@ -838,17 +917,19 @@ module cpu_top #(
 //结果口：只接 32 位数据 + 前送身份（按物理号）
         .data_alu_early(source_index_alu_early_0),
         .data_alu_lane1_early(source_index_alu_early_1),
-        .data_ld_early(load_data_early_lsu),
+        .data_ld_early(load_data_lsu),
 //旁路：只吃 ALU 自己那一组 + LOAD；mdu 的结果绝不进旁路网
         .write_enable_alu_early(write_enable_alu_early_0),       .phys_alu_early_0(phys_alu_early_0),
         .write_enable_alu_lane1_early(write_enable_alu_early_1), .phys_alu_early_1(phys_alu_early_1),
-        .write_enable_ld_early(load_write_enable_early_lsu),     .ld_phys_early(ld_phys_early),
+//★ 2026-11-11：LOAD 的前送/唤醒从【早写口 s2】搬到【返回级】。选通与数据必须同一级，
+//  所以这三根和下面的 load_write 一起换，不是只换数据。
+        .write_enable_ld_early(load_write_return),               .ld_phys_early(prf_ld_phys_wb),
 //唤醒：值表写口这一拍真的落笔（下一拍这个号一定读得到）
         .result_write_valid_0(prf_result_write_0), .result_write_phys_0(prf_wb_phys_0),
         .result_is_divide_0(result_is_divide_0), .result_is_divide_1(result_is_divide_1),
         .result_write_valid_1(prf_result_write_1), .result_write_phys_1(prf_wb_phys_1),
-        .load_write(prf_load_write),
-        .load_write_phys(prf_load_write_phys),
+        .load_write(load_write_return),
+        .load_write_phys(prf_ld_phys_wb),
 
 //D 级那一格两个源的物理号 + PRF 读口 / 就绪位
         .rs1_phys_in(phys_a_out_0),       .rs2_phys_in(phys_b_out_0),
@@ -865,7 +946,7 @@ module cpu_top #(
         .alloc_onehot_in(alloc_onehot),
 
 //---- 冲刷 / 陷阱 / 年龄基准 ----
-        .trap_fire_registered(trap_fire), .head_one_hot_registered(head_one_hot_registered),
+        .head_one_hot_registered(head_one_hot_registered),
         .csr_write_landing(csr_commit_write),
 //---- 单元就绪 / load 早唤醒 ----
         .lsu_full(~carriage_free_lsu),
@@ -959,7 +1040,7 @@ module cpu_top #(
 //==============================================================================
     exu u_exu_0 (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .exc_kill(exc_kill), .irq_kill(irq_kill), .flush_index_in(flush_index),
+        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .irq_kill(irq_kill), .flush_index_in(flush_index),
 
         .write_enable_in(write_enable_0), .jal_flag(jump_link_flag_0), .jalr_flag(jump_link_register_flag_0),
         .cs_wr_en(csr_write_enable_0),
@@ -1018,7 +1099,7 @@ module cpu_top #(
 
     exu u_exu_1 (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .exc_kill(exc_kill), .irq_kill(irq_kill), .flush_index_in(flush_index),
+        .redir_backend_0(redir_backend_0), .redir_backend_1(redir_backend_1), .irq_kill(irq_kill), .flush_index_in(flush_index),
 
         .write_enable_in(write_enable_1), .jal_flag(jump_link_flag_1), .jalr_flag(jump_link_register_flag_1),
         .cs_wr_en(csr_write_enable_1),
@@ -1080,8 +1161,8 @@ module cpu_top #(
 //==============================================================================
     lsu #(.ADDER_AT_D(ADDER_AT_D)) u_lsu (
         .clk(clk), .rst(rst),
-        .redir_backend_0(redir_backend_0), .exc_kill(exc_kill), .irq_kill(irq_kill), .exec_in(1'b1),
-//★ 总线被按住只在 LSU 内部生效（2026-10-31）：不再经 flag_bus[0] 去停整个前端。
+        .redir_backend_0(redir_backend_0), .irq_kill(irq_kill), .exec_in(1'b1),
+//★ 总线被按住只在 LSU 内部生效（2026-10-31）：不去停整个前端。
         .bus_hold_in(bus_hold_in),
         .payload_go(lsu_valid),
         .opcode(lsu_opcode), .function10(lsu_function10),
@@ -1140,7 +1221,7 @@ module cpu_top #(
         .allocation_csr_0(alloc_csr_0),
         .issue_csr_payload_0(csr_payload_0), .issue_csr_payload_1(csr_payload_1),
         .allocation_csr_1(alloc_csr_1),
-        .allocation_pc_0(h0_address), .allocation_pc_1(h1_address), .allocation_pc_2(h2_address),
+        .allocation_pc_0(h0_address), .allocation_pc_1(alloc_pc_1), .allocation_pc_2(h2_address),
         .allocation_en_2(alloc_enable_2), .allocation_rd_2(alloc_destination_register_2),
         .allocation_phys_2(alloc_phys_2), .allocation_we_2(alloc_write_enable_2),
         .allocation_jmp_2(alloc_jmp_2), .allocation_pend_2(alloc_pending_2),
@@ -1173,7 +1254,7 @@ module cpu_top #(
         .issue_enable_0(issue_valid_0), .issue_index_0(issue_index_0), .issue_generation_0(issue_generation_0),
         .issue_enable_1(issue_valid_1), .issue_index_1(issue_index_1), .issue_generation_1(issue_generation_1),
 
-        .interrupt_kill(irq_kill), .redir_backend_1(redir_backend_1),
+        .irq_kill(irq_kill), .redir_backend_1(redir_backend_1),
         
         .exc0_en(exc0_enable), .exc0_index(exc0_index), .exc0_cause(exc0_cause),
         .exc0_pc(exc0_pc), .exc0_tval(exc0_trap_value),
@@ -1188,7 +1269,6 @@ module cpu_top #(
         .commit_csr_valid(commit_csr_valid), .commit_csr_payload(commit_csr_payload),
         .squash_arch_hit(squash_arch_hit), .squash_arch_phys(squash_arch_phys),
         .squash_survive_hit(squash_survive_hit), .redirect_stop_alloc(redirect_stop_alloc),
-        .restore_valid(redirect_restore),
 //★ 真 PRF 的写口：物理号按槽查出来 + 存活判据
         .prf_wb_en_0(result_port_0_enable), .prf_wb_index_0(result_port_0_index), .prf_wb_generation_0(result_port_0_generation),
         .prf_wb_en_1(result_port_1_enable), .prf_wb_index_1(result_port_1_index), .prf_wb_generation_1(result_port_1_generation),
@@ -1207,8 +1287,8 @@ module cpu_top #(
         .head_pointer(head_pointer), .full(rob_full), .slot_above_head(above),
         .head_one_hot_registered(head_one_hot_registered), .retire_step(rob_ret_step),
         .empty(rob_empty), .occupancy(occupancy_rob),
-        .kill_trap(trap_fire), .kill_trap_cause(trap_cause),
-        .kill_trap_pc(trap_pc), .kill_trap_value(trap_trap_value)
+        .redir_cause(redir_cause), .trap_cause(trap_cause),
+        .trap_pc(trap_pc), .trap_value(trap_value)
     );
 
 //==============================================================================
@@ -1246,28 +1326,25 @@ module cpu_top #(
         .stall_bus_hold(bus_hold_in),
         .stall_rob_full(rob_full),
         .slot_above_head(above),
-        .rob_trap(trap_fire), .rob_ret_step(rob_ret_step), .rob_trap_cause(trap_cause),
-        .rob_trap_pc(trap_pc), .rob_trap_tval(trap_trap_value),
+        .redir_cause(redir_cause), .rob_ret_step(rob_ret_step), .trap_cause(trap_cause),
+        .trap_pc(trap_pc), .trap_value(trap_value),
         .flush_index(flush_index),
-        .jump_link(1'b0), .np_take(pc_take0 | pc_take1),
+        .jump_link(1'b0), .np_take(btb_take_0 | btb_take_1),
         .csr_address(csr_address_m),
         .csr_commit_valid(csr_commit_write), .csr_commit_address(csr_commit_address),
         .csr_commit_function3(csr_commit_function3), .csr_commit_source(csr_commit_source),
         .exti(exti), .timi(timer_interrupt), .softi(1'b0),
         .pc_address_in(head_pc_rob),
         .interrupt_service_address_2(isr_addr2), .mcause(mcause), .csr_data_combinational(csr_data_combinational),
-        .exception_interrupt_action(exception_interrupt_action), .exception_interrupt_processing(exception_interrupt_processing),
-        .exc_irq(exception_interrupt), .interrupt_return_address_2(iret_addr2),
-        .exc_kill(exc_kill), .irq_kill(irq_kill),
+        .interrupt_return_address_2(iret_addr2),
+        .irq_kill(irq_kill),
         .exc0_en(exc0_enable), .exc0_index(exc0_index), .exc0_cause(exc0_cause),
         .exc0_pc(exc0_pc), .exc0_tval(exc0_trap_value),
         .exc1_en(exc1_enable), .exc1_index(exc1_index), .exc1_cause(exc1_cause),
         .exc1_pc(exc1_pc), .exc1_tval(exc1_trap_value),
         .exception_selected_enable(excls_enable), .exception_selected_index(excls_index), .exception_selected_cause(excls_cause),
         .exception_selected_pc(excls_pc), .exception_selected_trap_value(excls_trap_value),
-        .mret_valid(mret_valid),
-        .redirect_go(redir_go), .redirect_target(redir_target),
-        .flush_pc_redirect(flush_pc_redir)
+        .mret_valid(mret_valid)
     );
 
 //==============================================================================

@@ -54,7 +54,6 @@ module isq(
 //★ 只接本模块真正用到的位。
     input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
     input        redir_backend_1,   // 同一笔的寄存版，晚一拍
-    input        exc_kill,           // 异常交付（rob 的 trap_fire）
     input        irq_kill,           // 中断受理（clint 自己判的）
 //前端：本 lane 的 D 有指令、且还没被收
     input        stage_advance,
@@ -160,7 +159,6 @@ module isq(
 
 //---- 冲刷 / 陷阱 ----
 
-    input        trap_fire_registered,
 // CSR 的写口在【提交拍】：上一拍的写正在这一拍落地，本拍放一条 CSR 出去会读到旧值。
     input        csr_write_landing,
 //★ CSR 的"必须在 ROB 队头才能发"这条纪律仍要看 ROB 头。它不进本地年龄系统。
@@ -330,6 +328,12 @@ module isq(
     reg  [RS_DEPTH-1:0]     pickable_0, pickable_1;
     reg  [RS_AW-1:0]        pe0_idx, pe1_idx;
     reg                     pe0_found, pe1_found;
+//---- 乘法静态唤醒的 2 拍移位寄存器（[0] 当拍发，[1] 下一拍）----
+    reg                     multiply_wake_valid_q_0 [0:1];
+    reg  [5:0]              multiply_wake_phys_q_0  [0:1];
+    reg                     multiply_wake_valid_q_1 [0:1];
+    reg  [5:0]              multiply_wake_phys_q_1  [0:1];
+    integer                 mw;
 //---- 出站寄存器 Q（每 lane 一个）：t0 选优落在这里，t1 直接发往执行级 ----
 //   ★ 只有一格。选优那一拍要判断它本拍末会不会空出来（q_room），空不出来就不推。
 //   ★ 出口这一拍重判四样：单元收不收、CSR 顺序、冲刷击杀、操作数取不取得到。
@@ -368,7 +372,7 @@ module isq(
     reg  [31:0]             operand_a_mem, operand_b_mem;
     reg                     mem_issue_valid, mem_load, mem_room;
 //---- 控制位 / 复位 ----
-    reg                     flush_control_exception, flush_control_interrupt, flush_window;
+    reg                     flush_window;
     reg                     reset_registered;
 //---- D 级"这条被冲刷杀着" ----
     reg                     dead_registered_0, dead_registered_1;
@@ -385,10 +389,7 @@ module isq(
 // 零、控制位 / 复位
 //==============================================================================
     always @(*) begin
-        flush_control_exception   = exc_kill;
-        flush_control_interrupt   = irq_kill;
-
-        flush_window         = flush_control_exception | flush_control_interrupt | redir_backend_0;
+        flush_window         = irq_kill | redir_backend_0;
     end
 
     always @(posedge clk) reset_registered <= rst;
@@ -810,17 +811,13 @@ module isq(
     assign alu_issue_1      = q_issue_1 & (q_data_1[RS_WE_LO    +: 1]) & ((q_data_1[RS_CLASS_LO +: 2]) != CLS_MUL)
                              & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
 
-    reg        multiply_wake_valid_q_0 [0:1];
-    reg [5:0]  multiply_wake_phys_q_0  [0:1];
-    reg        multiply_wake_valid_q_1 [0:1];
-    reg [5:0]  multiply_wake_phys_q_1  [0:1];
-    integer    mw;
-
+//★ 2026-11-11：这五个声明原来落在这里（第 452 行就开始用了）⇒ Vivado 报 8-6901
+//  "used before declaration"。全文件按"声明全部上移"的约定，声明一律放在上面那一块。
     wire multiply_issue_0 = q_issue_0 & ((q_data_0[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_0[RS_MULOP_LO + 2]) & ((q_data_0[RS_PHYSD_LO +: 6]) != 6'd0);
     wire multiply_issue_1 = q_issue_1 & ((q_data_1[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_1[RS_MULOP_LO + 2]) & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
 
     always @(posedge clk) begin
-        if (reset_registered | flush_window | (redir_backend_1 | trap_fire_registered)) begin
+        if (reset_registered | flush_window | redir_backend_1) begin
             for (mw = 0; mw < 2; mw = mw + 1) begin
                 multiply_wake_valid_q_0[mw] <= 1'b0;
                 multiply_wake_phys_q_0[mw]  <= 6'd0;
@@ -867,7 +864,7 @@ module isq(
         if (reset_registered) begin
             inflight_phys <= 64'd0;
         end
-        else if ((redir_backend_1 | trap_fire_registered)) begin
+        else if ((redir_backend_0 | redir_backend_1)) begin
             inflight_phys <= 64'd0;
         end
         else begin
@@ -962,7 +959,7 @@ module isq(
     end
 
     always @(posedge clk) begin
-        if (reset_registered | (redir_backend_1 | trap_fire_registered)) begin
+        if (reset_registered | (redir_backend_0 | redir_backend_1)) begin
             rs_valid_0 <= {RS_DEPTH{1'b0}};
             rs_valid_1 <= {RS_DEPTH{1'b0}};
             rs_count_0 <= 4'd0;
@@ -1008,7 +1005,7 @@ module isq(
             q_data_0  <= {RS_PAYLOAD_W{1'b0}};
             q_data_1  <= {RS_PAYLOAD_W{1'b0}};
         end
-        else if ((redir_backend_1 | trap_fire_registered)) begin
+        else if ((redir_backend_0 | redir_backend_1)) begin
             q_valid_0 <= 1'b0;
             q_valid_1 <= 1'b0;
         end
@@ -1116,8 +1113,8 @@ module isq(
                         load_forward_b_mem ? data_ld_early :
                         prf_data_b_mem;
         mem_room        = (mem_count_m != MEM_ST_DEPTH[2:0]);
-        mem_issue_valid = mem_sel_found & ~(redir_backend_1 | trap_fire_registered) & ~lsu_full;
-        mem_pop_out     = mem_valid_in & (mem_room | mem_issue_valid) & ~(redir_backend_1 | trap_fire_registered);
+        mem_issue_valid = mem_sel_found & ~(redir_backend_0 | redir_backend_1) & ~lsu_full;
+        mem_pop_out     = mem_valid_in & (mem_room | mem_issue_valid) & ~(redir_backend_0 | redir_backend_1);
         mem_load        = mem_pop_out & ~decode_dead_mem;
         mem_append_m    = mem_count_m - {2'd0, mem_issue_valid};
         for (i = 0; i < MEM_ST_DEPTH; i = i + 1)
@@ -1131,7 +1128,7 @@ module isq(
 //     直接搬 rdy[i+1] 会把正好撞在位移拍的唤醒丢掉（lane 站 seed 7 死在这里）。
 //==============================================================================
     always @(posedge clk) begin
-        if (reset_registered | (redir_backend_1 | trap_fire_registered)) begin
+        if (reset_registered | (redir_backend_0 | redir_backend_1)) begin
             mem_valid_m <= {MEM_ST_DEPTH{1'b0}};
             mem_count_m <= 3'd0;
         end
@@ -1192,7 +1189,7 @@ module isq(
             dead_registered_0 <= 1'b0;
             dead_registered_1 <= 1'b0;
         end
-        else if ((redir_backend_1 | trap_fire_registered)) begin
+        else if ((redir_backend_0 | redir_backend_1)) begin
             dead_registered_0 <= 1'b1;
             dead_registered_1 <= 1'b1;
         end

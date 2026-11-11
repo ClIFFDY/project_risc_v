@@ -5,13 +5,13 @@
 //
 // Create Date: 2026/08/27 19:04:53
 // Design Name:
-// Module Name: cont
+// Module Name: clint
 // Project Name:
 // Target Devices:
 // Tool Versions:
 // Description: 流水线控制与异常仲裁。
 //              ① 两条 lane 的 bju 事件按 ROB 年龄二选一（判定 / 解码级异常各一套）；
-//              ② 生成本拍的冲刷与停顿总线 flag_bus、ROB 冲刷边界 flush_index；
+//              ② 判中断受理（irq_kill）与 ROB 冲刷边界 flush_index；
 //              ③ 陷阱 / mret / 中断受理三种重定向的登记与落地；
 //              ④ 异常仲裁：谁报、报什么 cause、pc/tval 取哪一份（原 trap_unit 并进本模块）。
 //
@@ -46,18 +46,17 @@ module clint(
     input [4:0]  interrupt_head_index_in,
 //站里至少有一个有效项：中断的 mepc 与冲刷边界都取"站里最老有效项"，站空时它给不出地址
     input        interrupt_head_valid,
-//停顿源（按"顶层不运算"从 cpu_top 下放至此）：逐源各占 flag_bus 一位。
-//★ 保留站的"满"【不在本总线上】：它只喂前端三级（cpu_top 直连），见 idu 的端口说明。
-//本模块【不做任何或运算】—— 或/非一律下放到消费者模块内（见各家 stall_w/flush_window 的译码）。
+//★ 下面四个停顿源与 slot_above_head 目前【没有读者】（flag_bus 拆掉后留在端口上）：待删。
+//★ 保留站的"满"【不在本模块】：它只喂前端三级（cpu_top 直连），见 idu 的端口说明。
     input        stall_icache_miss, stall_bus_hold,
     input        stall_rob_full,
 //队空（重定向落地条件）
     input [31:0] slot_above_head,
-//异常交付口（ROB 的 trap_fire + 载荷）：透传给 csr，由它在【队头那一拍】锁 mepc/mcause/mtval
-    input        rob_trap,
+//异常交付口（ROB 队头交付陷阱那一拍 + 载荷）：透传给 csr，由它在【队头那一拍】锁 mepc/mcause/mtval
+    input [1:0]  redir_cause,          // 与 redir_backend_0 同拍：0=分支 1=陷阱 2=mret
     input [1:0]  rob_ret_step,
-    input [3:0]  rob_trap_cause,
-    input [31:0] rob_trap_pc, rob_trap_tval,
+    input [3:0]  trap_cause,
+    input [31:0] trap_pc, trap_value,
 //跳转判定与序号：np_take 是 pc 这一拍实际照做的落点（落点表命中），br2/br3 是判定延迟拍
     input        jump_link, np_take, br2, br3,
 //★ S3：改向判定现在由 ROB 在【提交口】给出（队头那条判错了的分支），边界就是队头。
@@ -75,26 +74,8 @@ module clint(
     input [31:0] pc_address_in,
     input        exti, timi, softi,
 //流水线状态（寄存输出）
-    output reg   irq_kill,          // 中断受理（本模块自己判的）
-//★ S5：前端域冲刷 {异常, 中断, 改PC}。只给 pc / icache / idu 的输入 lane。
-//  A（判定拍改向）只在这一份里；B（提交口清表）只在上面的 flag_bus 里。
-//  异常/中断两份都亮（它们本来就是 A+B 同拍）。mret 两份都亮（要改 PC，也要清表）。
-//★ 给【执行单元】的寄存版（v2）。当拍版仍然服务 pc 重定向与前端停手（那两条必须同拍），
-//  mdu/alu/lsu 这些"错了也无副作用、由 ROB 的世代校验兜底"的单元改吃这一版：
-//  它们的 D 引脚原来挂着「rob 的 trap_fire/head_ok → flag_bus → 单元作废」这条跨模块锥。
-//  晚一拍无害：作废晚一拍只是多迭代/多算一拍，结果报告会被 ROB 的 ent_v/世代挡掉。
-    output reg exc_kill,
+    output       irq_kill,          // 中断受理（受理判据打一拍再发）
     output reg [4:0] flush_index,
-//杀集【含边界那条自己】：只给中断用（边界 = 站里最老那条还没执行的指令，要在 mret 之后重跑）
-//★ 冲刷记录的【寄存版】：作废晚一拍做。
-//  为什么能晚：pc 改向、前端停手（flag_bus）仍然当拍；而 ROB 的作废、idu 的击杀、lsu 的丢弃
-//  都只是在"那条指令真的写回/提交之前"完成即可。实测冲刷之后前端连续 4 拍不往 D 送新指令
-//  （tb_reb：DNEW_AT +1..+4 全 0），这一拍本来就是空的。
-//  为什么必须晚：当拍那条链是 cont 仲裁(6 级) → rob 边界判定(6 级) → isq 击杀+操作数选择(11 级)，
-//  跨三个模块，实测 23 级 / 20.559ns / 84% 是布线。寄存一刀把三跳劈成"cont 一跳"和"rob→isq 一跳"。
-//  ★ 只有【ROB 侧】的消费者改吃这一版；flag_bus、pc、bju 的 keep_judge 必须继续吃当拍版
-//    （keep_judge 判的就是"冲刷这一拍我正在判的那条还算不算活着"，晚一拍就没有意义了）。
-//"上一拍刚冲刷过"：这 1 拍里 Q 里的错路指令可能够到发射，必须挡住（尤其错路 csrrw 会在发射拍锁存 CSR）
 //异常报告口 ×3：lane0 / lane1 / lsu。各带各的槽号，直接进 ROB 的三个标记口，本模块不做仲裁。
     output reg        exc0_en,
     output reg [4:0]  exc0_index,
@@ -111,18 +92,11 @@ module clint(
 // mret 搬到提交口：判定拍不再报标签（标签随分配从 idu 的译码位进 ROB），
 //  队头那一拍由 ROB 拉 mret_valid 回来。落点也不从这里出 —— pc 直接用 csr 的 mepc 锁存器。
     input             mret_valid,
-//重定向登记（原 pc.v 的 redirect_kind 状态机搬来）：陷阱 / mret / 中断受理三种，
-//都要等 ROB 排空之后才落地；分支/jalr 的错路不走这里（pc 直接用 jp_tgt）。
-    output reg        redirect_go,
-    output reg [31:0] redirect_target,
-//本拍 pc 落到重定向目标上（icache / iffu / bpu 的捕获窗口按它作废）
-    output reg        flush_pc_redirect,
 //判定延迟拍那一套（success/br_fail/jalr 落点/预测表索引/落点）该取哪条 lane：1 = `_1`
 //csr 的对外口（例化输出在本模块内对齐后送出）
     output reg [31:0] interrupt_service_address_2, mcause,
 //给 alu 的 csr 读值（组合、发那一拍）：站式后 csr 指令的发拍由站决定，提前一拍读不再可能
     output reg [31:0] csr_data_combinational,
-    output reg        exception_interrupt_action, exception_interrupt_processing, exc_irq,
     output reg [31:0] interrupt_return_address_2
     );
 
@@ -133,19 +107,14 @@ module clint(
     localparam CAUSE_STORE_MISALIGN = 4'd6;
     localparam CAUSE_BREAKPOINT     = 4'd3;
     localparam CAUSE_ECALL_M        = 4'd11;
+//改向原因（跟 rob 的 redir_cause 同一编码）
+    localparam [1:0] REDIR_CAUSE_TRAP = 2'd1;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg reset_registered;
 
-//流水线控制位：本模块只产自己那三条冲刷源与 exec；八条停顿源逐源过路进 flag_bus
-    reg exec, flush_control_jump;
-    reg flush_window;
-    reg redirect_pending;
-
-//重定向登记与异常窗口
-    reg [1:0] redirect_kind;
 //mret 的资格版：本拍有一条 mret 已经够资格。只在本模块内用（喂 csr 的 exc_irq_ret 闸门）。
     reg exception_interrupt_return_ok;
     // redirect_index 已删：它只服务"中断受理记录的撤销判据"，而那条判据 = older(flush_index, 记录时的队头)。
@@ -154,13 +123,13 @@ module clint(
     // exc_hold 已删
 
 //异常仲裁
-    reg flush_older, flush_older_decode, exception_gated, exception_decode, exception_load_store_decode, exception_load_store_select;
+    reg exception_gated, exception_decode, exception_load_store_decode, exception_load_store_select;
     reg load_store_older_decode;
 //（原来的 exception_pc_in_delayed 已删：访存非对齐的 pc 改由 lsu 与故障同拍锁存）
 
 //csr 例化的输出（对齐后送端口）
     reg [31:0] isr_addr2_i, mcause_judged, csr_data_combinational_judged;
-    reg exc_irq_act_i, exc_irq_processing_i;
+    reg exc_irq_act_i;
     reg [31:0] iret_addr2_i;
     
     wire exc_irq_ret_i;
@@ -172,25 +141,22 @@ module clint(
 //===============================================================
 // 控制位译码（本模块最前）
 //===============================================================
+//受理判据打一拍再发：irq_kill 是触发器输出（扇出 ~12），不是 csr/挂起/队头那条长锥。
+//  ★ 判据在 I 拍算、I+1 拍发；中间这条指令可以照常退休 ⇒ 中断边界往后挪一条（架构合法）。
+//  ★ 发的那一拍再和 redir_backend_0 排一次：B 改向那拍不许受理（否则 pc 去 mtvec、分支落的账没人认）。
+    reg irq_candidate;
+    always @(posedge clk) begin
+        if (reset_registered) irq_candidate <= 1'b0;
+        else if (irq_kill)    irq_candidate <= 1'b0;   // 这一拍就发了 → 撤
+        else                  irq_candidate <= exc_irq_act_i;
+    end
+    assign irq_kill = irq_candidate & ~redir_backend_0;
+
     always @(*) begin
-        irq_kill = exc_irq || exception_interrupt_action;
-        flush_control_jump  = redir_backend_0;   // S3：提交口改向（原 bju 判定拍）
         if (irq_kill)
             flush_index = interrupt_head_index_in;
         else
-// P4：改向边界是 ROB 自己的队头，由 ROB 内部解析（rob.flush_index_eff）。
-// cont 只报"异常/中断候选"；flush_index 的下游消费者（idu / isq / rob）
-// 只在 flush_inclusive=1（中断）时使用它，而中断永远不走改向这条路 ⇒ 改向这一档不必有值。
             flush_index = 4'd0;
-        if (reset_registered) begin
-            irq_kill  = 1'b0;
-            flush_control_jump = 1'b0;
-        end
-    end
-
-//流水线冲刷位（三条冲刷源的或）
-    always @(*) begin
-        flush_window = exc_kill | irq_kill | flush_control_jump;
     end
 
     always @(posedge clk) begin
@@ -198,29 +164,9 @@ module clint(
     end
 
 //===============================================================
-// 重定向登记（原 pc.v 的 redirect_kind 状态机搬来）
+// 中断落地：没有单独的一拍 —— irq_kill 那一拍 pc 就取 mtvec（本模块只出 irq_kill，
+//   mtvec 由 csr 直连 pc）。原来那个「登记 + 下一拍落地」的状态机已删。
 //===============================================================
-
-    always @(*) begin
-        redirect_pending     = (redirect_kind != 2'd0);
-        redirect_go       = redirect_pending & ~reset_registered;
-        redirect_target   = isr_addr2_i;   //只剩 1(陷阱) / 3(中断受理) 两档，落点都是 mtvec
-        flush_pc_redirect = redirect_go | (redir_frontend & ~exc_kill);
-    end
-
-    always @(posedge clk) begin
-        if (reset_registered) begin
-            redirect_kind <= 2'd0;
-        end
-        else if (redirect_go)
-            redirect_kind <= 2'd0;
-        else if (rob_trap)
-            redirect_kind <= 2'd1;
-        else if (exception_interrupt_action)
-            redirect_kind <= 2'd3;
-        else if (flush_pc_redirect && (redirect_kind != 2'd0) && redir_backend_0)
-            redirect_kind <= 2'd0;
-    end
 
 //===============================================================
 // 异常仲裁（原 trap_unit）
@@ -228,18 +174,10 @@ module clint(
 
     always @(*) begin
         exception_interrupt_return_ok = (exc_irq_ret_q_0 | exc_irq_ret_q_1)
-                       & ~(exc_tgt_mis_0 | exc_tgt_mis_1 | flush_control_jump
+                       & ~(exc_tgt_mis_0 | exc_tgt_mis_1 | redir_backend_0
                          | exc_ecall_q_0 | exc_ebreak_q_0 | exc_illegal_q_0
                          | exc_ecall_q_1 | exc_ebreak_q_1 | exc_illegal_q_1
                          | exception_load_store_misalign_in);
-    end
-
-    always @(*) begin
-        flush_older = flush_control_jump;
-    end
-
-    always @(*) begin
-        exc_kill = rob_trap;
     end
 
     always @(*) begin
@@ -247,7 +185,7 @@ module clint(
         exc1_pc  = bju_pc_in_1  - 32'd4;
         exception_selected_pc = exception_pc_in;
 
-        exc0_en    = (exc_tgt_mis_0 | exc_illegal_q_0 | exc_ebreak_q_0 | exc_ecall_q_0) & ~flush_older;
+        exc0_en    = (exc_tgt_mis_0 | exc_illegal_q_0 | exc_ebreak_q_0 | exc_ecall_q_0) & ~redir_backend_0;
         exc0_index   = bju_index_in_0;
         exc0_cause = exc_tgt_mis_0   ? CAUSE_MISALIGN_INST :
                      exc_illegal_q_0 ? CAUSE_ILLEGAL_INST  :
@@ -255,7 +193,7 @@ module clint(
         exc0_tval  = exc_tgt_mis_0  ? bju_tgt_in_0 :
                      exc_ebreak_q_0 ? exc0_pc : 32'd0;
 
-        exc1_en    = (exc_tgt_mis_1 | exc_illegal_q_1 | exc_ebreak_q_1 | exc_ecall_q_1) & ~flush_older;
+        exc1_en    = (exc_tgt_mis_1 | exc_illegal_q_1 | exc_ebreak_q_1 | exc_ecall_q_1) & ~redir_backend_0;
         exc1_index   = bju_index_in_1;
         exc1_cause = exc_tgt_mis_1   ? CAUSE_MISALIGN_INST :
                      exc_illegal_q_1 ? CAUSE_ILLEGAL_INST  :
@@ -263,7 +201,7 @@ module clint(
         exc1_tval  = exc_tgt_mis_1  ? bju_tgt_in_1 :
                      exc_ebreak_q_1 ? exc1_pc : 32'd0;
 
-        exception_selected_enable    = exception_load_store_misalign_in & ~flush_older;
+        exception_selected_enable    = exception_load_store_misalign_in & ~redir_backend_0;
         exception_selected_index   = exception_load_store_index_in;
         exception_selected_cause = exc_ldst_st_in ? CAUSE_STORE_MISALIGN : CAUSE_LOAD_MISALIGN;
         exception_selected_trap_value  = exception_load_store_address_in;
@@ -408,7 +346,7 @@ module clint(
 //★ 为什么不能在这里锁 mepc/mcause_judged/mtval：先报出来的异常未必是最老的异常 —— 更老的指令可能
 //  还在 lsu 队列里没报（lsu 入口才判非对齐，队列里的那条要到下一拍才报）。检测拍就锁，会锁成
 //  "年轻的那条"，而 ROB 是按老的那条交付的 ⇒ 两个侧面对不上。改为按 ROB 的交付口锁，才精确。
-            if (exc_kill) begin
+            if (redir_backend_0 && (redir_cause == REDIR_CAUSE_TRAP)) begin
                 exception_interrupt_enable_post_registered <= exception_interrupt_enable_registered;
                 exception_interrupt_enable_registered <= 1'b0;
                 exception_interrupt_process <= 1'b1;
@@ -417,7 +355,7 @@ module clint(
 //  mepc 取 pc_address_in - 4：cpu_top 把 pc_address_in 接的是 mid_decoder 的 aux_addr_2
 //  （那条指令"地址 + 4"），也就是【正要进发射级、还没被发出去】的那一条 = 中断返回点。
 //  旧写法是"取指 PC 减一个气泡计数"，ROB 之后前端在等 ROB 排空期间还在取指，那个计数已对不上。
-            else if (exc_irq_act_i && !exception_interrupt_process) begin
+            else if (irq_kill) begin
                 interrupt_return_address_1 <= pc_address_in - 32'd4;
                 iret_addr2_i <= pc_address_in - 32'd4;
                 if (exception_external_interrupt_enable && exception_external_interrupt_pending) begin
@@ -435,11 +373,11 @@ module clint(
             end
 //异常【交付】：ROB 的队头是那条故障指令（比它老的都退完了、比它年轻的已作废）⇒ 这一拍锁上下文。
 //  与上面两条不冲突：受理态（irq_process）一置起，中断那条就不可能再进来。
-            if (rob_trap) begin
-                interrupt_return_address_1 <= rob_trap_pc;
-                iret_addr2_i <= rob_trap_pc;
-                mcause_registered <= {28'd0, rob_trap_cause};
-                mtval_registered <= rob_trap_tval;
+            if (redir_backend_0 && (redir_cause == REDIR_CAUSE_TRAP)) begin
+                interrupt_return_address_1 <= trap_pc - 32'd4;
+                iret_addr2_i <= trap_pc - 32'd4;
+                mcause_registered <= {28'd0, trap_cause};
+                mtval_registered <= trap_value;
             end
 //isr返回（目前只支持机器模式）
             if (mret_valid) begin
@@ -473,7 +411,6 @@ module clint(
         if (reset_registered) begin
             exception_global_pending = 1'b0;
             exc_irq_act_i = 1'b0;
-            exc_irq_processing_i = 1'b0;
             mcause_judged = 32'd0;
             isr_addr2_i = 32'd0;
             exception_timer_interrupt_pending = 1'b0;
@@ -483,16 +420,15 @@ module clint(
             exception_timer_interrupt_pending = timi;
             exception_external_interrupt_pending = exti;
             exception_global_pending = (exception_external_interrupt_pending && exception_external_interrupt_enable) | (exception_timer_interrupt_pending && exception_timer_interrupt_enable) | (exception_software_interrupt_pending && exception_software_interrupt_enable);
-//★ 同拍只要有任何异常在交付路径上，中断一律让位：exc_kill 已经把
+//★ 同拍只要有任何异常在交付路径上，中断一律让位：redir_backend_0 已经把
 //  ecall/ebreak/illegal（经 bju 输入级）与访存非对齐（经 lsu 寄存拍）全含进来，
 //  所以不必在这里逐个列 —— 靠 else-if 优先级兜正确性是脆的。
 //★ S3：这里原本用 bju 的判定拍三根（jump_link_register_failure|br2|br3）表达"本拍有一次改向"——
 //  旧设计判定拍就是改向拍，成立；改向搬到提交拍后它们先到、改向后到 ⇒
 //  判定拍白挡一次中断，真正改向那一拍反倒没人挡（中断与分支改向可能同拍打架）。
-//  改成用【真正改向那一拍的事件】flush_control_in[0]（= 提交口改向）。
+//  改成用【真正改向那一拍的事件】redir_backend_0（= 提交口改向）。
             exc_irq_act_i = exception_interrupt_enable_registered && exception_global_pending && !exception_interrupt_process && !exception_interrupt_gate &&
-                          !(exc_irq_ret_i | redir_backend_0) && !exc_kill && interrupt_head_valid;
-            exc_irq_processing_i = exception_interrupt_process;
+                          !(exc_irq_ret_i | redir_backend_0) && interrupt_head_valid;
             mcause_judged = mcause_registered;
             isr_addr2_i = isr_addr_reg2;
         end
@@ -523,9 +459,6 @@ module clint(
         csr_data_combinational = csr_data_combinational_judged;
         interrupt_service_address_2 = isr_addr2_i;
         mcause = mcause_judged;
-        exception_interrupt_action = exc_irq_act_i;
-        exception_interrupt_processing = exc_irq_processing_i;
-        exc_irq = exc_irq_act_i;
         interrupt_return_address_2 = iret_addr2_i;
     end
 
@@ -539,17 +472,10 @@ module clint(
     always @(posedge clk) begin
         if (reset_registered)
             interrupt_request_timer <= 2'd0;
-        else if ((jump_link | np_take) && !flush_window)
+        else if ((jump_link | np_take) && !(irq_kill | redir_backend_0))
             interrupt_request_timer <= 2'd3;
         else if (interrupt_request_timer != 2'd0)
             interrupt_request_timer <= interrupt_request_timer - 2'd1;
-    end
-
-    always @(posedge clk) begin
-        if (reset_registered)
-            exec <= 1'b1;
-        else
-            exec <= exec;
     end
 
 endmodule
