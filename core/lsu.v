@@ -232,6 +232,11 @@ module lsu(
 //★ 2026-10-31：「发过没有」必须【跟着条目走】。原来是一个全局位，A 位的外设 load 出队后
 //  B 位那条挪上来，标志没清 ⇒ 新的队头被当成已发过 ⇒ 永远不发，而 blank_bus 又拿它把整核顶死。
     reg        store_queue_a_sent, store_queue_b_sent;
+//★ 2026-11-12：入队要按【年龄】定位（见下面 SQ 次态 "口1/口2 按年龄追加" 那段的说明）。
+//  年龄 = 与 ROB 队头的距离。两个候选项同减队头，比较就退化成比两个差值。
+    reg  [4:0] elsq_head_number;
+    wire [4:0] elsq_age_load_in  = stage1_index      - elsq_head_number;
+    wire [4:0] elsq_age_store_in = store_stage_index - elsq_head_number;
     reg [31:0] elsq_load_data;
 //★ ELSQ 外设 load 的返回口保持格：返回口一拍只送一笔，dcache 与 ELSQ 应答同拍时存这里。
     reg        elsq_return_hold;
@@ -682,6 +687,14 @@ module lsu(
     end
 
 //SQ 次态：先丢/排空，再入队（两笔同拍时排空腾出的位置给新来的）
+//★ 2026-11-12：ROB 队头 one-hot → 槽号。只用寄存器的 Q 端，不进发射级入口门。
+    always @(*) begin : blk_elsq_head_number
+        integer hb;
+        elsq_head_number = 5'd0;
+        for (hb = 0; hb < 32; hb = hb + 1)
+            if (head_one_hot_registered[hb]) elsq_head_number = hb[4:0];
+    end
+
     always @(*) begin
 //1) 先把本拍命中的退休脉冲锁进每一项的 rdy（必须在移位之前）
         next_a_valid = store_queue_a_valid; next_a_address = store_queue_a_address; next_a_write_data = store_queue_a_write_data;
@@ -711,12 +724,34 @@ module lsu(
         end
 //2) 两个写口按【年龄】追加：口1 的外设 load 比口2 的 store 老，必须先占更老的位。
 //   elsq_free 已经把这一拍能塞的笔数算进去了（见上面），所以这里不会溢出。
+//★★ 2026-11-12：访存站是【乱序】发的（更老那条的操作数还没就绪，年轻那条先发），
+//   所以入队的先后不等于年龄先后。而 ELSQ 只有 A 位能发/能排空，且队头唯一
+//   ⇒ A 位必须永远是最老的那条。原来的实现只按先后填 A→B：运行中的 store/load 阻挡了
+//   更老那条的就绪时，年轻那条先入 A，更老那条后入 B，而 B 位永远等不到"成为队头"
+//   ⇒ 两条互等（rand seed 3/8/17/20 实测：ROB 队头卡在 B 位那条上）。
+//   修法：入队时按年龄定位 —— 新来的比 A 位更老就把 A 搬到 B、新来的占 A。
+//   三条"不许换"的前提（任何一条不成立，A 位都必然是最老的）：
+//     · A 位已经退休（ready=1）：比 ROB 队头还老，永远是全场最老；
+//     · A 位已经发到总线上（sent=1）：发之前它必须是队头，比它更老的活条不存在；
+//     · store 正占着 dcache 的 B 口（inflight=1，且这一拍没 pop）：同上，它已经退休。
+//   B 位此刻必空：能入队 ⇒ elsq_free != 0；A 位有货 ⇒ 占用只可能是 1。
         if (load_push_queue) begin
             if (!next_a_valid) begin
                 next_a_valid = 1'b1; next_a_address = stage1_word; next_a_write_data = 32'd0;
                 next_a_index = stage1_index; next_a_generation = stage1_generation; next_a_phys = stage1_phys;
                 next_a_kind = 1'b0; next_a_size = stage1_size; next_a_offset = stage1_sum[1:0];
                 next_a_ready = 1'b0; next_a_sent = 1'b0;   // 外设 load 不预置 ready：它是「写回才算完」
+            end
+            else if (~next_a_sent & ~next_a_ready & (~store_inflight | elsq_pop)
+                     & (elsq_age_load_in < (next_a_index - elsq_head_number))) begin
+                next_b_valid = 1'b1; next_b_address = next_a_address; next_b_write_data = next_a_write_data;
+                next_b_index = next_a_index; next_b_generation = next_a_generation; next_b_phys = next_a_phys;
+                next_b_kind = next_a_kind; next_b_size = next_a_size; next_b_offset = next_a_offset;
+                next_b_ready = next_a_ready; next_b_sent = next_a_sent;
+                next_a_valid = 1'b1; next_a_address = stage1_word; next_a_write_data = 32'd0;
+                next_a_index = stage1_index; next_a_generation = stage1_generation; next_a_phys = stage1_phys;
+                next_a_kind = 1'b0; next_a_size = stage1_size; next_a_offset = stage1_sum[1:0];
+                next_a_ready = 1'b0; next_a_sent = 1'b0;
             end
             else begin
                 next_b_valid = 1'b1; next_b_address = stage1_word; next_b_write_data = 32'd0;
@@ -727,6 +762,17 @@ module lsu(
         end
         if (store_stage_push) begin
             if (!next_a_valid) begin
+                next_a_valid = 1'b1; next_a_address = store_stage_word; next_a_write_data = store_stage_write_data;
+                next_a_index = store_stage_index; next_a_generation = store_stage_generation; next_a_phys = store_stage_phys;
+                next_a_kind = 1'b1; next_a_size = store_stage_size; next_a_offset = store_stage_sum[1:0];
+                next_a_ready = store_queue_push_ready; next_a_sent = 1'b0;
+            end
+            else if (~next_a_sent & ~next_a_ready & (~store_inflight | elsq_pop)
+                     & (elsq_age_store_in < (next_a_index - elsq_head_number))) begin
+                next_b_valid = 1'b1; next_b_address = next_a_address; next_b_write_data = next_a_write_data;
+                next_b_index = next_a_index; next_b_generation = next_a_generation; next_b_phys = next_a_phys;
+                next_b_kind = next_a_kind; next_b_size = next_a_size; next_b_offset = next_a_offset;
+                next_b_ready = next_a_ready; next_b_sent = next_a_sent;
                 next_a_valid = 1'b1; next_a_address = store_stage_word; next_a_write_data = store_stage_write_data;
                 next_a_index = store_stage_index; next_a_generation = store_stage_generation; next_a_phys = store_stage_phys;
                 next_a_kind = 1'b1; next_a_size = store_stage_size; next_a_offset = store_stage_sum[1:0];
