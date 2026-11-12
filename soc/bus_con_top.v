@@ -4,10 +4,10 @@
 // Description: 总线汇聚层（mcu_top 里 cpu_top 之外的那一半）。
 //
 //   2026-11-12 多主改造：
-//     · 原来的 ahb_interconnect 是【单主直通】，换成 ahb_interconnect3（三主两从）；
+//     · 互联从【单主直通】换成三主两从（旧的单主版已删，ahb_interconnect 现在就是三主的）；
 //     · 新增 STCM（64KB 模拟外存，AHB 从设备 s1）作为 DMA 的搬运对象；
 //     · 新增 DMA（AHB 主设备 m2），寄存器口挂 3 号槽 0x0C00_0000。
-//     · m1 留给 L2（下一步把 itcm/dtcm 换成 l2cache 时接上），现在接空。
+//     · m1 是 L2 的 AHB 主口（cpu_top 里的 l2cache，从 mcu_top 引过来）。
 //
 //   地址口径（全树只有这一种）：
 //     CPU 字节地址 >> 2 = 本模块 bus_addr_f_cpu（字地址）
@@ -205,7 +205,7 @@ module bus_con_top(
 //==============================================================================
 //  三、互联（三主两从）
 //==============================================================================
-    ahb_interconnect3 u_ahb_ic (
+    ahb_interconnect u_ahb_ic (
         .clk(clk), .rst(rst_cpu),
         .m0_haddr(m0_haddr), .m0_htrans(m0_htrans), .m0_hwrite(m0_hwrite), .m0_hsize(m0_hsize),
         .m0_hburst(m0_hburst), .m0_hprot(m0_hprot), .m0_hmastlock(m0_hmastlock),
