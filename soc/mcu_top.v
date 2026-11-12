@@ -48,8 +48,8 @@ module mcu_top #(
     wire [3:0]  bus_be_out;
     wire        bus_we_out;
 
-    wire [31:0] uart_data_w, plic_data_w, gpio_data_w, i2c_data_w;
-    wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w;
+    wire [31:0] uart_data_w, plic_data_w, gpio_data_w, i2c_data_w, tim_data_w;
+    wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w, tim_ready_w;
     wire        plic_exti;
     wire        dma_irq_w;
 
@@ -123,6 +123,8 @@ module mcu_top #(
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
         .i2c_ready(i2c_ready_w),
+        .tim_data(tim_data_w),
+        .tim_ready(tim_ready_w),
         .dma_irq(dma_irq_w),
         .m1_haddr(l2_haddr_w), .m1_htrans(l2_htrans_w), .m1_hwrite(l2_hwrite_w),
         .m1_hsize(l2_hsize_w), .m1_hburst(l2_hburst_w),
@@ -151,6 +153,8 @@ module mcu_top #(
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
         .i2c_ready(i2c_ready_w),
+        .tim_data(tim_data_w),
+        .tim_ready(tim_ready_w),
         .plic_exti(plic_exti),
         .dma_irq(dma_irq_w),
         .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),

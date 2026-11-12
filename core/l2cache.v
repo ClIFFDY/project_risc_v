@@ -118,14 +118,35 @@ module l2cache(
     reg        d_pend;                       // D 口读请求寄存
     reg [31:0] d_pend_addr;
 
-//写队列：4 深
-    reg [1:0]  wq_wr, wq_rd;
+//写队列：4 深。
+//★★ 2026-11-12：指针必须 3 位（PTR_W = $clog2(DEPTH)+1）。原来是 2 位、再零扩展去算
+//  `wq_count = {1'b0,wr} - {1'b0,rd}` —— 那个数只在【永不满】时才等于占用：wr 追上 rd
+//  （真满 4 条）时差值是 0，和"空"一模一样 ⇒ **wq_full 永远不成立** ⇒ 队列照单全收、
+//  每 4 笔覆盖一遍，被覆盖的写静默丢失。
+//  实测：S_FILL 占 32 期，期间连写 6 笔，wr 转了一圈多，最早那笔（TCB 的 pvOwner）没了
+//  ⇒ FreeRTOS 第一次上下文切换 mret 到地址 0。
+    reg [2:0]  wq_wr, wq_rd;
     reg [31:0] wq_addr [0:3];
     reg [31:0] wq_data [0:3];
     reg [3:0]  wq_be   [0:3];
-    wire [2:0] wq_count = {1'b0, wq_wr} - {1'b0, wq_rd};
+    wire [2:0] wq_count = wq_wr - wq_rd;
     wire       wq_empty = (wq_wr == wq_rd);
     wire       wq_full  = (wq_count == 3'd4);
+
+//★ 2026-11-12：写队列里还有没落到内存的写时，**同一条线**的填充不许开工。
+//  填充是从内存整行读回来的，抢在排队写前面就会读成旧值；而 D 写是【写失效】的
+//  （见下面 dw_hit 那一段），那一行被装进来之后就是永久旧值。
+//  实测症状：FreeRTOS 建任务时写 TCB 的某个字段，之后读回 0，整条就绪表 pvOwner 为 0
+//  ⇒ pxCurrentTCB 变成 0 ⇒ 第一次上下文切换 mret 到地址 0。
+//  ★ 只按【线】判冲突，不是一律等队列排空 —— 否则每条指令缺失都要等一笔数据写出去。
+    wire [3:0] wq_hit_i = { (wq_addr[3][31:7] == i_pend_addr[31:7]),
+                            (wq_addr[2][31:7] == i_pend_addr[31:7]),
+                            (wq_addr[1][31:7] == i_pend_addr[31:7]),
+                            (wq_addr[0][31:7] == i_pend_addr[31:7]) };
+    wire [3:0] wq_hit_d = { (wq_addr[3][31:7] == d_pend_addr[31:7]),
+                            (wq_addr[2][31:7] == d_pend_addr[31:7]),
+                            (wq_addr[1][31:7] == d_pend_addr[31:7]),
+                            (wq_addr[0][31:7] == d_pend_addr[31:7]) };
 
 //==============================================================================
 //  三、查找
@@ -234,11 +255,11 @@ module l2cache(
                        (byp_issue >= 4'd8)        ? HTRANS_IDLE  : HTRANS_SEQ;
         end
         else if (state == S_WR) begin
-            m_haddr  = wq_addr[wq_rd];
+            m_haddr  = wq_addr[wq_rd[1:0]];
             m_htrans = HTRANS_NOSEQ;
             m_hwrite = 1'b1;
-            m_hwdata = wq_data[wq_rd];
-            m_hwstrb = wq_be[wq_rd];
+            m_hwdata = wq_data[wq_rd[1:0]];
+            m_hwstrb = wq_be[wq_rd[1:0]];
         end
 //未获授权时把 HTRANS 拉成 IDLE（AHB 约定）
 //★ htrans 不能按 hgrant 关掉：仲裁器把 htrans 当"我有请求"看（本总线没有独立的
@@ -262,14 +283,19 @@ module l2cache(
     assign i_valid = i_valid_q & st_is_i;
     assign d_data  = data_d_q;
     assign d_valid = d_valid_q & ~st_is_i;
-    assign d_ready = ~d_pend;                 // 只有读要排队；写永远接
+//★ 写队列满时 d_ready 必须低，上游（dcache 的写穿）才举着写使能等。
+//  ★ 不能写成 `d_we ? ~wq_full : ~d_pend`：d_we 是本模块的输入、又是 dcache 写使能的
+//    直接来源，那样会成 d_we → d_ready → mem_write_ready → mem_write_enable → d_we 的组合环
+//    （队列满时来回翻）。这里只用水位和 d_pend 两个寄存器量。
+//  读那一侧不看这根（L2 收读只看 d_req/d_we/d_pend），所以队列满不影响读。
+    assign d_ready = ~d_pend & ~wq_full;
 
     always @(posedge clk) begin
         if (reset_registered) begin
             state        <= S_IDLE;
             i_pend       <= 1'b0;   i_pend_addr <= 32'd0;
             d_pend       <= 1'b0;   d_pend_addr <= 32'd0;
-            wq_wr        <= 2'd0;   wq_rd       <= 2'd0;
+            wq_wr        <= 3'd0;   wq_rd       <= 3'd0;
             st_word      <= 5'd0;   st_count    <= 6'd0;
             st_way       <= 2'd0;   st_set      <= {SET_B{1'b0}};
             st_is_i      <= 1'b0;   st_prime    <= 1'b0;
@@ -300,10 +326,10 @@ module l2cache(
                 d_pend_addr <= d_addr;
             end
             if (d_write_now && !wq_full) begin
-                wq_addr[wq_wr] <= d_addr;
-                wq_data[wq_wr] <= d_wdata;
-                wq_be  [wq_wr] <= d_be;
-                wq_wr          <= wq_wr + 2'd1;
+                wq_addr[wq_wr[1:0]] <= d_addr;
+                wq_data[wq_wr[1:0]] <= d_wdata;
+                wq_be  [wq_wr[1:0]] <= d_be;
+                wq_wr          <= wq_wr + 3'd1;
             end
 //写失效
             if (d_write_now && !d_uncached) begin
@@ -321,6 +347,12 @@ module l2cache(
                     valid0 <= {SETS{1'b0}}; valid1 <= {SETS{1'b0}};
                     valid2 <= {SETS{1'b0}}; valid3 <= {SETS{1'b0}};
                     maint_done <= 1'b1;
+                end
+                else if ( !wq_empty
+                        && ( (i_pend && !(|i_hit)            && (|wq_hit_i))
+                          || (d_pend && (d_uncached | !(|d_hit)) && (|wq_hit_d)) ) ) begin
+//同线冲突：先把排队写落下去，再填充（i_pend / d_pend 不清，下一轮再来）
+                    state <= S_WR;
                 end
                 else if (i_pend) begin
 //I：命中直接流，缺失先整行填充
@@ -453,7 +485,7 @@ module l2cache(
             S_WR: begin
                 busy_flag <= 1'b1;
                 if (m_hready) begin                       // 拿到总线才真的发出去
-                    wq_rd <= wq_rd + 2'd1;
+                    wq_rd <= wq_rd + 3'd1;
                     state <= S_IDLE;
                 end
             end

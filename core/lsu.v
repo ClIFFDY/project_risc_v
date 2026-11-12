@@ -632,8 +632,13 @@ module lsu(
 //  窗口译码与同址比较，是那条 19 级链（地址和 → blank_bus → 排水 → isq 的 CE）的入口。
 //  现在这一句里除了 exec_in/flush（都是 flag_bus 的寄存器位）全是 ELSQ 与 dcache 的状态位。
 //  ★ elsq_load_go 与它天然互斥（队头是 load 还是 store），不需要再显式排。
+//  ★ 2026-11-12：加 ~bus_hold_in —— 外设总线上的那一笔还没被接受时不许换下一笔。
+//    上游 AHB 主设备是寄存的（收到→上总线要 2 拍，总线被占时更久），而这里 drain
+//    一拍换一个队头，换出来的脉冲会被主设备丢掉（实测丢过 UART 的 'S'）。
+//    bus_hold_in 是主设备的 pend 寄存器，单根 FF，不给这条判据加组合级。
         store_queue_drain = store_queue_a_valid & store_queue_a_kind & store_queue_a_ret
-                          & ~store_inflight & ~dcache_store_blocked & exec_in & ~flush_window;
+                          & ~store_inflight & ~dcache_store_blocked & exec_in & ~flush_window
+                          & ~bus_hold_in;
 //★ 落地：B 口忙位撤销那一拍才算这笔 store 真的办完（缓存更新 + 写穿都可能被回填推迟）。
 //  ★ 队列项必须挂到这一拍才出队 —— 提前出队会让同址的年轻 load 抢在缓存更新前面读到旧值。
         store_finish = store_inflight & ~dcache_store_blocked;

@@ -42,6 +42,10 @@ module dcache(
 //后端存储接口
     input [31:0] mem_data,
     input mem_valid, mem_ready,
+//★ 2026-11-12：写穿必须等后端"接住了"才算了结。后端（L2）的写队列只有 4 深，
+//  满了它会把这一笔静默丢掉；以前 mem_write_enable 是一拍脉冲、发出去就当成功，
+//  于是丢写没人知道（实测 FreeRTOS 的 TCB 字段就是这么没的）。现在没被接住就一直举着。
+    input mem_write_ready,
 
 //总线接口
     output [31:0] bus_data_out,
@@ -265,7 +269,9 @@ module dcache(
 //  缓存更新 one-shot：命中才有；回填写口这一拍要用 ⇒ 让开（下一拍再补，回填最多 8 拍）
         store_cache_write = store_busy & ~store_cache_done & (store_hit0 | store_hit1) & ~is_fill_write;
 //  写穿 one-shot：mem 口这一拍被回填占着就等。写穿与命中无关（miss 也要落到后端）。
-        store_mem_write = store_busy & ~store_mem_done & ~read_drive;
+//  ★ 后端没接住（mem_write_ready=0）时不许发：保持 mem_write_enable 高着等，
+//    直到被接住那一拍才算 store_mem_done。
+        store_mem_write = store_busy & ~store_mem_done & ~read_drive & mem_write_ready;
 
 //mem 口：回填优先，其次 B 口的写穿
 //★ 写使能只能由 store_mem_write 拉高 —— 回填那一路是【读】，写成 we 会把整条 dtcm 写坏

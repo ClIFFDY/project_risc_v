@@ -53,7 +53,11 @@ module ahb_apb_bridge(
 //★ 2026-11-12：DMA 挂 3 号槽（0x0C00_0000）。它不是 APB 外设，但在本仓的约定里
 //  所有从设备都共用这一组"字节地址 >> 2"的广播总线，各自按槽号认领 ⇒ 接法一致。
     input      [31:0] dma_data,
-    input             dma_ready
+    input             dma_ready,
+//★ 2026-11-12：定时器/PWM 挂 6 号槽（0x1800_0000）。FreeRTOS 的节拍源，gpio_group
+//  的 PWM1~4 模式也吃它的四路输出。接法与其它外设相同（字节地址 >> 2 广播 + 槽号认领）。
+    input      [31:0] tim_data,
+    input             tim_ready
     );
 
     localparam [5:0]
@@ -62,11 +66,12 @@ module ahb_apb_bridge(
     SLOT_PLIC = 6'd2,
     SLOT_DMA  = 6'd3,
     SLOT_GPIO = 6'd4,
-    SLOT_I2C  = 6'd5;
+    SLOT_I2C  = 6'd5,
+    SLOT_TIM  = 6'd6;
 
     reg [5:0] slot;
     always @(*) begin
-        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd5) slot = haddr[31:26];
+        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd6) slot = haddr[31:26];
         else slot = SLOT_NONE;
     end
 
@@ -102,6 +107,7 @@ module ahb_apb_bridge(
         SLOT_DMA:  sel_ld_ready = dma_ready;
         SLOT_GPIO: sel_ld_ready = gpio_ready;
         SLOT_I2C:  sel_ld_ready = i2c_ready;
+        SLOT_TIM:  sel_ld_ready = tim_ready;
         default:   sel_ld_ready = 1'b1;
         endcase
     end
@@ -117,7 +123,7 @@ module ahb_apb_bridge(
 //      hreadyout=0 ⇒ 主设备不撤 ⇒ htrans 一直高 ⇒ err_first 一直高 ⇒ 死锁（踩过）。
 //  ★ 本仓的总线没有独立的地址/数据相位寄存器，这两拍锚在【地址相位】上，
 //    比严格 AHB 从设备早一拍。功能等价：HREADYOUT=0 一样把主设备按住一拍。
-//  ★ 槽位 0 与 6~63 没有外设认领；这个洞还包含 0x0001_0000~0x03FF_FFFF
+//  ★ 槽位 0 与 7~63 没有外设认领；这个洞还包含 0x0001_0000~0x03FF_FFFF
 //    这一整片（互联只把 haddr[31:16]==0 判给 STCM）。以前这些地址的读
 //    根本不产生 rd_valid ⇒ 外设 load 卡在 ELSQ 队头 ⇒ 整核死锁。
 //==============================================================================
@@ -152,6 +158,7 @@ module ahb_apb_bridge(
         SLOT_DMA:  hrdata_c = dma_data;
         SLOT_GPIO: hrdata_c = gpio_data;
         SLOT_I2C:  hrdata_c = i2c_data;
+        SLOT_TIM:  hrdata_c = tim_data;
         default:   hrdata_c = 32'd0;
         endcase
         rd_valid_c = (pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready) | err_done;

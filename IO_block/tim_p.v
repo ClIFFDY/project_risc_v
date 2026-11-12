@@ -51,7 +51,9 @@ module tim_p(
 
     integer i;
 
-    wire sel = (bus_addr_in[31:24] == 8'd3);
+//槽号：本模块看到的 bus_addr_in 是【字地址】（字节地址 >> 2），所以槽号落在 [31:24]。
+//  6 号槽 = 0x1800_0000（1 UART / 2 PLIC / 3 DMA / 4 GPIO / 5 I2C / 6 TIM）
+    wire sel = (bus_addr_in[31:24] == 8'd6);
     wire wr  = sel & bus_we_in & (|bus_be_in);
     wire rd  = sel & ~bus_we_in;
     wire run = (cnt_set != 32'd0) & ~halted;

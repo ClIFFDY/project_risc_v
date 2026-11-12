@@ -36,6 +36,8 @@ module io_block_top(
     output            gpio_ready,
     output     [31:0] i2c_data,
     output            i2c_ready,
+    output     [31:0] tim_data,
+    output            tim_ready,
     output            plic_exti,
 //DMA 的完成中断：挂到 PLIC 的 2 号源（3/4 号已被 GPIO/I2C 占）
     input             dma_irq,
@@ -51,18 +53,21 @@ module io_block_top(
     PER_UART = 1,
     PER_PLIC = 2,
     PER_GPIO = 4,
-    PER_I2C  = 5;
+    PER_I2C  = 5,
+    PER_TIM  = 6;
 
     wire uart_rx_w, uart_tx_w;
-    wire uart_rx_irq, gpio_irq, i2c_irq;
+    wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq_w;
     wire i2c_scl_oe, i2c_sda_oe, i2c_scl_in, i2c_sda_in;
+    wire pwm1_w, pwm2_w, pwm3_w, pwm4_w;
 
-    reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c;
+    reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c, bus_we_tim;
     always @(*) begin
         bus_we_uart = bus_we_in & bus_sel_in[PER_UART];
         bus_we_plic = bus_we_in & bus_sel_in[PER_PLIC];
         bus_we_gpio = bus_we_in & bus_sel_in[PER_GPIO];
         bus_we_i2c  = bus_we_in & bus_sel_in[PER_I2C];
+        bus_we_tim  = bus_we_in & bus_sel_in[PER_TIM];
     end
 
     uart_top u_uart (
@@ -93,10 +98,10 @@ module io_block_top(
         .sda_oe(i2c_sda_oe),
         .scl_oe(i2c_scl_oe),
         .tx(uart_tx_w),
-        .pwm1(1'b0),
-        .pwm2(1'b0),
-        .pwm3(1'b0),
-        .pwm4(1'b0),
+        .pwm1(pwm1_w),
+        .pwm2(pwm2_w),
+        .pwm3(pwm3_w),
+        .pwm4(pwm4_w),
         .rx(uart_rx_w),
         .sda_in(i2c_sda_in),
         .scl_in(i2c_scl_in)
@@ -119,10 +124,25 @@ module io_block_top(
         .busy()
     );
 
+//定时器 / PWM（6 号槽）：FreeRTOS 的节拍源，四路 PWM 直接进 gpio_group 的 PWM1~4 模式
+    tim_p u_tim (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_tim),
+        .bus_data_out(tim_data),
+        .ld_ready(tim_ready),
+        .tim_p_irq(tim_irq_w),
+        .pwm1(pwm1_w), .pwm2(pwm2_w), .pwm3(pwm3_w), .pwm4(pwm4_w)
+    );
+
     plic u_plic (
         .clk(clk),
         .rst(rst_cpu),
-        .irq_sources({26'd0, err_valid, i2c_irq, gpio_irq, dma_irq, uart_rx_irq, 1'b0}),
+        //源号：1=uart_rx 2=dma 3=gpio 4=i2c 5=总线错误 6=定时器
+        .irq_sources({25'd0, tim_irq_w, err_valid, i2c_irq, gpio_irq, dma_irq, uart_rx_irq, 1'b0}),
         .exti(plic_exti),
         .bus_addr_in(bus_addr_in),
         .bus_data_in(bus_data_in),

@@ -14,7 +14,7 @@
 //     lsu_ahb_master 再 << 2 还原成 AHB 字节地址 haddr
 //     互联按 haddr[31:16]==0 选 STCM，否则选 APB 桥
 //     桥再 >> 2 吐给外设，外设按 bus_addr_in[31:26] 认槽位
-//       1 UART / 2 PLIC / 3 DMA / 4 GPIO / 5 I2C
+//       1 UART / 2 PLIC / 3 DMA / 4 GPIO / 5 I2C / 6 TIM(PWM)
 //////////////////////////////////////////////////////////////////////////////////
 
 
@@ -42,6 +42,8 @@ module bus_con_top(
     input             gpio_ready,
     input      [31:0] i2c_data,
     input             i2c_ready,
+    input      [31:0] tim_data,
+    input             tim_ready,
 //---- m1：L2（cpu_top 里的 64KB 统一二级缓存）----
     input      [31:0] m1_haddr,
     input      [1:0]  m1_htrans,
@@ -264,6 +266,8 @@ module bus_con_top(
         .gpio_ready(gpio_ready),
         .i2c_data(i2c_data),
         .i2c_ready(i2c_ready),
+        .tim_data(tim_data),
+        .tim_ready(tim_ready),
         .dma_data(dma_data_q),
         .dma_ready(1'b1)
     );

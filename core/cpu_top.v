@@ -419,6 +419,8 @@ module cpu_top #(
     wire [31:0] mem_address_dcache, mem_wdata_dcache, mem_data_dtcm;
     wire [3:0]  mem_byte_enable_dcache;
     wire        mem_req_dcache, mem_write_enable_dcache, mem_valid_dtcm;
+//L2 的 D 口 ready：读看排队，写看写队列有没有空位（满的时候不许发，否则那笔写会被丢掉）
+    wire        l2_d_ready_w;
     wire        ready_tim, timer_interrupt;
     wire        hold_dcache, load_ready_dcache, load_ready_next_dcache, busy_dcache, request_blocked_dcache;
 //load 早唤醒：载入那条在【地址进 dcache 那一拍】就宣告下一拍有数（load_ready_next 的当拍版）
@@ -1379,6 +1381,7 @@ module cpu_top #(
         .store_data_in(store_data_lsu), .store_byte_enable_in(store_byte_enable_lsu),
         .store_blocked(store_blocked_dcache),
         .mem_data(mem_data_dtcm), .mem_valid(mem_valid_dtcm), .mem_ready(1'b1),
+        .mem_write_ready(l2_d_ready_w),
         .bus_data_out(data_dcache),
         .load_ready(load_ready_dcache), .busy(busy_dcache), .hold(hold_dcache), .request_blocked(request_blocked_dcache),
         .load_ready_next(load_ready_next_dcache),
@@ -1425,7 +1428,7 @@ module cpu_top #(
         .d_addr(mem_address_dcache),
         .d_wdata(mem_wdata_dcache),
         .d_be(mem_byte_enable_dcache),
-        .d_data(mem_data_dtcm), .d_valid(mem_valid_dtcm), .d_ready(),
+        .d_data(mem_data_dtcm), .d_valid(mem_valid_dtcm), .d_ready(l2_d_ready_w),
 //维护 / 非缓存窗口
         .maint(l2_maint), .maint_done(l2_maint_done),
         .unc_base(l2_uncached_base), .unc_mask(l2_uncached_mask),

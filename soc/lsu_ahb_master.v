@@ -61,7 +61,12 @@ module lsu_ahb_master(
             lat_we   <= 1'b0;
         end
         else begin
-            if (bus_valid_in && !pend) begin
+//★ 2026-11-12：接受那一拍正好来新请求时，新请求【直接顶上】（原地替换，不加存储）。
+//  原写法 `bus_valid_in && !pend` 会把这一拍的新请求丢掉：LSU 的 stage1_valid_out 是
+//  一拍脉冲，而本模块从收到到被接受要 2 拍（脉冲拍 + 发出拍），于是背靠背的非缓存
+//  store 每隔一笔丢一笔。实测：FreeRTOS 配定时器时 `TIM_CNT_SET` 就是这么丢的
+//  （TIM_MODE / TIM_CNT_SET / PLIC 三条连着写，只有后两条出去了）。
+            if (bus_valid_in && (!pend || accepted)) begin
                 pend     <= 1'b1;
                 lat_addr <= bus_addr_in << 2;
                 lat_data <= bus_data_in;
@@ -88,7 +93,11 @@ module lsu_ahb_master(
         hwdata = lat_data;
         bus_data_out  = hrdata;
         bus_ready_out = rd_valid;
-        bus_hold_out  = 1'b0;
+//★ 2026-11-12：在飞期间反压上游。LSU 的请求是【一拍脉冲】，本模块却要 2 拍才把它
+//  送上总线；总线被 L2/DMA 占住时 pend 会挂很久，这期间来的脉冲本来会被直接丢掉
+//  （实测：FreeRTOS 配 PLIC 时 UART 的 'S' 就这么没了 —— 总线被 L2 回填占了 25 拍）。
+//  这一根就是那个"别发"信号：LSU 拿它挡 store 排空（见 lsu.v 的 store_queue_drain）。
+        bus_hold_out  = pend;
     end
 
 endmodule
