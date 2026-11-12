@@ -38,13 +38,18 @@ module io_block_top(
     output            i2c_ready,
     output     [31:0] tim_data,
     output            tim_ready,
-//7 号槽：SPI 主机（板上的 flash）
+//7 号槽：双通道 SPI 主机（flash + SD，共享 SCK/MOSI/MISO，各自 CS）
     output     [31:0] spi_data,
     output            spi_ready,
     output            spi_cs_n,
+    output            spi_cs_sd,
     output            spi_sck,
     output            spi_mosi,
     input             spi_miso,
+//boot 引擎的状态（只读展示在 pmem_spi 的 BOOT 寄存器里）
+    input             boot_done,
+    input             boot_err,
+    input      [16:0] boot_count,
     output            plic_exti,
 //DMA 的完成中断：挂到 PLIC 的 2 号源（3/4 号已被 GPIO/I2C 占）
     input             dma_irq,
@@ -147,8 +152,8 @@ module io_block_top(
         .pwm1(pwm1_w), .pwm2(pwm2_w), .pwm3(pwm3_w), .pwm4(pwm4_w)
     );
 
-//SPI 主机（7 号槽）：接板上的 SPI NOR flash，四根线直出、不经 gpio
-    flash_spi u_flash_spi (
+//双通道 SPI 主机（7 号槽）：flash 与 SD 共享三根线，CS 各一根
+    pmem_spi u_pmem_spi (
         .clk(clk),
         .rst(rst_cpu),
         .bus_addr_in(bus_addr_in),
@@ -158,9 +163,13 @@ module io_block_top(
         .bus_data_out(spi_data),
         .ld_ready(spi_ready),
         .spi_cs_n(spi_cs_n),
+        .spi_cs_sd(spi_cs_sd),
         .spi_sck(spi_sck),
         .spi_mosi(spi_mosi),
-        .spi_miso(spi_miso)
+        .spi_miso(spi_miso),
+        .boot_done(boot_done),
+        .boot_err(boot_err),
+        .boot_count(boot_count)
     );
 
     plic u_plic (

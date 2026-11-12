@@ -25,7 +25,12 @@ module bus_con_top(
     input      [3:0]  bus_be_f_cpu,
     input             bus_we_f_cpu,
     input             bus_valid_f_cpu,
-    output            rst_cpu,
+    output reg        rst_cpu,        // CPU / DMA 域：上电搬运期间一直压着
+    output            rst_sys,        // 总线 / STCM / APB 桥 / SPI 域：复位一放开就活
+//---- boot 引擎状态（给 pmem_spi 的 BOOT 寄存器展示）----
+    output            boot_done_out,
+    output            boot_err_out,
+    output     [16:0] boot_count_out,
     output     [31:0] bus_data_b_cpu,
     output            bus_loaded_out,
     output            bus_hold_out,
@@ -87,6 +92,15 @@ module bus_con_top(
     wire [3:0]  m2_hwstrb, m2_hprot;
     wire        dma_busy;
 
+//---- m3：boot 搬运引擎 ----
+    wire [31:0] m3_haddr, m3_hwdata, m3_hrdata;
+    wire [1:0]  m3_htrans;
+    wire        m3_hwrite, m3_hready, m3_rd_valid, m3_hgrant, m3_hresp, m3_hmastlock;
+    wire [2:0]  m3_hsize, m3_hburst;
+    wire [3:0]  m3_hwstrb, m3_hprot;
+    wire        boot_done_w, boot_err_w;
+    wire [16:0] boot_count_w;
+
 //---- s0：APB 外设桥 ----
     wire [31:0] s0_haddr, s0_hwdata, s0_hrdata;
     wire [1:0]  s0_htrans;
@@ -142,8 +156,31 @@ module bus_con_top(
     rst_buf u_rst_buf (
         .clk(clk),
         .rst_n(rst),
-        .rst_stable(rst_cpu)
+        .rst_stable(rst_stable)
     );
+
+//==============================================================================
+//  一之一、复位分域：boot 搬运期间 CPU / DMA 压着，总线与 SPI 先活
+//    rst_sys = rst_buf 拉长后的复位（一放开就活）
+//    rst_cpu = rst_sys 或 "还没搬完"      （搬完才放开）
+//  ★ boot_done 只在 rst_sys 为高时清 —— 也就是下一次复位才允许重新搬运。
+//==============================================================================
+    wire rst_stable;
+
+    reg boot_done_q;
+    always @(posedge clk) begin
+        if (rst_stable)
+            boot_done_q <= 1'b0;
+        else if (boot_done_w)
+            boot_done_q <= 1'b1;
+        else
+            boot_done_q <= boot_done_q;
+    end
+
+    always @(*) begin
+        rst_sys = rst_stable;
+        rst_cpu = rst_stable | ~boot_done_q;
+    end
 
 //==============================================================================
 //  一、CPU 侧主设备
@@ -208,7 +245,7 @@ module bus_con_top(
 //  三、互联（三主两从）
 //==============================================================================
     ahb_interconnect u_ahb_ic (
-        .clk(clk), .rst(rst_cpu),
+        .clk(clk), .rst(rst_sys),
         .m0_haddr(m0_haddr), .m0_htrans(m0_htrans), .m0_hwrite(m0_hwrite), .m0_hsize(m0_hsize),
         .m0_hburst(m0_hburst), .m0_hprot(m0_hprot), .m0_hmastlock(m0_hmastlock),
         .m0_hwdata(m0_hwdata), .m0_hwstrb(m0_hwstrb),
@@ -233,15 +270,43 @@ module bus_con_top(
         .s1_hburst(s1_hburst), .s1_hprot(s1_hprot), .s1_hmastlock(s1_hmastlock),
         .s1_hwdata(s1_hwdata), .s1_hwstrb(s1_hwstrb),
         .s1_hrdata(s1_hrdata), .s1_hreadyout(s1_hreadyout), .s1_hresp(s1_hresp),
-        .s1_rd_valid(s1_rd_valid)
+        .s1_rd_valid(s1_rd_valid),
+        .m3_haddr(m3_haddr), .m3_htrans(m3_htrans), .m3_hwrite(m3_hwrite), .m3_hsize(m3_hsize),
+        .m3_hburst(m3_hburst), .m3_hprot(m3_hprot), .m3_hmastlock(m3_hmastlock),
+        .m3_hwdata(m3_hwdata), .m3_hwstrb(m3_hwstrb),
+        .m3_hrdata(m3_hrdata), .m3_hready(m3_hready), .m3_hresp(m3_hresp),
+        .m3_rd_valid(m3_rd_valid), .m3_hgrant(m3_hgrant)
     );
+
+//==============================================================================
+//  三之二、boot 搬运引擎：上电把镜像从 SPI flash 搬进 STCM，搬完放开 CPU
+//==============================================================================
+    boot_loader #(
+        .SPI_BASE(32'h1C00_0000),
+        .LOAD_BASE(32'h0000_0000)
+    ) u_boot_loader (
+        .clk(clk),
+        .rst(rst_sys),
+        .haddr(m3_haddr), .htrans(m3_htrans), .hwrite(m3_hwrite), .hsize(m3_hsize),
+        .hburst(m3_hburst), .hprot(m3_hprot), .hmastlock(m3_hmastlock),
+        .hwdata(m3_hwdata), .hwstrb(m3_hwstrb),
+        .hrdata(m3_hrdata), .hready(m3_hready), .hresp(m3_hresp),
+        .hgrant(m3_hgrant), .rd_valid(m3_rd_valid),
+        .boot_done(boot_done_w), .boot_err(boot_err_w), .boot_count(boot_count_w)
+    );
+
+    always @(*) begin
+        boot_done_out = boot_done_q;
+        boot_err_out = boot_err_w;
+        boot_count_out = boot_count_w;
+    end
 
 //==============================================================================
 //  四、从设备
 //==============================================================================
     ahb_apb_bridge u_ahb_apb (
         .clk(clk),
-        .rst(rst_cpu),
+        .rst(rst_sys),
         .haddr(s0_haddr),
         .htrans(s0_htrans),
         .hwrite(s0_hwrite),
@@ -279,7 +344,7 @@ module bus_con_top(
 //64KB 模拟外存：DMA 的搬运对象，也是将来 L2 的后备存储
     stcm #(.AW(14)) u_stcm (
         .clk(clk),
-        .rst(rst_cpu),
+        .rst(rst_sys),
         .haddr(s1_haddr),
         .htrans(s1_htrans),
         .hwrite(s1_hwrite),

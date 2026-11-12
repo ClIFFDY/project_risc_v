@@ -99,10 +99,26 @@ module ahb_interconnect(
     input      [31:0] s1_hrdata,
     input             s1_hreadyout,
     input             s1_hresp,
-    input             s1_rd_valid
+    input             s1_rd_valid,
+
+//---- m3：boot 搬运引擎（只在上电搬运时说话）----
+    input      [31:0] m3_haddr,
+    input      [1:0]  m3_htrans,
+    input             m3_hwrite,
+    input      [2:0]  m3_hsize,
+    input      [2:0]  m3_hburst,
+    input      [3:0]  m3_hprot,
+    input             m3_hmastlock,
+    input      [31:0] m3_hwdata,
+    input      [3:0]  m3_hwstrb,
+    output reg [31:0] m3_hrdata,
+    output reg        m3_hready,
+    output reg        m3_hresp,
+    output reg        m3_rd_valid,
+    output reg        m3_hgrant
     );
 
-    localparam [1:0] M_LSU = 2'd0, M_L2 = 2'd1, M_DMA = 2'd2;
+    localparam [1:0] M_LSU = 2'd0, M_L2 = 2'd1, M_DMA = 2'd2, M_BOOT = 2'd3;
 
     reg reset_registered;
     always @(posedge clk) reset_registered <= rst;
@@ -116,10 +132,12 @@ module ahb_interconnect(
     wire m0_req = (m0_htrans != 2'b00);
     wire m1_req = (m1_htrans != 2'b00);
     wire m2_req = (m2_htrans != 2'b00);
+    wire m3_req = (m3_htrans != 2'b00);
 
 //当前授权主设备还在事务中（它还有节拍要发）⇒ 不换手
-    wire grant_busy = (grant == M_LSU) ? m0_req :
-                      (grant == M_L2)  ? m1_req : m2_req;
+    wire grant_busy = (grant == M_LSU)  ? m0_req :
+                      (grant == M_L2)   ? m1_req :
+                      (grant == M_DMA)  ? m2_req : m3_req;
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -128,7 +146,10 @@ module ahb_interconnect(
         end
         else begin
             if (!grant_busy) begin
-                if (m2_req && (dma_wait >= 7'd64))      grant <= M_DMA;
+//★ boot 引擎优先级最高：它只在"其他主设备全在复位里"的那段时间说话，
+//  给它最高优先级是为了不被 DMA 的 64 拍插队拖慢上电。
+                if (m3_req)                             grant <= M_BOOT;
+                else if (m2_req && (dma_wait >= 7'd64)) grant <= M_DMA;
                 else if (m0_req)                        grant <= M_LSU;
                 else if (m1_req)                        grant <= M_L2;
                 else if (m2_req)                        grant <= M_DMA;
@@ -144,6 +165,7 @@ module ahb_interconnect(
     wire g0 = (grant == M_LSU);
     wire g1 = (grant == M_L2);
     wire g2 = (grant == M_DMA);
+    wire g3 = (grant == M_BOOT);
 
 //==============================================================================
 //  二、请求信号选择
@@ -170,6 +192,9 @@ module ahb_interconnect(
         else if (g2) begin haddr = m2_haddr; htrans = m2_htrans; hwrite = m2_hwrite;
                            hsize = m2_hsize; hburst = m2_hburst; hprot = m2_hprot;
                            hmastlock = m2_hmastlock; hwdata = m2_hwdata; hwstrb = m2_hwstrb; end
+        else if (g3) begin haddr = m3_haddr; htrans = m3_htrans; hwrite = m3_hwrite;
+                           hsize = m3_hsize; hburst = m3_hburst; hprot = m3_hprot;
+                           hmastlock = m3_hmastlock; hwdata = m3_hwdata; hwstrb = m3_hwstrb; end
     end
 
 //==============================================================================
@@ -241,20 +266,24 @@ module ahb_interconnect(
         m0_hrdata = 32'd0; m0_hready = 1'b0; m0_rd_valid = 1'b0; m0_hgrant = g0; m0_hresp = 1'b0;
         m1_hrdata = 32'd0; m1_hready = 1'b0; m1_rd_valid = 1'b0; m1_hgrant = g1; m1_hresp = 1'b0;
         m2_hrdata = 32'd0; m2_hready = 1'b0; m2_rd_valid = 1'b0; m2_hgrant = g2; m2_hresp = 1'b0;
+        m3_hrdata = 32'd0; m3_hready = 1'b0; m3_rd_valid = 1'b0; m3_hgrant = g3; m3_hresp = 1'b0;
 //HREADY = 从设备 HREADYOUT & 被授权（标准做法）
         if (g0) m0_hready = s_hreadyout;
         if (g1) m1_hready = s_hreadyout;
         if (g2) m2_hready = s_hreadyout;
+        if (g3) m3_hready = s_hreadyout;
 //HRESP 送给【当前被授权】的主设备，不走 FIFO：错误是在被按住的那笔传输里
 //  举两拍，那两拍授权不会换手（grant_busy 看的就是它的 htrans），所以按 grant 选
 //  是准的。数据/应答才必须按 FIFO 里记的从设备号选（见上面那段注释）。
         if (g0) m0_hresp = s_hresp;
         if (g1) m1_hresp = s_hresp;
         if (g2) m2_hresp = s_hresp;
+        if (g3) m3_hresp = s_hresp;
         case (resp_owner)
         M_LSU: begin m0_hrdata = resp_hrdata; m0_rd_valid = resp_rd_valid; end
         M_L2:  begin m1_hrdata = resp_hrdata; m1_rd_valid = resp_rd_valid; end
-        default: begin m2_hrdata = resp_hrdata; m2_rd_valid = resp_rd_valid; end
+        M_DMA: begin m2_hrdata = resp_hrdata; m2_rd_valid = resp_rd_valid; end
+        default: begin m3_hrdata = resp_hrdata; m3_rd_valid = resp_rd_valid; end
         endcase
     end
 

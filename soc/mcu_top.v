@@ -38,12 +38,16 @@ module mcu_top #(
     inout wire [31:0] gpio_pin_bus,
 //---- SPI 主机（7 号槽）：接板上的 SPI NOR flash，直出、不经 gpio ----
     output spi_cs_n,
+    output spi_cs_sd,
     output spi_sck,
     output spi_mosi,
     input  spi_miso
     );
 
-    wire rst_cpu;
+    wire rst_cpu;        // CPU / DMA 域（boot 搬运期间压着）
+    wire rst_sys;        // 总线 / STCM / APB / SPI 域
+    wire boot_done_w, boot_err_w;
+    wire [16:0] boot_count_w;
 
     wire [31:0] bus_addr_f_cpu, bus_data_f_cpu, bus_data_b_cpu;
     wire [3:0]  bus_be_f_cpu;
@@ -112,6 +116,10 @@ module mcu_top #(
         .bus_we_f_cpu(bus_we_f_cpu),
         .bus_valid_f_cpu(bus_valid_f_cpu),
         .rst_cpu(rst_cpu),
+        .rst_sys(rst_sys),
+        .boot_done_out(boot_done_w),
+        .boot_err_out(boot_err_w),
+        .boot_count_out(boot_count_w),
         .bus_data_b_cpu(bus_data_b_cpu),
         .bus_loaded_out(bus_loaded_out),
         .bus_hold_out(bus_hold_out),
@@ -145,7 +153,7 @@ module mcu_top #(
 
     io_block_top u_io_block (
         .clk(clk),
-        .rst_cpu(rst_cpu),
+        .rst_cpu(rst_sys),
         .gpio_pin_bus(gpio_pin_bus),
         .bus_addr_in(bus_addr_out),
         .bus_data_in(bus_data_out),
@@ -165,9 +173,13 @@ module mcu_top #(
         .spi_data(spi_data_w),
         .spi_ready(spi_ready_w),
         .spi_cs_n(spi_cs_n),
+        .spi_cs_sd(spi_cs_sd),
         .spi_sck(spi_sck),
         .spi_mosi(spi_mosi),
         .spi_miso(spi_miso),
+        .boot_done(boot_done_w),
+        .boot_err(boot_err_w),
+        .boot_count(boot_count_w),
         .plic_exti(plic_exti),
         .dma_irq(dma_irq_w),
         .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),
