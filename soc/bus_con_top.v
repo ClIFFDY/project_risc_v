@@ -108,6 +108,13 @@ module bus_con_top(
     wire [2:0]  s0_hsize, s0_hburst;
     wire [3:0]  s0_hwstrb, s0_hprot;
 
+//---- s2：NPU（slot 8 = 0x2000_0000）----
+    wire [31:0] s2_haddr, s2_hwdata, s2_hrdata;
+    wire [1:0]  s2_htrans;
+    wire        s2_hwrite, s2_hreadyout, s2_hresp, s2_rd_valid, s2_hsel;
+    wire [2:0]  s2_hsize;
+    wire [1:0]  npu_hresp;
+
 //---- s1：STCM ----
     wire [31:0] s1_haddr, s1_hwdata, s1_hrdata;
     wire [1:0]  s1_htrans;
@@ -274,8 +281,28 @@ module bus_con_top(
         .m3_hburst(m3_hburst), .m3_hprot(m3_hprot), .m3_hmastlock(m3_hmastlock),
         .m3_hwdata(m3_hwdata), .m3_hwstrb(m3_hwstrb),
         .m3_hrdata(m3_hrdata), .m3_hready(m3_hready), .m3_hresp(m3_hresp),
-        .m3_rd_valid(m3_rd_valid), .m3_hgrant(m3_hgrant)
+        .m3_rd_valid(m3_rd_valid), .m3_hgrant(m3_hgrant),
+        .s2_haddr(s2_haddr), .s2_htrans(s2_htrans), .s2_hwrite(s2_hwrite),
+        .s2_hsize(s2_hsize), .s2_hwdata(s2_hwdata), .s2_hsel(s2_hsel),
+        .s2_hrdata(s2_hrdata), .s2_hreadyout(s2_hreadyout),
+        .s2_hresp(s2_hresp), .s2_rd_valid(s2_rd_valid)
     );
+
+//==============================================================================
+//  三之一、NPU（AHB-Lite 从设备，4x4 INT8 GEMM）
+//    · 它是变延迟从设备（Buffer 读要等同步 RAM、忙时回两拍 ERROR）⇒ 应答走互联的
+//      直达通路，不压 owner FIFO。
+//    · HRESP 是本从机的两拍结构，互联只认一位 ⇒ 取低一位给互联。
+//    · 复位跟总线域（rst_sys）：boot 期间 CPU 摸不到它，但总线活着就能答。
+//==============================================================================
+    npu_system u_npu (
+        .HCLK(clk), .HRESETn(~rst_sys),
+        .HSEL(s2_hsel), .HADDR(s2_haddr), .HTRANS(s2_htrans), .HWRITE(s2_hwrite),
+        .HSIZE(s2_hsize), .HWDATA(s2_hwdata), .HREADY(s2_hreadyout),
+        .HRDATA(s2_hrdata), .HREADYOUT(s2_hreadyout), .HRESP(npu_hresp),
+        .rd_valid(s2_rd_valid)
+    );
+    assign s2_hresp = npu_hresp[0];
 
 //==============================================================================
 //  三之二、boot 搬运引擎：上电把镜像从 SPI flash 搬进 STCM，搬完放开 CPU
@@ -341,7 +368,7 @@ module bus_con_top(
     );
 
 //64KB 模拟外存：DMA 的搬运对象，也是将来 L2 的后备存储
-    stcm #(.AW(14)) u_stcm (
+    stcm #(.AW(16)) u_stcm (
         .clk(clk),
         .rst(rst_sys),
         .haddr(s1_haddr),

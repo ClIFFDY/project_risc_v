@@ -27,7 +27,7 @@ module mcu_top #(
     parameter integer ROB_DEPTH         = 16,
     parameter integer IFFU_DEPTH        = 8,
     parameter integer VALUE_TABLE_DEPTH = 16,
-    parameter integer IC_INDEX_B        = 8,
+    parameter integer IC_INDEX_B        = 6,    // 16KB（8=64KB / 7=32KB）；与 cpu_top 默认一致
     parameter integer BHT_B             = 11,
     parameter integer BTB_B             = 11,
     parameter integer DC_SETS_B         = 9,
