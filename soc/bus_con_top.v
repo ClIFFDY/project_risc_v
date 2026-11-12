@@ -4,7 +4,9 @@
 // Description: 总线汇聚层（mcu_top 里 cpu_top 之外的那一半）。
 //
 //   2026-11-12 多主改造：
-//     · 互联从【单主直通】换成三主两从（旧的单主版已删，ahb_interconnect 现在就是三主的）；
+//     · 互联从【单主直通】换成四主四从（旧的单主版已删，ahb_interconnect 现在就是四主的）；
+//     · 新增 DDR/AXI 桥（AHB 从设备 s3，0x8000_0000 起 1GB），AXI4 主口出到模块外面，
+//       下游 MIG 7 系列还没接（2026-11-12）；
 //     · 新增 STCM（64KB 模拟外存，AHB 从设备 s1）作为 DMA 的搬运对象；
 //     · 新增 DMA（AHB 主设备 m2），寄存器口挂 3 号槽 0x0C00_0000。
 //     · m1 是 L2 的 AHB 主口（cpu_top 里的 l2cache，从 mcu_top 引过来）。
@@ -12,13 +14,16 @@
 //   地址口径（全树只有这一种）：
 //     CPU 字节地址 >> 2 = 本模块 bus_addr_f_cpu（字地址）
 //     lsu_ahb_master 再 << 2 还原成 AHB 字节地址 haddr
-//     互联按 haddr[31:16]==0 选 STCM，否则选 APB 桥
+//     互联按地址 slot 选从设备：STCM(0x0000_xxxx) / NPU(0x2000_xxxx) / DDR(0x8000_0000-0xBFFF_FFFF) / 其余 APB 桥
 //     桥再 >> 2 吐给外设，外设按 bus_addr_in[31:26] 认槽位
 //       1 UART / 2 PLIC / 3 DMA / 4 GPIO / 5 I2C / 6 TIM(PWM)
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module bus_con_top(
+module bus_con_top #(
+//DDR_PRESENT=0：下游没有存储器，桥对任何访问直接回 ERROR（AXI 口闭嘴，留着给 MIG）
+    parameter integer DDR_PRESENT = 0
+) (
     input clk, rst,
     input      [31:0] bus_addr_f_cpu,
     input      [31:0] bus_data_f_cpu,
@@ -72,7 +77,49 @@ module bus_con_top(
     output            err_write,
     output     [1:0]  err_owner,
     output     [31:0] err_addr,
-    input             err_clear
+    input             err_clear,
+//---- s3：DDR/AXI 主设备口（下游就是 MIG 7 系列的 AXI4 从口）----
+//  ★ 2026-11-12：桥已经挂上（s3，0x8000_0000-0xBFFF_FFFF），MIG 还没进来。
+//    现在这组口在 mcu_top 外面空着：任何访问 DDR 的总线操作都会一直等，
+//    ddr_mem_ready 拉低可以把它挡在 S_WAIT_MEM 里（同样是等）。
+    input             ddr_mem_ready,
+    output     [3:0]  ddr_axi_awid,
+    output     [31:0] ddr_axi_awaddr,
+    output     [7:0]  ddr_axi_awlen,
+    output     [2:0]  ddr_axi_awsize,
+    output     [1:0]  ddr_axi_awburst,
+    output            ddr_axi_awlock,
+    output     [3:0]  ddr_axi_awcache,
+    output     [2:0]  ddr_axi_awprot,
+    output     [3:0]  ddr_axi_awqos,
+    output            ddr_axi_awvalid,
+    input             ddr_axi_awready,
+    output     [127:0] ddr_axi_wdata,
+    output     [15:0] ddr_axi_wstrb,
+    output            ddr_axi_wlast,
+    output            ddr_axi_wvalid,
+    input             ddr_axi_wready,
+    input      [3:0]  ddr_axi_bid,
+    input      [1:0]  ddr_axi_bresp,
+    input             ddr_axi_bvalid,
+    output            ddr_axi_bready,
+    output     [3:0]  ddr_axi_arid,
+    output     [31:0] ddr_axi_araddr,
+    output     [7:0]  ddr_axi_arlen,
+    output     [2:0]  ddr_axi_arsize,
+    output     [1:0]  ddr_axi_arburst,
+    output            ddr_axi_arlock,
+    output     [3:0]  ddr_axi_arcache,
+    output     [2:0]  ddr_axi_arprot,
+    output     [3:0]  ddr_axi_arqos,
+    output            ddr_axi_arvalid,
+    input             ddr_axi_arready,
+    input      [3:0]  ddr_axi_rid,
+    input      [127:0] ddr_axi_rdata,
+    input      [1:0]  ddr_axi_rresp,
+    input             ddr_axi_rlast,
+    input             ddr_axi_rvalid,
+    output            ddr_axi_rready
     );
 
 //---- m0：LSU ----
@@ -121,6 +168,13 @@ module bus_con_top(
     wire        s1_hwrite, s1_hreadyout, s1_rd_valid, s1_hresp, s1_hmastlock;
     wire [2:0]  s1_hsize, s1_hburst;
     wire [3:0]  s1_hwstrb, s1_hprot;
+
+//---- s3：DDR/AXI 桥（slot 32 = 0x8000_0000）----
+    wire [31:0] s3_haddr, s3_hwdata, s3_hrdata;
+    wire [1:0]  s3_htrans;
+    wire        s3_hwrite, s3_hreadyout, s3_hresp, s3_rd_valid, s3_hsel;
+    wire [2:0]  s3_hsize;
+    wire [3:0]  s3_hprot, s3_hwstrb;
 
 //==============================================================================
 //  一、错误日志：只留第一次，软件写 1 清
@@ -285,7 +339,12 @@ module bus_con_top(
         .s2_haddr(s2_haddr), .s2_htrans(s2_htrans), .s2_hwrite(s2_hwrite),
         .s2_hsize(s2_hsize), .s2_hwdata(s2_hwdata), .s2_hsel(s2_hsel),
         .s2_hrdata(s2_hrdata), .s2_hreadyout(s2_hreadyout),
-        .s2_hresp(s2_hresp), .s2_rd_valid(s2_rd_valid)
+        .s2_hresp(s2_hresp), .s2_rd_valid(s2_rd_valid),
+        .s3_haddr(s3_haddr), .s3_htrans(s3_htrans), .s3_hwrite(s3_hwrite),
+        .s3_hsize(s3_hsize), .s3_hprot(s3_hprot), .s3_hwdata(s3_hwdata),
+        .s3_hwstrb(s3_hwstrb), .s3_hsel(s3_hsel),
+        .s3_hrdata(s3_hrdata), .s3_hreadyout(s3_hreadyout),
+        .s3_hresp(s3_hresp), .s3_rd_valid(s3_rd_valid)
     );
 
 //==============================================================================
@@ -303,6 +362,78 @@ module bus_con_top(
         .rd_valid(s2_rd_valid)
     );
     assign s2_hresp = npu_hresp[0];
+
+//==============================================================================
+//  三之三、DDR/AXI 桥（AHB 从设备 s3 → AXI4 主设备）
+//    · 和 NPU 一样是变延迟从设备，而且更硬：整笔传输期间压着 HREADYOUT，
+//      主设备的请求根本没被接受 ⇒ 授权与地址不会换手，应答按当拍 sel 直达。
+//    · 地址窗口：0x8000_0000 起 1 GB（互联只判 slot，精确窗口在桥里判）。
+//    · AXI 侧：128 位、ID=0、LEN=0、INCR、满宽；下游留给 MIG 7 系列的 AXI4 从口。
+//    · 复位跟总线域（rst_sys）。接 MIG 时 HCLK/RESET 要跟 c0_ui_clk / c0_aresetn
+//      同一个域（桥头注释有说明）。
+//==============================================================================
+    ahb_axi_bridge #(
+        .DDR_PRESENT    (DDR_PRESENT),
+        .AXI_ADDR_WIDTH (32),
+        .AXI_DATA_WIDTH (128),
+        .AXI_ID_WIDTH   (4),
+        .DDR_BASE       (32'h8000_0000),
+        .DDR_BYTES      (33'h0_4000_0000),
+        .AXI_BASE_ADDR  (32'h0000_0000)
+    ) u_ddr_bridge (
+        .HCLK       (clk),
+        .HRESETn    (~rst_sys),
+        .MEM_READY  (ddr_mem_ready),
+        .HSEL       (s3_hsel),
+        .HADDR      (s3_haddr),
+        .HTRANS     (s3_htrans),
+        .HWRITE     (s3_hwrite),
+        .HSIZE      (s3_hsize),
+        .HPROT      (s3_hprot),
+        .HWSTRB     (s3_hwstrb),
+        .HWDATA     (s3_hwdata),
+        .HRDATA     (s3_hrdata),
+        .HREADYOUT  (s3_hreadyout),
+        .HRESP      (s3_hresp),
+        .rd_valid   (s3_rd_valid),
+        .M_AXI_AWID    (ddr_axi_awid),
+        .M_AXI_AWADDR  (ddr_axi_awaddr),
+        .M_AXI_AWLEN   (ddr_axi_awlen),
+        .M_AXI_AWSIZE  (ddr_axi_awsize),
+        .M_AXI_AWBURST (ddr_axi_awburst),
+        .M_AXI_AWLOCK  (ddr_axi_awlock),
+        .M_AXI_AWCACHE (ddr_axi_awcache),
+        .M_AXI_AWPROT  (ddr_axi_awprot),
+        .M_AXI_AWQOS   (ddr_axi_awqos),
+        .M_AXI_AWVALID (ddr_axi_awvalid),
+        .M_AXI_AWREADY (ddr_axi_awready),
+        .M_AXI_WDATA   (ddr_axi_wdata),
+        .M_AXI_WSTRB   (ddr_axi_wstrb),
+        .M_AXI_WLAST   (ddr_axi_wlast),
+        .M_AXI_WVALID  (ddr_axi_wvalid),
+        .M_AXI_WREADY  (ddr_axi_wready),
+        .M_AXI_BID     (ddr_axi_bid),
+        .M_AXI_BRESP   (ddr_axi_bresp),
+        .M_AXI_BVALID  (ddr_axi_bvalid),
+        .M_AXI_BREADY  (ddr_axi_bready),
+        .M_AXI_ARID    (ddr_axi_arid),
+        .M_AXI_ARADDR  (ddr_axi_araddr),
+        .M_AXI_ARLEN   (ddr_axi_arlen),
+        .M_AXI_ARSIZE  (ddr_axi_arsize),
+        .M_AXI_ARBURST (ddr_axi_arburst),
+        .M_AXI_ARLOCK  (ddr_axi_arlock),
+        .M_AXI_ARCACHE (ddr_axi_arcache),
+        .M_AXI_ARPROT  (ddr_axi_arprot),
+        .M_AXI_ARQOS   (ddr_axi_arqos),
+        .M_AXI_ARVALID (ddr_axi_arvalid),
+        .M_AXI_ARREADY (ddr_axi_arready),
+        .M_AXI_RID     (ddr_axi_rid),
+        .M_AXI_RDATA   (ddr_axi_rdata),
+        .M_AXI_RRESP   (ddr_axi_rresp),
+        .M_AXI_RLAST   (ddr_axi_rlast),
+        .M_AXI_RVALID  (ddr_axi_rvalid),
+        .M_AXI_RREADY  (ddr_axi_rready)
+    );
 
 //==============================================================================
 //  三之二、boot 搬运引擎：上电把镜像从 SPI flash 搬进 STCM，搬完放开 CPU

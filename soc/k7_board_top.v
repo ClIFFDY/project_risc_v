@@ -91,6 +91,10 @@ module k7_board_top(
     endgenerate
 
 //--------------------------------------------------------------- MCU
+// ★ DDR 下游还没接（MIG 未进）。桥的 DDR_PRESENT=0 ⇒ 任何访问 0x8000_0000-0xBFFF_FFFF
+//   的传输都会被回成总线 ERROR（错误日志 plic 0x0900_0000 能看见），不挂死、不静默回 0。
+//   MIG 将来例化在 mcu_top 里面（AXI 链路不出 mcu_top 的边界）—— 顶层的 200 多根
+//   AXI 脚没有引脚约束时布局器会直接死，别再引出来。
     mcu_top u_mcu (
         .clk           (clk_50),
         .rst           (rst_por),

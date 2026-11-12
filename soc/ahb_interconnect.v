@@ -1,7 +1,8 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
 // Module Name: ahb_interconnect
-// Description: 三主两从 AHB 互联（单时钟）。按 AHB 的握手口径实现：
+// Description: 四主四从 AHB 互联（单时钟）。按 AHB 的握手口径实现：
+//              s0=APB 桥 / s1=STCM / s2=NPU（变延迟，直达）/ s3=DDR-AXI 桥（变延迟，直达）
 //
 //   ── 握手约定（这次是标准做法，别再退回"脉冲 valid"）────────────────────────
 //   1. 主设备把要发的节拍放在 HADDR/HTRANS 上，并【保持】；
@@ -127,7 +128,21 @@ module ahb_interconnect(
     input      [31:0] s2_hrdata,
     input             s2_hreadyout,
     input             s2_hresp,
-    input             s2_rd_valid
+    input             s2_rd_valid,
+
+//---- s3：DDR/AXI 桥（slot 32 = 0x8000_0000，AXI 往返几十拍 ⇒ 同样走直达通路）----
+    output reg [31:0] s3_haddr,
+    output reg [1:0]  s3_htrans,
+    output reg        s3_hwrite,
+    output reg [2:0]  s3_hsize,
+    output reg [3:0]  s3_hprot,
+    output reg [31:0] s3_hwdata,
+    output reg [3:0]  s3_hwstrb,
+    output reg        s3_hsel,
+    input      [31:0] s3_hrdata,
+    input             s3_hreadyout,
+    input             s3_hresp,
+    input             s3_rd_valid
     );
 
     localparam [1:0] M_LSU = 2'd0, M_L2 = 2'd1, M_DMA = 2'd2, M_BOOT = 2'd3;
@@ -216,6 +231,8 @@ module ahb_interconnect(
     wire sel_stcm = (haddr[31:18] == 14'd0);
     // NPU 占 slot 8（0x2000_0000）
     wire sel_npu  = (haddr[31:26] == 6'd8);
+    // DDR/AXI 桥占 0x8000_0000-0xBFFF_FFFF（slot 32..47）；精确窗口由桥自己再判
+    wire sel_ddr  = (haddr[31:30] == 2'b10);
 
     always @(*) begin
         s0_haddr = haddr; s0_htrans = htrans; s0_hwrite = hwrite;
@@ -227,23 +244,34 @@ module ahb_interconnect(
 //没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
         s2_haddr = haddr; s2_htrans = htrans; s2_hwrite = hwrite;
         s2_hsize = hsize; s2_hwdata = hwdata; s2_hsel = sel_npu;
+        s3_haddr = haddr; s3_htrans = htrans; s3_hwrite = hwrite;
+        s3_hsize = hsize; s3_hprot = hprot; s3_hwdata = hwdata; s3_hwstrb = hwstrb;
+        s3_hsel = sel_ddr;
 //没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
         if (sel_npu) begin
             s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
             s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
+            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
         end
         else if (sel_stcm) begin
             s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
+            s2_htrans = 2'b00; s2_hwrite = 1'b0;
+            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
+        end
+        else if (sel_ddr) begin
+            s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
+            s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
             s2_htrans = 2'b00; s2_hwrite = 1'b0;
         end
         else begin
             s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
             s2_htrans = 2'b00; s2_hwrite = 1'b0;
+            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
         end
     end
 
-    wire        s_hreadyout = sel_npu ? s2_hreadyout : sel_stcm ? s1_hreadyout : s0_hreadyout;
-    wire        s_hresp     = sel_npu ? s2_hresp     : sel_stcm ? s1_hresp     : s0_hresp;
+    wire        s_hreadyout = sel_npu ? s2_hreadyout : sel_ddr ? s3_hreadyout : sel_stcm ? s1_hreadyout : s0_hreadyout;
+    wire        s_hresp     = sel_npu ? s2_hresp     : sel_ddr ? s3_hresp     : sel_stcm ? s1_hresp     : s0_hresp;
 
 //==============================================================================
 //  四、owner FIFO：读地址被接受时把"谁发的 + 发给哪个从设备"一起记下来
@@ -257,7 +285,7 @@ module ahb_interconnect(
 //    ahb_apb_bridge 的应答都是"接受后第 2 拍"，成立。以后谁加了等待态，
 //    这里要么拆成每从设备一条队列，要么改成带标签的乱序回收。
 //==============================================================================
-    reg [3:0] owner_mem [0:7];                // {sel[1:0], owner[1:0]}：0=APB 1=STCM 2=NPU
+    reg [3:0] owner_mem [0:7];                // {sel[1:0], owner[1:0]}：0=APB 1=STCM（2=NPU、3=DDR 走直达不进队）
     reg [2:0] owner_wr, owner_rd;
     wire      owner_empty = (owner_wr == owner_rd);
     wire [2:0] owner_count = owner_wr - owner_rd;
@@ -266,30 +294,57 @@ module ahb_interconnect(
 //  只按 htrans 计会在从设备拉等待时把同一拍记成两次（现在的 STCM hready 恒 1
 //  看不出来，换了带等待的从设备就是致命的）。
     wire accept_read = (htrans != 2'b00) && !hwrite && s_hreadyout;
+
+//★ 2026-11-13：NPU 的直达应答必须按【接受时的记录】回送，不能拿当拍地址判。
+//  原因：LSU 主设备的地址锁存（lsu_ahb_master.v 的 lat_addr）在请求被接受后
+//  不会清零，所以 CPU 只要碰过一次 NPU，haddr 就一直指着 NPU、sel_npu 恒 1。
+//  这时别的从设备（尤其 L2 的 32 拍行填充）的读应答会被 resp_sel 选成 NPU
+//  然后丢掉：L2 的 fill_recv 停在 31/32，owner FIFO 里那一项永远不弹，
+//  icache 等不到数据，整核冻死。实测现象就是"写过一次 NPU 之后核卡死"。
+//  NPU 的 rd_valid 至少比地址被接受晚一拍（npu/bus/ahb_lite_slave.v 在 S_DATA
+//  才回），所以一深寄存器够用，不存在"接受与应答同拍"的冲突。
+//  ★ DDR 桥不走这条：它在 S_DONE 同拍给 HREADYOUT 和 rd_valid，而且整笔传输
+//    期间压着 HREADYOUT ⇒ 授权与地址都不换手，按当拍 sel_ddr 判是对的。
+    reg        npu_read_pending;
+    reg [1:0]  npu_read_owner;
+
+    always @(posedge clk) begin
+        if (reset_registered) begin
+            npu_read_pending <= 1'b0;
+            npu_read_owner   <= 2'd0;
+        end
+        else if (accept_read && sel_npu) begin
+            npu_read_pending <= 1'b1;
+            npu_read_owner   <= grant;
+        end
+        else if (resp_rd_valid && npu_read_pending)
+            npu_read_pending <= 1'b0;
+    end
+
     always @(posedge clk) begin
         if (reset_registered) begin
             owner_wr <= 3'd0;
             owner_rd <= 3'd0;
         end
         else begin
-            // ★ NPU 是变延迟从设备：它的"HREADYOUT 放开"那一拍就是应答那一拍，
-            //   压进 FIFO 会出现同拍 push+pop、队头还是旧值 ⇒ 应答错路由（踩过这个坑）。
-            //   它在飞期间 grant_busy 保证授权不换手 ⇒ 直接按当拍 sel/grant 回送即可。
-            if (accept_read && !sel_npu && (owner_count != 3'd7)) begin
+            if (accept_read && !sel_npu && !sel_ddr && (owner_count != 3'd7)) begin
                 owner_mem[owner_wr] <= {sel_stcm ? 2'd1 : 2'd0, grant};
                 owner_wr <= owner_wr + 3'd1;
             end
-            if (resp_rd_valid && !owner_empty)
+            if (resp_rd_valid && !npu_read_pending && !owner_empty)
                 owner_rd <= owner_rd + 3'd1;
         end
     end
 
     wire [3:0]  resp_tag   = owner_mem[owner_rd];
-    wire [1:0]  resp_sel   = sel_npu ? 2'd2 : resp_tag[3:2];
-    wire [1:0]  resp_owner = sel_npu ? grant : resp_tag[1:0];
-    wire [31:0] resp_hrdata   = (resp_sel == 2'd2) ? s2_hrdata :
+    wire [1:0]  resp_sel   = npu_read_pending ? 2'd2 : sel_ddr ? 2'd3 : resp_tag[3:2];
+    wire [1:0]  resp_owner = npu_read_pending ? npu_read_owner
+                                             : (sel_ddr ? grant : resp_tag[1:0]);
+    wire [31:0] resp_hrdata   = (resp_sel == 2'd3) ? s3_hrdata :
+                                (resp_sel == 2'd2) ? s2_hrdata :
                                 (resp_sel == 2'd1) ? s1_hrdata : s0_hrdata;
-    wire        resp_rd_valid = (resp_sel == 2'd2) ? s2_rd_valid :
+    wire        resp_rd_valid = (resp_sel == 2'd3) ? s3_rd_valid :
+                                (resp_sel == 2'd2) ? s2_rd_valid :
                                 (resp_sel == 2'd1) ? s1_rd_valid : s0_rd_valid;
 
 //==============================================================================

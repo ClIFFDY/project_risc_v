@@ -30,14 +30,16 @@ module mcu_top #(
     parameter integer IC_INDEX_B        = 6,    // 16KB（8=64KB / 7=32KB）；与 cpu_top 默认一致
     parameter integer BHT_B             = 11,
     parameter integer BTB_B             = 11,
-    parameter integer DC_SETS_B         = 9,
+    parameter integer DC_SETS_B         = 8,    // 16KB（9=32KB / 8=16KB / 7=8KB）；与 cpu_top 默认一致
     parameter integer ITCM_AW           = 14,
     parameter integer ADDER_AT_D        = 0,
 //★ 7 号槽 SPI 的分频由这两个频率算出来（见 IO_block/pmem_spi.v 头注释）：
 //  换核时钟只改 CLK_MHZ，SCK 目标频率保持不变。
     parameter integer CLK_MHZ           = 120,
     parameter integer FLASH_SCK_KHZ     = 2500,
-    parameter integer SD_SCK_KHZ        = 300
+    parameter integer SD_SCK_KHZ        = 300,
+//DDR 下游在不在。0（默认）= 没有存储器，访问 DDR 窗口一律回 ERROR；接 MIG 时改 1。
+    parameter integer DDR_PRESENT       = 0
 ) (
     input clk, rst,
     inout wire [31:0] gpio_pin_bus,
@@ -112,7 +114,9 @@ module mcu_top #(
         .l2_uncached_base(l2_unc_base_w), .l2_uncached_mask(l2_unc_mask_w)
     );
 
-    bus_con_top u_bus_con (
+    bus_con_top #(
+        .DDR_PRESENT(DDR_PRESENT)
+    ) u_bus_con (
         .clk(clk),
         .rst(rst),
         .bus_addr_f_cpu(bus_addr_f_cpu),
@@ -153,7 +157,19 @@ module mcu_top #(
         .m1_hrdata(l2_hrdata_w), .m1_hready(l2_hready_w), .m1_hresp(l2_hresp_w),
         .m1_rd_valid(l2_rd_valid_w), .m1_hgrant(l2_hgrant_w),
         .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),
-        .err_addr(err_addr_w), .err_clear(err_clear_w)
+        .err_addr(err_addr_w), .err_clear(err_clear_w),
+// ★ DDR/AXI 下游还没有东西（MIG 未接），桥的 DDR_PRESENT=0 ⇒ 访问 0x8000_0000 起的窗口
+//   一律回总线 ERROR。AXI 侧输入钉 0、输出不接。
+//   ★ 不要把 AXI 主口引成 mcu_top 的端口：顶层每根端口都要占一个 IO 缓冲，128 位数据
+//     + 32 位地址 + ID 一类一共 200 多根，没有引脚约束时布局器直接
+//     "[Place 30-99] IO Clock Placer failed"（实测 103 个 ERROR、OBUF 全部未布局）。
+//     接 MIG 时把 MIG 例化在【这个文件里】，AXI 链路保持内部；DDR 引脚才是顶层端口。
+        .ddr_mem_ready(1'b0),
+        .ddr_axi_awready(1'b0), .ddr_axi_wready(1'b0),
+        .ddr_axi_bid(4'd0), .ddr_axi_bresp(2'd0), .ddr_axi_bvalid(1'b0),
+        .ddr_axi_arready(1'b0),
+        .ddr_axi_rid(4'd0), .ddr_axi_rdata(128'd0), .ddr_axi_rresp(2'd0),
+        .ddr_axi_rlast(1'b0), .ddr_axi_rvalid(1'b0)
     );
 
     io_block_top #(
