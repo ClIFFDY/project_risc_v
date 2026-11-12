@@ -57,7 +57,10 @@ module ahb_apb_bridge(
 //★ 2026-11-12：定时器/PWM 挂 6 号槽（0x1800_0000）。FreeRTOS 的节拍源，gpio_group
 //  的 PWM1~4 模式也吃它的四路输出。接法与其它外设相同（字节地址 >> 2 广播 + 槽号认领）。
     input      [31:0] tim_data,
-    input             tim_ready
+    input             tim_ready,
+//★ 2026-11-12：SPI 主机挂 7 号槽（0x1C00_0000），接板上的 flash。
+    input      [31:0] spi_data,
+    input             spi_ready
     );
 
     localparam [5:0]
@@ -67,11 +70,12 @@ module ahb_apb_bridge(
     SLOT_DMA  = 6'd3,
     SLOT_GPIO = 6'd4,
     SLOT_I2C  = 6'd5,
-    SLOT_TIM  = 6'd6;
+    SLOT_TIM  = 6'd6,
+    SLOT_SPI  = 6'd7;
 
     reg [5:0] slot;
     always @(*) begin
-        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd6) slot = haddr[31:26];
+        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd7) slot = haddr[31:26];
         else slot = SLOT_NONE;
     end
 
@@ -108,6 +112,7 @@ module ahb_apb_bridge(
         SLOT_GPIO: sel_ld_ready = gpio_ready;
         SLOT_I2C:  sel_ld_ready = i2c_ready;
         SLOT_TIM:  sel_ld_ready = tim_ready;
+        SLOT_SPI:  sel_ld_ready = spi_ready;
         default:   sel_ld_ready = 1'b1;
         endcase
     end
@@ -159,6 +164,7 @@ module ahb_apb_bridge(
         SLOT_GPIO: hrdata_c = gpio_data;
         SLOT_I2C:  hrdata_c = i2c_data;
         SLOT_TIM:  hrdata_c = tim_data;
+        SLOT_SPI:  hrdata_c = spi_data;
         default:   hrdata_c = 32'd0;
         endcase
         rd_valid_c = (pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready) | err_done;

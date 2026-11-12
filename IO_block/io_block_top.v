@@ -38,6 +38,13 @@ module io_block_top(
     output            i2c_ready,
     output     [31:0] tim_data,
     output            tim_ready,
+//7 号槽：SPI 主机（板上的 flash）
+    output     [31:0] spi_data,
+    output            spi_ready,
+    output            spi_cs_n,
+    output            spi_sck,
+    output            spi_mosi,
+    input             spi_miso,
     output            plic_exti,
 //DMA 的完成中断：挂到 PLIC 的 2 号源（3/4 号已被 GPIO/I2C 占）
     input             dma_irq,
@@ -54,20 +61,22 @@ module io_block_top(
     PER_PLIC = 2,
     PER_GPIO = 4,
     PER_I2C  = 5,
-    PER_TIM  = 6;
+    PER_TIM  = 6,
+    PER_SPI  = 7;
 
     wire uart_rx_w, uart_tx_w;
     wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq_w;
     wire i2c_scl_oe, i2c_sda_oe, i2c_scl_in, i2c_sda_in;
     wire pwm1_w, pwm2_w, pwm3_w, pwm4_w;
 
-    reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c, bus_we_tim;
+    reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c, bus_we_tim, bus_we_spi;
     always @(*) begin
         bus_we_uart = bus_we_in & bus_sel_in[PER_UART];
         bus_we_plic = bus_we_in & bus_sel_in[PER_PLIC];
         bus_we_gpio = bus_we_in & bus_sel_in[PER_GPIO];
         bus_we_i2c  = bus_we_in & bus_sel_in[PER_I2C];
         bus_we_tim  = bus_we_in & bus_sel_in[PER_TIM];
+        bus_we_spi  = bus_we_in & bus_sel_in[PER_SPI];
     end
 
     uart_top u_uart (
@@ -136,6 +145,22 @@ module io_block_top(
         .ld_ready(tim_ready),
         .tim_p_irq(tim_irq_w),
         .pwm1(pwm1_w), .pwm2(pwm2_w), .pwm3(pwm3_w), .pwm4(pwm4_w)
+    );
+
+//SPI 主机（7 号槽）：接板上的 SPI NOR flash，四根线直出、不经 gpio
+    flash_spi u_flash_spi (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_spi),
+        .bus_data_out(spi_data),
+        .ld_ready(spi_ready),
+        .spi_cs_n(spi_cs_n),
+        .spi_sck(spi_sck),
+        .spi_mosi(spi_mosi),
+        .spi_miso(spi_miso)
     );
 
     plic u_plic (

@@ -44,6 +44,8 @@ module bus_con_top(
     input             i2c_ready,
     input      [31:0] tim_data,
     input             tim_ready,
+    input      [31:0] spi_data,
+    input             spi_ready,
 //---- m1：L2（cpu_top 里的 64KB 统一二级缓存）----
     input      [31:0] m1_haddr,
     input      [1:0]  m1_htrans,
@@ -268,6 +270,8 @@ module bus_con_top(
         .i2c_ready(i2c_ready),
         .tim_data(tim_data),
         .tim_ready(tim_ready),
+        .spi_data(spi_data),
+        .spi_ready(spi_ready),
         .dma_data(dma_data_q),
         .dma_ready(1'b1)
     );
