@@ -214,6 +214,7 @@ module isq(
     output reg [9:0]  lsu_function10,
     output reg [31:0] lsu_imm,
     output reg [4:0]  lsu_index,
+    output reg [5:0]  lsu_phys_d,
     output reg        lsu_generation,
     output reg [31:0] lsu_pc,
     output reg [31:0] lsu_a, lsu_b,
@@ -285,7 +286,10 @@ module isq(
     localparam MEM_IMM_LO   = 42;   // 32  立即数
     localparam MEM_PHYSA_LO = 74;   //  6  基址物理号
     localparam MEM_PHYSB_LO = 80;   //  6  数据物理号（load 侧是垃圾译码，与原来同悲观）
-    localparam MEM_PAYLOAD_W = 86;
+//★ 2026-11-12：目的物理号随站条目一起存。原来它不进站，load 写回时 ROB 要现查一次
+//  entry_phys（分布式 RAM）把槽号换成物理号 —— 那一次读正压在 lsu→isq 那条链中间。
+    localparam MEM_PHYSD_LO = 86;   //  6  目的物理号
+    localparam MEM_PAYLOAD_W = 92;
 //---- 站阵列（访存只有一份，不分 lane）----
     reg  [MEM_PAYLOAD_W-1:0] mem_data_m [0:MEM_ST_DEPTH-1];
     reg  [MEM_ST_DEPTH-1:0]  mem_valid_m;
@@ -295,10 +299,10 @@ module isq(
     reg  [MEM_ST_DEPTH-1:0]  mem_shift_m;
     reg  [2:0]               mem_append_m;
     reg  [MEM_ST_DEPTH-1:0]  mem_entry_ready_a, mem_entry_ready_b, mem_pickable;
+    reg  [MEM_ST_DEPTH-1:0]  mem_fwd_a, mem_fwd_b;
 //★ 当拍前送电平：这一格【没有出站寄存器】，一就绪就当拍被 LSU 取走 ——
 //  所以"常驻位"之外还要认这三条前送（它们说的就是"这一拍总线上有这个号"）。
 //  只认常驻位会把消费者往后压一拍；只认前送则会漏掉已经写进阵列的号。
-    reg  [MEM_ST_DEPTH-1:0]  mem_fwd_a, mem_fwd_b;
     reg  [2:0]               mem_store_barrier;
     reg                      mem_sel_found;
     reg  [MEM_AW-1:0]        mem_sel;
@@ -1041,6 +1045,14 @@ module isq(
             entry_phys_a   = mem_data_m[k][MEM_PHYSA_LO +: 6];
             entry_phys_b   = mem_data_m[k][MEM_PHYSB_LO +: 6];
             entry_is_store = mem_data_m[k][MEM_ISST_LO];
+//★ 2026-11-12：只留 load 那一项。实测（CoreMark 327,706 条访存发射）fwd-only 的
+//  55,433 条 **全部**来自 load 项，ALU 那两项贡献精确为 0 —— 因为 ALU 生产者在发射拍
+//  就叫醒了（alu_issue_0/1 进就绪列表），下一拍值上旁路时常驻位已经置好。
+//  load 不一样：它的早唤醒 load_wake_valid 根本没接进站（isq 里引用数 0），
+//  只有晚一拍的 load_write，所以这一项必须留。
+//  删掉 ALU 两项 = 把 ALU 的物理号从访存站选优锥上摘掉。
+            mem_fwd_a[k] = (ld_fwd_ok & (ld_phys_early == entry_phys_a));
+            mem_fwd_b[k] = (ld_fwd_ok & (ld_phys_early == entry_phys_b));
             mem_entry_ready_a[k] = mem_rdy_a_m[k]
                              | (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == entry_phys_a))
                              | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == entry_phys_a))
@@ -1057,12 +1069,15 @@ module isq(
                              | (load_write     & (load_write_phys     == entry_phys_b))
                              | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == entry_phys_b))
                              | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == entry_phys_b));
-            mem_fwd_a[k] = (alu_fwd_ok_0 & (phys_alu_early_0 == entry_phys_a))
-                         | (alu_fwd_ok_1 & (phys_alu_early_1 == entry_phys_a))
-                         | (ld_fwd_ok    & (ld_phys_early    == entry_phys_a));
-            mem_fwd_b[k] = (alu_fwd_ok_0 & (phys_alu_early_0 == entry_phys_b))
-                         | (alu_fwd_ok_1 & (phys_alu_early_1 == entry_phys_b))
-                         | (ld_fwd_ok    & (ld_phys_early    == entry_phys_b));
+//★ 2026-11-12：前送不再进 pickable。唤醒是静态的 —— 醒了就一定可发，前送只决定【值从哪来】。
+//  原来这里挂着 mem_fwd_a/b（"没醒但旁路有货也发"），那条判据把 ALU 的物理号
+//  (phys_alu_early) 拉进了选优锥 ⇒ 选优 → PRF 读地址 → store 基址 → lsu 一条 13 级链。
+//★ 2026-11-12：与两条 lane 站同构 —— pickable 吃【活的】ready（常驻位 | 当拍唤醒），
+//  不是只吃常驻位。原来只吃 mem_rdy_a_m，看不见当拍唤醒，于是拿 mem_fwd（"旁路有货就算能发"）
+//  补那一拍；那条判据把 ALU 的物理号拉进了选优锥（选优 → PRF 读地址 → store 基址 → lsu）。
+//★ 2026-11-12：这里【不能】照抄 lane 站吃活的 entry_ready —— 访存站没有 Q 阶段，
+//  选中和读操作数同一拍，唤醒那一拍值还没上总线（实测照抄后 rand 63/200）。
+//  所以只能用 mem_fwd（"上一拍的结果已经在旁路上"）来补，这是结构差异不是冗余。
             mem_pickable[k] = mem_valid_m[k]
                             & (mem_rdy_a_m[k] | mem_fwd_a[k])
 //★ B 侧只有 store 才要：load 的 B 就是立即数位域译出来的"假 rs2"，
@@ -1092,7 +1107,7 @@ module isq(
 //入站载荷：IDU FIFO 那一套字段原样搬进站。低位在前，与上面的 *_LO 表一致。
     always @(*) begin
         mem_enq_payload = {
-            mem_phys_b_in, mem_phys_a_in,
+            lsu_phys_d_in, mem_phys_b_in, mem_phys_a_in,
             mem_immediate_in, mem_auxiliary_address_in,
             mem_load_store_function3_in, mem_is_store_in,
             mem_generation_in, mem_index_in };
@@ -1289,6 +1304,7 @@ module isq(
         lsu_opcode = mem_data_m[mem_sel][MEM_ISST_LO] ? OPCODE_STORE : OPCODE_LOAD;
         lsu_function10 = {7'd0, mem_data_m[mem_sel][MEM_F3_LO +: 3]};
         lsu_index = mem_data_m[mem_sel][MEM_IDX_LO +: 5];
+        lsu_phys_d = mem_data_m[mem_sel][MEM_PHYSD_LO +: 6];
         lsu_generation = mem_data_m[mem_sel][MEM_GEN_LO +: 1];
 //载荷里存的是 auxiliary 约定（= 指令地址 + 4），这里减回真 pc。
         lsu_pc = mem_data_m[mem_sel][MEM_AUX_LO +: 32] - 32'd4;

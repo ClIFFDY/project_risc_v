@@ -18,6 +18,10 @@ module rename #(
     input [3:0]  store_flush_pop,
     output reg   credit_stall_out,
 //给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
+//给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
+//★ 2026-11-12 试过寄存一拍再送：rand 0/200、CoreMark 0 字符。
+//  因为 advance 与 iffu 的弹出是【同一拍的 1:1 契约】（我这一拍从你那几格收 N 条，你走 N 格），
+//  晚一拍就重复/漏发。要断这条环得改契约本身，不是插一个寄存器。
     output reg [3:0] advance,
 input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,    output        push1_valid, output [132:0] push1_data,    output        push2_valid, output [132:0] push2_data,
 //★ 保留站的空位（isq 出口）：站满就把本 lane 的分配门关掉。
@@ -415,15 +419,19 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     endfunction
 
 
+    reg alloc_block;
     (* max_fanout = 32 *) reg [3:0] lsu_queue_count;
     always @(*) begin
         exec    = exec_in;
 //★ 2026-11-11：不再吃 isq 的 station_room —— 本地空位就是背压。
 //  三个口各自的"第几条"必须与 dsq 的格数逐条对齐：alloc 一旦成立，ROB 就发槽、
 //  条目就必须真的推得进 dsq。少挡一条 ⇒ 条目被静默丢掉、ROB 那槽永远等不到完成。
-        lane0_free = (dsq_room >= 2'd1);
-        lane1_free = (dsq_room >= 2'd2);
-        lane2_free = (dsq_room >= 2'd3);
+//★ 2026-11-12：dsq 的三条队列各报一根 full，和 ROB 满【或】起来直接背压。
+//  room 只可能是 0/2（见 dsq），所以 lane0/lane1 同门；三宽（lane2）不再开。
+        alloc_block = (dsq_room == 2'd0) | stall_rob_full_in;
+        lane0_free = ~alloc_block;
+        lane1_free = ~alloc_block;
+        lane2_free = 1'b0;
 //★ 2026-11-11：分配门必须与 rob.v 的 alloc_take_* 逐字同门（`~(redir_backend_0 | irq_kill)`）。
 //  rob 那一拍不分配、rename 却把条目推进 dsq ⇒ 条目带着一个没被分配出去的槽号，
 //  下一拍同一槽号被别的指令正经分配 ⇒ ROB 项的 rd/jump 与指令对不上（实测 CoreMark 231 字符处卡死）。
@@ -1212,7 +1220,8 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //  不再让 free_vector 的选号扫描钻进 idu 的分配门（那条路会一路拖到 iffu 的推进上）。
     localparam [5:0] BANK_FREE_INIT = (PHYS_COUNT - ARCH_COUNT) / 2;
     reg [5:0] free_count_even, free_count_odd;
-    reg [5:0] flush_count_even, flush_count_odd;
+    wire [5:0] flush_count_even = flush_count_even_comb;
+    wire [5:0] flush_count_odd  = flush_count_odd_comb;
 
 //这一条要不要发号：有写回、且不是 x0
     wire need_0 = rename_alloc_en_0 & rename_alloc_we_0 & (rename_alloc_rd_0 != 5'd0);
@@ -1415,20 +1424,21 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                                      | (alloc_ok_3 ? pick_b1_1_onehot : {PHYS_COUNT{1'b0}});
     assign alloc_onehot = alloc_mask;
 
-//★ 冲刷后【唯一还在用】的物理号就是 arch_map 里那 32 个（在飞的项全被作废了）。
-//  所以空闲表直接取补集 —— 按构造正确，不会漏号。
-    reg [PHYS_COUNT-1:0] arch_next_mask;
+//★ 2026-11-12：冲刷后的空闲表 = arch_map 那 32 个号的补集。
+//  晚一拍重建（用户定的）：T 拍冲刷时 arch_map 已经被那条提交更新过，
+//  所以 T+1 拍只读 arch_map 这个【寄存器】就能重建 —— 不再碰 rob 的提交口，
+//  跨模块那一跳 1.9ns 和提交口 mux 全部消失。
+    reg                  flush_pending_q;   // 冲刷打一拍：重建晚一拍落地
+    reg [PHYS_COUNT-1:0] arch_mask_now;
     integer m;
     always @(*) begin
-        arch_next_mask = {PHYS_COUNT{1'b0}};
-        for (m = 0; m < ARCH_COUNT; m = m + 1) begin
-            if      (old_valid_b && (commit_rd1_in == m)) arch_next_mask = arch_next_mask | ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << commit_phys1_in);
-            else if (old_valid_a && (commit_rd0_in == m)) arch_next_mask = arch_next_mask | ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << commit_phys0_in);
-            else                                        arch_next_mask = arch_next_mask | ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << arch_map[m]);
-        end
+        arch_mask_now = {PHYS_COUNT{1'b0}};
+        for (m = 0; m < ARCH_COUNT; m = m + 1)
+            arch_mask_now = arch_mask_now | ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << arch_map[m]);
     end
-    wire [PHYS_COUNT-1:0] flush_free_mask = ~arch_next_mask;
-    assign arch_next_onehot = arch_next_mask;
+    wire flush_pending = flush_pending_q;
+    wire [PHYS_COUNT-1:0] flush_free_mask = ~arch_mask_now;
+    assign arch_next_onehot = ~arch_mask_now;
 
 //---- 两个 bank 的空闲号个数：按位向量同一套事件加减，冲刷时按构造重算 ----
 //  分配扣、提交还，口径与 free_vector 逐条同源 ⇒ 两者不会走散。
@@ -1437,18 +1447,71 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     wire [3:0] freed_cnt_even = {3'd0, (old_valid_a & ~old_a[0])} + {3'd0, (old_valid_b & ~old_b[0])};
     wire [3:0] freed_cnt_odd  = {3'd0, (old_valid_a &  old_a[0])} + {3'd0, (old_valid_b &  old_b[0])};
 
-    integer q;
-    always @(*) begin
-        flush_count_even = 6'd0;
-        flush_count_odd  = 6'd0;
-        for (q = 0; q < PHYS_COUNT; q = q + 1) begin
-            if (flush_free_mask[q]) begin
-                if (q[0]) flush_count_odd  = flush_count_odd  + 6'd1;
-                else      flush_count_even = flush_count_even + 6'd1;
-            end
-        end
-    end
-
+//★ popcount 树：32 个偶位两两相加，5 级出 6 位。输入是寄存器量（arch_mask_now）。
+    wire [1:0] fce_l0_0 = flush_free_mask[0] + flush_free_mask[2];
+    wire [1:0] fce_l0_1 = flush_free_mask[4] + flush_free_mask[6];
+    wire [1:0] fce_l0_2 = flush_free_mask[8] + flush_free_mask[10];
+    wire [1:0] fce_l0_3 = flush_free_mask[12] + flush_free_mask[14];
+    wire [1:0] fce_l0_4 = flush_free_mask[16] + flush_free_mask[18];
+    wire [1:0] fce_l0_5 = flush_free_mask[20] + flush_free_mask[22];
+    wire [1:0] fce_l0_6 = flush_free_mask[24] + flush_free_mask[26];
+    wire [1:0] fce_l0_7 = flush_free_mask[28] + flush_free_mask[30];
+    wire [1:0] fce_l0_8 = flush_free_mask[32] + flush_free_mask[34];
+    wire [1:0] fce_l0_9 = flush_free_mask[36] + flush_free_mask[38];
+    wire [1:0] fce_l0_10 = flush_free_mask[40] + flush_free_mask[42];
+    wire [1:0] fce_l0_11 = flush_free_mask[44] + flush_free_mask[46];
+    wire [1:0] fce_l0_12 = flush_free_mask[48] + flush_free_mask[50];
+    wire [1:0] fce_l0_13 = flush_free_mask[52] + flush_free_mask[54];
+    wire [1:0] fce_l0_14 = flush_free_mask[56] + flush_free_mask[58];
+    wire [1:0] fce_l0_15 = flush_free_mask[60] + flush_free_mask[62];
+    wire [2:0] fce_l1_0 = fce_l0_0 + fce_l0_1;
+    wire [2:0] fce_l1_1 = fce_l0_2 + fce_l0_3;
+    wire [2:0] fce_l1_2 = fce_l0_4 + fce_l0_5;
+    wire [2:0] fce_l1_3 = fce_l0_6 + fce_l0_7;
+    wire [2:0] fce_l1_4 = fce_l0_8 + fce_l0_9;
+    wire [2:0] fce_l1_5 = fce_l0_10 + fce_l0_11;
+    wire [2:0] fce_l1_6 = fce_l0_12 + fce_l0_13;
+    wire [2:0] fce_l1_7 = fce_l0_14 + fce_l0_15;
+    wire [3:0] fce_l2_0 = fce_l1_0 + fce_l1_1;
+    wire [3:0] fce_l2_1 = fce_l1_2 + fce_l1_3;
+    wire [3:0] fce_l2_2 = fce_l1_4 + fce_l1_5;
+    wire [3:0] fce_l2_3 = fce_l1_6 + fce_l1_7;
+    wire [4:0] fce_l3_0 = fce_l2_0 + fce_l2_1;
+    wire [4:0] fce_l3_1 = fce_l2_2 + fce_l2_3;
+    wire [5:0] fce_l4_0 = fce_l3_0 + fce_l3_1;
+    wire [1:0] fco_l0_0 = flush_free_mask[1] + flush_free_mask[3];
+    wire [1:0] fco_l0_1 = flush_free_mask[5] + flush_free_mask[7];
+    wire [1:0] fco_l0_2 = flush_free_mask[9] + flush_free_mask[11];
+    wire [1:0] fco_l0_3 = flush_free_mask[13] + flush_free_mask[15];
+    wire [1:0] fco_l0_4 = flush_free_mask[17] + flush_free_mask[19];
+    wire [1:0] fco_l0_5 = flush_free_mask[21] + flush_free_mask[23];
+    wire [1:0] fco_l0_6 = flush_free_mask[25] + flush_free_mask[27];
+    wire [1:0] fco_l0_7 = flush_free_mask[29] + flush_free_mask[31];
+    wire [1:0] fco_l0_8 = flush_free_mask[33] + flush_free_mask[35];
+    wire [1:0] fco_l0_9 = flush_free_mask[37] + flush_free_mask[39];
+    wire [1:0] fco_l0_10 = flush_free_mask[41] + flush_free_mask[43];
+    wire [1:0] fco_l0_11 = flush_free_mask[45] + flush_free_mask[47];
+    wire [1:0] fco_l0_12 = flush_free_mask[49] + flush_free_mask[51];
+    wire [1:0] fco_l0_13 = flush_free_mask[53] + flush_free_mask[55];
+    wire [1:0] fco_l0_14 = flush_free_mask[57] + flush_free_mask[59];
+    wire [1:0] fco_l0_15 = flush_free_mask[61] + flush_free_mask[63];
+    wire [2:0] fco_l1_0 = fco_l0_0 + fco_l0_1;
+    wire [2:0] fco_l1_1 = fco_l0_2 + fco_l0_3;
+    wire [2:0] fco_l1_2 = fco_l0_4 + fco_l0_5;
+    wire [2:0] fco_l1_3 = fco_l0_6 + fco_l0_7;
+    wire [2:0] fco_l1_4 = fco_l0_8 + fco_l0_9;
+    wire [2:0] fco_l1_5 = fco_l0_10 + fco_l0_11;
+    wire [2:0] fco_l1_6 = fco_l0_12 + fco_l0_13;
+    wire [2:0] fco_l1_7 = fco_l0_14 + fco_l0_15;
+    wire [3:0] fco_l2_0 = fco_l1_0 + fco_l1_1;
+    wire [3:0] fco_l2_1 = fco_l1_2 + fco_l1_3;
+    wire [3:0] fco_l2_2 = fco_l1_4 + fco_l1_5;
+    wire [3:0] fco_l2_3 = fco_l1_6 + fco_l1_7;
+    wire [4:0] fco_l3_0 = fco_l2_0 + fco_l2_1;
+    wire [4:0] fco_l3_1 = fco_l2_2 + fco_l2_3;
+    wire [5:0] fco_l4_0 = fco_l3_0 + fco_l3_1;
+    wire [5:0] flush_count_even_comb = fce_l4_0;
+    wire [5:0] flush_count_odd_comb  = fco_l4_0;
     integer i;
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -1457,9 +1520,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                 arch_map[i] <= i;
             end
 //0..ARCH_COUNT-1 被架构映射占着，上面那些才是空闲池
-            free_vector <= ~({{(PHYS_COUNT-ARCH_COUNT){1'b0}}, {ARCH_COUNT{1'b1}}});
-            free_count_even <= BANK_FREE_INIT;
-            free_count_odd  <= BANK_FREE_INIT;
+
         end
         else if (irq_kill | redir_frontend | redir_backend_0) begin
 //一拍恢复：整片抄回 + 把在册的号收回来。
@@ -1473,10 +1534,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
             end
             if (old_valid_a) arch_map[commit_rd0_in] <= commit_phys0_in;
             if (old_valid_b) arch_map[commit_rd1_in] <= commit_phys1_in;
-//空闲表按构造写：架构映射占着的之外全可用。
-            free_vector <= flush_free_mask;
-            free_count_even <= flush_count_even;
-            free_count_odd  <= flush_count_odd;
+
         end
         else begin
 //分配：同一个 rd 被同拍多条写时，最年轻的那条赢（按 age 次序赋值，后写覆盖先写）
@@ -1489,9 +1547,33 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
             if (old_valid_a) arch_map[commit_rd0_in] <= commit_phys0_in;
             if (old_valid_b) arch_map[commit_rd1_in] <= commit_phys1_in;
 
-            free_vector <= (free_vector & ~alloc_mask) | freed_mask;
-            free_count_even <= free_count_even - {2'b0, alloc_cnt_even} + {2'b0, freed_cnt_even};
-            free_count_odd  <= free_count_odd  - {2'b0, alloc_cnt_odd}  + {2'b0, freed_cnt_odd};
+
+        end
+    end
+
+
+//==============================================================================
+//  空闲表：正常增量更新；冲刷晚一拍按 arch_map 重建（T+1，只读寄存器）
+//==============================================================================
+    always @(posedge clk) begin
+        if (reset_registered) begin
+            free_vector     <= ~({{(PHYS_COUNT-ARCH_COUNT){1'b0}}, {ARCH_COUNT{1'b1}}});
+            free_count_even <= BANK_FREE_INIT;
+            free_count_odd  <= BANK_FREE_INIT;
+            flush_pending_q <= 1'b0;
+        end
+        else begin
+            flush_pending_q <= irq_kill | redir_frontend | redir_backend_0;
+            if (flush_pending_q) begin
+                free_vector     <= flush_free_mask;
+                free_count_even <= flush_count_even;
+                free_count_odd  <= flush_count_odd;
+            end
+            else begin
+                free_vector <= (free_vector & ~alloc_mask) | freed_mask;
+                free_count_even <= free_count_even - {2'b0, alloc_cnt_even} + {2'b0, freed_cnt_even};
+                free_count_odd  <= free_count_odd  - {2'b0, alloc_cnt_odd}  + {2'b0, freed_cnt_odd};
+            end
         end
     end
 

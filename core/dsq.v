@@ -80,29 +80,36 @@ module dsq #(
 //==============================================================================
 //  一、存储：三条 4 格环形队列
 //==============================================================================
-    reg [PW-1:0] q0 [0:QD-1];   reg [1:0] h0;   reg [2:0] n0;
-    reg [PW-1:0] q1 [0:QD-1];   reg [1:0] h1q;  reg [2:0] n1;
-    reg [PW-1:0] qm [0:QD-1];   reg [1:0] hm;   reg [2:0] nm;
+//★ 2026-11-12：改成【双指针 FIFO】（读写指针各多一位）。
+//  写格 = wp[1:0]（纯寄存器，不用 h+n）、读格 = rp[1:0]（纯寄存器）；
+//  满/空靠最高位区分（指针加宽是那个"满=空别名"坑的标准解）。
+    reg [PW-1:0] q0 [0:QD-1];   reg [2:0] wp0, rp0;
+    reg [PW-1:0] q1 [0:QD-1];   reg [2:0] wp1, rp1;
+    reg [PW-1:0] qm [0:QD-1];   reg [2:0] wpm, rpm;
 
-    assign lane0_valid = (n0 != 3'd0);
-    assign lane0_data  = q0[h0];
-    assign lane1_valid = (n1 != 3'd0);
-    assign lane1_data  = q1[h1q];
-    assign mem_valid   = (nm != 3'd0);
-    assign mem_data    = qm[hm];
+    assign lane0_valid = (wp0 != rp0);
+    assign lane0_data  = q0[rp0[1:0]];
+    assign lane1_valid = (wp1 != rp1);
+    assign lane1_data  = q1[rp1[1:0]];
+    assign mem_valid   = (wpm != rpm);
+    assign mem_data    = qm[rpm[1:0]];
 
-    wire pop0_take = lane0_pop & (n0 != 3'd0);
-    wire pop1_take = lane1_pop & (n1 != 3'd0);
-    wire popm_take = mem_pop   & (nm != 3'd0);
+    wire pop0_take = lane0_pop & (wp0 != rp0);
+    wire pop1_take = lane1_pop & (wp1 != rp1);
+    wire popm_take = mem_pop   & (wpm != rpm);
 
-//★ 只吃寄存器占用，不吃当拍弹出（理由见文件头）。
-    wire [2:0] free0 = QD_EXT - n0;
-    wire [2:0] free1 = QD_EXT - n1;
-    wire [2:0] freem = QD_EXT - nm;
+//占用 = wp − rp（指针多了最高位，差值是 0..4）
+    wire [2:0] occ0 = wp0 - rp0;
+    wire [2:0] occ1 = wp1 - rp1;
+    wire [2:0] occm = wpm - rpm;
 
-//★ 与类别无关的条数：取三个最小值，封顶 3。
-    wire [2:0] room_min = min3(min3(free0, free1), freem);
-    assign room = (room_min >= 3'd2) ? 2'd2 : room_min[1:0];
+//★ room = 三个"再来两条就装不下"的标志【或起来】，与类别无关。
+//  room 只可能是 0 或 2：瓶颈只可能出现在某条队列（或 ROB）满了，不存在"能收一条不能收两条"的更细档。
+//  占用 3 ⇒ 只剩 1 格 ⇒ 报 0（否则两条落同一条队列会溢出）；占用 ≤2 ⇒ 报 2。
+    wire stall0 = (occ0 >= 3'd3);
+    wire stall1 = (occ1 >= 3'd3);
+    wire stallm = (occm >= 3'd3);
+    assign room = (stall0 | stall1 | stallm) ? 2'd0 : 2'd2;
 
 //==============================================================================
 //  二、入队：前缀语义 —— 收第 k 条的先决条件是前面都收了，且 k < room
@@ -116,10 +123,10 @@ module dsq #(
     reg [1:0]  sm_0, sm_1, sm_2;      // mem 落格
     reg [1:0]  u0, u1, um;            // 本拍已经排进去的条数
 
-//落格起点 = (队头 + 占用) & 3
-    wire [1:0] wstart0 = h0  + n0[1:0];
-    wire [1:0] wstart1 = h1q + n1[1:0];
-    wire [1:0] wstartm = hm  + nm[1:0];
+//落格起点 = 写指针（本拍第 k 条就落在 wp+k）
+    wire [1:0] wstart0 = wp0[1:0];
+    wire [1:0] wstart1 = wp1[1:0];
+    wire [1:0] wstartm = wpm[1:0];
 
     always @(*) begin
         acc0 = push0_valid & (room >= 2'd1);
@@ -178,29 +185,29 @@ module dsq #(
 
     always @(posedge clk) begin
         if (rst | flush) begin
-            n0 <= 3'd0; h0  <= 2'd0;
-            n1 <= 3'd0; h1q <= 2'd0;
-            nm <= 3'd0; hm  <= 2'd0;
+            wp0 <= 3'd0; rp0 <= 3'd0;
+            wp1 <= 3'd0; rp1 <= 3'd0;
+            wpm <= 3'd0; rpm <= 3'd0;
         end
         else begin
 //---- lane0 ----
             if (w0_0) q0[s0_0] <= push0_data;
             if (w0_1) q0[s0_1] <= push1_data;
             if (w0_2) q0[s0_2] <= push2_data;
-            n0 <= n0 + {1'b0, push0_count} - {2'd0, pop0_take};
-            if (pop0_take) h0 <= h0 + 2'd1;
+            wp0 <= wp0 + {1'b0, push0_count};
+            if (pop0_take) rp0 <= rp0 + 3'd1;
 //---- lane1 ----
             if (w1_0) q1[s1_0] <= push0_data;
             if (w1_1) q1[s1_1] <= push1_data;
             if (w1_2) q1[s1_2] <= push2_data;
-            n1 <= n1 + {1'b0, push1_count} - {2'd0, pop1_take};
-            if (pop1_take) h1q <= h1q + 2'd1;
+            wp1 <= wp1 + {1'b0, push1_count};
+            if (pop1_take) rp1 <= rp1 + 3'd1;
 //---- mem ----
             if (wm_0) qm[sm_0] <= push0_data;
             if (wm_1) qm[sm_1] <= push1_data;
             if (wm_2) qm[sm_2] <= push2_data;
-            nm <= nm + {1'b0, pushm_count} - {2'd0, popm_take};
-            if (popm_take) hm <= hm + 2'd1;
+            wpm <= wpm + {1'b0, pushm_count};
+            if (popm_take) rpm <= rpm + 3'd1;
         end
     end
 

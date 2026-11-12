@@ -30,6 +30,9 @@ module lsu(
     input [9:0] function10,
 //ROB 索引载荷：与其它载荷同使能锁存，回填时用它写进 ROB 自己那一项
     input [4:0]  idx_in,
+//★ 2026-11-12：目的物理号随路带。原来写回时 ROB 要按 idx 现查一次 entry_phys，
+//  那次分布式 RAM 读压在 lsu→isq 那条链正中间。它发射时就在站载荷里。
+    input [5:0]  phys_in,
 //那一项的世代位：与 idx 全程同行，完成上报时带回 ROB 做身份校验（见 rob.v 文件头）
     input        gen_in,
 //本条指令的操作数（站选中项的终值，访存地址与 store 数据都从这里算）
@@ -91,6 +94,7 @@ module lsu(
     output reg        load_nack_generation_registered,
 //本条写回记录的 ROB 索引（与数据逐支同步；消费者自己拿去比源寄存器号）
     (* max_fanout = 8 *) output reg [4:0]  ld_index,
+    (* max_fanout = 8 *) output reg [5:0] ld_phys,
     (* max_fanout = 8 *) output reg        ld_generation,
 //ROB 的"本拍退休"回报（0/1 两条）：见下面 stage1_cmt 的注释
     input        ret0_valid, input [4:0] ret0_index, input ret0_generation,
@@ -153,6 +157,7 @@ module lsu(
     reg        stage1_valid, stage1_sent;
     reg        stage1_faulted;      // 非对齐已经报过了（一拍脉冲，别重复报）
     reg [4:0]  stage1_index;
+    reg [5:0]  stage1_phys;
     reg        stage1_generation;
     reg [2:0]  stage1_size;
     reg [31:0] stage1_base, stage1_imm, stage1_pc;
@@ -165,6 +170,7 @@ module lsu(
     reg        store_stage_valid, store_stage_cmt, store_stage_faulted;
     reg [31:0] store_stage_base, store_stage_imm, store_stage_write_data, store_stage_pc;
     reg [4:0]  store_stage_index;
+    reg [5:0]  store_stage_phys;
     reg        store_stage_generation;
     reg [2:0]  store_stage_size;
     reg        store_stage_misalign;
@@ -178,6 +184,7 @@ module lsu(
 //               在这一级只等数据回来（ready_in），所以不需要再发、也不用带载荷。
     reg        stage2_valid;      // 级3 只装 load（store 已经在 ELSQ 里了）
     reg [4:0]  stage2_index;
+    reg [5:0]  stage2_phys;
     reg        stage2_generation;
     (* max_fanout = 8 *) reg [2:0] stage2_size;
     reg [1:0]  stage2_off;
@@ -188,6 +195,7 @@ module lsu(
 //返回级：rdata 进寄存器，字节/符号扩展在它的 D 端做
     reg        return_valid;
     reg [4:0]  return_index;
+    reg [5:0]  return_phys;
     reg        return_generation;
     reg [31:0] return_data;
     reg [31:0] load_data_current;   // 返回级 D 端
@@ -206,6 +214,7 @@ module lsu(
     reg        store_queue_a_valid, store_queue_b_valid;
     reg [31:0] store_queue_a_address, store_queue_a_write_data, store_queue_b_address, store_queue_b_write_data;
     reg [4:0]  store_queue_a_index, store_queue_b_index;
+    reg [5:0]  store_queue_a_phys,  store_queue_b_phys;
     reg        store_queue_a_generation, store_queue_b_generation;
 //kind：1 = store，0 = 外设 load（只有外设 load 才允许 kind=0 进队）。
     reg        store_queue_a_kind, store_queue_b_kind;
@@ -228,6 +237,7 @@ module lsu(
     reg        elsq_return_hold;
     reg [31:0] elsq_return_data;
     reg [4:0]  elsq_return_index;
+    reg [5:0]  elsq_return_phys;
     reg        elsq_return_generation;
 //★ load_go = "本拍有一笔读摆上总线"。控制网，打 max_fanout 反而把 SQ 写使能推深，已撤。
     reg        store_queue_a_ret, store_queue_b_ret_now, store_queue_a_drop, store_queue_b_drop, store_queue_drain, load_go;
@@ -245,6 +255,7 @@ module lsu(
     reg [1:0]  next_a_offset, next_b_offset;
     reg [31:0] next_a_address, next_a_write_data, next_b_address, next_b_write_data;
     reg [4:0]  next_a_index, next_b_index;
+    reg [5:0]  next_a_phys,  next_b_phys;
     reg stage1_non_cacheable;
     reg stage2_done, stage2_ok, stage1_move, stage1_leave, stage1_ok, stage1_put_go;
     reg load_room, store_room;
@@ -327,7 +338,7 @@ module lsu(
 //空总线（blank）：miss 在跑，或在途那笔读还没被应答（含级2 刚摆上、下一拍才进级3 的那笔）⇒ 不摆。
 //★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
-        stage1_non_cacheable = ~((stage1_word[31:24] == 8'd0) & (stage1_word[23:13] == 11'h100));
+        stage1_non_cacheable = (stage1_word[31:14] != 18'd0);
 //★ st→ld 前送：级1 这条 load 的【字地址】命中 SQ 里一笔【整字】store ⇒ 数据现成
 //  （store 写满了整字，这条 load 要的字节全在里面），不必等它排空、更不必再去 dcache 读。
 //  只认 size==3'd2（sw）：sb/sh 没写满整字。试过按字节区间算覆盖（sb→lb、sh→lh 也前送），
@@ -372,7 +383,6 @@ module lsu(
 //★ 冲刷窗口内一条都不许进：外设访问已在 commit，冲刷拍没有"必须放行"的合法条。
         new_in_pre = mem_op & ~size_bad_now & ~flush_window & payload_go;
         new_in     = new_in_pre;
-//入口不看 miss：miss 当拍也进级锁操作数，只有发送等 miss 落下。
         new_go     = load_room & store_room;
 //★ 按 opcode 分流：一条指令只会走其中一条
         take_load  = new_in & new_go & ~is_store;
@@ -388,10 +398,7 @@ module lsu(
     reg [31:0] store_drain_data;
     reg [3:0]  store_drain_byte_enable;
     always @(*) begin
-        store_drain_non_cacheable = ~((store_queue_a_address[31:24] == 8'd0) &&
-                                      (store_queue_a_address[23:13] == 11'h100));
-//★ 2026-10-30：mask + 移位在这里做。三个输入（原始数据 / offset / size）全是 SQ 的寄存器，
-//  所以这坨完全在 Q 端之后，入口那一拍的桶移就没有了。
+        store_drain_non_cacheable = (store_queue_a_address[31:14] != 18'd0);
         case (store_queue_a_size)
             3'b000: begin
                 store_drain_data        = {24'd0, store_queue_a_write_data[7:0]}  << (8 * store_queue_a_offset);
@@ -505,7 +512,7 @@ module lsu(
             stage1_base <= 32'd0;
             stage1_imm  <= 32'd0;
             stage1_pc   <= 32'd0;
-            stage1_index <= 4'd0;
+            stage1_index <= 4'd0; stage1_phys <= 6'd0;
             stage1_generation <= 1'b0;
             stage1_size <= 3'd0;
             stage1_cmt <= 1'b0;
@@ -519,6 +526,7 @@ module lsu(
                 stage2_size <= stage1_size;
                 stage2_off <= stage1_sum[1:0];
                 stage2_index <= stage1_index;
+                stage2_phys  <= stage1_phys;
                 stage2_generation <= stage1_generation;
                 stage2_cmt <= stage1_cmt | stage1_ret;
                 stage2_forward <= store_forward_hit;
@@ -538,6 +546,7 @@ module lsu(
                 stage1_imm  <= stage1_imm_next;
                 stage1_pc   <= pc_in;
                 stage1_index <= idx_in;
+                stage1_phys  <= phys_in;
                 stage1_generation <= gen_in;
                 stage1_sent <= 1'b0;                                        // 一律从'没发过'起步
                 stage1_faulted <= 1'b0;
@@ -575,7 +584,7 @@ module lsu(
             store_stage_imm <= 32'd0;
             store_stage_write_data <= 32'd0;
             store_stage_pc <= 32'd0;
-            store_stage_index <= 4'd0;
+            store_stage_index <= 4'd0; store_stage_phys <= 6'd0;
             store_stage_generation <= 1'b0;
             store_stage_size <= 3'd0;
         end
@@ -587,6 +596,7 @@ module lsu(
                 store_stage_write_data <= source_b_data_final;
                 store_stage_pc   <= pc_in;
                 store_stage_index <= idx_in;
+            store_stage_phys  <= phys_in;
                 store_stage_generation <= gen_in;
                 store_stage_size <= function10[2:0];
                 store_stage_cmt <= retire_hit_now;   // ★ 可能进 LSU 那一拍就已经退休了
@@ -672,11 +682,13 @@ module lsu(
         next_a_valid = store_queue_a_valid; next_a_address = store_queue_a_address; next_a_write_data = store_queue_a_write_data;
         next_a_kind = store_queue_a_kind; next_a_size = store_queue_a_size; next_a_offset = store_queue_a_offset;
         next_a_index = store_queue_a_index; next_a_generation = store_queue_a_generation;
+        next_a_phys  = store_queue_a_phys;
         next_a_ready = store_queue_a_ready | (store_queue_a_valid & ((ret0_valid & (ret0_index == store_queue_a_index) & (ret0_generation == store_queue_a_generation)) |
                                       (ret1_valid & (ret1_index == store_queue_a_index) & (ret1_generation == store_queue_a_generation))));
         next_b_valid = store_queue_b_valid; next_b_address = store_queue_b_address; next_b_write_data = store_queue_b_write_data;
         next_b_kind = store_queue_b_kind; next_b_size = store_queue_b_size; next_b_offset = store_queue_b_offset;
         next_b_index = store_queue_b_index; next_b_generation = store_queue_b_generation;
+        next_b_phys  = store_queue_b_phys;
         next_a_sent = store_queue_a_sent | (store_queue_a_valid & ~store_queue_a_kind & elsq_load_go);
         next_b_sent = store_queue_b_sent;
         next_b_ready = store_queue_b_ready | (store_queue_b_valid & ((ret0_valid & (ret0_index == store_queue_b_index) & (ret0_generation == store_queue_b_generation)) |
@@ -685,6 +697,7 @@ module lsu(
             next_a_valid = next_b_valid & ~store_queue_b_drop;
             next_a_address = next_b_address; next_a_write_data = next_b_write_data;
             next_a_index = next_b_index; next_a_generation = next_b_generation; next_a_ready = next_b_ready; next_a_sent = next_b_sent;
+            next_a_phys = next_b_phys;
             next_a_kind = next_b_kind; next_a_size = next_b_size; next_a_offset = next_b_offset;
             next_b_valid = 1'b0;
         end
@@ -696,13 +709,13 @@ module lsu(
         if (load_push_queue) begin
             if (!next_a_valid) begin
                 next_a_valid = 1'b1; next_a_address = stage1_word; next_a_write_data = 32'd0;
-                next_a_index = stage1_index; next_a_generation = stage1_generation;
+                next_a_index = stage1_index; next_a_generation = stage1_generation; next_a_phys = stage1_phys;
                 next_a_kind = 1'b0; next_a_size = stage1_size; next_a_offset = stage1_sum[1:0];
                 next_a_ready = 1'b0; next_a_sent = 1'b0;   // 外设 load 不预置 ready：它是「写回才算完」
             end
             else begin
                 next_b_valid = 1'b1; next_b_address = stage1_word; next_b_write_data = 32'd0;
-                next_b_index = stage1_index; next_b_generation = stage1_generation;
+                next_b_index = stage1_index; next_b_generation = stage1_generation; next_b_phys = stage1_phys;
                 next_b_kind = 1'b0; next_b_size = stage1_size; next_b_offset = stage1_sum[1:0];
                 next_b_ready = 1'b0; next_b_sent = 1'b0;
             end
@@ -710,13 +723,13 @@ module lsu(
         if (store_stage_push) begin
             if (!next_a_valid) begin
                 next_a_valid = 1'b1; next_a_address = store_stage_word; next_a_write_data = store_stage_write_data;
-                next_a_index = store_stage_index; next_a_generation = store_stage_generation;
+                next_a_index = store_stage_index; next_a_generation = store_stage_generation; next_a_phys = store_stage_phys;
                 next_a_kind = 1'b1; next_a_size = store_stage_size; next_a_offset = store_stage_sum[1:0];
                 next_a_ready = store_queue_push_ready; next_a_sent = 1'b0;
             end
             else begin
                 next_b_valid = 1'b1; next_b_address = store_stage_word; next_b_write_data = store_stage_write_data;
-                next_b_index = store_stage_index; next_b_generation = store_stage_generation;
+                next_b_index = store_stage_index; next_b_generation = store_stage_generation; next_b_phys = store_stage_phys;
                 next_b_kind = 1'b1; next_b_size = store_stage_size; next_b_offset = store_stage_sum[1:0];
                 next_b_ready = store_queue_push_ready; next_b_sent = 1'b0;
             end
@@ -730,6 +743,7 @@ module lsu(
             store_queue_a_address <= 32'd0; store_queue_b_address <= 32'd0;
             store_queue_a_write_data <= 32'd0; store_queue_b_write_data <= 32'd0;
             store_queue_a_index <= 4'd0; store_queue_b_index <= 4'd0;
+            store_queue_a_phys  <= 6'd0; store_queue_b_phys  <= 6'd0;
             store_queue_a_generation <= 1'b0; store_queue_b_generation <= 1'b0;
             store_queue_a_kind <= 1'b0; store_queue_b_kind <= 1'b0;
             store_queue_a_size <= 3'd0; store_queue_b_size <= 3'd0;
@@ -740,6 +754,7 @@ module lsu(
         else begin
             store_queue_a_valid <= next_a_valid; store_queue_a_address <= next_a_address; store_queue_a_write_data <= next_a_write_data;
             store_queue_a_index <= next_a_index; store_queue_a_generation <= next_a_generation;
+            store_queue_a_phys  <= next_a_phys;
 //★ 完成口必须是一拍脉冲 + 同拍锁存的载荷：idx/gen 无条件跟输入口走会认错槽 ⇒ 那条 store 永远退不了。
 //★ 完成口现在挂在【入口收下 store 那一拍】：它后面一定会进 ELSQ（没有"被拒"这条路），
 //  早报一拍就少占一拍 ROB。只有 store 才报；外设 load 由它自己的写回来给。
@@ -754,6 +769,7 @@ module lsu(
             store_queue_a_sent <= next_a_sent; store_queue_b_sent <= next_b_sent;
             store_queue_b_valid <= next_b_valid; store_queue_b_address <= next_b_address; store_queue_b_write_data <= next_b_write_data;
             store_queue_b_index <= next_b_index; store_queue_b_generation <= next_b_generation;
+            store_queue_b_phys  <= next_b_phys;
             store_queue_b_ready <= next_b_ready;
         end
     end
@@ -803,8 +819,9 @@ module lsu(
     always @(posedge clk) begin
         if (reset_registered) begin
             return_valid <= 1'b0; return_index <= 4'd0; return_generation <= 1'b0; return_data <= 32'd0;
+            return_phys <= 6'd0;
             elsq_return_hold <= 1'b0; elsq_return_data <= 32'd0;
-            elsq_return_index <= 4'd0; elsq_return_generation <= 1'b0;
+            elsq_return_index <= 4'd0; elsq_return_generation <= 1'b0; elsq_return_phys <= 6'd0;
         end
         else begin
             return_valid <= load_answer;
@@ -813,6 +830,7 @@ module lsu(
                 elsq_return_hold       <= 1'b1;
                 elsq_return_data       <= elsq_load_data;
                 elsq_return_index      <= store_queue_a_index;
+                elsq_return_phys       <= store_queue_a_phys;
                 elsq_return_generation <= store_queue_a_generation;
             end
             else if (elsq_return_deliver) begin
@@ -821,16 +839,19 @@ module lsu(
 
             if (elsq_return_deliver) begin
                 return_index  <= elsq_return_index;
+                return_phys   <= elsq_return_phys;
                 return_generation  <= elsq_return_generation;
                 return_data <= elsq_return_data;
             end
             else if (stage2_answer) begin
                 return_index  <= stage2_index;
+                return_phys   <= stage2_phys;
                 return_generation  <= stage2_generation;
                 return_data <= load_data_current;
             end
             else if (elsq_load_answer) begin
                 return_index  <= store_queue_a_index;
+                return_phys   <= store_queue_a_phys;
                 return_generation  <= store_queue_a_generation;
                 return_data <= elsq_load_data;
             end
@@ -849,6 +870,7 @@ module lsu(
         ld_index_e    = stage2_index;
         ld_generation_e    = stage2_generation;
         ld_index      = return_valid ? return_index : 4'd0;
+        ld_phys       = return_valid ? return_phys  : 6'd0;
         ld_generation      = return_valid ? return_generation : 1'b0;
     end
 //★ stage_free 是喂给发射级的入口门（isq: lsu_full = ~stage_free），必须与 new_in_pre 逐项同门。

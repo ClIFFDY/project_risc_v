@@ -175,6 +175,7 @@ module mdu(
     reg        divide_state_generation;
     reg [4:0]  divide_state_count;
     reg        divide_state_busy;
+    reg        divide_state_prepared;         // 原码已锁、补码还没写回的那一拍（Q 侧取绝对值）
     reg        divide_state_issued;          // 本条 div 已发起过（防止离开 mdu 级之前重复发起）
     reg        divide_state_done_registered;
     reg        divide_state_done;            // 完成脉冲（比最后一次迭代晚一拍）
@@ -375,6 +376,7 @@ module mdu(
         if (reset_registered) begin
             divide_state_busy <= 1'b0;
             divide_state_issued <= 1'b0;
+            divide_state_prepared <= 1'b0;
             divide_state_count  <= 5'd0;
             divide_state_remainder_partial <= 32'd0;
             divide_state_quotient_partial <= 32'd0;
@@ -402,20 +404,31 @@ module mdu(
             divide_state_busy   <= 1'b0;
         end
         else if (divide_state_busy) begin
-            divide_state_a     <= {divide_state_a[30:0], 1'b0};
-            divide_state_remainder_partial <= divide_state_greater_equal ? divide_state_subtract[31:0] : {divide_state_remainder_partial[30:0], divide_state_a[31]};
-            divide_state_quotient_partial <= {divide_state_quotient_partial[30:0], divide_state_greater_equal};
-            if (divide_state_last)
-                divide_state_busy <= 1'b0;
-            else
-                divide_state_count <= divide_state_count + 5'd1;
-            if (divide_state_count == 5'd0) begin
-                divide_state_zero  <= (divide_state_b == 32'd0);
-                divide_state_overflow   <= divide_state_sign && (divide_state_dividend == 32'h80000000) &&
-                           (divide_state_b == 32'd1) && divide_state_sign_b;
-                divide_state_negative_registered <= divide_state_sign && (divide_state_dividend[31] ^ divide_state_sign_b) &&
-                           (divide_state_b != 32'd0);
-                divide_state_negative_result <= divide_state_sign && divide_state_dividend[31] && (divide_state_b != 32'd0);
+//★ 取绝对值改在【寄存器 Q 侧】做：发起拍只锁原码（见下面 divide_start 分支），本拍判符号再把补码写回。
+//  原来发起拍同拍算 ~x+1，端口五选一的锥和 32 位加叠在一起 ⇒ 17 级 / 布线 9.0ns，全核最差族之一。
+//  代价：除法迭代多一拍（33 → 34），除法是长延迟本身不吃吞吐。
+            if (~divide_state_prepared) begin
+                divide_state_a <= (divide_state_sign && divide_state_a[31]) ? (~divide_state_a + 32'd1) : divide_state_a;
+                divide_state_b <= (divide_state_sign && divide_state_b[31]) ? (~divide_state_b + 32'd1) : divide_state_b;
+                divide_state_prepared <= 1'b1;
+            end
+            else begin
+                divide_state_a     <= {divide_state_a[30:0], 1'b0};
+                divide_state_remainder_partial <= divide_state_greater_equal ? divide_state_subtract[31:0] : {divide_state_remainder_partial[30:0], divide_state_a[31]};
+                divide_state_quotient_partial <= {divide_state_quotient_partial[30:0], divide_state_greater_equal};
+                if (divide_state_last)
+                    divide_state_busy <= 1'b0;
+                else
+                    divide_state_count <= divide_state_count + 5'd1;
+//b==0 / b==1 / b!=0 这三处判据在 count==0 这拍执行，那时 divide_state_b 已经是补码（准备拍先写过），口径不变。
+                if (divide_state_count == 5'd0) begin
+                    divide_state_zero  <= (divide_state_b == 32'd0);
+                    divide_state_overflow   <= divide_state_sign && (divide_state_dividend == 32'h80000000) &&
+                               (divide_state_b == 32'd1) && divide_state_sign_b;
+                    divide_state_negative_registered <= divide_state_sign && (divide_state_dividend[31] ^ divide_state_sign_b) &&
+                               (divide_state_b != 32'd0);
+                    divide_state_negative_result <= divide_state_sign && divide_state_dividend[31] && (divide_state_b != 32'd0);
+                end
             end
         end
 //★ 发起条件 = divide_start：缓冲里有货就发起它，缓冲空就发起这一拍口上的那一笔。
@@ -432,8 +445,10 @@ module mdu(
             divide_state_sign    <= (divide_start_function10[0] == 1'b0);
             divide_state_dividend    <= divide_start_source_a;
             divide_state_sign_b <= divide_start_r2[31];
-            divide_state_a     <= ((divide_start_function10[0] == 1'b0) && divide_start_source_a[31]) ? (~divide_start_source_a + 32'd1) : divide_start_source_a;
-            divide_state_b     <= ((divide_start_function10[0] == 1'b0) && divide_start_r2[31]) ? (~divide_start_r2 + 32'd1) : divide_start_r2;
+//★ 只锁原码：取绝对值在下一拍的 Q 侧做（见上面 divide_state_busy 分支）。
+            divide_state_a     <= divide_start_source_a;
+            divide_state_b     <= divide_start_r2;
+            divide_state_prepared <= 1'b0;
             divide_state_remainder_partial <= 32'd0;
             divide_state_quotient_partial <= 32'd0;
             divide_state_count   <= 5'd0;

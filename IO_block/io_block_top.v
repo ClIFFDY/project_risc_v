@@ -36,7 +36,15 @@ module io_block_top(
     output            gpio_ready,
     output     [31:0] i2c_data,
     output            i2c_ready,
-    output            plic_exti
+    output            plic_exti,
+//DMA 的完成中断：挂到 PLIC 的 2 号源（3/4 号已被 GPIO/I2C 占）
+    input             dma_irq,
+//---- 总线错误日志（厂商扩展，寄存器在 plic 的 0x0900_0000 窗口）----
+    input             err_valid,
+    input             err_write,
+    input      [1:0]  err_owner,
+    input      [31:0] err_addr,
+    output            err_clear
     );
 
     localparam
@@ -114,14 +122,19 @@ module io_block_top(
     plic u_plic (
         .clk(clk),
         .rst(rst_cpu),
-        .irq_sources({26'd0, 1'b0, i2c_irq, gpio_irq, 1'b0, uart_rx_irq, 1'b0}),
+        .irq_sources({26'd0, err_valid, i2c_irq, gpio_irq, dma_irq, uart_rx_irq, 1'b0}),
         .exti(plic_exti),
         .bus_addr_in(bus_addr_in),
         .bus_data_in(bus_data_in),
         .bus_be_in(bus_be_in),
         .bus_we_in(bus_we_plic),
         .ld_ready(plic_ready),
-        .bus_data_out(plic_data)
+        .bus_data_out(plic_data),
+        .err_valid(err_valid),
+        .err_write(err_write),
+        .err_owner(err_owner),
+        .err_addr(err_addr),
+        .err_clear(err_clear)
     );
 
 endmodule

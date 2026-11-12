@@ -37,7 +37,28 @@ module cpu_top #(
     input bus_loaded_in, bus_hold_in, exti,
     output reg [31:0] bus_addr_out, bus_data_out,
     output reg [3:0] bus_be_out,
-    output reg bus_we_out, bus_valid_out
+    output reg bus_we_out, bus_valid_out,
+//---- L2 的 AHB 主口（2026-11-12：itcm/dtcm 撤掉，由 64KB 统一 L2 顶替）----
+    output     [31:0] l2_haddr,
+    output     [1:0]  l2_htrans,
+    output            l2_hwrite,
+    output     [2:0]  l2_hsize,
+    output     [2:0]  l2_hburst,
+    output     [3:0]  l2_hprot,
+    output            l2_hmastlock,
+    output     [31:0] l2_hwdata,
+    output     [3:0]  l2_hwstrb,
+    input      [31:0] l2_hrdata,
+    input             l2_hready,
+    input             l2_rd_valid,
+    input             l2_hgrant,
+    input             l2_hresp,
+    output            l2_busy,
+//---- L2 维护与非缓存窗口（自举/重装代码时用）----
+    input      [1:0]  l2_maint,
+    output            l2_maint_done,
+    input      [31:0] l2_uncached_base,
+    input      [31:0] l2_uncached_mask
     );
 
 //==============================================================================
@@ -210,6 +231,8 @@ module cpu_top #(
 //★ 2026-11-06 提前唤醒：目的物理号随载荷走，isq 的站拿它当唤醒源
     wire [5:0]  phys_d_out_0, phys_d_out_1;
     wire [5:0]  lsu_phys_a_idu, lsu_phys_b_idu, lsu_phys_d_idu;
+//★ 2026-11-12：目的物理号从访存站随路带到 lsu 的返回级，ROB 不再现查 entry_phys
+    wire [5:0]  lsu_phys_d_isq, load_phys_lsu;
 //除法那一笔：两条 lane 各自的 mdu 报 done+1 的索引，由 ROB 换成物理号（同时最多一条在报）
     wire        divide_wake_valid_0, divide_wake_valid_1;
     wire [4:0]  divide_wake_index_0, divide_wake_index_1;
@@ -239,7 +262,9 @@ module cpu_top #(
 //提交拍的 CSR 源（第 7 个读口，地址 = ROB 提交口吐出来的 rs1 物理号）
     wire [31:0] prf_read_c_data;
 //---- PRF 写口（物理号由 rob 按槽查出来；live = 本项还有效且世代对得上）----
-    wire [5:0]  prf_wb_phys_0, prf_wb_phys_1, prf_ld_phys_wb;
+    wire [5:0]  prf_wb_phys_0, prf_wb_phys_1;
+//★ 2026-11-12：直接从 lsu 的返回级来（见 lsu 的 phys_in/ld_phys）
+    wire [5:0]  prf_ld_phys_wb = load_phys_lsu;
     wire        prf_wb_live_0, prf_wb_live_1, prf_ld_live_wb, prf_ld_early_live;
 //★ 2026-11-07：发射级的唤醒取【值表写口真的落笔】那一拍，不取发射拍。
 //  发射拍和"值进阵列"之间隔着结果口仲裁（div>mul>alu，抢不到进影子晚一拍）和 live 门，
@@ -588,13 +613,8 @@ module cpu_top #(
         .mem_address(mem_address_icache), .mem_write_data(mem_wdata_icache), .mem_byte_enable(mem_byte_enable_icache)
     );
 
-    itcm #(.ITCM_AW(ITCM_AW)) u_itcm (
-        .clk(clk), .rst(rst),
-        .mem_req(mem_req_icache),
-        .mem_addr(mem_address_icache),
-        .mem_data(mem_data_icache),
-        .mem_valid(mem_valid_icache)
-    );
+//★ 2026-11-12：u_itcm 撤掉。指令侧的后备存储改由下面的 64KB 统一 L2 顶替
+//  （itcm 与 L2 的 I 口同形：mem_req 给一行起始地址，连吐 32 个字）。
 
 //交付口上这条指令自己的地址：直接取 icache 交付时随数据出的 inst_addr。
 //★ 取指地址与交付口之间的拍差只在这里换算一次。
@@ -936,6 +956,7 @@ module cpu_top #(
         .rs1_phys_in_lane1(phys_a_out_1), .rs2_phys_in_lane1(phys_b_out_1),
         .phys_d_in(phys_d_out_0), .phys_d_in_lane1(phys_d_out_1),
         .lsu_phys_d_in(lsu_phys_d_idu),
+        .lsu_phys_d(lsu_phys_d_isq),
         .divide_wake_valid(divide_wake_valid), .divide_wake_phys(divide_wake_phys),
         .prf_read_a_0_phys(prf_read_a_0_phys), .prf_read_b_0_phys(prf_read_b_0_phys),
         .prf_read_a_1_phys(prf_read_a_1_phys), .prf_read_b_1_phys(prf_read_b_1_phys),
@@ -1166,7 +1187,7 @@ module cpu_top #(
         .bus_hold_in(bus_hold_in),
         .payload_go(lsu_valid),
         .opcode(lsu_opcode), .function10(lsu_function10),
-        .idx_in(lsu_index), .gen_in(lsu_generation),
+        .idx_in(lsu_index), .gen_in(lsu_generation), .phys_in(lsu_phys_d_isq),
         .source_a_data_final(lsu_a), .source_b_data_final(lsu_b), .source_imm(lsu_imm),
         
         .bus_data_external(bus_data_in_ext), .bus_data_from_dcache(data_dcache),
@@ -1189,7 +1210,7 @@ module cpu_top #(
         .stage_free(carriage_free_lsu),
         .load_wake_registered(load_wake_registered_lsu), .load_wake_index_registered(load_wake_index_lsu), .load_wake_generation_registered(load_wake_generation_lsu),
         .load_nack_registered(), .load_nack_index_registered(), .load_nack_generation_registered(),
-        .ld_index(load_index_lsu), .ld_generation(load_generation_lsu),
+        .ld_index(load_index_lsu), .ld_generation(load_generation_lsu), .ld_phys(load_phys_lsu),
         .store_done(store_done_lsu), .store_index_out(store_index_lsu), .store_generation_out(store_generation_lsu),
         .ret0_valid(ret0_valid_rob), .ret0_index(ret0_index_rob), .ret0_generation(ret0_generation_rob),
         .ret1_valid(ret1_valid_rob), .ret1_index(ret1_index_rob), .ret1_generation(ret1_generation_rob),
@@ -1275,7 +1296,7 @@ module cpu_top #(
         .prf_ld_index(load_index_lsu), .prf_ld_generation(load_generation_lsu),
         .prf_ld_early_index(load_index_early_lsu), .prf_ld_early_generation(load_generation_early_lsu),
         .prf_ld_early_phys(ld_phys_early), .prf_ld_early_live(prf_ld_early_live),
-        .prf_wb_phys_0(prf_wb_phys_0), .prf_wb_phys_1(prf_wb_phys_1), .prf_ld_phys(prf_ld_phys_wb),
+        .prf_wb_phys_0(prf_wb_phys_0), .prf_wb_phys_1(prf_wb_phys_1), .prf_ld_phys(),
         .prf_wb_live_0(prf_wb_live_0), .prf_wb_live_1(prf_wb_live_1), .prf_ld_live(prf_ld_live_wb),
         .prf_alu_early_index_0(index_alu_early_0), .prf_alu_early_index_1(index_alu_early_1),
         .prf_alu_early_generation_0(generation_alu_early_0), .prf_alu_early_generation_1(generation_alu_early_1),
@@ -1365,11 +1386,55 @@ module cpu_top #(
         .mem_addr(mem_address_dcache), .mem_write_data(mem_wdata_dcache), .mem_byte_enable(mem_byte_enable_dcache)
     );
 
-    dtcm u_dtcm (
+//==============================================================================
+// 64KB 统一二级缓存（2026-11-12 起顶替 itcm + dtcm）
+//
+//   ★ 两个上游的握手是【电平】的（itcm/dtcm 时代的口径）：请求一直举着，自己数
+//     mem_valid 收字；而 L2 的 i_req/d_req 是【脉冲】。这里做电平→脉冲的转换。
+//     · I：icache 的 mem_req 在整个 32 拍填充期都是高 ⇒ 取上升沿；
+//     · D 读：dcache 的 read_drive 是 8 拍电平、地址每拍都变（L2 只认起始地址）；
+//     · D 写：dcache 的 mem_write_enable 本身已经是 1 拍 one-shot，直接当脉冲用。
+//   ★ 不能只按 mem_req 的上升沿唤醒读：一笔写紧接一笔读时 mem_req 全程为高、
+//     没有上升沿，那笔读就丢了（写使能是独立的一根，所以读要按"读状态"取沿）。
+//==============================================================================
+    reg  i_req_active;
+    wire i_req_pulse = mem_req_icache & ~i_req_active;
+    always @(posedge clk) begin
+        if (rst) i_req_active <= 1'b0;
+        else     i_req_active <= mem_req_icache;
+    end
+
+    reg  d_read_active;
+    wire d_read_now   = mem_req_dcache & ~mem_write_enable_dcache;
+    wire d_read_pulse = d_read_now & ~d_read_active;
+    always @(posedge clk) begin
+        if (rst) d_read_active <= 1'b0;
+        else     d_read_active <= d_read_now;
+    end
+    wire d_write_pulse = mem_write_enable_dcache;
+    wire d_req_pulse   = d_read_pulse | d_write_pulse;
+
+    l2cache u_l2 (
         .clk(clk), .rst(rst),
-        .mem_req(mem_req_dcache), .mem_we(mem_write_enable_dcache),
-        .mem_addr(mem_address_dcache), .mem_write_data(mem_wdata_dcache), .mem_byte_enable(mem_byte_enable_dcache),
-        .mem_data(mem_data_dtcm), .mem_valid(mem_valid_dtcm), .mem_ready()
+//I 口
+        .i_req(i_req_pulse), .i_addr(mem_address_icache),
+        .i_data(mem_data_icache), .i_valid(mem_valid_icache),
+//D 口
+        .d_req(d_req_pulse),
+        .d_we(mem_write_enable_dcache),
+        .d_addr(mem_address_dcache),
+        .d_wdata(mem_wdata_dcache),
+        .d_be(mem_byte_enable_dcache),
+        .d_data(mem_data_dtcm), .d_valid(mem_valid_dtcm), .d_ready(),
+//维护 / 非缓存窗口
+        .maint(l2_maint), .maint_done(l2_maint_done),
+        .unc_base(l2_uncached_base), .unc_mask(l2_uncached_mask),
+//AHB 主口
+        .m_haddr(l2_haddr), .m_htrans(l2_htrans), .m_hwrite(l2_hwrite), .m_hsize(l2_hsize),
+        .m_hburst(l2_hburst), .m_hprot(l2_hprot), .m_hmastlock(l2_hmastlock),
+        .m_hwdata(l2_hwdata), .m_hwstrb(l2_hwstrb),
+        .m_hrdata(l2_hrdata), .m_hready(l2_hready), .m_rd_valid(l2_rd_valid),
+        .m_busy(l2_busy), .m_hgrant(l2_hgrant), .m_hresp(l2_hresp)
     );
 
     tim_in u_tim_in (

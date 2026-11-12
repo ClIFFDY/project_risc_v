@@ -51,6 +51,30 @@ module mcu_top #(
     wire [31:0] uart_data_w, plic_data_w, gpio_data_w, i2c_data_w;
     wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w;
     wire        plic_exti;
+    wire        dma_irq_w;
+
+//---- L2 的 AHB 主口（cpu_top ↔ bus_con_top 的 m1）----
+    wire [31:0] l2_haddr_w, l2_hwdata_w, l2_hrdata_w;
+    wire [1:0]  l2_htrans_w;
+    wire        l2_hwrite_w, l2_hready_w, l2_rd_valid_w, l2_hgrant_w, l2_busy_w;
+    wire        l2_hresp_w, l2_hmastlock_w;
+    wire [2:0]  l2_hsize_w, l2_hburst_w;
+    wire [3:0]  l2_hwstrb_w, l2_hprot_w;
+    wire        l2_maint_done_w;
+
+//---- 总线错误日志（厂商扩展，寄存器在 plic）----
+    wire        err_valid_w, err_write_w, err_clear_w;
+    wire [1:0]  err_owner_w;
+    wire [31:0] err_addr_w;
+
+//L2 维护与"非缓存窗口"（走总线的 DMA 缓冲区用）。
+//★ 现在没有任何软件通路去写它们：maint 恒 0（不失效），非缓存窗口设成永不命中。
+//  ⇒ DMA 直接改 STCM 之后，L2 里若有同一行的旧副本，CPU 会读到旧值。
+//  这块要接上"某个能从软件写的寄存器"（PLIC 旁边加一个槽，或者拿一条 CSR），
+//  在那之前 DMA 只能用于"搬完就不由 CPU 再读"的场景。
+    wire [1:0]  l2_maint_w   = 2'b00;
+    wire [31:0] l2_unc_base_w = 32'hFFFF_FFFF;
+    wire [31:0] l2_unc_mask_w = 32'h0000_0000;
 
     cpu_top #(.LANES(LANES), .ROB_DEPTH(ROB_DEPTH), .IFFU_DEPTH(IFFU_DEPTH), .VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH), .IC_INDEX_B(IC_INDEX_B), .BHT_B(BHT_B), .BTB_B(BTB_B), .ADDER_AT_D(ADDER_AT_D), .DC_SETS_B(DC_SETS_B), .ITCM_AW(ITCM_AW)) u_cpu_top (
         .clk(clk),
@@ -63,7 +87,15 @@ module mcu_top #(
         .bus_data_in_ext(bus_data_b_cpu),
         .bus_loaded_in(bus_loaded_out),
         .bus_hold_in(bus_hold_out),
-        .exti(plic_exti)
+        .exti(plic_exti),
+        .l2_haddr(l2_haddr_w), .l2_htrans(l2_htrans_w), .l2_hwrite(l2_hwrite_w),
+        .l2_hsize(l2_hsize_w), .l2_hburst(l2_hburst_w),
+        .l2_hprot(l2_hprot_w), .l2_hmastlock(l2_hmastlock_w),
+        .l2_hwdata(l2_hwdata_w), .l2_hwstrb(l2_hwstrb_w),
+        .l2_hrdata(l2_hrdata_w), .l2_hready(l2_hready_w), .l2_rd_valid(l2_rd_valid_w),
+        .l2_hgrant(l2_hgrant_w), .l2_hresp(l2_hresp_w), .l2_busy(l2_busy_w),
+        .l2_maint(l2_maint_w), .l2_maint_done(l2_maint_done_w),
+        .l2_uncached_base(l2_unc_base_w), .l2_uncached_mask(l2_unc_mask_w)
     );
 
     bus_con_top u_bus_con (
@@ -90,7 +122,16 @@ module mcu_top #(
         .gpio_data(gpio_data_w),
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
-        .i2c_ready(i2c_ready_w)
+        .i2c_ready(i2c_ready_w),
+        .dma_irq(dma_irq_w),
+        .m1_haddr(l2_haddr_w), .m1_htrans(l2_htrans_w), .m1_hwrite(l2_hwrite_w),
+        .m1_hsize(l2_hsize_w), .m1_hburst(l2_hburst_w),
+        .m1_hprot(l2_hprot_w), .m1_hmastlock(l2_hmastlock_w),
+        .m1_hwdata(l2_hwdata_w), .m1_hwstrb(l2_hwstrb_w),
+        .m1_hrdata(l2_hrdata_w), .m1_hready(l2_hready_w), .m1_hresp(l2_hresp_w),
+        .m1_rd_valid(l2_rd_valid_w), .m1_hgrant(l2_hgrant_w),
+        .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),
+        .err_addr(err_addr_w), .err_clear(err_clear_w)
     );
 
     io_block_top u_io_block (
@@ -110,7 +151,10 @@ module mcu_top #(
         .gpio_ready(gpio_ready_w),
         .i2c_data(i2c_data_w),
         .i2c_ready(i2c_ready_w),
-        .plic_exti(plic_exti)
+        .plic_exti(plic_exti),
+        .dma_irq(dma_irq_w),
+        .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),
+        .err_addr(err_addr_w), .err_clear(err_clear_w)
     );
 
 endmodule

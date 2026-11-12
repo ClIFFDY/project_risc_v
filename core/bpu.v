@@ -296,31 +296,32 @@ module bpu(
     wire lane0_count = lane_enable_0 & fetch_new_0 & meta_hit_0;
     wire lane1_count = lane_enable_1 & fetch_new_1 & meta_hit_1 & ~lane0_take_now & ~lane0_count;
 
-    reg [LOOP_B-1:0]  count_wr_index;
-    reg [LOOP_TW-1:0] count_wr_tag;
-    reg               count_wr_exit;
-    reg [LOOP_CN-1:0] count_wr_value;
-//★ 2026-11-11 晚更新：上面那组（含 take）是"这一拍取指读出来的"组合量，直接当表写值会把
-//  BRAM 出数 → tag 比较 → take → 表写数据 全串成一拍。这里寄存一拍再写，统计更新晚一拍不影响预测。
-    reg               count_upd_valid;
+//★ 2026-11-12 时序：训练侧【换寄存器位置】而不是加拍。
+//  原来：表读 → lane 选择/取值（组合）→ 打一拍 → 表写（用寄存后的 Q）。
+//  现在：表读 → 打一拍（把取指侧那一组原始量整体寄存）→ lane 选择/取值（组合）→ 表写。
+//  表仍然在 T+1 沿写、写进去的值一模一样（中间本来就串着一个寄存器），
+//  但训练路径上的两次表读（pht 完全不进这条路、loop_count_tab 的读也被寄存）全部消失。
+    reg               q_valid;
+    reg               q_count1;
+    reg [LOOP_B-1:0]  q_index0,   q_index1;
+    reg [LOOP_TW-1:0] q_tag0,     q_tag1;
+    reg               q_exit0,    q_exit1;
+    reg [LOOP_CN-1:0] q_val0,     q_val1;
+    initial q_valid = 1'b0;
+
     reg [LOOP_B-1:0]  count_upd_index;
     reg [LOOP_TW-1:0] count_upd_tag;
     reg               count_upd_exit;
     reg [LOOP_CN-1:0] count_upd_value;
-    initial count_upd_valid = 1'b0;
-    reg [LOOP_CN-1:0] count_wr_val_src;
+    reg [LOOP_CN-1:0] count_upd_val_src;
 
     always @(*) begin
-        count_wr_index = lindex_0;
-        count_wr_tag   = ltag_0;
-        count_wr_exit  = loop_exit_0;
-        count_wr_val_src = lcnt_val_0;
-        if      (lane1_count) begin
-            count_wr_index = lindex_1; count_wr_tag = ltag_1;
-            count_wr_exit = loop_exit_1; count_wr_val_src = lcnt_val_1;
-        end
-        count_wr_value = (count_wr_exit | (count_wr_val_src == {LOOP_CN{1'b1}}))
-                       ? {LOOP_CN{1'b0}} : (count_wr_val_src + 1'b1);
+        count_upd_index   = q_count1 ? q_index1 : q_index0;
+        count_upd_tag     = q_count1 ? q_tag1   : q_tag0;
+        count_upd_exit    = q_count1 ? q_exit1  : q_exit0;
+        count_upd_val_src = q_count1 ? q_val1   : q_val0;
+        count_upd_value   = (count_upd_exit | (count_upd_val_src == {LOOP_CN{1'b1}}))
+                          ? {LOOP_CN{1'b0}} : (count_upd_val_src + 1'b1);
     end
 
 //────────────────────────── 判定侧：记趟数 ──────────────────────────
@@ -466,16 +467,18 @@ module bpu(
                 loop_count_tab_a[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
                 loop_count_tab_c[lindex_w] <= {1'b1, 1'b0, ltag_w, {LOOP_CN{1'b0}}};
             end
-            else if (count_upd_valid) begin
+            else if (q_valid) begin
                 loop_count_tab_a[count_upd_index] <= {1'b1, count_upd_exit, count_upd_tag, count_upd_value};
                 loop_count_tab_c[count_upd_index] <= {1'b1, count_upd_exit, count_upd_tag, count_upd_value};
             end
 //★ 晚一拍：本拍读出来的计数/出口结果，下一拍才落表（写口只有一个，判定侧的出口复位优先）。
-            count_upd_valid <= lane0_count | lane1_count;
-            count_upd_index <= count_wr_index;
-            count_upd_tag   <= count_wr_tag;
-            count_upd_exit  <= count_wr_exit;
-            count_upd_value <= count_wr_value;
+//训练包整体打一拍（lane 选择留在下一拍做）
+            q_valid  <= lane0_count | lane1_count;
+            q_count1 <= lane1_count;
+            q_index0 <= lindex_0; q_index1 <= lindex_1;
+            q_tag0   <= ltag_0;   q_tag1   <= ltag_1;
+            q_exit0  <= loop_exit_0; q_exit1 <= loop_exit_1;
+            q_val0   <= lcnt_val_0;  q_val1  <= lcnt_val_1;
 //"上一拍被问的地址"，用来判"这是不是新的一次取指"
             fetch_pc_prev_0 <= pc_addr_0;
             fetch_pc_prev_1 <= pc_addr_1;

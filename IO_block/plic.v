@@ -31,7 +31,15 @@ module plic(
     input [3:0] bus_be_in,
     input bus_we_in,
     output reg [31:0] bus_data_out,
-    output reg ld_ready
+    output reg ld_ready,
+//---- 总线错误日志（厂商扩展，不是 PLIC 标准寄存器）----
+//  实体在 soc/bus_con_top.v（它才看得见各主设备的 hresp），这里只负责
+//  把这四个量摆到 0x0900_0000 窗口上，并给出"写 1 清"的清除脉冲。
+    input             err_valid,
+    input             err_write,
+    input      [1:0]  err_owner,
+    input      [31:0] err_addr,
+    output reg        err_clear
     );
 
     reg [2:0] irq_prio [1:31];
@@ -74,6 +82,7 @@ module plic(
             pending <= 31'd0;
             bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
+            err_clear <= 1'b0;
             threshold <= 3'd0;
             for (i = 1; i < 32; i = i + 1) begin
                 irq_prio[i] <= 3'd0;
@@ -86,6 +95,7 @@ module plic(
             end
             bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
+            err_clear <= 1'b0;
             if (bus_addr_in[31:24] == 8'd2) begin
                 if (bus_addr_in[23:20] == 4'd0) begin
                     if (bus_addr_in[5:0] >= 1 && bus_addr_in[5:0] <= 31) begin
@@ -126,6 +136,23 @@ module plic(
                         bus_data_out <= super_id;
                         ld_ready <= 1'b1;
                         if (sel_id != 6'd0) pending[sel_id] <= 1'd0;
+                    end
+                end
+                else if (bus_addr_in[23:20] == 4'd4) begin
+//错误日志：0x0900_0000 控制 / 0x0900_0004 出错地址。厂商扩展。
+                    if (bus_addr_in[5:0] == 6'd0) begin
+                        if (bus_we_in && bus_be_in[0] && bus_data_in[0])
+                            err_clear <= 1'b1;          // 写 1 清（自清，不锁存）
+                        else if (!bus_we_in) begin
+                            bus_data_out <= {28'd0, err_owner, err_write, err_valid};
+                            ld_ready <= 1'b1;
+                        end
+                    end
+                    else if (bus_addr_in[5:0] == 6'd1) begin
+                        if (!bus_we_in) begin
+                            bus_data_out <= err_addr;
+                            ld_ready <= 1'b1;
+                        end
                     end
                 end
             end

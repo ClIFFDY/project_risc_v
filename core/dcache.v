@@ -241,7 +241,7 @@ module dcache(
 //★ ~miss_q：缺失已经判出来、这一拍就要进回填，不许再收同一个请求
 //★ 2026-11-04：A 口只收读 —— 写全部走 B 口（见端口注释）。
         read_request = (stage == 1'b0) && !miss_q && bus_valid_in
-                    && (bus_address_in[31:24] == 8'd0) && (bus_address_in[23:13] == 11'h100);
+                    && (bus_address_in[31:14] == 18'd0);
 //命中命中即行内就地更新（B 口），一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
@@ -458,7 +458,7 @@ module dcache(
 //  只在 stage==0 收不会引入顺序问题：stage==0 收下 ⇒ 下一拍 store_busy，写穿当拍就发
 //  （read_drive 这时还是 0），比同拍收下的 load 判 miss 进回填还早一拍。
             if (store_valid_in && !store_busy && (stage == 1'b0) && !miss_q
-                && (store_address_in[31:24] == 8'd0) && (store_address_in[23:13] == 11'h100)) begin
+                && (store_address_in[31:14] == 18'd0)) begin
                 store_busy        <= 1'b1;
                 store_cache_done  <= 1'b0;
                 store_mem_done    <= 1'b0;
