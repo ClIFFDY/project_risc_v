@@ -112,7 +112,12 @@ module lsu(
 //  "报故障那一拍 aux 正好是故障指令 +4"。前端一停就完全不成立 —— mt11：故障在 0x30，
 //  aux 冻在 0x18 ⇒ mepc 记成 0x14 ⇒ mret 回到 0x14 ⇒ 0x14/0x18/0x1c 死循环。
 //  pc 和 idx 是同性质的伴生量，必须由同一个使能一起锁，不能去借别的级的地址。
-    output reg [31:0] exception_load_store_pc_out
+    output reg [31:0] exception_load_store_pc_out,
+//★ 2026-11-13（fence）：ELSQ 里还压着【已退休、还没排出去】的访存项。
+//  只喂 ROB 提交口的排空判据，不进任何常规访存通路（见 docs/SPEC_fence_i_and_cache_range_2026-11-13.txt §2.3）。
+//  ★ 为什么不是"队列全空"：年轻 store 在队里时它退不了休（退休在队头），
+//    拿"全空"当判据会与队头的 fence 互相等待 ⇒ 死锁。已退休 = 比队头（fence）老，才是该等的。
+    output wire       elsq_retired_pending
     );
 //★★ 地址加法器位置宏（参数，不用 ifdef）：
 //  0 = 现结构：D 端只锁两个加数，地址在 Q 端现算（大核默认）
@@ -341,9 +346,14 @@ module lsu(
         stage2_done  = stage2_valid & (ready_in | stage2_forward);
         stage2_ok    = ~stage2_valid | stage2_done;
 //空总线（blank）：miss 在跑，或在途那笔读还没被应答（含级2 刚摆上、下一拍才进级3 的那笔）⇒ 不摆。
-//★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码
+//★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码 
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
-        stage1_non_cacheable = (stage1_word[31:14] != 18'd0);
+//★ 可缓存判据 ≡ 内存译码（2026-11-13）：字地址 [31:16] 全 0 ⇔ 落在 STCM 的 256 KB 内。
+//  原来这里是 [31:14]（= 前 64 KB），那是 64 KB dtcm 年代的遗留 —— 统一 L2 顶上来之后
+//  没人跟着改，结果指令能在 256 KB 里任何位置被缓存、数据在 64 KB 以上却不能（取指走
+//  icache→L2，不经过这条判据）。dcache.v 的两处收请求判据必须与这里【同一个口径】，
+//  四处一起改；接 DDR 时在这里加一项即可，不要再散成四处。
+        stage1_non_cacheable = (stage1_word[31:16] != 16'd0);
 //★ st→ld 前送：级1 这条 load 的【字地址】命中 SQ 里一笔【整字】store ⇒ 数据现成
 //  （store 写满了整字，这条 load 要的字节全在里面），不必等它排空、更不必再去 dcache 读。
 //  只认 size==3'd2（sw）：sb/sh 没写满整字。试过按字节区间算覆盖（sb→lb、sh→lh 也前送），
@@ -403,7 +413,7 @@ module lsu(
     reg [31:0] store_drain_data;
     reg [3:0]  store_drain_byte_enable;
     always @(*) begin
-        store_drain_non_cacheable = (store_queue_a_address[31:14] != 18'd0);
+        store_drain_non_cacheable = (store_queue_a_address[31:16] != 16'd0);
         case (store_queue_a_size)
             3'b000: begin
                 store_drain_data        = {24'd0, store_queue_a_write_data[7:0]}  << (8 * store_queue_a_offset);
@@ -436,6 +446,14 @@ module lsu(
     assign store_data_out        = store_drain_data;
     assign store_byte_enable_out = store_drain_byte_enable;
     assign store_valid_out       = store_queue_drain & ~store_drain_non_cacheable;
+
+//★ 2026-11-13（fence 排空判据）：还压着"比队头老、已退休、没排出去"的项。
+//  A 位是最老的，所以只要 A 位不够退休资格，队里剩下的就全是年轻项（与队头的 fence 无关）；
+//  fence 在队头时它自己不在 ELSQ 里 ⇒ 读到的每一项只要是 _ret，就一定是比 fence 老的。
+//  A 位的 _ret 包含"已发出去但还没收到落地确认"的那段（store_inflight 期间它保持 _ret）。
+//  纯寄存器量相与，没有任何地址参与 ⇒ 不给访存通路加级。
+    assign elsq_retired_pending = (store_queue_a_valid & store_queue_a_ret) |
+                                  (store_queue_b_valid & store_queue_b_ret_now);
 
 //外部口（AHB master + tim_in）：仍然寄存 —— 两个源都是 ELSQ 的寄存器
     always @(posedge clk) begin

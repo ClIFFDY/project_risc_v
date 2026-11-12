@@ -149,6 +149,9 @@ module cpu_top #(
 //分配拍的 SYSTEM 类译码（与 alloc_jmp 同相）—— 给 ROB 判"退休要不要等判定延迟级"
     wire        alloc_ecall_0, alloc_ebreak_0, alloc_illegal_0, alloc_mret_0;
     wire        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1;
+//★ 2026-11-13（fence）：MISC-MEM 的两条，随分配写进 ROB 项（与 alloc_mret 同型）
+    wire        alloc_fence_0, alloc_fence_i_0, alloc_fence_1, alloc_fence_i_1;
+    wire        alloc_fence_2, alloc_fence_i_2;
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
 //★ 2026-11-04 真 PRF：物理号与冲刷掩码
     wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
@@ -591,11 +594,32 @@ module cpu_top #(
 
 //==============================================================================
 // 前端：指令缓存 + 指令紧耦合存储
+//★ 2026-11-13：icache 全失效脉冲。由 rob 的提交口状态机驱动（fence.i 那一拍，P3 接上）。
+    wire icache_invalidate;
+//★ 2026-11-13（P2b）：三层失效的另一半 —— dcache 的世代位与 L2 的 maint 口。
+//  P3 只把 icache 接到 fence.i 上：dcache 是写穿、L2 对同址写是写失效 ⇒ 改指令的那笔 store
+//  已经把这两层的旧副本作废了，fence.i 不必再付一次全清。这两根留给 P4 的软件失效原语
+//  （DMA 一致性要用），在那之前钉 0。
+//  L2 的 maint 是 2 位编码（2'b10 = 清全部 valid），所以这里拼成一根 2 位的"内部源"，
+//  再和外部口 l2_maint 相或 —— 外部口现在 mcu_top 钉常量，将来接 MIG/mcu 的硬件维护用。
+    wire dcache_invalidate = 1'b0;
+    wire l2_maint_internal = 1'b0;
+    wire [1:0] l2_maint_source = {l2_maint_internal, 1'b0} | l2_maint;
+//---- 排空判据：只喂 rob 的提交口，那边先打一拍再用（见 rob 的 drain_ok 端口注释）----
+//  · elsq_retired_pending：ELSQ 里还压着"比队头老、已退休、没排出去"的访存项
+//  · bus_hold_in        ：LSU 的 AHB 主设备手上还有一笔没被接受（= 非缓存写还在飞）
+//  · l2_write_queue_empty：L2 的 4 深写队列空了 ⇒ 缓存写已经落到后端
+//  · ~l2_busy           ：L2 不在回填/写穿途中（软件失效要用；fence.i 顺带一起等，代价可忽略）
+    wire elsq_retired_pending_lsu;
+    wire l2_write_queue_empty;
+    wire drain_ok = ~elsq_retired_pending_lsu & ~bus_hold_in & l2_write_queue_empty & ~l2_busy;
+
 //==============================================================================
     icache #(.IC_INDEX_B(IC_INDEX_B)) u_icache (
         .clk(clk), .rst(rst),
         .pc_address_0(pc_address_0),
         .redir_frontend(redir_frontend), .irq_kill(irq_kill),
+        .invalidate(icache_invalidate),     // ★ 2026-11-13：fence.i / 软件失效原语
         .mem_valid(mem_valid_icache), .mem_data(mem_data_icache),
         .fifo_full(full_iffu),
         .instruction_0(instruction_0_icache), .instruction_1(instruction_1_icache),
@@ -696,6 +720,7 @@ module cpu_top #(
         .alloc_jmp_0(alloc_jmp_0), .alloc_pend_0(alloc_pending_0),
         .alloc_ecall_0(alloc_ecall_0), .alloc_ebreak_0(alloc_ebreak_0),
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
+        .alloc_fence_0(alloc_fence_0), .alloc_fence_i_0(alloc_fence_i_0),
         .alloc_rd_0(alloc_destination_register_0),
         .alloc_csr_0(alloc_csr_0),
         .alloc_phys_0(alloc_phys_0), .alloc_pc_1(alloc_pc_1),
@@ -729,6 +754,7 @@ module cpu_top #(
         .alloc_jmp_1(alloc_jmp_1), .alloc_pend_1(alloc_pending_1),
         .alloc_ecall_1(alloc_ecall_1), .alloc_ebreak_1(alloc_ebreak_1),
         .alloc_illegal_1(alloc_illegal_1), .alloc_mret_1(alloc_mret_1),
+        .alloc_fence_1(alloc_fence_1), .alloc_fence_i_1(alloc_fence_i_1),
         .alloc_rd_1(alloc_destination_register_1),
         .alloc_csr_1(alloc_csr_1),
         .alloc_phys_1(alloc_phys_1),
@@ -736,6 +762,7 @@ module cpu_top #(
         .alloc_jmp_2(alloc_jmp_2), .alloc_pend_2(alloc_pending_2),
         .alloc_ecall_2(alloc_ecall_2), .alloc_ebreak_2(alloc_ebreak_2),
         .alloc_illegal_2(alloc_illegal_2), .alloc_mret_2(alloc_mret_2),
+        .alloc_fence_2(alloc_fence_2), .alloc_fence_i_2(alloc_fence_i_2),
         .alloc_rd_2(alloc_destination_register_2),
         .alloc_csr_2(alloc_csr_2),
         .alloc_phys_2(alloc_phys_2),
@@ -1221,6 +1248,8 @@ module cpu_top #(
         .exception_load_store_address_out(exception_ldst_address_lsu),
         .exception_load_store_index_out(exception_ldst_index_lsu),
         .exception_load_store_pc_out(exception_ldst_pc_lsu),
+//★ 2026-11-13（P2b）：只引出给 P3 的排空判据，本阶段没有消费者。
+        .elsq_retired_pending(elsq_retired_pending_lsu),
         .pc_in(lsu_pc)
     );
 
@@ -1237,8 +1266,10 @@ module cpu_top #(
         .allocation_pend_0(alloc_pending_0), .allocation_pend_1(alloc_pending_1),
         .allocation_ecall_0(alloc_ecall_0), .allocation_ebreak_0(alloc_ebreak_0),
         .allocation_illegal_0(alloc_illegal_0), .allocation_mret_0(alloc_mret_0),
+        .allocation_fence_0(alloc_fence_0), .allocation_fence_i_0(alloc_fence_i_0),
         .allocation_ecall_1(alloc_ecall_1), .allocation_ebreak_1(alloc_ebreak_1),
         .allocation_illegal_1(alloc_illegal_1), .allocation_mret_1(alloc_mret_1),
+        .allocation_fence_1(alloc_fence_1), .allocation_fence_i_1(alloc_fence_i_1),
         .allocation_index_0(alloc_index_0), .allocation_index_1(alloc_index_1),
         .allocation_generation_0(alloc_generation_0), .allocation_generation_1(alloc_generation_1),
         .allocation_csr_0(alloc_csr_0),
@@ -1250,6 +1281,7 @@ module cpu_top #(
         .allocation_jmp_2(alloc_jmp_2), .allocation_pend_2(alloc_pending_2),
         .allocation_ecall_2(alloc_ecall_2), .allocation_ebreak_2(alloc_ebreak_2),
         .allocation_illegal_2(alloc_illegal_2), .allocation_mret_2(alloc_mret_2),
+        .allocation_fence_2(alloc_fence_2), .allocation_fence_i_2(alloc_fence_i_2),
         .allocation_index_2(alloc_index_2), .allocation_generation_2(alloc_generation_2),
         .allocation_csr_2(alloc_csr_2),
         .head_pc_out(head_pc_rob), .head_valid_out(head_valid_rob),
@@ -1258,6 +1290,7 @@ module cpu_top #(
         .bju_redir(redir_registered_0), .bju_tgt(jump_target_0),
         .branch_unit_lane1_redir(redir_registered_1), .branch_unit_lane1_tgt(jump_target_1),
         .redir_backend_0(redir_backend_0), .kill_redirect_target(rob_redir_pc), .redirect_any(rob_redir_any),
+        .icache_invalidate(icache_invalidate), .drain_ok(drain_ok),
         .redir_frontend(redir_frontend),
         .kill_redirect_mret(mret_valid),
         .branch_unit_lane1_judged(judged_1), .branch_unit_lane1_index(bju_index_registered_1), .branch_unit_lane1_generation(generation_registered_1),
@@ -1382,6 +1415,7 @@ module cpu_top #(
         .store_blocked(store_blocked_dcache),
         .mem_data(mem_data_dtcm), .mem_valid(mem_valid_dtcm), .mem_ready(1'b1),
         .mem_write_ready(l2_d_ready_w),
+        .invalidate(dcache_invalidate),     // ★ 2026-11-13：fence / 软件失效原语
         .bus_data_out(data_dcache),
         .load_ready(load_ready_dcache), .busy(busy_dcache), .hold(hold_dcache), .request_blocked(request_blocked_dcache),
         .load_ready_next(load_ready_next_dcache),
@@ -1430,7 +1464,8 @@ module cpu_top #(
         .d_be(mem_byte_enable_dcache),
         .d_data(mem_data_dtcm), .d_valid(mem_valid_dtcm), .d_ready(l2_d_ready_w),
 //维护 / 非缓存窗口
-        .maint(l2_maint), .maint_done(l2_maint_done),
+        .maint(l2_maint_source), .maint_done(l2_maint_done),
+        .write_queue_empty(l2_write_queue_empty),
         .unc_base(l2_uncached_base), .unc_mask(l2_uncached_mask),
 //AHB 主口
         .m_haddr(l2_haddr), .m_htrans(l2_htrans), .m_hwrite(l2_hwrite), .m_hsize(l2_hsize),

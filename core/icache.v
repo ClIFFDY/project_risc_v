@@ -50,6 +50,10 @@ module icache(
 //★ 2026-10-31：只接本模块真正用到的位（原来整根八位总线扇进来，其中好几位没人读）。
     input        redir_frontend,     // 前端重定向（rob 判定拍出的那根）
     input        irq_kill,           // 中断受理（clint 自己判的）
+//★ 2026-11-13：全失效（fence.i / 软件失效原语）。一拍脉冲，翻转 pvalid 代次。
+//  ★ 不要在这里写成"清 valid 向量"：valid 位是塞在 tag 阵列字里的（{pvalid,valid,tag}），
+//    没有独立向量；代次翻转是 1 拍完成、不需要碰阵列。
+    input        invalidate,
 //★ 落点表输出（bpu 已仲裁成 one hot）：take 时取指地址直接吃落点，覆盖 pc_address_0；
 //  这几位同时随指令进交付寄存器，当"这一块被预测跳"的凭证。
     input        btb_take_0, btb_take_1,
@@ -101,7 +105,10 @@ module icache(
     parameter integer IC_INDEX_B = 8;                                  // 组数位宽（256 组）
     localparam integer IC_SETS   = 1 << IC_INDEX_B;                    // 组数
     localparam integer IC_TAG_B  = 32 - IC_WORD_B - IC_INDEX_B;        // tag_* 寄存器位宽
-    localparam integer IC_TAGW   = IC_TAG_B + 1;                       // tag 阵列字宽
+//★ 2026-11-13：tag 阵列字从 {valid, tag} 扩成 {pvalid, valid, tag}，多一位代次。
+//  pvalid = 当前代次；写进去的是"填充开始那一刻"的代次（见 fill_pvalid 的锁存），
+//  翻一下 pvalid_q 就等于全部作废，1 拍完成。命中仍是一次整字比较。
+    localparam integer IC_TAGW   = IC_TAG_B + 2;                       // tag 阵列字宽
     localparam integer IC_FOLD   = 32 - IC_INDEX_B - IC_WORD_B - 2;    // tag 的有效位（拼回 pc 用）
     localparam integer IC_WG_B   = IC_WORD_B - 2;                      // 块内字号（16B = 4 字）⇒ 块号位宽
 //★ 2026-11-11 时序：半选位 block_offset[1] 必须进【地址】，不能留在数据端做 2:1 mux。
@@ -118,6 +125,14 @@ module icache(
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
     reg reset_registered;
     always @(posedge clk) reset_registered <= rst;
+
+//★ 2026-11-13 代次寄存器：invalidate 一拍脉冲 ⇒ 翻转 = 全部作废。
+    reg pvalid_q;
+//  阵列初值全 0（pvalid=0 / valid=0），复位后 pvalid_q=0 ⇒ 天然不命中。
+    always @(posedge clk) begin
+        if (reset_registered) pvalid_q <= 1'b0;
+        else if (invalidate)  pvalid_q <= ~pvalid_q;
+    end
 //寄存器（按级分组）
 //第 0 级：本拍组合
     (* max_fanout = 32 *) reg [31:0] fetch_word_index_0;
@@ -164,6 +179,10 @@ module icache(
     reg [IC_WORD_B-1:0] fill_count;
     reg [31:0] fill_addr;
     reg [IC_TAG_B-1:0] fill_tag;
+//★ 2026-11-13 代次：pvalid_q 是当前代次；fill_pvalid 是"这次填充开始那一刻"的代次。
+//  ★ 必须锁存：填充可能跨过失效点，若直接写当拍 pvalid_q，在途填充会把新代次盖到旧数据上
+//    ⇒ 那一行永久有效（表现为"偶尔跑旧指令"，最难查）。锁存版写进去自动不命中，正确。
+    reg                fill_pvalid;
     (* max_fanout = 32 *) reg [IC_INDEX_B-1:0] fill_index;
 //★ 回填替换路：只依赖【寄存好的 fill_index】，不依赖缺失检测那一拍的任何东西。
     wire [IC_TAGW-1:0] fill_tag_way1 = way1_tag[fill_index];
@@ -261,8 +280,8 @@ module icache(
     always @(*) begin
         fetch_address_0 = {fetch_tag_registered_0[IC_FOLD-1:0], index_registered_0,
                            word_q0[IC_WORD_B-1:2], 4'd0};
-        hit_way_0[0] = (way1_tag_registered_0 == {1'b1, fetch_tag_registered_0});
-        hit_way_0[1] = (way2_tag_registered_0 == {1'b1, fetch_tag_registered_0});
+        hit_way_0[0] = (way1_tag_registered_0 == {pvalid_q, 1'b1, fetch_tag_registered_0});
+        hit_way_0[1] = (way2_tag_registered_0 == {pvalid_q, 1'b1, fetch_tag_registered_0});
 //★ 16B 块恒在一条行内 ⇒ 命中判定只有一次（老版本是两个字各比一次、两个都要中）。
         hit_0 = hit_way_0[0] | hit_way_0[1];
 // 命中路号直接进 iram 地址：0 = way0(way1_tag)，1 = way1(way2_tag)
@@ -356,6 +375,7 @@ module icache(
             fill_addr <= 32'd0;
             fill_tag <= 0;
             fill_index <= 0;
+            fill_pvalid <= 1'b0;
             lru <= 0;
         end
         else begin
@@ -372,6 +392,7 @@ module icache(
                     fill_addr <= {fetch_tag_registered_0[IC_FOLD-1:0], index_registered_0, {IC_WORD_B+2{1'b0}}};
                     fill_tag <= fetch_tag_registered_0;
                     fill_index <= index_registered_0;
+                    fill_pvalid <= pvalid_q;      // ★ 锁存：在途填充不许吃到新代次
                 end
             end
             else begin
@@ -383,9 +404,9 @@ module icache(
                 end
                 if (fill_end) begin
                     if (fill_way == 1'b0)
-                        way1_tag[fill_index] <= {1'b1, fill_tag};
+                        way1_tag[fill_index] <= {fill_pvalid, 1'b1, fill_tag};
                     else
-                        way2_tag[fill_index] <= {1'b1, fill_tag};
+                        way2_tag[fill_index] <= {fill_pvalid, 1'b1, fill_tag};
 //填完这一路 ⇒ 下次该换另一路。
                     lru[fill_index] <= ~fill_way;
                     stage <= 1'b0;
@@ -411,7 +432,7 @@ module icache(
 //===============================================================
 // synthesis translate_off
     initial begin
-        if ((IC_TAGW   != IC_TAG_B + 1) ||
+        if ((IC_TAGW   != IC_TAG_B + 2) ||   // {pvalid, valid, tag}，2026-11-13 起多一位代次
             (IC_TAG_B  != IC_FOLD + 2) ||
             (IC_ADDR_B != 1 + IC_INDEX_B + IC_WG_B + IC_HALF_B) ||
             (IC_WORDS  != (2 << (IC_INDEX_B + IC_WORD_B))) ||

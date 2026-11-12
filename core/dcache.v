@@ -46,6 +46,9 @@ module dcache(
 //  满了它会把这一笔静默丢掉；以前 mem_write_enable 是一拍脉冲、发出去就当成功，
 //  于是丢写没人知道（实测 FreeRTOS 的 TCB 字段就是这么没的）。现在没被接住就一直举着。
     input mem_write_ready,
+//★ 2026-11-13（fence / DMA 一致性）：失效脉冲。抬一拍 ⇒ 世代位取反 ⇒ 整张 tag 表当拍全部作废，
+//  不扫阵列、不写阵列。与复位那条是同一套机制（valid_generation），所以只需要一根多路或。
+    input        invalidate,
 
 //总线接口
     output [31:0] bus_data_out,
@@ -193,6 +196,10 @@ module dcache(
     reg [2:0] fill_count;
     reg [31:0] fill_addr;
     reg [DC_TAG_B-1:0] fill_tag;
+//★ 2026-11-13：回填写进阵列的世代位必须是【开始填充那一拍】锁下来的那一份，不能写当拍的
+//  valid_generation。否则一笔跨越失效的填充会把新世代盖到旧数据上 ⇒ 那行永久有效（和 icache
+//  的 fill_pvalid 同一个坑，见 icache.v）。
+    reg        fill_generation;
     reg [DC_SETS_B-1:0] fill_index;
 //★ 2026-10-31：缺失判定整体打一拍。
 //  原来「读 tag 阵列 → 比较 → 命中判定」当拍就要驱动 stage 与 fill_* 一整族的 CE，
@@ -245,7 +252,7 @@ module dcache(
 //★ ~miss_q：缺失已经判出来、这一拍就要进回填，不许再收同一个请求
 //★ 2026-11-04：A 口只收读 —— 写全部走 B 口（见端口注释）。
         read_request = (stage == 1'b0) && !miss_q && bus_valid_in
-                    && (bus_address_in[31:14] == 18'd0);
+                    && (bus_address_in[31:16] == 16'd0);
 //命中命中即行内就地更新（B 口），一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
@@ -395,6 +402,7 @@ module dcache(
             fill_word_q     <= 3'd0;
             fill_addr_q     <= 32'd0;
             fill_tag_q      <= 21'd0;
+            fill_generation <= 1'b0;
             fill_way_q      <= 1'b0;
             access_valid_q  <= 1'b0;
             access_address_q <= 11'd0;
@@ -415,6 +423,11 @@ module dcache(
         end
         else begin
             fill_end_q <= fill_end;
+//★ 2026-11-13（fence / DMA 一致性）：失效 = 世代位取反，与复位那条同一套机制。
+//  ★ 同拍受理的填充在下面锁 fill_generation 时读到的是【取反前】的值（非阻塞赋值读旧值），
+//    所以跨越失效的那笔填充写进去自动不命中 —— 正好是我们要的。
+            if (invalidate)
+                valid_generation <= ~valid_generation;
 //命中更新：索引和 way 都取【请求拍捉下的那份】，与 hit_upd 的相位对齐。
 //  再往下一拍才落到 LRU 阵列（lru_hit_upd_q），即命中后两拍写完，提示量，晚一拍无妨。
             lru_hit_upd_q   <= hit_upd;
@@ -431,6 +444,7 @@ module dcache(
                 fill_word_q  <= word;
                 fill_addr_q  <= (bus_address_in & 32'hFFFFFFF8) << 2;
                 fill_tag_q   <= tag;
+                fill_generation <= valid_generation;
                 fill_way_q   <= ((way0_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b0 :
                                 ((way1_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b1 : lru[index];
             end
@@ -464,7 +478,7 @@ module dcache(
 //  只在 stage==0 收不会引入顺序问题：stage==0 收下 ⇒ 下一拍 store_busy，写穿当拍就发
 //  （read_drive 这时还是 0），比同拍收下的 load 判 miss 进回填还早一拍。
             if (store_valid_in && !store_busy && (stage == 1'b0) && !miss_q
-                && (store_address_in[31:14] == 18'd0)) begin
+                && (store_address_in[31:16] == 16'd0)) begin
                 store_busy        <= 1'b1;
                 store_cache_done  <= 1'b0;
                 store_mem_done    <= 1'b0;
@@ -495,12 +509,12 @@ module dcache(
 
             if (fill_end) begin
                 if (fill_way) begin
-                    way1_tag  [fill_index] <= {valid_generation, fill_tag};
-                    way1_tag_b[fill_index] <= {valid_generation, fill_tag};
+                    way1_tag  [fill_index] <= {fill_generation, fill_tag};
+                    way1_tag_b[fill_index] <= {fill_generation, fill_tag};
                 end
                 else begin
-                    way0_tag  [fill_index] <= {valid_generation, fill_tag};
-                    way0_tag_b[fill_index] <= {valid_generation, fill_tag};
+                    way0_tag  [fill_index] <= {fill_generation, fill_tag};
+                    way0_tag_b[fill_index] <= {fill_generation, fill_tag};
                 end
                 stage <= 1'b0;
                 fill_end <= 1'b0;

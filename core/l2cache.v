@@ -52,6 +52,9 @@ module l2cache(
 //---- 维护 ----
     input      [1:0]  maint,
     output reg        maint_done,
+//★ 2026-11-13（fence 排空判据）：4 深写队列里没有排队项 ⇒ 已收下的缓存写全部落到后端了。
+//  只喂 ROB 提交口，不进访存通路（见 docs/SPEC_fence_i_and_cache_range_2026-11-13.txt §2.3）。
+    output wire       write_queue_empty,
 
 //---- 非缓存窗口 ----
     input      [31:0] unc_base,
@@ -132,6 +135,8 @@ module l2cache(
     wire [2:0] wq_count = wq_wr - wq_rd;
     wire       wq_empty = (wq_wr == wq_rd);
     wire       wq_full  = (wq_count == 3'd4);
+//★ 2026-11-13（fence 排空判据）：与内部 l2_maint_w / rob 的排空握手用同一根。纯寄存器比较。
+    assign write_queue_empty = wq_empty;
 
 //★ 2026-11-12：写队列里还有没落到内存的写时，**同一条线**的填充不许开工。
 //  填充是从内存整行读回来的，抢在排队写前面就会读成旧值；而 D 写是【写失效】的
@@ -199,16 +204,23 @@ module l2cache(
 
     wire [AWB-1:0] read_index = {st_way, st_set, st_word};
     reg [31:0]     data_i_q, data_d_q;
+    reg [31:0]     byp_data_q;                // 旁路（非缓存窗口）读回的数据
+    reg            byp_sel_q;                 // 那个条件延一拍，和 data_d_q 对齐
     reg            i_valid_q, d_valid_q;
 
+//★ 2026-11-12：这里原先是 `if (S_BYP) data_d_q <= m_hrdata; else data_d_q <= data_d[...]`，
+//  数组的读输出寄存器被旁路数据分了源 ⇒ 综合报 [Synth 8-6849] Infeasible
+//  ram_style="block" for "u_l2/data_d_reg"，16Kx32 整个退回 LUTRAM（实测 11964 个 LUTRAM，
+//  占器件 11.8%）。改成【阵列读走纯形状 + 出口显式 mux】，拍数一点没变。
     always @(posedge clk) begin
-        data_i_q <= data_i[read_index];
-//旁路读（非缓存窗口）直接进 D 口输出寄存器 —— 单一驱动，不能再开一个 always
-        if (state == S_BYP && m_rd_valid)
-            data_d_q <= m_hrdata;
-        else
-            data_d_q <= data_d[read_index];
+        data_i_q   <= data_i[read_index];
+        data_d_q   <= data_d[read_index];     // 纯阵列读 ⇒ 才推得出 BRAM
+        byp_data_q <= m_hrdata;
+        byp_sel_q  <= (state == S_BYP) && m_rd_valid;
     end
+
+//D 口出口：旁路值优先（与原来那条 if 同拍、同优先级）
+    wire [31:0] data_d_sel = byp_sel_q ? byp_data_q : data_d_q;
 
 //==============================================================================
 //  六、状态机
@@ -281,7 +293,7 @@ module l2cache(
     assign m_busy  = busy_flag;
     assign i_data  = data_i_q;
     assign i_valid = i_valid_q & st_is_i;
-    assign d_data  = data_d_q;
+    assign d_data  = data_d_sel;      // 旁路优先，见 §201-218 的说明
     assign d_valid = d_valid_q & ~st_is_i;
 //★ 写队列满时 d_ready 必须低，上游（dcache 的写穿）才举着写使能等。
 //  ★ 不能写成 `d_we ? ~wq_full : ~d_pend`：d_we 是本模块的输入、又是 dcache 写使能的
