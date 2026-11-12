@@ -26,11 +26,11 @@ module bus_con_top(
     input             bus_we_f_cpu,
     input             bus_valid_f_cpu,
     output reg        rst_cpu,        // CPU / DMA 域：上电搬运期间一直压着
-    output            rst_sys,        // 总线 / STCM / APB 桥 / SPI 域：复位一放开就活
+    output reg        rst_sys,        // 总线 / STCM / APB 桥 / SPI 域：复位一放开就活
 //---- boot 引擎状态（给 pmem_spi 的 BOOT 寄存器展示）----
-    output            boot_done_out,
-    output            boot_err_out,
-    output     [16:0] boot_count_out,
+    output reg        boot_done_out,
+    output reg        boot_err_out,
+    output reg [16:0] boot_count_out,
     output     [31:0] bus_data_b_cpu,
     output            bus_loaded_out,
     output            bus_hold_out,
@@ -158,6 +158,7 @@ module bus_con_top(
         .rst_n(rst),
         .rst_stable(rst_stable)
     );
+    wire rst_stable;
 
 //==============================================================================
 //  一之一、复位分域：boot 搬运期间 CPU / DMA 压着，总线与 SPI 先活
@@ -165,8 +166,6 @@ module bus_con_top(
 //    rst_cpu = rst_sys 或 "还没搬完"      （搬完才放开）
 //  ★ boot_done 只在 rst_sys 为高时清 —— 也就是下一次复位才允许重新搬运。
 //==============================================================================
-    wire rst_stable;
-
     reg boot_done_q;
     always @(posedge clk) begin
         if (rst_stable)

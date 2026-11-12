@@ -32,7 +32,12 @@ module mcu_top #(
     parameter integer BTB_B             = 11,
     parameter integer DC_SETS_B         = 9,
     parameter integer ITCM_AW           = 14,
-    parameter integer ADDER_AT_D        = 0
+    parameter integer ADDER_AT_D        = 0,
+//★ 7 号槽 SPI 的分频由这两个频率算出来（见 IO_block/pmem_spi.v 头注释）：
+//  换核时钟只改 CLK_MHZ，SCK 目标频率保持不变。
+    parameter integer CLK_MHZ           = 120,
+    parameter integer FLASH_SCK_KHZ     = 2500,
+    parameter integer SD_SCK_KHZ        = 300
 ) (
     input clk, rst,
     inout wire [31:0] gpio_pin_bus,
@@ -151,7 +156,11 @@ module mcu_top #(
         .err_addr(err_addr_w), .err_clear(err_clear_w)
     );
 
-    io_block_top u_io_block (
+    io_block_top #(
+        .CLK_MHZ(CLK_MHZ),
+        .FLASH_SCK_KHZ(FLASH_SCK_KHZ),
+        .SD_SCK_KHZ(SD_SCK_KHZ)
+    ) u_io_block (
         .clk(clk),
         .rst_cpu(rst_sys),
         .gpio_pin_bus(gpio_pin_bus),

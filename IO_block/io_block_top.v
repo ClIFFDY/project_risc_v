@@ -20,7 +20,13 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module io_block_top(
+module io_block_top #(
+//★ CLK_MHZ = 核时钟频率（MHz）：UART 波特率、I2C SCL、SPI 分频全都由它算出来，
+//  换核时钟只改这一处（子模块各自按目标频率反解自己的分频）。
+    parameter integer CLK_MHZ       = 120,
+    parameter integer FLASH_SCK_KHZ = 2500,
+    parameter integer SD_SCK_KHZ    = 300
+)(
     input clk, rst_cpu,
     inout wire [31:0] gpio_pin_bus,
     input      [31:0] bus_addr_in,
@@ -84,7 +90,7 @@ module io_block_top(
         bus_we_spi  = bus_we_in & bus_sel_in[PER_SPI];
     end
 
-    uart_top u_uart (
+    uart_top #(.CLK_MHZ(CLK_MHZ)) u_uart (
         .clk(clk),
         .rst(rst_cpu),
         .rx(uart_rx_w),
@@ -121,7 +127,7 @@ module io_block_top(
         .scl_in(i2c_scl_in)
     );
 
-    i2c u_i2c (
+    i2c #(.CLK_MHZ(CLK_MHZ)) u_i2c (
         .clk(clk),
         .rst(rst_cpu),
         .bus_addr_in(bus_addr_in),
@@ -153,7 +159,11 @@ module io_block_top(
     );
 
 //双通道 SPI 主机（7 号槽）：flash 与 SD 共享三根线，CS 各一根
-    pmem_spi u_pmem_spi (
+    pmem_spi #(
+        .CLK_MHZ(CLK_MHZ),
+        .FLASH_SCK_KHZ(FLASH_SCK_KHZ),
+        .SD_SCK_KHZ(SD_SCK_KHZ)
+    ) u_pmem_spi (
         .clk(clk),
         .rst(rst_cpu),
         .bus_addr_in(bus_addr_in),

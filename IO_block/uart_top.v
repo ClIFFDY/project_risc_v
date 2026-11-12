@@ -20,7 +20,15 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module uart_top(
+module uart_top #(
+//★ 分频由核时钟算出来。原来写死 localparam CLK = 50 MHz ⇒ 核改 120 MHz 时
+//  波特率会整体乘 2.4（9600 变 23040），对端必然收错。改核频率只改 CLK_MHZ。
+//  mcnt 是 14 位：CLK/BPS_LOW 最大 16383 ⇒ 9600 只支持到 CLK_MHZ ≤ 157
+//  （120 MHz 时 12500，余量够；再往上要么加宽 mcnt、要么降 BPS_LOW）。
+    parameter integer CLK_MHZ  = 120,
+    parameter integer BPS_LOW  = 9600,
+    parameter integer BPS_HIGH = 115200
+) (
     input clk, rst,
     input rx,
     output tx,
@@ -33,29 +41,27 @@ module uart_top(
     output reg rx_irq
     );
 
-    localparam CLK = 50_000_000;
-    localparam BPSL = 9600;
-    localparam BPSH = 115200;
+    localparam integer CLK = CLK_MHZ * 1_000_000;
 
     reg uart_bps;
     reg [13:0] mcnt, mcnt_half, mcnt_3q;
 
     always @(posedge clk) begin
         if (rst) begin
-            mcnt <= CLK/BPSL;
-            mcnt_half <= (CLK/BPSL)/2;
-            mcnt_3q <= (CLK/BPSL)/2 + (CLK/BPSL)/4 - 1;
+            mcnt <= CLK/BPS_LOW;
+            mcnt_half <= (CLK/BPS_LOW)/2;
+            mcnt_3q <= (CLK/BPS_LOW)/2 + (CLK/BPS_LOW)/4 - 1;
         end
         else if (bus_addr_in[23:20] == 4'b0011 && bus_we_in && bus_be_in[0]) begin
             if (bus_data_in[1:0] == 2'b01) begin
-                mcnt <= CLK/BPSH;
-                mcnt_half <= (CLK/BPSH)/2;
-                mcnt_3q <= (CLK/BPSH)/2 + (CLK/BPSH)/4 - 1;
+                mcnt <= CLK/BPS_HIGH;
+                mcnt_half <= (CLK/BPS_HIGH)/2;
+                mcnt_3q <= (CLK/BPS_HIGH)/2 + (CLK/BPS_HIGH)/4 - 1;
             end
             else begin
-                mcnt <= CLK/BPSL;
-                mcnt_half <= (CLK/BPSL)/2;
-                mcnt_3q <= (CLK/BPSL)/2 + (CLK/BPSL)/4 - 1;
+                mcnt <= CLK/BPS_LOW;
+                mcnt_half <= (CLK/BPS_LOW)/2;
+                mcnt_3q <= (CLK/BPS_LOW)/2 + (CLK/BPS_LOW)/4 - 1;
             end
         end
     end

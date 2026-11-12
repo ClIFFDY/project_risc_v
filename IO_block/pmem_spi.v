@@ -16,8 +16,8 @@
 //     3  RXDATA  R: 最近一次收齐的字节
 //     4  CS      W: bit0 = flash 的 CS（0 = 选中） bit1 = SD 的 CS（0 = 选中）
 //                  R: 回读
-//     5  DIV0    W/R: flash 通道分频，SCK = clk/(2*(div+1))，复位值 9 ⇒ 2.5 MHz
-//     6  DIV1    W/R: SD 通道分频，复位值 99 ⇒ 250 kHz（SD 初始化要求 100~400 kHz）
+//     5  DIV0    W/R: flash 通道分频，SCK = clk/(2*(div+1))；复位值由参数算（见下）
+//     6  DIV1    W/R: SD 通道分频，同理（SD 初始化要求 100~400 kHz）
 //     7  BOOT    R: {13'd0, boot_count[16:0], boot_err, boot_done}
 //   对应字节地址（槽基址 0x1C00_0000）：00 / 04 / 08 / 0C / 10 / 14 / 18 / 1C
 //
@@ -30,7 +30,15 @@
 //////////////////////////////////////////////////////////////////////////////////
 
 
-module pmem_spi(
+module pmem_spi #(
+//★ 分频的复位值【不写死】：由"核时钟频率 + 目标 SCK"算出来。
+//  换时钟（50 / 100 / 120 MHz）只改 CLK_MHZ，SCK 目标频率保持不变。
+//  手算过的坑：原来按 50 MHz 写死 9 / 99，核改 120 MHz 之后 SCK 悄悄变成
+//  6 MHz / 600 kHz —— 后者已经超出 SD 卡上电初始化 100~400 kHz 的硬要求。
+    parameter integer CLK_MHZ       = 120,    // 核时钟频率（MHz）
+    parameter integer FLASH_SCK_KHZ = 2500,   // flash 通道目标 SCK
+    parameter integer SD_SCK_KHZ    = 300     // SD 通道目标 SCK（初始化要 100~400 kHz）
+)(
     input clk, rst,
 
     input      [31:0] bus_addr_in,
@@ -62,6 +70,15 @@ module pmem_spi(
     R_DIV0   = 3'd5,
     R_DIV1   = 3'd6,
     R_BOOT   = 3'd7;
+
+//SCK = clk/(2*(div+1)) ⇒ 半周期 = ceil(clk/(2*SCK)) 个核时钟，div = 半周期 - 1。
+//  向上取整是故意的：宁可慢一点也不许超过目标频率（SD 卡对初始化频率有上限）。
+    localparam integer FLASH_HALF = (CLK_MHZ * 1000 + 2 * FLASH_SCK_KHZ - 1) / (2 * FLASH_SCK_KHZ);
+    localparam integer SD_HALF    = (CLK_MHZ * 1000 + 2 * SD_SCK_KHZ    - 1) / (2 * SD_SCK_KHZ);
+    localparam [7:0]   DIV_FLASH_INIT = (FLASH_HALF <= 1) ? 8'd0 :
+                                        (FLASH_HALF > 256) ? 8'd255 : FLASH_HALF[7:0] - 8'd1;
+    localparam [7:0]   DIV_SD_INIT    = (SD_HALF    <= 1) ? 8'd0 :
+                                        (SD_HALF    > 256) ? 8'd255 : SD_HALF[7:0]    - 8'd1;
 
     wire sel = (bus_addr_in[31:24] == 8'd7);
 
@@ -105,8 +122,8 @@ module pmem_spi(
             cs_level <= 1'b1;
             cs_sd <= 1'b1;
             lsb_first <= 1'b0;
-            div_flash <= 8'd9;
-            div_sd <= 8'd99;
+            div_flash <= DIV_FLASH_INIT;
+            div_sd <= DIV_SD_INIT;
             tx_byte <= 8'd0;
         end
         else begin
@@ -246,7 +263,7 @@ module pmem_spi(
             tx_shift <= 8'd0;
             rx_shift <= 8'd0;
             rx_byte <= 8'd0;
-            div_active <= 8'd99;
+            div_active <= DIV_SD_INIT;
         end
         else begin
             if (done_clear)

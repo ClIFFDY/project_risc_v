@@ -37,7 +37,10 @@ module i2c(
     output reg busy
     );
 
-    parameter CLK_FREQ = 32'd50_000_000;
+//★ 同上：SCL 分频由核时钟算。原来写死 50 MHz，核改 120 MHz 时
+//  400 kHz 那档会变成 960 kHz，超出 fast-mode 器件上限。
+    parameter integer CLK_MHZ = 120;
+    localparam [31:0] CLK_FREQ = CLK_MHZ * 1_000_000;
 
     localparam [7:0]
         R_DATA     = 8'h00,
