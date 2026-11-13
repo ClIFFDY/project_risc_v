@@ -17,9 +17,11 @@ module buffer_access_ctrl(
     input        sel_a_buf,
     input        sel_bt_buf,
     input        sel_c_buf,
+    input        sel_wgt,
     input [`NPU_ABUF_REG_AW-1:0] a_local_addr,
     input [`NPU_BBUF_REG_AW-1:0] bt_local_addr,
     input [`NPU_CBUF_AW-1:0] c_local_addr,
+    input [`NPU_WGT_AW-1:0] wgt_local_addr,
     input [31:0] req_wdata,
     // NPU 状态
     input        core_busy,
@@ -34,6 +36,10 @@ module buffer_access_ctrl(
     output reg [31:0] cpu_a_wdata,
     output reg [31:0] cpu_bt_wdata,
     output reg [31:0] cpu_c_wdata,
+    // 权重块写口（只写；忙时和别的 buffer 一样拒绝）
+    output reg        cpu_wgt_we,
+    output reg [`NPU_WGT_AW-1:0] cpu_wgt_addr,
+    output reg [31:0] cpu_wgt_wdata,
     // Buffer 读数据返回(CPU 侧)
     input [31:0] a_rdata_cpu,
     input [31:0] bt_rdata_cpu,
@@ -64,6 +70,9 @@ module buffer_access_ctrl(
         cpu_a_wdata  = req_wdata & byte_mask;
         cpu_bt_wdata = req_wdata & byte_mask;
         cpu_c_wdata  = req_wdata & byte_mask;
+        cpu_wgt_we    = req_valid && req_we && sel_wgt && cpu_ok;
+        cpu_wgt_addr  = wgt_local_addr;
+        cpu_wgt_wdata = req_wdata & byte_mask;
 
         // req_addr 由 ahb_lite_slave 锁存，所以 sel_* 在整个 Buffer 读等待期间保持稳定。
         buffer_rdata = sel_a_buf  ? a_rdata_cpu  :

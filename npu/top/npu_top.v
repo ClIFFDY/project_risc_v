@@ -40,6 +40,8 @@ module npu_top(
     output reg        sel_a_buf,
     output reg        sel_bt_buf,
     output reg        sel_c_buf,
+    output reg        sel_wgt,        // 0x4000-0x7FFF 权重块
+    output reg        sel_wgt_cfg,    // 0x0800-0x080F 权重块配置
     output reg [31:0] control_rdata,
     output reg [31:0] status_rdata,
     output reg [31:0] buffer_rdata,
@@ -61,6 +63,12 @@ module npu_top(
     output reg [`NPU_BBUF_REG_AW-1:0] cpu_bt_addr,
     output reg [`NPU_CBUF_AW-1:0] cpu_c_addr,
     output reg [31:0] cpu_a_wdata, cpu_bt_wdata, cpu_c_wdata,
+    output reg        cpu_wgt_we,
+    output reg [`NPU_WGT_AW-1:0] cpu_wgt_addr,
+    output reg [31:0] cpu_wgt_wdata,
+    // 权重块配置直通（只在任务之间变化，不必像 m/n/k 那样锁存）
+    output [`NPU_WGT_AW-1:0] wgt_base,
+    output                   wgt_en,
     input [31:0] a_rdata_cpu, bt_rdata_cpu, c_rdata_cpu
 );
 
@@ -68,6 +76,8 @@ module npu_top(
     reg [`NPU_ABUF_REG_AW-1:0] a_local_addr;
     reg [`NPU_BBUF_REG_AW-1:0] bt_local_addr;
     reg [`NPU_CBUF_AW-1:0] c_local_addr;
+    reg [`NPU_WGT_AW-1:0]  wgt_local_addr;
+    reg [1:0]  wgt_reg_off;
     reg [2:0]  ctrl_reg_off;
 
     wire [31:0] buffer_rdata_w;
@@ -90,6 +100,9 @@ module npu_top(
     wire [`NPU_BBUF_REG_AW-1:0] cpu_bt_addr_w;
     wire [`NPU_CBUF_AW-1:0] cpu_c_addr_w;
     wire [31:0] cpu_a_wdata_w, cpu_bt_wdata_w, cpu_c_wdata_w;
+    wire        cpu_wgt_we_w;
+    wire [`NPU_WGT_AW-1:0] cpu_wgt_addr_w;
+    wire [31:0] cpu_wgt_wdata_w;
 
     // ---- MMIO 地址译码：req_addr 由 ahb_lite_slave 在数据阶段给出 ----
     always @(*) begin
@@ -100,9 +113,13 @@ module npu_top(
         sel_a_buf   = (req_addr[31:12] == 20'h00001) && (req_addr[10:8] == 3'd0);
         sel_bt_buf  = (req_addr[31:12] == 20'h00002) && (req_addr[10:8] == 3'd0);
         sel_c_buf   = (req_addr[31:10] == 22'h00000C);      // 0x3000-0x33FF
+        sel_wgt     = (req_addr[31:15] == 17'd0) && req_addr[14];  // 0x4000-0x7FFF
+        sel_wgt_cfg = (req_addr[31:4] == 28'h00000080);     // 0x0800-0x080F
         a_local_addr  = {req_addr[11], req_addr[7:2]};
         bt_local_addr = {req_addr[11], req_addr[7:2]};
         c_local_addr  = req_addr[9:2];
+        wgt_local_addr = req_addr[13:2];
+        wgt_reg_off    = req_addr[3:2];
         ctrl_reg_off  = req_addr[4:2];
     end
 
@@ -112,6 +129,8 @@ module npu_top(
     wire [`NPU_QS_W-1:0]   cr_qs;
     wire                   cr_accumulate;
     wire                   cr_bank;
+    wire [`NPU_WGT_AW-1:0] cr_wgt_base;
+    wire                   cr_wgt_en;
 
     // ---- control_regs ----
     control_regs u_control_regs(
@@ -122,6 +141,8 @@ module npu_top(
         .cfg_m(cr_m), .cfg_n(cr_n), .cfg_k(cr_k),
         .cfg_tk(cr_tk), .cfg_qshift(cr_qs), .cfg_accumulate(cr_accumulate),
         .cfg_bank(cr_bank),
+        .sel_wgt_cfg(sel_wgt_cfg), .wgt_reg_off(wgt_reg_off),
+        .cfg_wgt_base(cr_wgt_base), .cfg_wgt_en(cr_wgt_en),
         .start_req(start_req), .clear_done_req(clear_done_req),
         .control_rdata(control_rdata_w)
     );
@@ -158,6 +179,8 @@ module npu_top(
         .cpu_c_we(cpu_c_we_w), .cpu_c_re(cpu_c_re_w),
         .cpu_a_addr(cpu_a_addr_w), .cpu_bt_addr(cpu_bt_addr_w), .cpu_c_addr(cpu_c_addr_w),
         .cpu_a_wdata(cpu_a_wdata_w), .cpu_bt_wdata(cpu_bt_wdata_w), .cpu_c_wdata(cpu_c_wdata_w),
+        .sel_wgt(sel_wgt), .wgt_local_addr(wgt_local_addr),
+        .cpu_wgt_we(cpu_wgt_we_w), .cpu_wgt_addr(cpu_wgt_addr_w), .cpu_wgt_wdata(cpu_wgt_wdata_w),
         .a_rdata_cpu(a_rdata_cpu), .bt_rdata_cpu(bt_rdata_cpu),
         .c_rdata_cpu(c_rdata_cpu), .buffer_rdata(buffer_rdata_w)
     );
@@ -194,6 +217,12 @@ module npu_top(
         cpu_a_wdata     = cpu_a_wdata_w;
         cpu_bt_wdata    = cpu_bt_wdata_w;
         cpu_c_wdata     = cpu_c_wdata_w;
+        cpu_wgt_we      = cpu_wgt_we_w;
+        cpu_wgt_addr    = cpu_wgt_addr_w;
+        cpu_wgt_wdata   = cpu_wgt_wdata_w;
     end
+
+    assign wgt_base = cr_wgt_base;
+    assign wgt_en   = cr_wgt_en;
 
 endmodule

@@ -23,6 +23,8 @@ module control_regs(
     input        req_we,
     input        sel_ctrl,
     input [2:0]  ctrl_reg_off,
+    input        sel_wgt_cfg,       // 0x0800-0x080F 权重块配置
+    input [1:0]  wgt_reg_off,
     input [31:0] req_wdata,
     input [3:0]  req_byte_en,
     output reg  [`NPU_DIM_W-1:0]  cfg_m,
@@ -32,6 +34,9 @@ module control_regs(
     output reg  [`NPU_QS_W-1:0]   cfg_qshift,
     output reg        cfg_accumulate,
     output reg        cfg_bank,
+    // 权重块配置（只写，回读为 0；调试需要再补读通路）
+    output reg [`NPU_WGT_AW-1:0] cfg_wgt_base,
+    output reg        cfg_wgt_en,
     output reg        start_req,        // 单拍
     output reg        clear_done_req,   // 单拍
     output reg [31:0] control_rdata
@@ -42,6 +47,7 @@ module control_regs(
     // 这样字节写和整字写行为一致，也不会误改高位保留字段。
     wire wr       = req_valid && sel_ctrl && req_we;
     wire byte0_wr = wr && req_byte_en[0];
+    wire wgt_wr   = req_valid && sel_wgt_cfg && req_we && req_byte_en[0];
 
     // 两个命令脉冲：只有写 0x00 CTRL 且低字节有效时才产生。
     // 若同时写 CTRL=0x03，两个命令都会产生；start_ctrl 只在对应状态接受命令。
@@ -59,6 +65,14 @@ module control_regs(
             cfg_qshift     <= 5'd0;
             cfg_accumulate <= 1'b0;
             cfg_bank       <= 1'b0;
+            cfg_wgt_base   <= {`NPU_WGT_AW{1'b0}};
+            cfg_wgt_en     <= 1'b0;
+        end else if (wgt_wr) begin
+            case (wgt_reg_off)
+                2'd0: cfg_wgt_base <= req_wdata[`NPU_WGT_AW-1:0];
+                2'd1: cfg_wgt_en   <= req_wdata[0];
+                default: ;
+            endcase
         end else if (byte0_wr) begin
             case (ctrl_reg_off)
                 3'd1: cfg_m          <= req_wdata[`NPU_DIM_W-1:0];

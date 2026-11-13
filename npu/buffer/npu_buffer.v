@@ -13,6 +13,12 @@ module npu_buffer(
     input        rst,
     input        core_busy,
     input        core_bank,          // 核正在读的那一组 A/BT（双缓冲）
+    // 权重块（16KB）：WGT_EN=1 时 A 侧读的是它，地址 = WGT_BASE + a_addr
+    input        cpu_wgt_we,
+    input [`NPU_WGT_AW-1:0] cpu_wgt_addr,
+    input [31:0] cpu_wgt_wdata,
+    input [`NPU_WGT_AW-1:0] wgt_base,
+    input        wgt_en,
     input        accumulate,        // 跨任务累加：C 写回做读-改-写
     // CPU 侧端口(来自 npu_top.buffer_access_ctrl)
     input        cpu_a_we,  cpu_a_re,
@@ -55,6 +61,17 @@ module npu_buffer(
     wire [`NPU_ABUF_REG_AW-1:0] a_ram_raddr = core_busy ? {core_bank, npu_a_addr} : cpu_a_addr;
     wire                     a_ram_re    = core_busy ? npu_a_re    : cpu_a_re;
     wire [31:0]              a_ram_rdata;
+
+    // ---- 权重块 RAM：和 A Buffer 同构的同步读（一拍延迟），所以 FIFO 时序不变 ----
+    wire [`NPU_WGT_AW-1:0] wgt_raddr = wgt_base + npu_a_addr;
+    wire [31:0] wgt_rdata;
+    npu_ram #(.AW(`NPU_WGT_AW)) u_wgt_ram(
+        .clk(clk),
+        .we(cpu_wgt_we), .waddr(cpu_wgt_addr), .wdata(cpu_wgt_wdata),
+        .re(core_busy && wgt_en), .raddr(wgt_raddr), .rdata(wgt_rdata)
+    );
+    // A 侧数据来源：驻留模式读权重块，否则读 A Buffer
+    wire [31:0] a_src_rdata = (core_busy && wgt_en) ? wgt_rdata : a_ram_rdata;
 
     npu_ram #(.AW(`NPU_ABUF_REG_AW)) u_a_buffer(
         .clk(clk),
@@ -117,7 +134,7 @@ module npu_buffer(
 
     npu_sync_fifo #(.AW(`NPU_FIFO_AW), .DW(32)) u_a_prefetch_fifo(
         .clk(clk), .rst(rst),
-        .push(a_fifo_push), .wdata(a_ram_rdata), .pop(fifo_pair_pop),
+        .push(a_fifo_push), .wdata(a_src_rdata), .pop(fifo_pair_pop),
         .rdata(a_fifo_rdata_w), .valid(), .empty(), .full(),
         .count(a_fifo_count_w)
     );

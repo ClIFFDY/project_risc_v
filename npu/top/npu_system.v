@@ -71,6 +71,12 @@ module npu_system #(
     wire [`NPU_ABUF_REG_AW-1:0] cpu_a_addr;
     wire [`NPU_BBUF_REG_AW-1:0] cpu_bt_addr;
     wire        core_bank;
+    wire        cpu_wgt_we;
+    wire [`NPU_WGT_AW-1:0] cpu_wgt_addr;
+    wire [31:0] cpu_wgt_wdata;
+    wire [`NPU_WGT_AW-1:0] wgt_base;
+    wire        wgt_en;
+    wire        sel_wgt, sel_wgt_cfg;
     wire [`NPU_CBUF_AW-1:0] cpu_c_addr;
     wire [31:0] cpu_a_wdata, cpu_bt_wdata, cpu_c_wdata;
     wire [31:0] a_rdata_cpu, bt_rdata_cpu, c_rdata_cpu;
@@ -109,6 +115,7 @@ module npu_system #(
         .req_byte_en(req_byte_en), .req_we(req_we), .req_valid(req_valid),
         .sel_ctrl(sel_ctrl), .sel_status(sel_status),
         .sel_a_buf(sel_a_buf), .sel_bt_buf(sel_bt_buf), .sel_c_buf(sel_c_buf),
+        .sel_wgt(sel_wgt), .sel_wgt_cfg(sel_wgt_cfg),
         .control_rdata(control_rdata), .status_rdata(status_rdata),
         .buffer_rdata(buffer_rdata)
     );
@@ -138,7 +145,10 @@ module npu_system #(
         .cpu_a_addr(cpu_a_addr), .cpu_bt_addr(cpu_bt_addr), .cpu_c_addr(cpu_c_addr),
         .cpu_a_wdata(cpu_a_wdata), .cpu_bt_wdata(cpu_bt_wdata), .cpu_c_wdata(cpu_c_wdata),
         .a_rdata_cpu(a_rdata_cpu), .bt_rdata_cpu(bt_rdata_cpu), .c_rdata_cpu(c_rdata_cpu),
-        .core_bank(core_bank)
+        .core_bank(core_bank),
+        .cpu_wgt_we(cpu_wgt_we), .cpu_wgt_addr(cpu_wgt_addr), .cpu_wgt_wdata(cpu_wgt_wdata),
+        .wgt_base(wgt_base), .wgt_en(wgt_en),
+        .sel_wgt(sel_wgt), .sel_wgt_cfg(sel_wgt_cfg)
     );
 
     // ============ tile_controller ============
@@ -166,6 +176,8 @@ module npu_system #(
     // ============ npu_buffer ============
     npu_buffer u_npu_buffer(
         .clk(HCLK), .rst(rst), .core_busy(core_busy), .core_bank(core_bank),
+        .cpu_wgt_we(cpu_wgt_we), .cpu_wgt_addr(cpu_wgt_addr), .cpu_wgt_wdata(cpu_wgt_wdata),
+        .wgt_base(wgt_base), .wgt_en(wgt_en),
         .accumulate(cfg_accumulate),
         .cpu_a_we(cpu_a_we), .cpu_a_re(cpu_a_re), .cpu_a_addr(cpu_a_addr),
         .cpu_a_wdata(cpu_a_wdata),

@@ -32,6 +32,11 @@
 `define NPU_BBUF_REG_AW 7
 `define NPU_BBUF_WORDS 64
 `define NPU_CBUF_WORDS 256
+// ---- 权重块（2026-11-12 新增）----
+//   A 侧权重驻留：WGT_EN=1 时阵列读的是这块 RAM，不再每个输出 Tile 重搬一遍权重。
+//   全模型（x4）权重 15,992 B，16KB 装得下；换层只改 WGT_BASE。
+`define NPU_WGT_AW 12                  // 4096 字 = 16 KB
+`define NPU_WGT_WORDS 4096
 
 // ---- FIFO 深度 ----
 // A/BT 预取 FIFO：预取的单位是"一个输出 Tile 在 K 方向上的整段连续数据"（长度 K），
@@ -67,5 +72,7 @@
 `define NPU_ADDR_ABUF_BASE 32'h0000_1000  // 0x1000-0x10FF A Buffer
 `define NPU_ADDR_BBUF_BASE 32'h0000_2000  // 0x2000-0x20FF BT Buffer
 `define NPU_ADDR_CBUF_BASE 32'h0000_3000  // 0x3000-0x33FF C Buffer
+`define NPU_ADDR_WGT_BASE  32'h0000_4000  // 0x4000-0x7FFF 权重块 16KB（4096 字）
+`define NPU_ADDR_WGCFG_BASE 32'h0000_0800 // 0x0800-0x080F 权重块配置寄存器
 
 `endif

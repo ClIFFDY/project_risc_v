@@ -85,6 +85,8 @@ module ahb_lite_slave #(
     input              sel_a_buf,
     input              sel_bt_buf,
     input              sel_c_buf,
+    input              sel_wgt,
+    input              sel_wgt_cfg,
     input       [31:0] control_rdata,
     input       [31:0] status_rdata,
     input       [31:0] buffer_rdata
@@ -143,8 +145,8 @@ module ahb_lite_slave #(
 
         // ★ 双缓冲：忙的时候【仍然允许】往核没在读的那一组 A/BT 写（预装下一块）。
         //   核正在读的那一组、以及 C，忙时一律 ERROR —— 这是数据一致性的最后一道防线。
-        is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf;
-        mapped  = sel_ctrl || sel_status || is_buf;
+        is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf || sel_wgt;
+        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || is_buf;
         idle_bank_wr = write_q && (sel_a_buf || sel_bt_buf) && (addr_q[11] != core_bank);
         err_now = !mapped || !size_ok_q || (core_busy && is_buf && !idle_bank_wr);
 
