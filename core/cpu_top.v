@@ -152,6 +152,8 @@ module cpu_top #(
 //★ 2026-11-13（fence）：MISC-MEM 的两条，随分配写进 ROB 项（与 alloc_mret 同型）
     wire        alloc_fence_0, alloc_fence_i_0, alloc_fence_1, alloc_fence_i_1;
     wire        alloc_fence_2, alloc_fence_i_2;
+//★ 2026-11-13（P4）：写 CSR 0x7C0 = 三层缓存全失效
+    wire        alloc_cache_flush_0, alloc_cache_flush_1, alloc_cache_flush_2;
     wire [4:0]  alloc_destination_register_0, alloc_destination_register_1;
 //★ 2026-11-04 真 PRF：物理号与冲刷掩码
     wire [5:0]  alloc_phys_0, alloc_phys_1, commit_phys0, commit_phys1;
@@ -596,15 +598,16 @@ module cpu_top #(
 // 前端：指令缓存 + 指令紧耦合存储
 //★ 2026-11-13：icache 全失效脉冲。由 rob 的提交口状态机驱动（fence.i 那一拍，P3 接上）。
     wire icache_invalidate;
-//★ 2026-11-13（P2b）：三层失效的另一半 —— dcache 的世代位与 L2 的 maint 口。
-//  P3 只把 icache 接到 fence.i 上：dcache 是写穿、L2 对同址写是写失效 ⇒ 改指令的那笔 store
-//  已经把这两层的旧副本作废了，fence.i 不必再付一次全清。这两根留给 P4 的软件失效原语
-//  （DMA 一致性要用），在那之前钉 0。
-//  L2 的 maint 是 2 位编码（2'b10 = 清全部 valid），所以这里拼成一根 2 位的"内部源"，
-//  再和外部口 l2_maint 相或 —— 外部口现在 mcu_top 钉常量，将来接 MIG/mcu 的硬件维护用。
-    wire dcache_invalidate = 1'b0;
-    wire l2_maint_internal = 1'b0;
-    wire [1:0] l2_maint_source = {l2_maint_internal, 1'b0} | l2_maint;
+//★ 2026-11-13（P2b / P4）：三层失效的另一半 —— dcache 的世代位与 L2 的 maint 口。
+//  fence.i（P3）【只】动 icache：dcache 是写穿、L2 对同址写是写失效 ⇒ 改指令的那笔 store
+//  已经把这两层的旧副本作废了，不必再付一次全清。
+//  P4 把这两根接到 rob 的 CSR-0x7C0 状态机（软件的一致性原语）：dcache 吃 1 拍脉冲，
+//  L2 吃【电平】（l2cache 只在 S_IDLE 看它，脉冲会在回填期间被整个丢掉）。
+//  L2 的 maint 是 2 位编码（bit1 = 清全部 valid），和外部口 l2_maint 相或 ——
+//  外部口现在 mcu_top 钉常量，将来接 MIG/mcu 的硬件维护用。
+    wire dcache_invalidate;              // rob 驱动，1 拍脉冲
+    wire cache_flush_maint_rob;          // rob 驱动，电平（举到 maint_done）
+    wire [1:0] l2_maint_source = {cache_flush_maint_rob, 1'b0} | l2_maint;
 //---- 排空判据：只喂 rob 的提交口，那边先打一拍再用（见 rob 的 drain_ok 端口注释）----
 //  · elsq_retired_pending：ELSQ 里还压着"比队头老、已退休、没排出去"的访存项
 //  · bus_hold_in        ：LSU 的 AHB 主设备手上还有一笔没被接受（= 非缓存写还在飞）
@@ -721,6 +724,7 @@ module cpu_top #(
         .alloc_ecall_0(alloc_ecall_0), .alloc_ebreak_0(alloc_ebreak_0),
         .alloc_illegal_0(alloc_illegal_0), .alloc_mret_0(alloc_mret_0),
         .alloc_fence_0(alloc_fence_0), .alloc_fence_i_0(alloc_fence_i_0),
+        .alloc_cache_flush_0(alloc_cache_flush_0),
         .alloc_rd_0(alloc_destination_register_0),
         .alloc_csr_0(alloc_csr_0),
         .alloc_phys_0(alloc_phys_0), .alloc_pc_1(alloc_pc_1),
@@ -755,6 +759,7 @@ module cpu_top #(
         .alloc_ecall_1(alloc_ecall_1), .alloc_ebreak_1(alloc_ebreak_1),
         .alloc_illegal_1(alloc_illegal_1), .alloc_mret_1(alloc_mret_1),
         .alloc_fence_1(alloc_fence_1), .alloc_fence_i_1(alloc_fence_i_1),
+        .alloc_cache_flush_1(alloc_cache_flush_1),
         .alloc_rd_1(alloc_destination_register_1),
         .alloc_csr_1(alloc_csr_1),
         .alloc_phys_1(alloc_phys_1),
@@ -763,6 +768,7 @@ module cpu_top #(
         .alloc_ecall_2(alloc_ecall_2), .alloc_ebreak_2(alloc_ebreak_2),
         .alloc_illegal_2(alloc_illegal_2), .alloc_mret_2(alloc_mret_2),
         .alloc_fence_2(alloc_fence_2), .alloc_fence_i_2(alloc_fence_i_2),
+        .alloc_cache_flush_2(alloc_cache_flush_2),
         .alloc_rd_2(alloc_destination_register_2),
         .alloc_csr_2(alloc_csr_2),
         .alloc_phys_2(alloc_phys_2),
@@ -1267,9 +1273,11 @@ module cpu_top #(
         .allocation_ecall_0(alloc_ecall_0), .allocation_ebreak_0(alloc_ebreak_0),
         .allocation_illegal_0(alloc_illegal_0), .allocation_mret_0(alloc_mret_0),
         .allocation_fence_0(alloc_fence_0), .allocation_fence_i_0(alloc_fence_i_0),
+        .allocation_cache_flush_0(alloc_cache_flush_0),
         .allocation_ecall_1(alloc_ecall_1), .allocation_ebreak_1(alloc_ebreak_1),
         .allocation_illegal_1(alloc_illegal_1), .allocation_mret_1(alloc_mret_1),
         .allocation_fence_1(alloc_fence_1), .allocation_fence_i_1(alloc_fence_i_1),
+        .allocation_cache_flush_1(alloc_cache_flush_1),
         .allocation_index_0(alloc_index_0), .allocation_index_1(alloc_index_1),
         .allocation_generation_0(alloc_generation_0), .allocation_generation_1(alloc_generation_1),
         .allocation_csr_0(alloc_csr_0),
@@ -1282,6 +1290,7 @@ module cpu_top #(
         .allocation_ecall_2(alloc_ecall_2), .allocation_ebreak_2(alloc_ebreak_2),
         .allocation_illegal_2(alloc_illegal_2), .allocation_mret_2(alloc_mret_2),
         .allocation_fence_2(alloc_fence_2), .allocation_fence_i_2(alloc_fence_i_2),
+        .allocation_cache_flush_2(alloc_cache_flush_2),
         .allocation_index_2(alloc_index_2), .allocation_generation_2(alloc_generation_2),
         .allocation_csr_2(alloc_csr_2),
         .head_pc_out(head_pc_rob), .head_valid_out(head_valid_rob),
@@ -1291,6 +1300,8 @@ module cpu_top #(
         .branch_unit_lane1_redir(redir_registered_1), .branch_unit_lane1_tgt(jump_target_1),
         .redir_backend_0(redir_backend_0), .kill_redirect_target(rob_redir_pc), .redirect_any(rob_redir_any),
         .icache_invalidate(icache_invalidate), .drain_ok(drain_ok),
+        .dcache_invalidate(dcache_invalidate), .cache_flush_maint(cache_flush_maint_rob),
+        .maint_done(l2_maint_done),
         .redir_frontend(redir_frontend),
         .kill_redirect_mret(mret_valid),
         .branch_unit_lane1_judged(judged_1), .branch_unit_lane1_index(bju_index_registered_1), .branch_unit_lane1_generation(generation_registered_1),

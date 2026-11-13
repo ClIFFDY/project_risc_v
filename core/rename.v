@@ -65,6 +65,9 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //  fence.i 还要求把 icache 整表作废并重取。在这里按 MISC-MEM 的 funct3 直接译，
 //  不走 idu 的 SYSTEM 那一路 —— 它们不是异常，也不改 PC 的控制流来源。
     output reg        alloc_fence_0, alloc_fence_i_0,
+//★ 2026-11-13（P4）：写自定义 CSR 0x7C0 = "把三层缓存全部作废"（软件的一致性原语，
+//  给 DMA 用）。它和 fence.i 走同一套提交口机构，只是多作废 dcache 和 L2。
+    output reg        alloc_cache_flush_0,
     output reg [4:0]  alloc_rd_0,
 //★ 2026-11-04（CSR 步骤 C）：这条是 CSR 指令，以及随 ROB 项走的载荷
     output reg        alloc_csr_0,
@@ -131,7 +134,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output reg        alloc_jmp_1,
     output reg        alloc_pend_1,
     output reg        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1,
-    output reg        alloc_fence_1, alloc_fence_i_1,
+    output reg        alloc_fence_1, alloc_fence_i_1, alloc_cache_flush_1,
     output reg [4:0]  alloc_rd_1,
 //★ 同 lane0：CSR / 载荷
     output reg        alloc_csr_1,
@@ -142,7 +145,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output reg        alloc_jmp_2,
     output reg        alloc_pend_2,
     output reg        alloc_ecall_2, alloc_ebreak_2, alloc_illegal_2, alloc_mret_2,
-    output reg        alloc_fence_2, alloc_fence_i_2,
+    output reg        alloc_fence_2, alloc_fence_i_2, alloc_cache_flush_2,
     output reg [4:0]  alloc_rd_2,
     output reg        alloc_csr_2,
     output reg [5:0]  alloc_phys_2,
@@ -889,6 +892,9 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_mret_0    = exc_irq_ret_dec;
         alloc_fence_0   = (instruction_in_0[6:0] == 7'b0001111) && (instruction_in_0[14:12] == 3'b000);
         alloc_fence_i_0 = (instruction_in_0[6:0] == 7'b0001111) && (instruction_in_0[14:12] == 3'b001);
+//CSR 0x7C0：写（funct3 != 000 的三条都算）就触发三层失效。见 Tools/sw/include/memmap.h 的 dma_sync_after()
+        alloc_cache_flush_0 = (instruction_in_0[6:0] == 7'b1110011) && (instruction_in_0[14:12] != 3'b000) &&
+                              (instruction_in_0[31:20] == 12'h7C0);
         alloc_pend_0 = (instruction_in_0[6:0] == OPCODE_LOAD) | (instruction_in_0[6:0] == 7'b0100011) |
                      ((instruction_in_0[6:0] == OPCODE_OP) && (instruction_in_0[31:25] == 7'b0000001));
     end
@@ -1194,6 +1200,8 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_mret_1    = pick_mem ? 1'b0 : exc_irq_ret_dec_1;
         alloc_fence_1   = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b000));
         alloc_fence_i_1 = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b001));
+        alloc_cache_flush_1 = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b1110011) &&
+                              (instruction_stage1[14:12] != 3'b000) && (instruction_stage1[31:20] == 12'h7C0));
         alloc_pend_1 = pick_mem ? 1'b1
                    : ((instruction_stage1[6:0] == OPCODE_LOAD) | (instruction_stage1[6:0] == 7'b0100011) |
                      ((instruction_stage1[6:0] == OPCODE_OP) && (instruction_stage1[31:25] == 7'b0000001)));
@@ -1212,6 +1220,8 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_mret_2    = lsu_push_2 ? 1'b0 : exc_irq_ret_dec_1;
         alloc_fence_2   = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b000));
         alloc_fence_i_2 = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b001));
+        alloc_cache_flush_2 = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b1110011) &&
+                              (instruction_stage1[14:12] != 3'b000) && (instruction_stage1[31:20] == 12'h7C0));
         alloc_pend_2 = lsu_push_2 ? 1'b1
                                   : ((instruction_stage1[6:0] == OPCODE_LOAD) | (instruction_stage1[6:0] == 7'b0100011) |
                                      ((instruction_stage1[6:0] == OPCODE_OP) && (instruction_stage1[31:25] == 7'b0000001)));

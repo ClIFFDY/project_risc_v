@@ -47,7 +47,7 @@ module dcache(
 //  于是丢写没人知道（实测 FreeRTOS 的 TCB 字段就是这么没的）。现在没被接住就一直举着。
     input mem_write_ready,
 //★ 2026-11-13（fence / DMA 一致性）：失效脉冲。抬一拍 ⇒ 世代位取反 ⇒ 整张 tag 表当拍全部作废，
-//  不扫阵列、不写阵列。与复位那条是同一套机制（valid_generation），所以只需要一根多路或。
+//  不扫阵列、不写阵列。与复位那条是同一套机制（dpvalid），所以只需要一根多路或。
     input        invalidate,
 
 //总线接口
@@ -72,7 +72,7 @@ module dcache(
     localparam integer DC_SETS   = 1 << DC_SETS_B;
     localparam integer DC_WORDS  = DC_SETS << 3;
     localparam integer DC_TAG_B  = 32 - 3 - DC_SETS_B;
-    localparam integer DC_TAGW   = DC_TAG_B + 1;
+    localparam integer DC_TAGW   = DC_TAG_B + 2;
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
@@ -181,14 +181,18 @@ module dcache(
 //触发器 + 一棵 256:1 mux 树（实测 256 FDRE + 353 LUT6 + 42 MUXF7/F8，还带一条 fo=260 的
 //译码网），而阵列才推得成 LUTRAM。
 //★ 2026-10-30：valid 也照这个道理折进了 tag 字（见上），所以下面 initial 里必须把 tag 阵列清零 ——
-//  valid=0 现在编码成"整个 tag 字为 0"，不再有独立的 valid 向量兜底。
+//  从没写过的表项是"整个字为 0"，靠字里的 valid 位（2026-11-13 起显式一位）保证不命中。
     (* ram_style = "distributed" *) reg lru [0:DC_SETS-1];
 
-//★ valid 用【世代位】而不是常量 1：tag 字里存的是 `{valid_generation, tag}`，
-//  命中的判据是"这一位等于当拍的有效世代"。复位只要把这一位取反，整张表【一次全部作废】，
-//  不需要扫 256 项去清、也不依赖配置时初值。
-//  这比 icache 那种"清成全 0"更稳（icache 靠 initial 清表，热复位后旧表项还在）。
-    reg valid_generation;
+//★ valid 用【世代位】而不是常量 1：tag 字里存的是 `{dpvalid, valid, tag}`，
+//  命中的判据是"valid=1 且世代位等于当拍的有效世代"。失效只要把世代位取反，整张表
+//  【一次全部作废】，不需要扫 256 项去清、也不依赖配置时初值。
+//★★ 2026-11-13（加软件失效原语时踩到的坑）：原来只有一位 `{generation, tag}`，
+//  "valid" 就是世代位本身 —— 这在世代恒为 1 时没事，可一旦失效把它翻成 0，
+//  **从没写过的全 0 表项就和 {gen=0, tag=0} 撞上了** ⇒ 地址落在 tag==0 的那一段
+//  （字地址 < 0x800）会假命中、读出 0。实测就是这里把 prog4 的读回值打成 0。
+//  所以照 icache 的做法补一个真正的 valid 位：{generation, valid, tag}，命中要求 valid=1。
+    reg dpvalid;
 
     reg stage;
     reg fill_end;
@@ -197,9 +201,9 @@ module dcache(
     reg [31:0] fill_addr;
     reg [DC_TAG_B-1:0] fill_tag;
 //★ 2026-11-13：回填写进阵列的世代位必须是【开始填充那一拍】锁下来的那一份，不能写当拍的
-//  valid_generation。否则一笔跨越失效的填充会把新世代盖到旧数据上 ⇒ 那行永久有效（和 icache
-//  的 fill_pvalid 同一个坑，见 icache.v）。
-    reg        fill_generation;
+//  dpvalid。否则一笔跨越失效的填充会把新世代盖到旧数据上 ⇒ 那行永久有效（和 icache
+//  的 fill_ipvalid 同一个坑，见 icache.v）。
+    reg        fill_dpvalid;
     reg [DC_SETS_B-1:0] fill_index;
 //★ 2026-10-31：缺失判定整体打一拍。
 //  原来「读 tag 阵列 → 比较 → 命中判定」当拍就要驱动 stage 与 fill_* 一整族的 CE，
@@ -233,7 +237,7 @@ module dcache(
             way0_tag_b[i] = {DC_TAGW{1'b0}};
             way1_tag_b[i] = {DC_TAGW{1'b0}};
         end
-        valid_generation = 1'b1;
+        dpvalid = 1'b1;
     end
 
 //===============================================================
@@ -271,8 +275,8 @@ module dcache(
 
 //---- B 口（ELSQ 排空）：全部由寄存器量与 B 口自己的状态决定 ----
 //  收下：本口窗口 + 不忙。命中判定用【上一拍捉下来的 tag 字】，纯寄存器比较。
-        store_hit0 = (store_tag_word0_q == {valid_generation, store_tag_q});
-        store_hit1 = (store_tag_word1_q == {valid_generation, store_tag_q});
+        store_hit0 = (store_tag_word0_q == {dpvalid, 1'b1, store_tag_q});
+        store_hit1 = (store_tag_word1_q == {dpvalid, 1'b1, store_tag_q});
 //  缓存更新 one-shot：命中才有；回填写口这一拍要用 ⇒ 让开（下一拍再补，回填最多 8 拍）
         store_cache_write = store_busy & ~store_cache_done & (store_hit0 | store_hit1) & ~is_fill_write;
 //  写穿 one-shot：mem 口这一拍被回填占着就等。写穿与命中无关（miss 也要落到后端）。
@@ -318,8 +322,8 @@ module dcache(
     always @(*) begin
         is_fill_write = (stage == 1'b1) && !fill_end && mem_valid;
 //命中判定：两个输入都是寄存器（请求拍捉下的 tag 字 + 请求拍的 tag），整段从 CLK 出发
-        access_hit_way0 = (access_tag_word0_q == {valid_generation, access_tag_q});
-        access_hit_way1 = (access_tag_word1_q == {valid_generation, access_tag_q});
+        access_hit_way0 = (access_tag_word0_q == {dpvalid, 1'b1, access_tag_q});
+        access_hit_way1 = (access_tag_word1_q == {dpvalid, 1'b1, access_tag_q});
         way0_write_enable = (is_fill_write & ~fill_way) | (store_cache_write & ~store_hit1);
         way1_write_enable = (is_fill_write &  fill_way) | (store_cache_write &  store_hit1);
         ram_byte_enable     = is_fill_write ? 4'b1111 : store_byte_enable_q;
@@ -393,7 +397,7 @@ module dcache(
             fill_count <= 3'd0;
             fill_way <= 1'b0;
             fill_end_q      <= 1'b0;
-            valid_generation <= ~valid_generation;   // 取反一次 ⇒ 整张 tag 表当拍全部作废
+            dpvalid <= ~dpvalid;   // 取反一次 ⇒ 整张 tag 表当拍全部作废
             lru_hit_upd_q   <= 1'b0;
             lru_hit_value_q <= 1'b0;
             lru_hit_index_q <= 8'd0;
@@ -402,7 +406,7 @@ module dcache(
             fill_word_q     <= 3'd0;
             fill_addr_q     <= 32'd0;
             fill_tag_q      <= 21'd0;
-            fill_generation <= 1'b0;
+            fill_dpvalid <= 1'b0;
             fill_way_q      <= 1'b0;
             access_valid_q  <= 1'b0;
             access_address_q <= 11'd0;
@@ -424,10 +428,10 @@ module dcache(
         else begin
             fill_end_q <= fill_end;
 //★ 2026-11-13（fence / DMA 一致性）：失效 = 世代位取反，与复位那条同一套机制。
-//  ★ 同拍受理的填充在下面锁 fill_generation 时读到的是【取反前】的值（非阻塞赋值读旧值），
+//  ★ 同拍受理的填充在下面锁 fill_dpvalid 时读到的是【取反前】的值（非阻塞赋值读旧值），
 //    所以跨越失效的那笔填充写进去自动不命中 —— 正好是我们要的。
             if (invalidate)
-                valid_generation <= ~valid_generation;
+                dpvalid <= ~dpvalid;
 //命中更新：索引和 way 都取【请求拍捉下的那份】，与 hit_upd 的相位对齐。
 //  再往下一拍才落到 LRU 阵列（lru_hit_upd_q），即命中后两拍写完，提示量，晚一拍无妨。
             lru_hit_upd_q   <= hit_upd;
@@ -444,9 +448,12 @@ module dcache(
                 fill_word_q  <= word;
                 fill_addr_q  <= (bus_address_in & 32'hFFFFFFF8) << 2;
                 fill_tag_q   <= tag;
-                fill_generation <= valid_generation;
-                fill_way_q   <= ((way0_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b0 :
-                                ((way1_tag[tag_index][DC_TAG_B] != valid_generation)) ? 1'b1 : lru[index];
+                fill_dpvalid <= dpvalid;
+//★ 2026-11-13：从 {generation, tag} 改成 {generation, valid, tag} 之后，这里的"能不能用"
+//  也必须跟着改口径：原来是"世代位不等于当前世代 ⇒ 这一路是空的"，现在是
+//  "valid=1 且世代等于当前世代 ⇒ 这一路装着当前有效的行"。两处都要取反。
+                fill_way_q   <= !(way0_tag[tag_index][DC_TAG_B] && (way0_tag[tag_index][DC_TAG_B+1] == dpvalid)) ? 1'b0 :
+                                !(way1_tag[tag_index][DC_TAG_B] && (way1_tag[tag_index][DC_TAG_B+1] == dpvalid)) ? 1'b1 : lru[index];
             end
 //缺失判定上一拍就做完了，这一拍直接进回填
             if (miss_q) begin
@@ -509,12 +516,12 @@ module dcache(
 
             if (fill_end) begin
                 if (fill_way) begin
-                    way1_tag  [fill_index] <= {fill_generation, fill_tag};
-                    way1_tag_b[fill_index] <= {fill_generation, fill_tag};
+                    way1_tag  [fill_index] <= {fill_dpvalid, 1'b1, fill_tag};
+                    way1_tag_b[fill_index] <= {fill_dpvalid, 1'b1, fill_tag};
                 end
                 else begin
-                    way0_tag  [fill_index] <= {fill_generation, fill_tag};
-                    way0_tag_b[fill_index] <= {fill_generation, fill_tag};
+                    way0_tag  [fill_index] <= {fill_dpvalid, 1'b1, fill_tag};
+                    way0_tag_b[fill_index] <= {fill_dpvalid, 1'b1, fill_tag};
                 end
                 stage <= 1'b0;
                 fill_end <= 1'b0;

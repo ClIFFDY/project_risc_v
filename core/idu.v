@@ -275,7 +275,9 @@ module idu(
         csr_exists_dec_s0    = 1'b0;
         case (p0_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14: csr_exists_dec_s0 = 1'b1;
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
+            12'h7C0: csr_exists_dec_s0 = 1'b1;
             default: csr_exists_dec_s0 = 1'b0;
         endcase
     end
@@ -559,7 +561,9 @@ module idu(
         csr_exists_dec_s1    = 1'b0;
         case (p1_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14: csr_exists_dec_s1 = 1'b1;
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
+            12'h7C0: csr_exists_dec_s1 = 1'b1;
             default: csr_exists_dec_s1 = 1'b0;
         endcase
     end
@@ -843,7 +847,9 @@ module idu(
         csr_exists_dec_sm    = 1'b0;
         case (pm_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14: csr_exists_dec_sm = 1'b1;
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+            12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
+            12'h7C0: csr_exists_dec_sm = 1'b1;
             default: csr_exists_dec_sm = 1'b0;
         endcase
     end

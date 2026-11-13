@@ -49,6 +49,11 @@ module rob(
     input        allocation_fence_0, allocation_fence_i_0,
     input        allocation_fence_1, allocation_fence_i_1,
     input        allocation_fence_2, allocation_fence_i_2,
+//★ 2026-11-13（P4）：写 CSR 0x7C0 = 三层缓存全失效（软件一致性原语）。
+//  提交口的时序与 fence.i 同构，只是多走一步"等 L2 的 maint_done"。
+    input        allocation_cache_flush_0,
+    input        allocation_cache_flush_1,
+    input        allocation_cache_flush_2,
 //分到的槽号与世代（随载荷走到执行单元，完成上报时带回校验）
     output reg [4:0]  allocation_index_0,
     output reg [4:0]  allocation_index_1,
@@ -195,6 +200,13 @@ module rob(
     output reg [31:0] kill_redirect_target,
 //★ 2026-11-13（fence.i）：icache 整表作废脉冲，与改向同拍（1 拍）。
     output reg        icache_invalidate,
+//★ 2026-11-13（P4，软件的一致性原语 CSR 0x7C0）：另外两层的失效。
+//  dcache 是 1 拍脉冲（翻世代位）；L2 是【电平】—— 一直举到 maint_done 为止。
+//  ★ L2 必须是电平而不是脉冲：l2cache 只在 S_IDLE 里看 maint，回填/写穿期间
+//    一个单拍脉冲会被整条丢掉 ⇒ 等 maint_done 就永远等不到（死锁）。
+    output reg        dcache_invalidate,
+    output reg        cache_flush_maint,
+    input             maint_done,
 //★ 2026-11-13（fence）：排空判据，由 cpu_top 组合给出（ELSQ 无已退休项 / 总线无在飞 /
 //  L2 写队列空 / L2 空闲）。本模块【先打一拍再用】—— 它反过来参与 head_ok，
 //  不寄存就是一条组合环（SQ 的 _ret 里含 ret0_valid = head_ok 的一部分）。
@@ -297,10 +309,22 @@ reg        entry_mret [0:DEPTH-1];
 //  fence_i 是"栅栏 + 作废 icache"；两者的区别只在退役那一拍做什么，排队与年龄语义完全一样。
 reg        entry_fence    [0:DEPTH-1];
 reg        entry_fence_i  [0:DEPTH-1];
+//★ 2026-11-13（P4）：写 CSR 0x7C0 ⇒ 三层全失效。队头读到它就走那条两拍的状态机。
+reg        entry_cache_flush [0:DEPTH-1];
 //排空判据的打拍版（见端口注释：不打拍就是组合环）
 reg        drain_ok_registered;
 //"队头这道 fence.i 这一拍真的走"：在组合提交口里算，下一沿变成 icache 作废 + 改向。
 reg        fence_i_now;
+//★ 2026-11-13（P4）：CSR 0x7C0 的提交口状态机。
+//   IDLE → 队头是它且已排空 ⇒ 拉 maint（电平）→ MAINT → maint_done ⇒ 三层失效 + 退休 → IDLE。
+localparam [1:0] CACHE_FLUSH_IDLE  = 2'd0,
+                 CACHE_FLUSH_MAINT = 2'd1;
+reg [1:0]  cache_flush_state;
+reg        cache_flush_ready;       // 置起后，队头这一项才许退休
+reg        cache_flush_invalidate;  // 1 拍：dcache + icache 一起作废
+reg        cache_flush_start;       // 组合：这一拍该起手
+reg        cache_flush_now;         // 组合：L2 办完了，这一拍失效 + 改向
+reg        head_is_cache_flush;     // 组合：队头这一项就是它
 //head 拍判定出来的事件（组合）。下一沿变成对外的重定向事件 —— 冲刷从这排触发器出去。
 reg        mret_now, exc_now;
 //★ entry_target 按【写者】分阵列（5 个任意槽的写者，没法按槽分银行），配一张 entry_target_source 记最后写者。
@@ -797,6 +821,10 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
         head_is_fence_i = (entry_count != 5'd0) && entry_valid[head_pointer] && entry_fence_i[head_pointer] &&
                           !entry_exception[head_pointer];
         fence_head      = head_is_fence | head_is_fence_i;
+//★ 2026-11-13（P4）：CSR 0x7C0 的那一项。它也要等排空（语义与 fence 相同），
+//  而且要等 L2 把 maint 办完才许退。
+        head_is_cache_flush = (entry_count != 5'd0) && entry_valid[head_pointer] &&
+                              entry_cache_flush[head_pointer] && !entry_exception[head_pointer];
 //★ S5：判定拍只出 A；边界那条要走到队头自己退休才发 B。
 //★ 改向那一拍【要退】：队头就是那条分支、它是正确路径，改向/退休/杀后续是同一个事件；吃 kill_any 会自锁。
 //★ 三条标记口各自成项、不合成一根：命中队头就在 head_ok 里逐条取反。
@@ -807,6 +835,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                     !(exc1_en  && (exc1_index  == head_pointer))  &&
                     !(exception_selected_enable && (exception_selected_index == head_pointer))  &&
                     (!fence_head || drain_ok_registered) &&
+                    (!head_is_cache_flush || cache_flush_ready) &&
                     !kill_any;
 //★ 边界那条不许同拍从 head+1 一起退（实测 seed5：jal 后面那条 lui 提交了）。
         head_next_ok  = head_ok && !mret_now && !exc_now &&
@@ -815,6 +844,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //★ 2026-11-13（fence）：栅栏一拍一道。同拍退第二道会把 fence.i 的作废/改向相位搞乱，
 //  代价只是多一拍（栅栏本来就极少）。
                     !entry_fence[head_next_pointer] && !entry_fence_i[head_next_pointer] &&
+                    !entry_cache_flush[head_next_pointer] &&
                     (entry_count >= 5'd2) && entry_valid[head_next_pointer] && entry_written[head_next_pointer] &&
                     (entry_judged[head_next_pointer] || (!entry_jump[head_next_pointer] && !entry_system_rd_head_next_pointer)) &&
                     !entry_exception[head_next_pointer] &&
@@ -842,6 +872,17 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //  head_ok 里已经含了 drain_ok_registered / !kill_any / entry_written。
 //  与判定拍抢同一拍时让给判定（它更急，而栅栏下一拍还稳稳在队头）。
         fence_i_now = head_ok && head_is_fence_i && !judge_accept && !mret_now && !exc_now;
+//★ 2026-11-13（P4）：CSR 0x7C0 起手 —— 只在 IDLE 且排空已就绪时，去叫 L2 干活。
+//  ★ 与 head_ok 无关（这时它还退不了），也【不进 kill_any】：它是"要办一件事"，
+//    不是一次作废。被打断就回 IDLE，等它再走到队头重来一遍（幂等）。
+        cache_flush_start = head_is_cache_flush && (cache_flush_state == CACHE_FLUSH_IDLE) &&
+                            drain_ok_registered && entry_written[head_pointer] && !kill_any &&
+                            !cache_flush_ready;
+//★ 2026-11-13（P4）：ready 置起之后那一拍 —— 失效已经做完（上一沿），
+//  这一拍【退休 + 改向 pc+4】。落点仍取队头这项的 entry_pc（= 指令地址 + 4），与 fence.i 同一口径。
+//  ★ 改向是必须的，不是锦上添花：更年轻的 load 可能早就乱序执行过、把旧值读进 PRF 了，
+//    只作废缓存救不回来。改向把整条年轻流冲掉重取 —— 这正是 fence.i 那条路。
+        cache_flush_now = head_is_cache_flush && cache_flush_ready && !kill_any;
 //B 事件：在册边界走到提交口。两条 lane 都认 —— 它从 head+1 退掉也照样发。
         boundary_now = flush_boundary_valid &
                        ((head_ok      & (head_pointer      == flush_boundary_index)) |
@@ -888,19 +929,21 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //A 域（判定拍 / mret / 陷阱）：改 PC + 清前端。不门 redir_backend_0（judge_accept 已吃过 kill_any，再门会吞掉刚受理的边界）。
 //★ 2026-11-13（fence.i）：与 mret 同构 —— A 域改 PC（落点 = 本项 pc+4）、B 域清整表，
 //  ★ 额外一根 icache_invalidate 【同一沿】：世代位翻在改向那拍，重取的第一条指令就按新世代查。
-            redir_frontend <= judge_accept | mret_now | exc_now | fence_i_now;
-            icache_invalidate <= fence_i_now;
+            redir_frontend <= judge_accept | mret_now | exc_now | fence_i_now | cache_flush_now;
+            icache_invalidate <= fence_i_now | cache_flush_invalidate;
             if (judge_accept)  kill_redirect_target <= judge_target;
 //fence.i 的落点就是顺序下一条（项里存的是"指令地址 + 4"，与 mepc 同一个口径）
             if (fence_i_now)   kill_redirect_target <= entry_pc_rd_head_pointer;
+//CSR 0x7C0 也一样：落在本项 pc+4，把更年轻的指令全部冲掉重取（它们可能读过旧数据）
+            if (cache_flush_now) kill_redirect_target <= entry_pc_rd_head_pointer;
 //改向原因跟事件同沿寄存（pc 按它选落点，本模块按它选"陷阱要不要跳过队头"）
             if (exc_now)             redir_cause <= REDIR_CAUSE_TRAP;
             else if (mret_now)       redir_cause <= REDIR_CAUSE_MRET;
-            else if (judge_accept | boundary_now | fence_i_now) redir_cause <= REDIR_CAUSE_BRANCH;
+            else if (judge_accept | boundary_now | fence_i_now | cache_flush_now) redir_cause <= REDIR_CAUSE_BRANCH;
             if (!redir_backend_0) begin
 //B 域（提交口）：在册边界走到队列头 ⇒ 整表 + 后端一起作废。
 //★ mret 的 B 跟 A 同拍；陷阱也同构 —— 清表和改 PC 不许错开。
-                redir_backend_0   <= boundary_now | mret_now | exc_now | fence_i_now;
+                redir_backend_0   <= boundary_now | mret_now | exc_now | fence_i_now | cache_flush_now;
                 kill_redirect_mret    <= mret_now;
                 if (exc_now) begin
                     trap_cause <= entry_exc [head_pointer];
@@ -968,6 +1011,46 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     always @(posedge clk) begin
         if (reset_registered) drain_ok_registered <= 1'b0;
         else                  drain_ok_registered <= drain_ok;
+    end
+
+//★ 2026-11-13（P4）：CSR 0x7C0 的两拍状态机（软件的一致性原语，给 DMA 用）。
+//   IDLE  ──队头是它、已排空──→ 举 cache_flush_maint（电平）→ MAINT
+//   MAINT ──maint_done───────→ dcache / icache 失效脉冲 + 置 cache_flush_ready → IDLE
+//   · maint 用【电平】不用脉冲：l2cache 只在 S_IDLE 看它，回填期间的单拍会被整个丢掉，
+//     那样 maint_done 永远不来 ⇒ 队头卡死。
+//   · 被打断（改向 / 中断）一律回 IDLE：作废是幂等的，它下次走到队头再做一遍即可。
+//   · 退休与失效同拍（ready 与两个脉冲是同一个沿置起的），所以"失效完成之后才退休"成立。
+    always @(posedge clk) begin
+        if (reset_registered) begin
+            cache_flush_state      <= CACHE_FLUSH_IDLE;
+            cache_flush_ready      <= 1'b0;
+            cache_flush_maint      <= 1'b0;
+            cache_flush_invalidate <= 1'b0;
+            dcache_invalidate      <= 1'b0;
+        end
+        else begin
+            cache_flush_invalidate <= 1'b0;
+            dcache_invalidate      <= 1'b0;
+            if (redir_backend_0 | irq_kill) begin
+                cache_flush_state <= CACHE_FLUSH_IDLE;
+                cache_flush_ready <= 1'b0;
+                cache_flush_maint <= 1'b0;
+            end
+            else if (cache_flush_start) begin
+                cache_flush_maint <= 1'b1;
+                cache_flush_state <= CACHE_FLUSH_MAINT;
+            end
+            else if ((cache_flush_state == CACHE_FLUSH_MAINT) && maint_done) begin
+                cache_flush_maint      <= 1'b0;
+                cache_flush_invalidate <= 1'b1;
+                dcache_invalidate      <= 1'b1;
+                cache_flush_ready      <= 1'b1;
+                cache_flush_state      <= CACHE_FLUSH_IDLE;
+            end
+//退了就把"可以退"撤掉（下一道同类的项要重新走一遍）
+            if (head_ok && head_is_cache_flush)
+                cache_flush_ready <= 1'b0;
+        end
     end
 
     always @(posedge clk) begin
@@ -1054,6 +1137,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_mret[ri]  <= 1'b0;
                 entry_fence[ri]     <= 1'b0;
                 entry_fence_i[ri]   <= 1'b0;
+                entry_cache_flush[ri] <= 1'b0;
             end
             csr_side_valid <= 1'b0;
         end
@@ -1081,6 +1165,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_mret[tail_pointer]  <= allocation_mret_0;
                 entry_fence[tail_pointer]   <= allocation_fence_0;
                 entry_fence_i[tail_pointer] <= allocation_fence_i_0;
+                entry_cache_flush[tail_pointer] <= allocation_cache_flush_0;
             end
             if (alloc_take_1) begin
                 entry_valid[allocation_index_1]  <= 1'b1;
@@ -1090,6 +1175,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_mret[allocation_index_1]  <= allocation_mret_1;
                 entry_fence[allocation_index_1]   <= allocation_fence_1;
                 entry_fence_i[allocation_index_1] <= allocation_fence_i_1;
+                entry_cache_flush[allocation_index_1] <= allocation_cache_flush_1;
             end
             if (alloc_take_2) begin
                 entry_valid[allocation_index_2]  <= 1'b1;
@@ -1099,6 +1185,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_mret[allocation_index_2]  <= allocation_mret_2;
                 entry_fence[allocation_index_2]   <= allocation_fence_2;
                 entry_fence_i[allocation_index_2] <= allocation_fence_i_2;
+                entry_cache_flush[allocation_index_2] <= allocation_cache_flush_2;
             end
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验必需：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（entry_valid 挡不住"新住户也 valid"）。
@@ -1206,6 +1293,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                     entry_mret[ri]  <= 1'b0;
                     entry_fence[ri]     <= 1'b0;
                     entry_fence_i[ri]   <= 1'b0;
+                    entry_cache_flush[ri] <= 1'b0;
                 end
                 csr_side_valid <= 1'b0;
             end
