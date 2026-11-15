@@ -47,11 +47,11 @@ module dsq #(
     input        push1_valid, input [PW-1:0] push1_data,
     input        push2_valid, input [PW-1:0] push2_data,
 //给 iffU 的背压：这一拍还能收几条（0..3，口径与类别无关）
-    output [1:0] room,
+    output reg [1:0] room,
 //---- 出队口：每类一条 4 格 FIFO，各取自己那条的队头 ----
-    output        lane0_valid, output [PW-1:0] lane0_data, input lane0_pop,
-    output        lane1_valid, output [PW-1:0] lane1_data, input lane1_pop,
-    output        mem_valid,   output [PW-1:0] mem_data,   input mem_pop
+    output reg        lane0_valid, output reg [PW-1:0] lane0_data, input lane0_pop,
+    output reg        lane1_valid, output reg [PW-1:0] lane1_data, input lane1_pop,
+    output reg        mem_valid,   output reg [PW-1:0] mem_data,   input mem_pop
     );
 
 //载荷最低两位 = 类别，编码与 idu 的 CLS_* 一致：0=ALU 1=MUL 2=LSU 3=BJU
@@ -83,33 +83,49 @@ module dsq #(
 //★ 2026-11-12：改成【双指针 FIFO】（读写指针各多一位）。
 //  写格 = wp[1:0]（纯寄存器，不用 h+n）、读格 = rp[1:0]（纯寄存器）；
 //  满/空靠最高位区分（指针加宽是那个"满=空别名"坑的标准解）。
-    reg [PW-1:0] q0 [0:QD-1];   reg [2:0] wp0, rp0;
-    reg [PW-1:0] q1 [0:QD-1];   reg [2:0] wp1, rp1;
-    reg [PW-1:0] qm [0:QD-1];   reg [2:0] wpm, rpm;
+    reg [PW-1:0] q0 [0:QD-1];
+    reg [2:0] wp0, rp0;
+    reg [PW-1:0] q1 [0:QD-1];
+    reg [2:0] wp1, rp1;
+    reg [PW-1:0] qm [0:QD-1];
+    reg [2:0] wpm, rpm;
 
-    assign lane0_valid = (wp0 != rp0);
-    assign lane0_data  = q0[rp0[1:0]];
-    assign lane1_valid = (wp1 != rp1);
-    assign lane1_data  = q1[rp1[1:0]];
-    assign mem_valid   = (wpm != rpm);
-    assign mem_data    = qm[rpm[1:0]];
+    always @(*) begin
+        lane0_valid = (wp0 != rp0);
+        lane0_data = q0[rp0[1:0]];
+        lane1_valid = (wp1 != rp1);
+        lane1_data = q1[rp1[1:0]];
+        mem_valid = (wpm != rpm);
+        mem_data = qm[rpm[1:0]];
+    end
 
-    wire pop0_take = lane0_pop & (wp0 != rp0);
-    wire pop1_take = lane1_pop & (wp1 != rp1);
-    wire popm_take = mem_pop   & (wpm != rpm);
+    reg pop0_take, pop1_take, popm_take;
+    always @(*) begin
+        pop0_take = lane0_pop & (wp0 != rp0);
+        pop1_take = lane1_pop & (wp1 != rp1);
+        popm_take = mem_pop   & (wpm != rpm);
+    end
 
 //占用 = wp − rp（指针多了最高位，差值是 0..4）
-    wire [2:0] occ0 = wp0 - rp0;
-    wire [2:0] occ1 = wp1 - rp1;
-    wire [2:0] occm = wpm - rpm;
+    reg [2:0] occ0, occ1, occm;
+    always @(*) begin
+        occ0 = wp0 - rp0;
+        occ1 = wp1 - rp1;
+        occm = wpm - rpm;
+    end
 
 //★ room = 三个"再来两条就装不下"的标志【或起来】，与类别无关。
 //  room 只可能是 0 或 2：瓶颈只可能出现在某条队列（或 ROB）满了，不存在"能收一条不能收两条"的更细档。
 //  占用 3 ⇒ 只剩 1 格 ⇒ 报 0（否则两条落同一条队列会溢出）；占用 ≤2 ⇒ 报 2。
-    wire stall0 = (occ0 >= 3'd3);
-    wire stall1 = (occ1 >= 3'd3);
-    wire stallm = (occm >= 3'd3);
-    assign room = (stall0 | stall1 | stallm) ? 2'd0 : 2'd2;
+    reg stall0, stall1, stallm;
+    always @(*) begin
+        stall0 = (occ0 >= 3'd3);
+        stall1 = (occ1 >= 3'd3);
+        stallm = (occm >= 3'd3);
+    end
+    always @(*) begin
+        room = (stall0 | stall1 | stallm) ? 2'd0 : 2'd2;
+    end
 
 //==============================================================================
 //  二、入队：前缀语义 —— 收第 k 条的先决条件是前面都收了，且 k < room
@@ -124,54 +140,89 @@ module dsq #(
     reg [1:0]  u0, u1, um;            // 本拍已经排进去的条数
 
 //落格起点 = 写指针（本拍第 k 条就落在 wp+k）
-    wire [1:0] wstart0 = wp0[1:0];
-    wire [1:0] wstart1 = wp1[1:0];
-    wire [1:0] wstartm = wpm[1:0];
+    reg [1:0] wstart0, wstart1, wstartm;
+    always @(*) begin
+        wstart0 = wp0[1:0];
+        wstart1 = wp1[1:0];
+        wstartm = wpm[1:0];
+    end
 
     always @(*) begin
         acc0 = push0_valid & (room >= 2'd1);
         acc1 = acc0 & push1_valid & (room >= 2'd2);
         acc2 = acc1 & push2_valid & (room >= 2'd3);
 
-        w0_0=1'b0; w0_1=1'b0; w0_2=1'b0;
-        w1_0=1'b0; w1_1=1'b0; w1_2=1'b0;
-        wm_0=1'b0; wm_1=1'b0; wm_2=1'b0;
-        s0_0=2'd0; s0_1=2'd0; s0_2=2'd0;
-        s1_0=2'd0; s1_1=2'd0; s1_2=2'd0;
-        sm_0=2'd0; sm_1=2'd0; sm_2=2'd0;
-        u0=2'd0; u1=2'd0; um=2'd0;
+        w0_0=1'b0;
+        w0_1=1'b0;
+        w0_2=1'b0;
+        w1_0=1'b0;
+        w1_1=1'b0;
+        w1_2=1'b0;
+        wm_0=1'b0;
+        wm_1=1'b0;
+        wm_2=1'b0;
+        s0_0=2'd0;
+        s0_1=2'd0;
+        s0_2=2'd0;
+        s1_0=2'd0;
+        s1_1=2'd0;
+        s1_2=2'd0;
+        sm_0=2'd0;
+        sm_1=2'd0;
+        sm_2=2'd0;
+        u0=2'd0;
+        u1=2'd0;
+        um=2'd0;
 
         if (acc0) begin
             if (is_lsu(push0_data)) begin
-                wm_0 = 1'b1; sm_0 = wstartm + um; um = um + 2'd1;
+                wm_0 = 1'b1;
+                sm_0 = wstartm + um;
+                um = um + 2'd1;
             end
             else if (lane_of(push0_data)) begin
-                w1_0 = 1'b1; s1_0 = wstart1 + u1; u1 = u1 + 2'd1;
+                w1_0 = 1'b1;
+                s1_0 = wstart1 + u1;
+                u1 = u1 + 2'd1;
             end
             else begin
-                w0_0 = 1'b1; s0_0 = wstart0 + u0; u0 = u0 + 2'd1;
+                w0_0 = 1'b1;
+                s0_0 = wstart0 + u0;
+                u0 = u0 + 2'd1;
             end
         end
         if (acc1) begin
             if (is_lsu(push1_data)) begin
-                wm_1 = 1'b1; sm_1 = wstartm + um; um = um + 2'd1;
+                wm_1 = 1'b1;
+                sm_1 = wstartm + um;
+                um = um + 2'd1;
             end
             else if (lane_of(push1_data)) begin
-                w1_1 = 1'b1; s1_1 = wstart1 + u1; u1 = u1 + 2'd1;
+                w1_1 = 1'b1;
+                s1_1 = wstart1 + u1;
+                u1 = u1 + 2'd1;
             end
             else begin
-                w0_1 = 1'b1; s0_1 = wstart0 + u0; u0 = u0 + 2'd1;
+                w0_1 = 1'b1;
+                s0_1 = wstart0 + u0;
+                u0 = u0 + 2'd1;
             end
         end
         if (acc2) begin
             if (is_lsu(push2_data)) begin
-                wm_2 = 1'b1; sm_2 = wstartm + um; um = um + 2'd1;
+                wm_2 = 1'b1;
+                sm_2 = wstartm + um;
+                um = um + 2'd1;
             end
             else if (lane_of(push2_data)) begin
-                w1_2 = 1'b1; s1_2 = wstart1 + u1; u1 = u1 + 2'd1;
+                w1_2 = 1'b1;
+                s1_2 = wstart1 + u1;
+                u1 = u1 + 2'd1;
             end
             else begin
-                w0_2 = 1'b1; s0_2 = wstart0 + u0; u0 = u0 + 2'd1;
+                w0_2 = 1'b1;
+                s0_2 = wstart0 + u0;
+                u0 = u0 + 2'd1;
             end
         end
     end
@@ -179,35 +230,53 @@ module dsq #(
 //==============================================================================
 //  三、时序：写 / 弹出 / 清
 //==============================================================================
-    wire [1:0] push0_count = {1'b0, w0_0} + {1'b0, w0_1} + {1'b0, w0_2};
-    wire [1:0] push1_count = {1'b0, w1_0} + {1'b0, w1_1} + {1'b0, w1_2};
-    wire [1:0] pushm_count = {1'b0, wm_0} + {1'b0, wm_1} + {1'b0, wm_2};
+    reg [1:0] push0_count, push1_count, pushm_count;
+    always @(*) begin
+        push0_count = {1'b0, w0_0} + {1'b0, w0_1} + {1'b0, w0_2};
+        push1_count = {1'b0, w1_0} + {1'b0, w1_1} + {1'b0, w1_2};
+        pushm_count = {1'b0, wm_0} + {1'b0, wm_1} + {1'b0, wm_2};
+    end
 
     always @(posedge clk) begin
         if (rst | flush) begin
-            wp0 <= 3'd0; rp0 <= 3'd0;
-            wp1 <= 3'd0; rp1 <= 3'd0;
-            wpm <= 3'd0; rpm <= 3'd0;
+            wp0 <= 3'd0;
+            rp0 <= 3'd0;
+            wp1 <= 3'd0;
+            rp1 <= 3'd0;
+            wpm <= 3'd0;
+            rpm <= 3'd0;
         end
         else begin
 //---- lane0 ----
-            if (w0_0) q0[s0_0] <= push0_data;
-            if (w0_1) q0[s0_1] <= push1_data;
-            if (w0_2) q0[s0_2] <= push2_data;
+            if (w0_0)
+                q0[s0_0] <= push0_data;
+            if (w0_1)
+                q0[s0_1] <= push1_data;
+            if (w0_2)
+                q0[s0_2] <= push2_data;
             wp0 <= wp0 + {1'b0, push0_count};
-            if (pop0_take) rp0 <= rp0 + 3'd1;
+            if (pop0_take)
+                rp0 <= rp0 + 3'd1;
 //---- lane1 ----
-            if (w1_0) q1[s1_0] <= push0_data;
-            if (w1_1) q1[s1_1] <= push1_data;
-            if (w1_2) q1[s1_2] <= push2_data;
+            if (w1_0)
+                q1[s1_0] <= push0_data;
+            if (w1_1)
+                q1[s1_1] <= push1_data;
+            if (w1_2)
+                q1[s1_2] <= push2_data;
             wp1 <= wp1 + {1'b0, push1_count};
-            if (pop1_take) rp1 <= rp1 + 3'd1;
+            if (pop1_take)
+                rp1 <= rp1 + 3'd1;
 //---- mem ----
-            if (wm_0) qm[sm_0] <= push0_data;
-            if (wm_1) qm[sm_1] <= push1_data;
-            if (wm_2) qm[sm_2] <= push2_data;
+            if (wm_0)
+                qm[sm_0] <= push0_data;
+            if (wm_1)
+                qm[sm_1] <= push1_data;
+            if (wm_2)
+                qm[sm_2] <= push2_data;
             wpm <= wpm + {1'b0, pushm_count};
-            if (popm_take) rpm <= rpm + 3'd1;
+            if (popm_take)
+                rpm <= rpm + 3'd1;
         end
     end
 

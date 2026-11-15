@@ -38,7 +38,7 @@ module dcache(
     input [31:0] store_data_in,
     input [3:0]  store_byte_enable_in,
 //B 口忙：从收下到"缓存更新 + 写穿"都发完。LSU 用它挡排水（纯寄存器，不含任何地址量）。
-    output wire  store_blocked,
+    output reg  store_blocked,
 //后端存储接口
     input [31:0] mem_data,
     input mem_valid, mem_ready,
@@ -51,15 +51,15 @@ module dcache(
     input        invalidate,
 
 //总线接口
-    output [31:0] bus_data_out,
+    output reg [31:0] bus_data_out,
     output reg busy, hold, load_ready_next,
 //★ 2026-11-04：load_ready 改成【纯组合】，由寄存下来的命中与 fill_end_q 直接给出（见下面 assign）。
-    output load_ready,
+    output reg load_ready,
 //★★ 2026-10-31：给 LSU 的"这一拍能不能收新请求"——只由【寄存器】决定（stage），
 //  绝不含当拍请求的贡献。这样上层可以用它做发送门而不会成组合环：
 //    load_go → 请求 → read_request → busy → hold → miss → blank_bus → load_go   （原来这一圈）
 //  本信号 = "再发我就丢了"，语义比 hold 窄，足够且无环。
-    output wire request_blocked,
+    output reg request_blocked,
 //后端存储接口
     output reg mem_req, mem_write_enable,
     output reg [31:0] mem_addr, mem_write_data,
@@ -232,7 +232,8 @@ module dcache(
         end
         for (i = 0; i < DC_SETS;  i = i + 1) begin
             lru[i]  = 1'b0;
-            way0_tag[i] = {DC_TAGW{1'b0}};    // 全 0 = valid=0
+            way0_tag[i] = {DC_TAGW{1'b0}};
+            // 全 0 = valid=0
             way1_tag[i] = {DC_TAGW{1'b0}};
             way0_tag_b[i] = {DC_TAGW{1'b0}};
             way1_tag_b[i] = {DC_TAGW{1'b0}};
@@ -255,8 +256,10 @@ module dcache(
         miss_q = access_valid_q & access_read_q & ~(access_hit_way0 | access_hit_way1);
 //★ ~miss_q：缺失已经判出来、这一拍就要进回填，不许再收同一个请求
 //★ 2026-11-04：A 口只收读 —— 写全部走 B 口（见端口注释）。
-        read_request = (stage == 1'b0) && !miss_q && bus_valid_in
-                    && (bus_address_in[31:16] == 16'd0);
+        read_request = (stage == 1'b0) && !miss_q && bus_valid_in;
+//★ 2026-11-13：这里原来自己再判一遍「地址在不在 STCM」([31:16]==0)。那条判据已经
+//  收到 core/lsu.v 的 lsuv_cacheable() 一处；dcache 收到的 valid 本来就是那边判完
+//  才发出来的 ⇒ 这里那次是重复，删掉。文件末尾留了一条仿真期自检当安全网。
 //命中命中即行内就地更新（B 口），一律【不失效】：整字写整字，子字写按 be 只改那几个字节。
 //写穿照做，缓存与后端始终一致。原先子字 store 走失效——失效会连带丢掉同行其余 7 个字，
 //下一个 lw/lb 立刻回填（实测 9983 次失效 / 10104 次缺失，1:1），这是缺失的全部来源。
@@ -342,19 +345,27 @@ module dcache(
 //===============================================================
     always @(posedge clk) begin
         if (way0_write_enable) begin
-            if (ram_byte_enable[0]) data_way0[ram_write_address][7:0]   <= ram_write_data[7:0];
-            if (ram_byte_enable[1]) data_way0[ram_write_address][15:8]  <= ram_write_data[15:8];
-            if (ram_byte_enable[2]) data_way0[ram_write_address][23:16] <= ram_write_data[23:16];
-            if (ram_byte_enable[3]) data_way0[ram_write_address][31:24] <= ram_write_data[31:24];
+            if (ram_byte_enable[0])
+                data_way0[ram_write_address][7:0]   <= ram_write_data[7:0];
+            if (ram_byte_enable[1])
+                data_way0[ram_write_address][15:8]  <= ram_write_data[15:8];
+            if (ram_byte_enable[2])
+                data_way0[ram_write_address][23:16] <= ram_write_data[23:16];
+            if (ram_byte_enable[3])
+                data_way0[ram_write_address][31:24] <= ram_write_data[31:24];
         end
     end
 
     always @(posedge clk) begin
         if (way1_write_enable) begin
-            if (ram_byte_enable[0]) data_way1[ram_write_address][7:0]   <= ram_write_data[7:0];
-            if (ram_byte_enable[1]) data_way1[ram_write_address][15:8]  <= ram_write_data[15:8];
-            if (ram_byte_enable[2]) data_way1[ram_write_address][23:16] <= ram_write_data[23:16];
-            if (ram_byte_enable[3]) data_way1[ram_write_address][31:24] <= ram_write_data[31:24];
+            if (ram_byte_enable[0])
+                data_way1[ram_write_address][7:0]   <= ram_write_data[7:0];
+            if (ram_byte_enable[1])
+                data_way1[ram_write_address][15:8]  <= ram_write_data[15:8];
+            if (ram_byte_enable[2])
+                data_way1[ram_write_address][23:16] <= ram_write_data[23:16];
+            if (ram_byte_enable[3])
+                data_way1[ram_write_address][31:24] <= ram_write_data[31:24];
         end
     end
 
@@ -385,7 +396,9 @@ module dcache(
             dout1 <= data_way1[read_address];
         end
     end
-    assign bus_data_out = out_sel_q ? ((out_fill_q ? fill_way : access_hit_way1) ? dout1 : dout0) : 32'd0;
+    always @(*) begin
+        bus_data_out = out_sel_q ? ((out_fill_q ? fill_way : access_hit_way1) ? dout1 : dout0) : 32'd0;
+    end
 
 //===============================================================
 // 缺失回填状态机与 busy/hold 延拓
@@ -484,8 +497,7 @@ module dcache(
 //  挡到回填结束再收，tag 已是新行 ⇒ 走命中那一路（阵列写 + 写穿），两条路都在。
 //  只在 stage==0 收不会引入顺序问题：stage==0 收下 ⇒ 下一拍 store_busy，写穿当拍就发
 //  （read_drive 这时还是 0），比同拍收下的 load 判 miss 进回填还早一拍。
-            if (store_valid_in && !store_busy && (stage == 1'b0) && !miss_q
-                && (store_address_in[31:16] == 16'd0)) begin
+            if (store_valid_in && !store_busy && (stage == 1'b0) && !miss_q) begin
                 store_busy        <= 1'b1;
                 store_cache_done  <= 1'b0;
                 store_mem_done    <= 1'b0;
@@ -530,7 +542,9 @@ module dcache(
     end
 
 //★ request_blocked：纯状态量（A 口）。只有回填期间不收新读。
-    assign request_blocked = (stage != 1'b0);
+    always @(*) begin
+        request_blocked = (stage != 1'b0);
+    end
 //★ store_blocked：B 口忙。LSU 用它挡排水 —— 这是【寄存器】，排水判据里再没有地址量。
 //★ 2026-11-05：回填期间也算"B 口忙"，否则 store 会在回填中途被收下（收下那拍的 tag 还是旧行，
 //  store_hit=0 ⇒ 不写阵列），而写穿带着 ~read_drive 只能排在回填之后 ⇒ 回填先把旧值整行写进
@@ -543,10 +557,14 @@ module dcache(
 //    只在 stage==0 收 store 会让它正好落在"回填下一拍就开始"的缝里 —— 收下当拍没事，
 //    写穿被下一拍起的 read_drive 压到回填结束，回填就已经把旧值读走了（实测 c=64152 收、
 //    c=64162 回填读、c=64163 才写穿，`lw x1,12(sp)` 读回 0）。
-    assign store_blocked = store_busy | (stage != 1'b0) | miss_q;
+    always @(*) begin
+        store_blocked = store_busy | (stage != 1'b0) | miss_q;
+    end
 
 //结果口就绪：命中那一路与 fill_end 那一路，都用寄存量出，D 脚路径整段消失。
-    assign load_ready = (access_read_q & (access_hit_way0 | access_hit_way1)) | fill_end_q;
+    always @(*) begin
+        load_ready = (access_read_q & (access_hit_way0 | access_hit_way1)) | fill_end_q;
+    end
 
 //busy 的 1 拍延拓（原 cpu_top 的 d_hold_int，按"顶层不运算"下放到此）：
 //fill_end 拍 busy 就掉、load_ready 要再等一拍，这 1 拍空窗必须兜住。
@@ -560,4 +578,25 @@ module dcache(
     always @(*) begin
         hold = busy | busy_delayed;
     end
+
+//==============================================================================
+//  自检（不综合）—— dcache 只该收到落在 STCM 256 KB 内的地址
+//
+//  ★ 这是一条**检查**，故意与 core/lsu.v 的 lsuv_cacheable() 重复一次：那边是闸门，
+//    这边是安全网。判据收敛之后，如果有一天真把外设地址送进来，缓存会把它留成一行，
+//    症状极难查（"读串口拿到上次 dtcm 的值"那一类），所以宁可留一条响亮的告警。
+//  ★ 只在 valid 那一拍查：地址在非 valid 拍没有意义。
+//==============================================================================
+//synthesis translate_off
+    always @(posedge clk) begin
+        if (!reset_registered) begin
+            if (bus_valid_in && (bus_address_in[31:16] != 16'd0))
+                $display("CFG_FAIL: dcache A 口收到非 STCM 地址 addr=%h valid=%b",
+                         bus_address_in, bus_valid_in);
+            if (store_valid_in && (store_address_in[31:16] != 16'd0))
+                $display("CFG_FAIL: dcache B 口收到非 STCM 地址 addr=%h valid=%b",
+                         store_address_in, store_valid_in);
+        end
+    end
+//synthesis translate_on
 endmodule

@@ -34,8 +34,8 @@ module ahb_apb_bridge(
     output reg [31:0] hrdata,
 //标准 AHB-Lite 从设备口。rd_valid 是本仓自己的完成脉冲（非标准），
 //第一期先和 HREADYOUT 并存，等三个主设备都改认 HREADY/HRESP 之后再删。
-    output            hreadyout,
-    output            hresp,
+    output reg            hreadyout,
+    output reg            hresp,
     output reg        rd_valid,
     output reg [31:0] bus_addr_out,
     output reg [31:0] bus_data_out,
@@ -60,7 +60,11 @@ module ahb_apb_bridge(
     input             tim_ready,
 //★ 2026-11-12：SPI 主机挂 7 号槽（0x1C00_0000），接板上的 flash。
     input      [31:0] spi_data,
-    input             spi_ready
+    input             spi_ready,
+//★ 2026-11-13：DPU（显示引擎）挂 9 号槽（0x2400_0000）。8 号槽是 NPU（直连互联，
+//  不走 APB），所以槽位译码从 1..7 放开到 1..9，中间那格空着不占。
+    input      [31:0] dpu_data,
+    input             dpu_ready
     );
 
     localparam [5:0]
@@ -71,12 +75,15 @@ module ahb_apb_bridge(
     SLOT_GPIO = 6'd4,
     SLOT_I2C  = 6'd5,
     SLOT_TIM  = 6'd6,
-    SLOT_SPI  = 6'd7;
+    SLOT_SPI  = 6'd7,
+    SLOT_DPU  = 6'd9;
 
     reg [5:0] slot;
     always @(*) begin
-        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd7) slot = haddr[31:26];
-        else slot = SLOT_NONE;
+        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd9)
+            slot = haddr[31:26];
+        else
+            slot = SLOT_NONE;
     end
 
     reg [5:0] sel_pend;
@@ -90,7 +97,8 @@ module ahb_apb_bridge(
         else begin
             pend_v  <= (htrans != 2'b00);
             pend_we <= hwrite;
-            if (htrans != 2'b00) sel_pend <= slot;
+            if (htrans != 2'b00)
+                sel_pend <= slot;
         end
     end
 
@@ -113,6 +121,7 @@ module ahb_apb_bridge(
         SLOT_I2C:  sel_ld_ready = i2c_ready;
         SLOT_TIM:  sel_ld_ready = tim_ready;
         SLOT_SPI:  sel_ld_ready = spi_ready;
+        SLOT_DPU:  sel_ld_ready = dpu_ready;
         default:   sel_ld_ready = 1'b1;
         endcase
     end
@@ -136,14 +145,24 @@ module ahb_apb_bridge(
 
     reg [1:0] err_state;
     reg       err_done;
+    reg       err_we_q;              // 出错那一笔是不是写（完成脉冲只给读）
 
     always @(posedge clk) begin
         if (rst) begin
             err_state <= ERR_IDLE;
             err_done  <= 1'b0;
+            err_we_q  <= 1'b0;
         end
         else begin
-            err_done <= (err_state == ERR_SECOND);
+//★ 2026-11-14（总线审计）：完成脉冲必须和正常读一样落在【接受后第 2 拍】。
+//  互联的 owner FIFO 是单指针顺序出队，代码里写明的隐含假设是"两个从设备的读延迟相同"。
+//  原来 err_done 要等 ERR_SECOND 之后才寄存（晚 2 拍 ⇒ 总共 +4），
+//  错误读后面紧跟的那一笔读的应答会落在"队头还指着错误项"的那几拍里被吞掉，
+//  之后也不会再来 ⇒ 那个主设备永久等应答。改成地址拍之后一拍出（= +2，与正常读对齐）。
+//  两拍 ERROR 的 hresp/hreadyout 形状不动（那是给将来会看 HRESP 的主设备留的）。
+            err_done <= (err_state == ERR_IDLE) && (htrans != 2'b00) && (slot == SLOT_NONE);
+            if ((err_state == ERR_IDLE) && (htrans != 2'b00) && (slot == SLOT_NONE))
+                err_we_q <= hwrite;
             case (err_state)
             ERR_IDLE:   if ((htrans != 2'b00) && (slot == SLOT_NONE)) err_state <= ERR_FIRST;
             ERR_FIRST:  err_state <= ERR_SECOND;
@@ -153,8 +172,10 @@ module ahb_apb_bridge(
         end
     end
 
-    assign hreadyout = (err_state != ERR_FIRST);
-    assign hresp     = (err_state == ERR_FIRST) || (err_state == ERR_SECOND);
+    always @(*) begin
+        hreadyout = (err_state != ERR_FIRST);
+        hresp = (err_state == ERR_FIRST) || (err_state == ERR_SECOND);
+    end
 
     always @(*) begin
         case (sel_pend)
@@ -165,12 +186,17 @@ module ahb_apb_bridge(
         SLOT_I2C:  hrdata_c = i2c_data;
         SLOT_TIM:  hrdata_c = tim_data;
         SLOT_SPI:  hrdata_c = spi_data;
+        SLOT_DPU:  hrdata_c = dpu_data;
         default:   hrdata_c = 32'd0;
         endcase
-        rd_valid_c = (pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready) | err_done;
-//出错那一笔读照样给一个确定的完成（数据 0）：第一期 LSU 还不认 HRESP，
+        rd_valid_c = (pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready)
+                   | (err_done && !err_we_q);
+//出错那一笔**读**照样给一个确定的完成（数据 0）：第一期 LSU 还不认 HRESP，
 //不给完成就会挂死（见 docs/SPEC_bus_error_2026-11-12.txt 第七节）。第二期删。
-        if (err_done) hrdata_c = 32'd0;
+//★ 2026-11-14（总线审计）：写错误不能给 —— 互联是无条件出队，一次写空洞会弹掉
+//  队头一条**读**项，把 0 当数据送给那条读的主人。所以用 err_we_q 区分。
+        if (err_done)
+            hrdata_c = 32'd0;
     end
 
 //读回再打一拍才交出去。四家外设的 ld_ready 与 bus_data_out 本来就都是寄存器，中间只隔

@@ -175,7 +175,7 @@ module bju(
             judged_jump_link_target <= 32'd0;
             judged_function4 <= 4'd0;
             judged_branch_prediction <= 1'b0;
-            judged_index <= 4'd0;
+            judged_index <= 5'd0;
             judged_generation <= 1'b0;
         end
         else if (flush_window) begin
@@ -187,7 +187,7 @@ module bju(
             judged_jump_link_target <= 32'd0;
             judged_function4 <= 4'd0;
             judged_branch_prediction <= 1'b0;
-            judged_index <= 4'd0;
+            judged_index <= 5'd0;
             judged_generation <= 1'b0;
         end
         else if (advance_in & ~redir_backend_1) begin
@@ -402,7 +402,7 @@ module bju(
             exception_target_misalign <= 1'b0;
             jump_target <= 32'd0;
             jump_link_register_target_registered <= 32'd0;
-            index_registered <= 4'd0;
+            index_registered <= 5'd0;
             branch_pc_index <= 9'd0;
             branch_pc_registered   <= 32'd0;
             jump_link_register_target_valid_registered <= 1'b0;
@@ -413,8 +413,10 @@ module bju(
             branch_unit_taken <= 1'b0;
             branch_unit_pc    <= 32'd0;
             branch_unit_target   <= 32'd0;
-            exception_ecall_registered <= 1'b0; exception_ebreak_registered <= 1'b0;
-            exception_illegal_registered <= 1'b0; exception_interrupt_return_registered <= 1'b0;
+            exception_ecall_registered <= 1'b0;
+            exception_ebreak_registered <= 1'b0;
+            exception_illegal_registered <= 1'b0;
+            exception_interrupt_return_registered <= 1'b0;
         end
         else if (kill_all_delayed) begin
             success <= 1'b0;
@@ -425,7 +427,7 @@ module bju(
             exception_target_misalign <= 1'b0;
             jump_target <= 32'd0;
             jump_link_register_target_registered <= 32'd0;
-            index_registered <= 4'd0;
+            index_registered <= 5'd0;
             branch_pc_index <= 9'd0;
             branch_pc_registered   <= 32'd0;
             jump_link_register_target_valid_registered <= 1'b0;
@@ -436,8 +438,10 @@ module bju(
             branch_unit_taken <= 1'b0;
             branch_unit_pc    <= 32'd0;
             branch_unit_target   <= 32'd0;
-            exception_ecall_registered <= 1'b0; exception_ebreak_registered <= 1'b0;
-            exception_illegal_registered <= 1'b0; exception_interrupt_return_registered <= 1'b0;
+            exception_ecall_registered <= 1'b0;
+            exception_ebreak_registered <= 1'b0;
+            exception_illegal_registered <= 1'b0;
+            exception_interrupt_return_registered <= 1'b0;
         end
         else begin
             success <= success_now & advance_delayed;

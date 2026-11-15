@@ -100,25 +100,52 @@ module alu(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            op_write_enable <= 1'b0; op_jal <= 1'b0; op_jalr <= 1'b0; op_cs_wr <= 1'b0;
-            op_bypass_load_a <= 1'b0; op_bypass_load_b <= 1'b0;
-            op_index <= 4'd0; op_generation <= 1'b0;
-            op_alu_function4 <= 4'd0; op_csr_function3 <= 3'd0;
-            op_auxiliary_address <= 32'd0; op_source_a <= 32'd0; op_r2 <= 32'd0; op_cs <= 32'd0;
+            op_write_enable <= 1'b0;
+            op_jal <= 1'b0;
+            op_jalr <= 1'b0;
+            op_cs_wr <= 1'b0;
+            op_bypass_load_a <= 1'b0;
+            op_bypass_load_b <= 1'b0;
+            op_index <= 5'd0;
+            op_generation <= 1'b0;
+            op_alu_function4 <= 4'd0;
+            op_csr_function3 <= 3'd0;
+            op_auxiliary_address <= 32'd0;
+            op_source_a <= 32'd0;
+            op_r2 <= 32'd0;
+            op_cs <= 32'd0;
         end
         else if (redir_backend_0) begin
-            op_write_enable <= op_write_enable; op_jal <= op_jal; op_jalr <= op_jalr; op_cs_wr <= op_cs_wr;
-            op_bypass_load_a <= op_bypass_load_a; op_bypass_load_b <= op_bypass_load_b;
-            op_index <= op_index; op_generation <= op_generation;
-            op_alu_function4 <= op_alu_function4; op_csr_function3 <= op_csr_function3;
-            op_auxiliary_address <= op_auxiliary_address; op_source_a <= op_source_a; op_r2 <= op_r2; op_cs <= op_cs;
+            op_write_enable <= op_write_enable;
+            op_jal <= op_jal;
+            op_jalr <= op_jalr;
+            op_cs_wr <= op_cs_wr;
+            op_bypass_load_a <= op_bypass_load_a;
+            op_bypass_load_b <= op_bypass_load_b;
+            op_index <= op_index;
+            op_generation <= op_generation;
+            op_alu_function4 <= op_alu_function4;
+            op_csr_function3 <= op_csr_function3;
+            op_auxiliary_address <= op_auxiliary_address;
+            op_source_a <= op_source_a;
+            op_r2 <= op_r2;
+            op_cs <= op_cs;
         end
         else begin
-            op_write_enable <= write_enable_in; op_jal <= jal_flag; op_jalr <= jalr_flag; op_cs_wr <= cs_wr_en;
-            op_bypass_load_a <= bypass_load_a; op_bypass_load_b <= bypass_load_b;
-            op_index <= index_in; op_generation <= generation_in;
-            op_alu_function4 <= alu_function4; op_csr_function3 <= csr_function3;
-            op_auxiliary_address <= auxiliary_address_in; op_source_a <= source_a_data; op_r2 <= r2_data; op_cs <= cs_data;
+            op_write_enable <= write_enable_in;
+            op_jal <= jal_flag;
+            op_jalr <= jalr_flag;
+            op_cs_wr <= cs_wr_en;
+            op_bypass_load_a <= bypass_load_a;
+            op_bypass_load_b <= bypass_load_b;
+            op_index <= index_in;
+            op_generation <= generation_in;
+            op_alu_function4 <= alu_function4;
+            op_csr_function3 <= csr_function3;
+            op_auxiliary_address <= auxiliary_address_in;
+            op_source_a <= source_a_data;
+            op_r2 <= r2_data;
+            op_cs <= cs_data;
         end
     end
 
@@ -128,8 +155,11 @@ module alu(
 
 //---- 结果级（组合，锥只从操作数寄存器出发）----
 //★ 唯一例外：load 晚到那一档。它不参与唤醒（唤醒在发射拍就做了），只是把数据在 ALU 输入上顶进去。
-    wire [31:0] alu_source_a = op_bypass_load_a ? load_data_forward : op_source_a;
-    wire [31:0] alu_source_b = op_bypass_load_b ? load_data_forward : op_r2;
+    reg [31:0] alu_source_a, alu_source_b;
+    always @(*) begin
+        alu_source_a = op_bypass_load_a ? load_data_forward : op_source_a;
+        alu_source_b = op_bypass_load_b ? load_data_forward : op_r2;
+    end
 
     always @(*) begin
         if (op_write_enable && op_cs_wr) begin
@@ -177,7 +207,7 @@ module alu(
 //★ 跳转冲刷拍【保持】：发起者自己那一笔此刻正挂在输出上。
     always @(posedge clk) begin
         if (reset_registered) begin
-            index_out       <= 4'd0;
+            index_out       <= 5'd0;
             generation_out  <= 1'b0;
             result          <= 32'd0;
             write_enable    <= 1'b0;
@@ -197,7 +227,7 @@ module alu(
             write_enable    <= write_enable_next;
         end
         else begin
-            index_out       <= 4'd0;
+            index_out       <= 5'd0;
             generation_out  <= 1'b0;
             result          <= 32'd0;
             write_enable    <= 1'b0;

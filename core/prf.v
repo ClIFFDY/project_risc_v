@@ -51,12 +51,12 @@ module prf #(
     input  [PHYS_BITS-1:0] read_a_m_phys, read_b_m_phys,
 //★ 2026-11-04（CSR 步骤 C）：第 7 个读口 = 提交拍的 CSR 源操作数。地址是 ROB 提交口那级触发器。
     input  [PHYS_BITS-1:0] read_c_phys,
-    output [31:0] read_a_0_data, read_b_0_data,
-    output [31:0] read_a_1_data, read_b_1_data,
-    output [31:0] read_a_m_data, read_b_m_data,
-    output [31:0] read_c_data,
-    output                load_write,
-    output [PHYS_BITS-1:0] load_write_phys,
+    output reg [31:0] read_a_0_data, read_b_0_data,
+    output reg [31:0] read_a_1_data, read_b_1_data,
+    output reg [31:0] read_a_m_data, read_b_m_data,
+    output reg [31:0] read_c_data,
+    output reg                load_write,
+    output reg [PHYS_BITS-1:0] load_write_phys,
 
 //---- 分配口：这一拍新分配的物理号 + 它将来走哪个写口（owner 表就靠它写）----
     input                 alloc_write_0, input [PHYS_BITS-1:0] alloc_phys_0, input [2:0] alloc_owner_0,
@@ -84,11 +84,16 @@ module prf #(
     );
 
 //---- owner 编码：必须与 idu.v 里 ALLOC_OWNER_* 一致 ----
-    localparam [2:0] OWNER_ALU0 = 3'd0;   // 写口 4
-    localparam [2:0] OWNER_MUL0 = 3'd1;   // 写口 0
-    localparam [2:0] OWNER_ALU1 = 3'd2;   // 写口 5
-    localparam [2:0] OWNER_MUL1 = 3'd3;   // 写口 1
-    localparam [2:0] OWNER_LOAD = 3'd4;   // 写口 2/3
+    localparam [2:0] OWNER_ALU0 = 3'd0;
+    // 写口 4
+    localparam [2:0] OWNER_MUL0 = 3'd1;
+    // 写口 0
+    localparam [2:0] OWNER_ALU1 = 3'd2;
+    // 写口 5
+    localparam [2:0] OWNER_MUL1 = 3'd3;
+    // 写口 1
+    localparam [2:0] OWNER_LOAD = 3'd4;
+    // 写口 2/3
 
 //复位就地打一拍（全核统一做法）
     reg reset_registered;
@@ -104,20 +109,31 @@ module prf #(
     (* ram_style = "distributed" *) reg [31:0] array_load [0:PHYS_COUNT-1];
 
 //写口使能：物理 0 是 x0，永远不写
-    wire write_ok_0 = write_en_0 & write_live_0 & (|write_phys_0);
-    wire write_ok_1 = write_en_1 & write_live_1 & (|write_phys_1);
-    wire write_ok_2 = write_en_2 & write_live_2 & (|write_phys_2);
-    wire write_ok_3 = write_en_3 & write_live_3 & (|write_phys_3);
-    wire write_ok_4 = write_en_4 & write_live_4 & (|write_phys_4);
-    wire write_ok_5 = write_en_5 & write_live_5 & (|write_phys_5);
+    reg write_ok_0, write_ok_1, write_ok_2, write_ok_3, write_ok_4, write_ok_5;
+    always @(*) begin
+        write_ok_0 = write_en_0 & write_live_0 & (|write_phys_0);
+        write_ok_1 = write_en_1 & write_live_1 & (|write_phys_1);
+        write_ok_2 = write_en_2 & write_live_2 & (|write_phys_2);
+        write_ok_3 = write_en_3 & write_live_3 & (|write_phys_3);
+        write_ok_4 = write_en_4 & write_live_4 & (|write_phys_4);
+        write_ok_5 = write_en_5 & write_live_5 & (|write_phys_5);
+    end
 
 //早口和返回级共用一块阵列：同拍都亮只可能是两笔不同的 load，晚的赢（权威值）。
 //合成一条写语句 —— 这正是 LUTRAM 推断要求的形状。
-    wire        wp3_active      = write_ok_3 & ~write_ok_2;
+    reg wp3_active;
+    always @(*) begin
+        wp3_active = write_ok_3 & ~write_ok_2;
+    end
 
-    assign load_write           = write_ok_2 | wp3_active;
-    assign load_write_phys      = write_ok_2 ? write_phys_2 : write_phys_3;
-    wire [31:0] load_write_data = write_ok_2 ? write_data_2 : write_data_3;
+    always @(*) begin
+        load_write = write_ok_2 | wp3_active;
+        load_write_phys = write_ok_2 ? write_phys_2 : write_phys_3;
+    end
+    reg [31:0] load_write_data;
+    always @(*) begin
+        load_write_data = write_ok_2 ? write_data_2 : write_data_3;
+    end
 
     always @(posedge clk) if (write_ok_4) array_alu0[write_phys_4] <= write_data_4;
     always @(posedge clk) if (write_ok_0) array_mul0[write_phys_0] <= write_data_0;
@@ -131,64 +147,37 @@ module prf #(
     reg [2:0] phys_owner [0:PHYS_COUNT-1];
 
     always @(posedge clk) begin
-        if (alloc_write_0) phys_owner[alloc_phys_0] <= alloc_owner_0;
-        if (alloc_write_1) phys_owner[alloc_phys_1] <= alloc_owner_1;
-        if (alloc_write_2) phys_owner[alloc_phys_2] <= alloc_owner_2;
+        if (alloc_write_0)
+            phys_owner[alloc_phys_0] <= alloc_owner_0;
+        if (alloc_write_1)
+            phys_owner[alloc_phys_1] <= alloc_owner_1;
+        if (alloc_write_2)
+            phys_owner[alloc_phys_2] <= alloc_owner_2;
     end
 
 //==============================================================================
 // 读口：先查 owner 选阵列，再取值。物理 0 恒为 0（阵列不复位，不兜底会读到不定值）。
 //  ★ 函数体内读数组进不了敏感表（本仓踩过），所以读口一律写成 assign 逐项表达。
 //==============================================================================
-    wire [2:0] own_a_0 = phys_owner[read_a_0_phys];
-    wire [2:0] own_b_0 = phys_owner[read_b_0_phys];
-    wire [2:0] own_a_1 = phys_owner[read_a_1_phys];
-    wire [2:0] own_b_1 = phys_owner[read_b_1_phys];
-    wire [2:0] own_a_m = phys_owner[read_a_m_phys];
-    wire [2:0] own_b_m = phys_owner[read_b_m_phys];
-    wire [2:0] own_c   = phys_owner[read_c_phys];
+    reg [2:0] own_a_0, own_b_0, own_a_1, own_b_1, own_a_m, own_b_m, own_c;
+    always @(*) begin
+        own_a_0 = phys_owner[read_a_0_phys];
+        own_b_0 = phys_owner[read_b_0_phys];
+        own_a_1 = phys_owner[read_a_1_phys];
+        own_b_1 = phys_owner[read_b_1_phys];
+        own_a_m = phys_owner[read_a_m_phys];
+        own_b_m = phys_owner[read_b_m_phys];
+        own_c = phys_owner[read_c_phys];
+    end
 
-    assign read_a_0_data = (|read_a_0_phys) ?
-        ((own_a_0==OWNER_ALU0) ? array_alu0[read_a_0_phys] :
-         (own_a_0==OWNER_MUL0) ? array_mul0[read_a_0_phys] :
-         (own_a_0==OWNER_ALU1) ? array_alu1[read_a_0_phys] :
-         (own_a_0==OWNER_MUL1) ? array_mul1[read_a_0_phys] : 
-         array_load[read_a_0_phys]) : 32'd0;
-    assign read_b_0_data = (|read_b_0_phys) ?
-        ((own_b_0==OWNER_ALU0) ? array_alu0[read_b_0_phys] :
-         (own_b_0==OWNER_MUL0) ? array_mul0[read_b_0_phys] :
-         (own_b_0==OWNER_ALU1) ? array_alu1[read_b_0_phys] :
-         (own_b_0==OWNER_MUL1) ? array_mul1[read_b_0_phys] : 
-         array_load[read_b_0_phys]) : 32'd0;
-    assign read_a_1_data = (|read_a_1_phys) ?
-        ((own_a_1==OWNER_ALU0) ? array_alu0[read_a_1_phys] :
-         (own_a_1==OWNER_MUL0) ? array_mul0[read_a_1_phys] :
-         (own_a_1==OWNER_ALU1) ? array_alu1[read_a_1_phys] :
-         (own_a_1==OWNER_MUL1) ? array_mul1[read_a_1_phys] : 
-         array_load[read_a_1_phys]) : 32'd0;
-    assign read_b_1_data = (|read_b_1_phys) ?
-        ((own_b_1==OWNER_ALU0) ? array_alu0[read_b_1_phys] :
-         (own_b_1==OWNER_MUL0) ? array_mul0[read_b_1_phys] :
-         (own_b_1==OWNER_ALU1) ? array_alu1[read_b_1_phys] :
-         (own_b_1==OWNER_MUL1) ? array_mul1[read_b_1_phys] : 
-         array_load[read_b_1_phys]) : 32'd0;
-    assign read_a_m_data = (|read_a_m_phys) ?
-        ((own_a_m==OWNER_ALU0) ? array_alu0[read_a_m_phys] :
-         (own_a_m==OWNER_MUL0) ? array_mul0[read_a_m_phys] :
-         (own_a_m==OWNER_ALU1) ? array_alu1[read_a_m_phys] :
-         (own_a_m==OWNER_MUL1) ? array_mul1[read_a_m_phys] : 
-         array_load[read_a_m_phys]) : 32'd0;
-    assign read_b_m_data = (|read_b_m_phys) ?
-        ((own_b_m==OWNER_ALU0) ? array_alu0[read_b_m_phys] :
-         (own_b_m==OWNER_MUL0) ? array_mul0[read_b_m_phys] :
-         (own_b_m==OWNER_ALU1) ? array_alu1[read_b_m_phys] :
-         (own_b_m==OWNER_MUL1) ? array_mul1[read_b_m_phys] : 
-         array_load[read_b_m_phys]) : 32'd0;
-    assign read_c_data   = (|read_c_phys)   ?
-        ((own_c==OWNER_ALU0) ? array_alu0[read_c_phys] :
-         (own_c==OWNER_MUL0) ? array_mul0[read_c_phys] :
-         (own_c==OWNER_ALU1) ? array_alu1[read_c_phys] :
-         (own_c==OWNER_MUL1) ? array_mul1[read_c_phys] : 
-         array_load[read_c_phys]) : 32'd0;
+    always @(*) begin
+        read_a_0_data = (|read_a_0_phys) ? ((own_a_0==OWNER_ALU0) ? array_alu0[read_a_0_phys] : (own_a_0==OWNER_MUL0) ? array_mul0[read_a_0_phys] : (own_a_0==OWNER_ALU1) ? array_alu1[read_a_0_phys] : (own_a_0==OWNER_MUL1) ? array_mul1[read_a_0_phys] : array_load[read_a_0_phys]) : 32'd0;
+        read_b_0_data = (|read_b_0_phys) ? ((own_b_0==OWNER_ALU0) ? array_alu0[read_b_0_phys] : (own_b_0==OWNER_MUL0) ? array_mul0[read_b_0_phys] : (own_b_0==OWNER_ALU1) ? array_alu1[read_b_0_phys] : (own_b_0==OWNER_MUL1) ? array_mul1[read_b_0_phys] : array_load[read_b_0_phys]) : 32'd0;
+        read_a_1_data = (|read_a_1_phys) ? ((own_a_1==OWNER_ALU0) ? array_alu0[read_a_1_phys] : (own_a_1==OWNER_MUL0) ? array_mul0[read_a_1_phys] : (own_a_1==OWNER_ALU1) ? array_alu1[read_a_1_phys] : (own_a_1==OWNER_MUL1) ? array_mul1[read_a_1_phys] : array_load[read_a_1_phys]) : 32'd0;
+        read_b_1_data = (|read_b_1_phys) ? ((own_b_1==OWNER_ALU0) ? array_alu0[read_b_1_phys] : (own_b_1==OWNER_MUL0) ? array_mul0[read_b_1_phys] : (own_b_1==OWNER_ALU1) ? array_alu1[read_b_1_phys] : (own_b_1==OWNER_MUL1) ? array_mul1[read_b_1_phys] : array_load[read_b_1_phys]) : 32'd0;
+        read_a_m_data = (|read_a_m_phys) ? ((own_a_m==OWNER_ALU0) ? array_alu0[read_a_m_phys] : (own_a_m==OWNER_MUL0) ? array_mul0[read_a_m_phys] : (own_a_m==OWNER_ALU1) ? array_alu1[read_a_m_phys] : (own_a_m==OWNER_MUL1) ? array_mul1[read_a_m_phys] : array_load[read_a_m_phys]) : 32'd0;
+        read_b_m_data = (|read_b_m_phys) ? ((own_b_m==OWNER_ALU0) ? array_alu0[read_b_m_phys] : (own_b_m==OWNER_MUL0) ? array_mul0[read_b_m_phys] : (own_b_m==OWNER_ALU1) ? array_alu1[read_b_m_phys] : (own_b_m==OWNER_MUL1) ? array_mul1[read_b_m_phys] : array_load[read_b_m_phys]) : 32'd0;
+        read_c_data = (|read_c_phys)   ? ((own_c==OWNER_ALU0) ? array_alu0[read_c_phys] : (own_c==OWNER_MUL0) ? array_mul0[read_c_phys] : (own_c==OWNER_ALU1) ? array_alu1[read_c_phys] : (own_c==OWNER_MUL1) ? array_mul1[read_c_phys] : array_load[read_c_phys]) : 32'd0;
+    end
 
 endmodule

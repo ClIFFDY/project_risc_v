@@ -56,6 +56,9 @@ module bus_con_top #(
     input             tim_ready,
     input      [31:0] spi_data,
     input             spi_ready,
+//9 号槽：DPU（显示引擎）。和别的 APB 外设一样：字节地址>>2 广播 + 槽号认领。
+    input      [31:0] dpu_data,
+    input             dpu_ready,
 //---- m1：L2（cpu_top 里的 64KB 统一二级缓存）----
     input      [31:0] m1_haddr,
     input      [1:0]  m1_htrans,
@@ -73,10 +76,10 @@ module bus_con_top #(
     output            m1_hgrant,
     output            dma_irq,
 //---- 错误日志（寄存器实体在 plic.v，这里只做汇总）----
-    output            err_valid,
-    output            err_write,
-    output     [1:0]  err_owner,
-    output     [31:0] err_addr,
+    output reg            err_valid,
+    output reg            err_write,
+    output reg     [1:0]  err_owner,
+    output reg     [31:0] err_addr,
     input             err_clear,
 //---- s3：DDR/AXI 主设备口（下游就是 MIG 7 系列的 AXI4 从口）----
 //  ★ 2026-11-12：桥已经挂上（s3，0x8000_0000-0xBFFF_FFFF），MIG 还没进来。
@@ -158,7 +161,11 @@ module bus_con_top #(
 //---- s2：NPU（slot 8 = 0x2000_0000）----
     wire [31:0] s2_haddr, s2_hwdata, s2_hrdata;
     wire [1:0]  s2_htrans;
-    wire        s2_hwrite, s2_hreadyout, s2_hresp, s2_rd_valid, s2_hsel;
+    wire        s2_hwrite, s2_hreadyout, s2_rd_valid, s2_hsel;
+    reg         s2_hresp;
+    always @(*) begin
+        s2_hresp = npu_hresp[0];
+    end
     wire [2:0]  s2_hsize;
     wire [1:0]  npu_hresp;
 
@@ -181,38 +188,36 @@ module bus_con_top #(
 //    锁存放在这里（只有本模块看得见三个主设备的 hresp）；寄存器窗口开在
 //    plic 的 0x0900_0000（厂商扩展），那边只负责摆出来 + 产生 err_clear。
 //==============================================================================
-    wire        err_now     = m0_hresp | m1_hresp | m2_hresp;
-    wire [1:0]  err_owner_now = m0_hresp ? 2'd0 : m1_hresp ? 2'd1 : 2'd2;
-    wire [31:0] err_addr_now  = m0_hresp ? m0_haddr : (m1_hresp ? m1_haddr : m2_haddr);
-    wire        err_write_now = m0_hresp ? m0_hwrite : (m1_hresp ? m1_hwrite : m2_hwrite);
+    reg err_now;
+    reg [1:0] err_owner_now;
+    reg [31:0] err_addr_now;
+    reg err_write_now;
+    always @(*) begin
+        err_now = m0_hresp | m1_hresp | m2_hresp;
+        err_owner_now = m0_hresp ? 2'd0 : m1_hresp ? 2'd1 : 2'd2;
+        err_addr_now = m0_hresp ? m0_haddr : (m1_hresp ? m1_haddr : m2_haddr);
+        err_write_now = m0_hresp ? m0_hwrite : (m1_hresp ? m1_hwrite : m2_hwrite);
+    end
 
-    reg        err_valid_q;
-    reg        err_write_q;
-    reg [1:0]  err_owner_q;
-    reg [31:0] err_addr_q;
 
     always @(posedge clk) begin
         if (rst_cpu) begin
-            err_valid_q <= 1'b0;
-            err_write_q <= 1'b0;
-            err_owner_q <= 2'd0;
-            err_addr_q  <= 32'd0;
+            err_valid <= 1'b0;
+            err_write <= 1'b0;
+            err_owner <= 2'd0;
+            err_addr  <= 32'd0;
         end
         else if (err_clear) begin
-            err_valid_q <= 1'b0;
+            err_valid <= 1'b0;
         end
-        else if (err_now && !err_valid_q) begin
-            err_valid_q <= 1'b1;
-            err_write_q <= err_write_now;
-            err_owner_q <= err_owner_now;
-            err_addr_q  <= err_addr_now;
+        else if (err_now && !err_valid) begin
+            err_valid <= 1'b1;
+            err_write <= err_write_now;
+            err_owner <= err_owner_now;
+            err_addr  <= err_addr_now;
         end
     end
 
-    assign err_valid = err_valid_q;
-    assign err_write = err_write_q;
-    assign err_owner = err_owner_q;
-    assign err_addr  = err_addr_q;
 
     rst_buf u_rst_buf (
         .clk(clk),
@@ -276,18 +281,25 @@ module bus_con_top #(
 //  二、DMA：AHB 主设备 + 寄存器口（3 号槽，0x0C00_0000）
 //==============================================================================
 //寄存器字节地址 = bus_addr_out[4:0] << 2（haddr[6:2] = 字偏移，haddr[6:0] 里通道号在 [6:5]）
-    wire        dma_slot      = bus_sel_out[3];
-    wire [7:0]  dma_reg_addr  = {1'b0, bus_addr_out[4:0], 2'b00};
-    wire        dma_reg_we    = dma_slot & bus_we_out & bus_be_out[0];
-    wire        dma_reg_re    = dma_slot & ~bus_we_out;
+    reg dma_slot;
+    reg [7:0] dma_reg_addr;
+    reg dma_reg_we, dma_reg_re;
+    always @(*) begin
+        dma_slot = bus_sel_out[3];
+        dma_reg_addr = {1'b0, bus_addr_out[4:0], 2'b00};
+        dma_reg_we = dma_slot & bus_we_out & bus_be_out[0];
+        dma_reg_re = dma_slot & ~bus_we_out;
+    end
     wire [31:0] dma_reg_rdata;
 
 //读数据必须在这里锁一拍：桥的应答比地址相位晚一拍，而 dma.v 的 reg_rdata 是
 //纯组合量（地址一撤就变了）。其余外设自己锁，DMA 不回写就只在这里锁。
     reg [31:0] dma_data_q;
     always @(posedge clk) begin
-        if (rst_cpu)                     dma_data_q <= 32'd0;
-        else if (dma_slot && !bus_we_out) dma_data_q <= dma_reg_rdata;
+        if (rst_cpu)
+            dma_data_q <= 32'd0;
+        else if (dma_slot && !bus_we_out)
+            dma_data_q <= dma_reg_rdata;
     end
 
     dma u_dma (
@@ -361,7 +373,6 @@ module bus_con_top #(
         .HRDATA(s2_hrdata), .HREADYOUT(s2_hreadyout), .HRESP(npu_hresp),
         .rd_valid(s2_rd_valid)
     );
-    assign s2_hresp = npu_hresp[0];
 
 //==============================================================================
 //  三之三、DDR/AXI 桥（AHB 从设备 s3 → AXI4 主设备）
@@ -494,6 +505,8 @@ module bus_con_top #(
         .tim_ready(tim_ready),
         .spi_data(spi_data),
         .spi_ready(spi_ready),
+        .dpu_data(dpu_data),
+        .dpu_ready(dpu_ready),
         .dma_data(dma_data_q),
         .dma_ready(1'b1)
     );

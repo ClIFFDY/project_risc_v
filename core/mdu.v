@@ -144,8 +144,11 @@ module mdu(
 //  被外部 hold 冻住没有道理。这里现在恒 0。
 //  ★ 必须用 wire + 连续赋值，不能写成 `always @(*)` 里赋常数：那样敏感表是空的，
 //    整块从不触发，reg 停在 X ⇒ multiply_ready = ~X ⇒ 全核 X 传播（实测 mt 直接掉到 11/15）。
-    wire pipe_stall = 1'b0;
-    wire bus_hold   = 1'b0;
+    reg pipe_stall, bus_hold;
+    always @(*) begin
+        pipe_stall = 1'b0;
+        bus_hold = 1'b0;
+    end
 
 //寄存器声明（按级分组）
 //乘法：第一级锁操作数 / 第二级锁乘积
@@ -487,11 +490,12 @@ module mdu(
     always @(posedge clk) begin
         if (reset_registered | divide_state_kill) begin
             divide_wake_early <= 1'b0;
-            divide_wake_index_early <= 4'd0;
+            divide_wake_index_early <= 5'd0;
         end
         else begin
             divide_wake_early <= divide_state_done;
-            if (divide_state_done) divide_wake_index_early <= divide_state_index;
+            if (divide_state_done)
+                divide_wake_index_early <= divide_state_index;
         end
     end
 
@@ -507,7 +511,9 @@ module mdu(
         if (reset_registered) begin
             divide_state_commit_registered <= 3'd0;
 //载荷也要复位：D 端（divide_data_early）每拍都往外送，不复位就会把 X 灌进前送表
-            divide_state_commit_index <= 4'd0; divide_state_commit_generation <= 1'b0; divide_state_commit_data <= 32'd0;
+            divide_state_commit_index <= 5'd0;
+            divide_state_commit_generation <= 1'b0;
+            divide_state_commit_data <= 32'd0;
         end
         else if (!pipe_stall) begin
             divide_state_commit_registered <= {divide_state_commit_registered[1:0], divide_state_done};
@@ -575,7 +581,7 @@ module mdu(
             multiply_data_out = hold_data;
         end
         else begin
-            multiply_index      = 4'd0;
+            multiply_index      = 5'd0;
             multiply_generation      = 1'b0;
             multiply_data_out = 32'd0;
         end
@@ -595,10 +601,10 @@ module mdu(
     always @(posedge clk) begin
         if (reset_registered) begin
             multiply_wake_registered <= 1'b0;
-            multiply_wake_index_registered <= 4'd0;
+            multiply_wake_index_registered <= 5'd0;
             multiply_wake_generation_registered <= 1'b0;
             multiply_nack_registered <= 1'b0;
-            multiply_nack_index_registered <= 4'd0;
+            multiply_nack_index_registered <= 5'd0;
             multiply_nack_generation_registered <= 1'b0;
         end
         else begin

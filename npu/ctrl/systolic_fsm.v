@@ -77,9 +77,12 @@ module systolic_fsm(
     // 一对 A/BT 数据是否就绪：两个 FIFO 都非空就可以开喂。整段突发会让 FIFO
     // 边填边被消费，早开喂能把突发的首字延迟和喂数重叠，所以不等满一个 K Tile。
     // 每拍消费 1 对、突发每拍补 1 个字，稳态下 FIFO 深度只留几个字的余量。
-    wire pair_ready     = (a_fifo_count != 0) && (bt_fifo_count != 0);
-    wire feed_beat_done = pair_fire && (feed_cnt + 6'd1 >= {1'b0, valid_tk});
-    wire is_beat_done   = (state == S_FEED) && feed_beat_done;
+    reg pair_ready, feed_beat_done, is_beat_done;
+    always @(*) begin
+        pair_ready = (a_fifo_count != 0) && (bt_fifo_count != 0);
+        feed_beat_done = pair_fire && (feed_cnt + 6'd1 >= {1'b0, valid_tk});
+        is_beat_done = (state == S_FEED) && feed_beat_done;
+    end
 
     always @(*) begin
         core_busy    = (state != S_IDLE);
@@ -107,7 +110,8 @@ module systolic_fsm(
             feed_go       <= 1'b0;
             feed_cnt      <= 6'd0;
             pf_done_q     <= 1'b0;
-        end else begin
+        end
+        else begin
             // 单拍脉冲默认清零；电平信号在各状态分支中显式拉高。
             // acc_clear 也在这里清零：它是"换输出 Tile 时的电平"，只在排空结束那一拍
             // 重新拉高，否则会一直保持高把累加器每拍清零。
@@ -164,7 +168,8 @@ module systolic_fsm(
                                     pf_next <= 1'b1;
                                 feed_go <= 1'b0;
                                 state   <= S_DRAIN;
-                            end else begin
+                            end
+                            else begin
                                 // 直接留在 S_FEED 进下一个 K Tile：预取是整块 tile 的
                                 // 连续突发，下一个 K Tile 的数据已经在 FIFO 里或正在
                                 // 路上；万一没到齐，pair_fire 自然为 0，在这里等即可。
@@ -187,7 +192,8 @@ module systolic_fsm(
                         acc_clear <= 1'b1;
                         if (last_out_tile) begin
                             state <= S_DONE;
-                        end else begin
+                        end
+                        else begin
                             next_out_req <= 1'b1;
                             state        <= S_PREFETCH;
                         end

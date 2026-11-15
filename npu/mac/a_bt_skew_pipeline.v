@@ -46,7 +46,8 @@ module a_bt_skew_pipeline(
                     b_sh[l][s]  <= 8'd0;
                     b_shv[l][s] <= 1'b0;
                 end
-        end else if (enable_in) begin
+        end
+        else if (enable_in) begin
             // 数据与 valid 必须一起延迟，否则无效数据会被 PE 累加。
             for (l = 1; l < `NPU_P; l = l + 1) begin
                 a_sh[l][0]  <= a_in[l*8 +: 8];

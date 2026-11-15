@@ -55,15 +55,15 @@ module exu (
     input  [9:0] divide_function10,
 
 //--------------------------------------------------------------- alu 结果
-    (* max_fanout = 8 *) output [4:0]  alu_index_out,
-    output        alu_generation_out,
-    (* max_fanout = 8 *) output [31:0] alu_result,
-    (* max_fanout = 8 *) output [31:0] alu_result_csr,
-    (* max_fanout = 8 *) output [31:0] alu_result_early,
-    output            alu_write_enable_early,
-    output     [4:0]  alu_index_early,
-    output            alu_generation_early,
-    (* max_fanout = 8 *) output alu_write_enable,
+    (* max_fanout = 8 *) output [4:0]  index_out,
+    output        generation_out,
+    (* max_fanout = 8 *) output [31:0] result,
+    (* max_fanout = 8 *) output [31:0] result_csr,
+    (* max_fanout = 8 *) output [31:0] result_early,
+    output            write_enable_early,
+    output     [4:0]  index_early,
+    output            generation_early,
+    (* max_fanout = 8 *) output write_enable,
 
 //--------------------------------------------------------------- mdu 结果
     (* max_fanout = 8 *) output [31:0] multiply_data_out,
@@ -119,30 +119,18 @@ module exu (
     output        exception_interrupt_return_registered,
 
 //--------------------------------------------------------------- 收窄后的唯一结果口
-    output        result_write_enable,
-    output        result_is_divide,
-    output [4:0]  result_index,
-    output        result_generation,
-    output [31:0] result_data,
-    output        result_overflow
+    output reg        result_write_enable,
+    output reg        result_is_divide,
+    output reg [4:0]  result_index,
+    output reg        result_generation,
+    output reg [31:0] result_data,
+    output reg        result_overflow
 );
 
 //==============================================================================
 // alu
 //==============================================================================
-    wire [31:0] alu_result_i, alu_result_csr_i, alu_result_early_i;
-    wire [4:0]  alu_index_early_i;
-    wire        alu_generation_early_i;
-    wire [4:0]  alu_index_i;
-    wire        alu_generation_i;
-    wire        alu_write_enable_early_i;
 
-    assign alu_result            = alu_result_i;
-    assign alu_result_csr        = alu_result_csr_i;
-    assign alu_result_early      = alu_result_early_i;
-    assign alu_write_enable_early = alu_write_enable_early_i;
-    assign alu_index_early       = alu_index_early_i;
-    assign alu_generation_early  = alu_generation_early_i;
 
     alu u_alu (
         .clk(clk), .rst(rst),
@@ -154,14 +142,12 @@ module exu (
         .auxiliary_address_in(auxiliary_address_in),
         .source_a_data(source_a_data), .r2_data(r2_data), .cs_data(cs_data),
         .bypass_load_a(bypass_load_a), .bypass_load_b(bypass_load_b), .load_data_forward(load_data_forward),
-        .index_out(alu_index_i), .generation_out(alu_generation_i),
-        .result(alu_result_i), .result_csr(alu_result_csr_i),
-        .result_now(), .result_early(alu_result_early_i),
-        .write_enable_early(alu_write_enable_early_i), .index_early(alu_index_early_i), .generation_early(alu_generation_early_i),
-        .write_enable(alu_write_enable)
+        .index_out(index_out), .generation_out(generation_out),
+        .result(result), .result_csr(result_csr),
+        .result_now(), .result_early(result_early),
+        .write_enable_early(write_enable_early), .index_early(index_early), .generation_early(generation_early),
+        .write_enable(write_enable)
     );
-    assign alu_index_out      = alu_index_i;
-    assign alu_generation_out = alu_generation_i;
 
 //==============================================================================
 // mdu
@@ -245,52 +231,53 @@ module exu (
     reg        multiply_gen_q   [0:1];
     reg [31:0] multiply_data_q  [0:1];
 
-    reg        result_port_write_enable;
-    reg [4:0]  result_port_index;
-    reg        result_port_generation;
-    reg [31:0] result_port_data;
-    reg        result_port_overflow;
 
     integer result_index_i;
 
-    assign result_write_enable = result_port_write_enable;
-    assign result_index        = result_port_index;
-    assign result_generation   = result_port_generation;
-    assign result_data         = result_port_data;
-    assign result_overflow     = result_port_overflow;
 
 //---- 谁在抢：本类有存货，或者本拍来了新结果 ----
-    wire divide_available   = (divide_count   != 2'd0) | divide_write_enable_early;
-    wire multiply_available = (multiply_count != 2'd0) | multiply_write_enable_early;
+    reg divide_available, multiply_available;
+    always @(*) begin
+        divide_available = (divide_count   != 2'd0) | divide_write_enable_early;
+        multiply_available = (multiply_count != 2'd0) | multiply_write_enable_early;
+    end
 
 // ★ 2026-11-10：优先级翻过来——【乘法恒赢，除法让路】。
 //   为什么：发射级的静态唤醒是按"乘法写口恒在 issue+2"定的两拍链，只要 DIV 还能抢在 MUL 前面，
 //   MUL 的写口就会滑到 issue+3，那条链就必须再挂一级 ⇒ 多等一拍（CoreMark 实测 +0.97%）。
 //   代价可忽略：divide_write_enable 两次至少隔 32 拍（单 FSM + 1 格缓冲），影子从来不会超过 1 项，
 //   MUL 只在连续两拍都有结果时才会把 DIV 挤进影子，而单发射 lane 的 MUL 结果最多两拍出一个。
-    wire serve_multiply = multiply_available;
-    wire serve_divide   = ~multiply_available & divide_available;
+    reg serve_multiply;
+    always @(*) begin
+        serve_multiply = multiply_available;
+        result_is_divide = ~multiply_available & divide_available;
+    end
 
 //★ 结果口这一拍服务的是不是除法（含影子取的那一笔）。发射级用它把乘法从动态唤醒里摘掉。
-//  必须写 serve_divide 而不是 divide_available：影子在等的时候 divide_available 仍然是 1，
+//  必须写 result_is_divide 而不是 divide_available：影子在等的时候 divide_available 仍然是 1，
 //  用它会把这个拍正在写的【乘法】结果当成除法唤醒发出去。
-    assign result_is_divide    = serve_divide;
 
-    wire divide_from_shadow   = (divide_count   != 2'd0);
-    wire multiply_from_shadow = (multiply_count != 2'd0);
+    reg divide_from_shadow, multiply_from_shadow;
+    always @(*) begin
+        divide_from_shadow = (divide_count   != 2'd0);
+        multiply_from_shadow = (multiply_count != 2'd0);
+    end
 
-    wire divide_pop    = serve_divide    & divide_from_shadow;
-    wire multiply_pop  = serve_multiply  & multiply_from_shadow;
-    wire divide_push   = divide_write_enable_early   & ~(serve_divide   & ~divide_from_shadow);
-    wire multiply_push = multiply_write_enable_early & ~(serve_multiply & ~multiply_from_shadow);
+    reg divide_pop, multiply_pop, divide_push, multiply_push;
+    always @(*) begin
+        divide_pop = result_is_divide    & divide_from_shadow;
+        multiply_pop = serve_multiply  & multiply_from_shadow;
+        divide_push = divide_write_enable_early   & ~(result_is_divide   & ~divide_from_shadow);
+        multiply_push = multiply_write_enable_early & ~(serve_multiply & ~multiply_from_shadow);
+    end
 
     always @(*) begin
-        result_port_write_enable = divide_available | multiply_available;
-        result_port_index        = serve_divide   ? (divide_from_shadow   ? divide_index_q[0]   : divide_index_early)   :
+        result_write_enable = divide_available | multiply_available;
+        result_index        = result_is_divide   ? (divide_from_shadow   ? divide_index_q[0]   : divide_index_early)   :
                                                     (multiply_from_shadow ? multiply_index_q[0] : multiply_index_early);
-        result_port_generation   = serve_divide   ? (divide_from_shadow   ? divide_gen_q[0]     : divide_generation_early)   :
+        result_generation   = result_is_divide   ? (divide_from_shadow   ? divide_gen_q[0]     : divide_generation_early)   :
                                                     (multiply_from_shadow ? multiply_gen_q[0]   : multiply_generation_early);
-        result_port_data         = serve_divide   ? (divide_from_shadow   ? divide_data_q[0]    : divide_data_early)    :
+        result_data         = result_is_divide   ? (divide_from_shadow   ? divide_data_q[0]    : divide_data_early)    :
                                                     (multiply_from_shadow ? multiply_data_q[0]  : multiply_data_early);
     end
 
@@ -298,14 +285,18 @@ module exu (
         if (rst) begin
             divide_count   <= 2'd0;
             multiply_count <= 2'd0;
-            result_port_overflow <= 1'b0;
+            result_overflow <= 1'b0;
             for (result_index_i = 0; result_index_i < 2; result_index_i = result_index_i + 1) begin
-                divide_index_q[result_index_i]   <= 4'd0;  divide_gen_q[result_index_i]   <= 1'b0;  divide_data_q[result_index_i]   <= 32'd0;
-                multiply_index_q[result_index_i] <= 4'd0;  multiply_gen_q[result_index_i] <= 1'b0;  multiply_data_q[result_index_i] <= 32'd0;
+                divide_index_q[result_index_i]   <= 4'd0;
+                divide_gen_q[result_index_i]   <= 1'b0;
+                divide_data_q[result_index_i]   <= 32'd0;
+                multiply_index_q[result_index_i] <= 4'd0;
+                multiply_gen_q[result_index_i] <= 1'b0;
+                multiply_data_q[result_index_i] <= 32'd0;
             end
         end
         else begin
-            result_port_overflow <= 1'b0;
+            result_overflow <= 1'b0;
 
             if (divide_pop) begin
                 divide_index_q[0] <= divide_index_q[1];
@@ -323,7 +314,8 @@ module exu (
                     divide_gen_q[1]   <= divide_generation_early;
                     divide_data_q[1]  <= divide_data_early;
                 end
-                if ((divide_count - {1'b0, divide_pop}) >= 2'd2) result_port_overflow <= 1'b1;
+                if ((divide_count - {1'b0, divide_pop}) >= 2'd2)
+                    result_overflow <= 1'b1;
             end
             divide_count <= divide_count + {1'b0, divide_push} - {1'b0, divide_pop};
 
@@ -343,7 +335,8 @@ module exu (
                     multiply_gen_q[1]   <= multiply_generation_early;
                     multiply_data_q[1]  <= multiply_data_early;
                 end
-                if ((multiply_count - {1'b0, multiply_pop}) >= 2'd2) result_port_overflow <= 1'b1;
+                if ((multiply_count - {1'b0, multiply_pop}) >= 2'd2)
+                    result_overflow <= 1'b1;
             end
             multiply_count <= multiply_count + {1'b0, multiply_push} - {1'b0, multiply_pop};
         end

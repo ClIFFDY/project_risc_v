@@ -156,15 +156,19 @@ module ahb_interconnect(
     reg [1:0] grant;
     reg [6:0] dma_wait;
 
-    wire m0_req = (m0_htrans != 2'b00);
-    wire m1_req = (m1_htrans != 2'b00);
-    wire m2_req = (m2_htrans != 2'b00);
-    wire m3_req = (m3_htrans != 2'b00);
+    reg m0_req, m1_req, m2_req, m3_req;
+    always @(*) begin
+        m0_req = (m0_htrans != 2'b00);
+        m1_req = (m1_htrans != 2'b00);
+        m2_req = (m2_htrans != 2'b00);
+        m3_req = (m3_htrans != 2'b00);
+    end
 
 //当前授权主设备还在事务中（它还有节拍要发）⇒ 不换手
-    wire grant_busy = (grant == M_LSU)  ? m0_req :
-                      (grant == M_L2)   ? m1_req :
-                      (grant == M_DMA)  ? m2_req : m3_req;
+    reg grant_busy;
+    always @(*) begin
+        grant_busy = (grant == M_LSU)  ? m0_req : (grant == M_L2)   ? m1_req : (grant == M_DMA)  ? m2_req : m3_req;
+    end
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -175,24 +179,33 @@ module ahb_interconnect(
             if (!grant_busy) begin
 //★ boot 引擎优先级最高：它只在"其他主设备全在复位里"的那段时间说话，
 //  给它最高优先级是为了不被 DMA 的 64 拍插队拖慢上电。
-                if (m3_req)                             grant <= M_BOOT;
-                else if (m2_req && (dma_wait >= 7'd64)) grant <= M_DMA;
-                else if (m0_req)                        grant <= M_LSU;
-                else if (m1_req)                        grant <= M_L2;
-                else if (m2_req)                        grant <= M_DMA;
+                if (m3_req)
+                    grant <= M_BOOT;
+                else if (m2_req && (dma_wait >= 7'd64))
+                    grant <= M_DMA;
+                else if (m0_req)
+                    grant <= M_LSU;
+                else if (m1_req)
+                    grant <= M_L2;
+                else if (m2_req)
+                    grant <= M_DMA;
             end
             if (m2_req && (grant != M_DMA) && grant_busy) begin
-                if (dma_wait != 7'd127) dma_wait <= dma_wait + 7'd1;
+                if (dma_wait != 7'd127)
+                    dma_wait <= dma_wait + 7'd1;
             end
             else if (grant == M_DMA)
                 dma_wait <= 7'd0;
         end
     end
 
-    wire g0 = (grant == M_LSU);
-    wire g1 = (grant == M_L2);
-    wire g2 = (grant == M_DMA);
-    wire g3 = (grant == M_BOOT);
+    reg g0, g1, g2, g3;
+    always @(*) begin
+        g0 = (grant == M_LSU);
+        g1 = (grant == M_L2);
+        g2 = (grant == M_DMA);
+        g3 = (grant == M_BOOT);
+    end
 
 //==============================================================================
 //  二、请求信号选择
@@ -207,71 +220,200 @@ module ahb_interconnect(
     reg [3:0]  hwstrb;
 
     always @(*) begin
-        haddr = 32'd0; htrans = 2'b00; hwrite = 1'b0; hsize = 3'b010;
-        hburst = 3'b000; hprot = 4'b0011; hmastlock = 1'b0;
-        hwdata = 32'd0; hwstrb = 4'd0;
-        if (g0)      begin haddr = m0_haddr; htrans = m0_htrans; hwrite = m0_hwrite;
-                           hsize = m0_hsize; hburst = m0_hburst; hprot = m0_hprot;
-                           hmastlock = m0_hmastlock; hwdata = m0_hwdata; hwstrb = m0_hwstrb; end
-        else if (g1) begin haddr = m1_haddr; htrans = m1_htrans; hwrite = m1_hwrite;
-                           hsize = m1_hsize; hburst = m1_hburst; hprot = m1_hprot;
-                           hmastlock = m1_hmastlock; hwdata = m1_hwdata; hwstrb = m1_hwstrb; end
-        else if (g2) begin haddr = m2_haddr; htrans = m2_htrans; hwrite = m2_hwrite;
-                           hsize = m2_hsize; hburst = m2_hburst; hprot = m2_hprot;
-                           hmastlock = m2_hmastlock; hwdata = m2_hwdata; hwstrb = m2_hwstrb; end
-        else if (g3) begin haddr = m3_haddr; htrans = m3_htrans; hwrite = m3_hwrite;
-                           hsize = m3_hsize; hburst = m3_hburst; hprot = m3_hprot;
-                           hmastlock = m3_hmastlock; hwdata = m3_hwdata; hwstrb = m3_hwstrb; end
+        haddr = 32'd0;
+        htrans = 2'b00;
+        hwrite = 1'b0;
+        hsize = 3'b010;
+        hburst = 3'b000;
+        hprot = 4'b0011;
+        hmastlock = 1'b0;
+        hwdata = 32'd0;
+        hwstrb = 4'd0;
+        if (g0) begin
+            haddr = m0_haddr;
+            htrans = m0_htrans;
+            hwrite = m0_hwrite;
+                           hsize = m0_hsize;
+                           hburst = m0_hburst;
+                           hprot = m0_hprot;
+                           hmastlock = m0_hmastlock;
+                           hwdata = m0_hwdata;
+                           hwstrb = m0_hwstrb;
+                           end
+        else if (g1) begin
+            haddr = m1_haddr;
+            htrans = m1_htrans;
+            hwrite = m1_hwrite;
+                           hsize = m1_hsize;
+                           hburst = m1_hburst;
+                           hprot = m1_hprot;
+                           hmastlock = m1_hmastlock;
+                           hwdata = m1_hwdata;
+                           hwstrb = m1_hwstrb;
+                           end
+        else if (g2) begin
+            haddr = m2_haddr;
+            htrans = m2_htrans;
+            hwrite = m2_hwrite;
+                           hsize = m2_hsize;
+                           hburst = m2_hburst;
+                           hprot = m2_hprot;
+                           hmastlock = m2_hmastlock;
+                           hwdata = m2_hwdata;
+                           hwstrb = m2_hwstrb;
+                           end
+        else if (g3) begin
+            haddr = m3_haddr;
+            htrans = m3_htrans;
+            hwrite = m3_hwrite;
+                           hsize = m3_hsize;
+                           hburst = m3_hburst;
+                           hprot = m3_hprot;
+                           hmastlock = m3_hmastlock;
+                           hwdata = m3_hwdata;
+                           hwstrb = m3_hwstrb;
+                           end
     end
 
 //==============================================================================
 //  三、地址译码
 //==============================================================================
     // STCM 扩到 256KB（AW=16）：haddr[31:18]==0
-    wire sel_stcm = (haddr[31:18] == 14'd0);
+    reg sel_stcm;
+    always @(*) begin
+        sel_stcm = (haddr[31:18] == 14'd0);
+    end
     // NPU 占 slot 8（0x2000_0000）
-    wire sel_npu  = (haddr[31:26] == 6'd8);
+    reg sel_npu;
+    always @(*) begin
+        sel_npu = (haddr[31:26] == 6'd8);
+    end
     // DDR/AXI 桥占 0x8000_0000-0xBFFF_FFFF（slot 32..47）；精确窗口由桥自己再判
-    wire sel_ddr  = (haddr[31:30] == 2'b10);
+    reg sel_ddr;
+    always @(*) begin
+        sel_ddr = (haddr[31:30] == 2'b10);
+    end
+
+//★ 2026-11-15：owner FIFO 快满时【反压主设备】，不许"照收但丢项"。
+//  原来那句 `(owner_count != 3'd7)` 只是不记账，HREADY 照样放行 ⇒ 主设备以为这笔读
+//  被接受了，可 FIFO 里没有它的项 ⇒ 应答到了以后被当成队头那项的应答消化掉，
+//  真正的主人永远等不到。实测：L2 的 32 拍整行填充和 LSU 的外设读并发时，
+//  fill_issue=32 / fill_recv=16 卡死，accept 与 pop 差 16，整核冻死。
+//  修法：FIFO 满就把这一笔读【压住】—— 既不发给从设备（htrans 拉回 IDLE，
+//  否则从设备照样执行、多吐一个没人认领的应答），也不回 HREADY。
+//  ★ 只压"要进 FIFO 的读"：写不记账、NPU/DDR 走直达，都不压。
+//  ★ 指针在这里提前声明（原来在下面 owner FIFO 那一节），否则压不住从设备侧。
+    reg [3:0] owner_mem [0:7];                // {sel[1:0], owner[1:0]}
+    reg  [2:0] owner_wr, owner_rd;
+    reg owner_empty;
+    reg [2:0] owner_count;
+    always @(*) begin
+        owner_empty = (owner_wr == owner_rd);
+        owner_count = owner_wr - owner_rd;
+    end
+//★ 不变式：FIFO 里【同时只装一个从设备】的读项。
+//  出队时按队头 tag 选从设备、按接受顺序还原 —— 这条只有在"应答顺序 = 接受顺序"
+//  时才成立。同一个从设备的应答天然保序；跨从设备就不一定（APB 侧可能被外设的
+//  ld_ready / 错误两拍拖后）。所以这里干脆不允许两个从设备的读同时在飞：
+//  新读的目标从设备跟队头不一致时，压住它。
+    reg [1:0] new_sel;
+    reg fifo_same;
+    always @(*) begin
+        new_sel = sel_stcm ? 2'd1 : 2'd0;
+        fifo_same = owner_empty || (owner_mem[owner_rd][3:2] == new_sel);
+    end
+    reg read_hold;
+    always @(*) begin
+        read_hold = (htrans != 2'b00) && !hwrite && !sel_npu && !sel_ddr && ((owner_count == 3'd7) || !fifo_same);
+    end
+    reg [1:0] htrans_gated;
+    always @(*) begin
+        htrans_gated = read_hold ? 2'b00 : htrans;
+    end
 
     always @(*) begin
-        s0_haddr = haddr; s0_htrans = htrans; s0_hwrite = hwrite;
-        s0_hsize = hsize; s0_hburst = hburst; s0_hprot = hprot; s0_hmastlock = hmastlock;
-        s0_hwdata = hwdata; s0_hwstrb = hwstrb;
-        s1_haddr = haddr; s1_htrans = htrans; s1_hwrite = hwrite;
-        s1_hsize = hsize; s1_hburst = hburst; s1_hprot = hprot; s1_hmastlock = hmastlock;
-        s1_hwdata = hwdata; s1_hwstrb = hwstrb;
+        s0_haddr = haddr;
+        s0_htrans = htrans_gated;
+        s0_hwrite = hwrite;
+        s0_hsize = hsize;
+        s0_hburst = hburst;
+        s0_hprot = hprot;
+        s0_hmastlock = hmastlock;
+        s0_hwdata = hwdata;
+        s0_hwstrb = hwstrb;
+        s1_haddr = haddr;
+        s1_htrans = htrans_gated;
+        s1_hwrite = hwrite;
+        s1_hsize = hsize;
+        s1_hburst = hburst;
+        s1_hprot = hprot;
+        s1_hmastlock = hmastlock;
+        s1_hwdata = hwdata;
+        s1_hwstrb = hwstrb;
 //没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
-        s2_haddr = haddr; s2_htrans = htrans; s2_hwrite = hwrite;
-        s2_hsize = hsize; s2_hwdata = hwdata; s2_hsel = sel_npu;
-        s3_haddr = haddr; s3_htrans = htrans; s3_hwrite = hwrite;
-        s3_hsize = hsize; s3_hprot = hprot; s3_hwdata = hwdata; s3_hwstrb = hwstrb;
+        s2_haddr = haddr;
+        s2_htrans = htrans_gated;
+        s2_hwrite = hwrite;
+        s2_hsize = hsize;
+        s2_hwdata = hwdata;
+        s2_hsel = sel_npu;
+        s3_haddr = haddr;
+        s3_htrans = htrans_gated;
+        s3_hwrite = hwrite;
+        s3_hsize = hsize;
+        s3_hprot = hprot;
+        s3_hwdata = hwdata;
+        s3_hwstrb = hwstrb;
         s3_hsel = sel_ddr;
 //没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
         if (sel_npu) begin
-            s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
-            s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
-            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
+            s0_htrans = 2'b00;
+            s0_hwrite = 1'b0;
+            s0_hwstrb = 4'd0;
+            s1_htrans = 2'b00;
+            s1_hwrite = 1'b0;
+            s1_hwstrb = 4'd0;
+            s3_htrans = 2'b00;
+            s3_hwrite = 1'b0;
+            s3_hwstrb = 4'd0;
         end
         else if (sel_stcm) begin
-            s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
-            s2_htrans = 2'b00; s2_hwrite = 1'b0;
-            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
+            s0_htrans = 2'b00;
+            s0_hwrite = 1'b0;
+            s0_hwstrb = 4'd0;
+            s2_htrans = 2'b00;
+            s2_hwrite = 1'b0;
+            s3_htrans = 2'b00;
+            s3_hwrite = 1'b0;
+            s3_hwstrb = 4'd0;
         end
         else if (sel_ddr) begin
-            s0_htrans = 2'b00; s0_hwrite = 1'b0; s0_hwstrb = 4'd0;
-            s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
-            s2_htrans = 2'b00; s2_hwrite = 1'b0;
+            s0_htrans = 2'b00;
+            s0_hwrite = 1'b0;
+            s0_hwstrb = 4'd0;
+            s1_htrans = 2'b00;
+            s1_hwrite = 1'b0;
+            s1_hwstrb = 4'd0;
+            s2_htrans = 2'b00;
+            s2_hwrite = 1'b0;
         end
         else begin
-            s1_htrans = 2'b00; s1_hwrite = 1'b0; s1_hwstrb = 4'd0;
-            s2_htrans = 2'b00; s2_hwrite = 1'b0;
-            s3_htrans = 2'b00; s3_hwrite = 1'b0; s3_hwstrb = 4'd0;
+            s1_htrans = 2'b00;
+            s1_hwrite = 1'b0;
+            s1_hwstrb = 4'd0;
+            s2_htrans = 2'b00;
+            s2_hwrite = 1'b0;
+            s3_htrans = 2'b00;
+            s3_hwrite = 1'b0;
+            s3_hwstrb = 4'd0;
         end
     end
 
-    wire        s_hreadyout = sel_npu ? s2_hreadyout : sel_ddr ? s3_hreadyout : sel_stcm ? s1_hreadyout : s0_hreadyout;
-    wire        s_hresp     = sel_npu ? s2_hresp     : sel_ddr ? s3_hresp     : sel_stcm ? s1_hresp     : s0_hresp;
+    reg s_hreadyout, s_hresp;
+    always @(*) begin
+        s_hreadyout = sel_npu ? s2_hreadyout : sel_ddr ? s3_hreadyout : sel_stcm ? s1_hreadyout : s0_hreadyout;
+        s_hresp = sel_npu ? s2_hresp     : sel_ddr ? s3_hresp     : sel_stcm ? s1_hresp     : s0_hresp;
+    end
 
 //==============================================================================
 //  四、owner FIFO：读地址被接受时把"谁发的 + 发给哪个从设备"一起记下来
@@ -285,15 +427,16 @@ module ahb_interconnect(
 //    ahb_apb_bridge 的应答都是"接受后第 2 拍"，成立。以后谁加了等待态，
 //    这里要么拆成每从设备一条队列，要么改成带标签的乱序回收。
 //==============================================================================
-    reg [3:0] owner_mem [0:7];                // {sel[1:0], owner[1:0]}：0=APB 1=STCM（2=NPU、3=DDR 走直达不进队）
-    reg [2:0] owner_wr, owner_rd;
-    wire      owner_empty = (owner_wr == owner_rd);
-    wire [2:0] owner_count = owner_wr - owner_rd;
 
 //★ 必须带 s_hready：地址相位"被接受"的定义是 HREADY 为 1 的那一拍。
 //  只按 htrans 计会在从设备拉等待时把同一拍记成两次（现在的 STCM hready 恒 1
 //  看不出来，换了带等待的从设备就是致命的）。
-    wire accept_read = (htrans != 2'b00) && !hwrite && s_hreadyout;
+//  ★ 2026-11-15：判据用 htrans_gated，不是 htrans —— 被反压压住的那一拍，
+//    从设备根本没看到这笔读，就不能记进 FIFO（否则记了一项永远等不到应答）。
+    reg accept_read;
+    always @(*) begin
+        accept_read = (htrans_gated != 2'b00) && !hwrite && s_hreadyout;
+    end
 
 //★ 2026-11-13：NPU 的直达应答必须按【接受时的记录】回送，不能拿当拍地址判。
 //  原因：LSU 主设备的地址锁存（lsu_ahb_master.v 的 lat_addr）在请求被接受后
@@ -336,42 +479,94 @@ module ahb_interconnect(
         end
     end
 
-    wire [3:0]  resp_tag   = owner_mem[owner_rd];
-    wire [1:0]  resp_sel   = npu_read_pending ? 2'd2 : sel_ddr ? 2'd3 : resp_tag[3:2];
-    wire [1:0]  resp_owner = npu_read_pending ? npu_read_owner
-                                             : (sel_ddr ? grant : resp_tag[1:0]);
-    wire [31:0] resp_hrdata   = (resp_sel == 2'd3) ? s3_hrdata :
-                                (resp_sel == 2'd2) ? s2_hrdata :
-                                (resp_sel == 2'd1) ? s1_hrdata : s0_hrdata;
-    wire        resp_rd_valid = (resp_sel == 2'd3) ? s3_rd_valid :
-                                (resp_sel == 2'd2) ? s2_rd_valid :
-                                (resp_sel == 2'd1) ? s1_rd_valid : s0_rd_valid;
+    reg [3:0] resp_tag;
+    reg [1:0] resp_sel;
+    always @(*) begin
+        resp_tag = owner_mem[owner_rd];
+        resp_sel = npu_read_pending ? 2'd2 : sel_ddr ? 2'd3 : resp_tag[3:2];
+    end
+    reg [1:0] resp_owner;
+    always @(*) begin
+        resp_owner = npu_read_pending ? npu_read_owner : (sel_ddr ? grant : resp_tag[1:0]);
+    end
+    reg [31:0] resp_hrdata;
+    always @(*) begin
+        resp_hrdata = (resp_sel == 2'd3) ? s3_hrdata : (resp_sel == 2'd2) ? s2_hrdata : (resp_sel == 2'd1) ? s1_hrdata : s0_hrdata;
+    end
+    reg resp_rd_valid;
+    always @(*) begin
+        resp_rd_valid = (resp_sel == 2'd3) ? s3_rd_valid : (resp_sel == 2'd2) ? s2_rd_valid : (resp_sel == 2'd1) ? s1_rd_valid : s0_rd_valid;
+    end
 
 //==============================================================================
 //  五、回送
 //==============================================================================
     always @(*) begin
-        m0_hrdata = 32'd0; m0_hready = 1'b0; m0_rd_valid = 1'b0; m0_hgrant = g0; m0_hresp = 1'b0;
-        m1_hrdata = 32'd0; m1_hready = 1'b0; m1_rd_valid = 1'b0; m1_hgrant = g1; m1_hresp = 1'b0;
-        m2_hrdata = 32'd0; m2_hready = 1'b0; m2_rd_valid = 1'b0; m2_hgrant = g2; m2_hresp = 1'b0;
-        m3_hrdata = 32'd0; m3_hready = 1'b0; m3_rd_valid = 1'b0; m3_hgrant = g3; m3_hresp = 1'b0;
+        m0_hrdata = 32'd0;
+        m0_hready = 1'b0;
+        m0_rd_valid = 1'b0;
+        m0_hgrant = g0;
+        m0_hresp = 1'b0;
+        m1_hrdata = 32'd0;
+        m1_hready = 1'b0;
+        m1_rd_valid = 1'b0;
+        m1_hgrant = g1;
+        m1_hresp = 1'b0;
+        m2_hrdata = 32'd0;
+        m2_hready = 1'b0;
+        m2_rd_valid = 1'b0;
+        m2_hgrant = g2;
+        m2_hresp = 1'b0;
+        m3_hrdata = 32'd0;
+        m3_hready = 1'b0;
+        m3_rd_valid = 1'b0;
+        m3_hgrant = g3;
+        m3_hresp = 1'b0;
 //HREADY = 从设备 HREADYOUT & 被授权（标准做法）
-        if (g0) m0_hready = s_hreadyout;
-        if (g1) m1_hready = s_hreadyout;
-        if (g2) m2_hready = s_hreadyout;
-        if (g3) m3_hready = s_hreadyout;
+//★ 2026-11-15：owner FIFO 快满时【反压主设备】，不许"照收但丢项"。
+//  原来那句 `(owner_count != 3'd7)` 只是不记账，HREADY 照样放行 ⇒ 主设备以为这笔读
+//  被接受了，可 FIFO 里没有它的项 ⇒ 应答到了以后被当成队头那项的应答消化掉，
+//  真正的主人永远等不到。实测：L2 的 32 拍整行填充和 LSU 的外设读并发时，
+//  fill_issue=32 / fill_recv=16 卡死，acc 与 pop 差 16，整核冻死。
+//  修法：FIFO 满时把这一笔读压住（htrans_gated 已经在从设备侧拉成 IDLE，
+//  这里再压一拍 HREADY，让主设备知道"这笔没被接受"）。
+//  两处必须成对：只压 HREADY 的话从设备照样执行、多吐一个没人认领的应答。
+        if (g0)
+            m0_hready = s_hreadyout && !read_hold;
+        if (g1)
+            m1_hready = s_hreadyout && !read_hold;
+        if (g2)
+            m2_hready = s_hreadyout && !read_hold;
+        if (g3)
+            m3_hready = s_hreadyout && !read_hold;
 //HRESP 送给【当前被授权】的主设备，不走 FIFO：错误是在被按住的那笔传输里
 //  举两拍，那两拍授权不会换手（grant_busy 看的就是它的 htrans），所以按 grant 选
 //  是准的。数据/应答才必须按 FIFO 里记的从设备号选（见上面那段注释）。
-        if (g0) m0_hresp = s_hresp;
-        if (g1) m1_hresp = s_hresp;
-        if (g2) m2_hresp = s_hresp;
-        if (g3) m3_hresp = s_hresp;
+        if (g0)
+            m0_hresp = s_hresp;
+        if (g1)
+            m1_hresp = s_hresp;
+        if (g2)
+            m2_hresp = s_hresp;
+        if (g3)
+            m3_hresp = s_hresp;
         case (resp_owner)
-        M_LSU: begin m0_hrdata = resp_hrdata; m0_rd_valid = resp_rd_valid; end
-        M_L2:  begin m1_hrdata = resp_hrdata; m1_rd_valid = resp_rd_valid; end
-        M_DMA: begin m2_hrdata = resp_hrdata; m2_rd_valid = resp_rd_valid; end
-        default: begin m3_hrdata = resp_hrdata; m3_rd_valid = resp_rd_valid; end
+        M_LSU: begin
+            m0_hrdata = resp_hrdata;
+            m0_rd_valid = resp_rd_valid;
+        end
+        M_L2: begin
+            m1_hrdata = resp_hrdata;
+            m1_rd_valid = resp_rd_valid;
+        end
+        M_DMA: begin
+            m2_hrdata = resp_hrdata;
+            m2_rd_valid = resp_rd_valid;
+        end
+        default: begin
+            m3_hrdata = resp_hrdata;
+            m3_rd_valid = resp_rd_valid;
+        end
         endcase
     end
 

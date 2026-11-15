@@ -33,7 +33,8 @@ module npu_stream_ctrl #(parameter AW = `NPU_ABUF_AW) (
             rd_re_out   <= 1'b0;
             busy_q      <= 1'b0;
             left_q      <= {`NPU_DIM_W{1'b0}};
-        end else begin
+        end
+        else begin
             rd_re_out <= 1'b0;
             if (start_in && (len_in != 0)) begin
                 // 第 1 个请求在启动当拍发出，剩余 len-1 个逐拍发出。
@@ -41,7 +42,8 @@ module npu_stream_ctrl #(parameter AW = `NPU_ABUF_AW) (
                 rd_re_out   <= 1'b1;
                 left_q      <= len_in - 1'b1;
                 busy_q      <= (len_in > 1'b1);
-            end else if (busy_q) begin
+            end
+            else if (busy_q) begin
                 rd_addr_out <= rd_addr_out + 1'b1;
                 rd_re_out   <= 1'b1;
                 left_q      <= left_q - 1'b1;

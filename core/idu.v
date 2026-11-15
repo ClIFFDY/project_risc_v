@@ -14,8 +14,8 @@ module idu(
     input [1:0]  store_pop,
     input [3:0]  store_flush_pop,
 //---- dsq 三个出口 ----
-    input        dq0_valid, input [132:0] dq0_data, output dq0_pop,
-    input        dq1_valid, input [132:0] dq1_data, output dq1_pop,
+    input        dq0_valid, input [132:0] dq0_data, output reg dq0_pop,
+    input        dq1_valid, input [132:0] dq1_data, output reg dq1_pop,
     input        dqm_valid, input [132:0] dqm_data, output dqm_pop,
 //---- lane0 / lane1 交付给 isq ----
     input        accept_in_0, accept_in_1,
@@ -68,13 +68,13 @@ module idu(
     output reg [31:0] dec_r1_immv_1, dec_r2_immv_1,
 //---- LSU FIFO 队头（给 isq 的访存站）----
     input         lsu_pop_in,
-    output [31:0] lsu_instruction_out, lsu_auxiliary_address_out, lsu_immediate_out,
-    output [4:0]  lsu_source_a_out, lsu_source_b_out, lsu_destination_register_out,
-    output [2:0]  lsu_load_store_function3_out,
-    output        lsu_is_store_out, lsu_write_enable_out,
-    output [4:0]  lsu_index_out,
-    output        lsu_generation_out, lsu_valid_out,
-    output [5:0]  lsu_phys_a_out, lsu_phys_b_out, lsu_phys_d_out
+    output reg [31:0] lsu_instruction_out, lsu_auxiliary_address_out, lsu_immediate_out,
+    output reg [4:0]  lsu_source_a_out, lsu_source_b_out, lsu_destination_register_out,
+    output reg [2:0]  lsu_load_store_function3_out,
+    output reg        lsu_is_store_out, lsu_write_enable_out,
+    output reg [4:0]  lsu_index_out,
+    output reg        lsu_generation_out, lsu_valid_out,
+    output reg [5:0]  lsu_phys_a_out, lsu_phys_b_out, lsu_phys_d_out
     );
 
     localparam OPCODE_OP_IMM = 7'b0010011;
@@ -94,13 +94,26 @@ module idu(
     localparam [3:0] BJU_NONE = 4'd0, BJU_JAL = 4'd1, BJU_JAL_MIS = 4'd2, BJU_JALR = 4'd3,
                      BJU_ECALL = 4'd4, BJU_EBREAK = 4'd5, BJU_ILLEGAL = 4'd6, BJU_MRET = 4'd7;
 
-    function [31:0] immI; input [31:0] i; immI = {{20{i[31]}}, i[31:20]}; endfunction
-    function [31:0] immS; input [31:0] i; immS = {{20{i[31]}}, i[31:25], i[11:7]}; endfunction
-    function [31:0] immB; input [31:0] i;
-        immB = {{19{i[31]}}, i[31], i[7], i[30:25], i[11:8], 1'b0}; endfunction
-    function [31:0] immU; input [31:0] i; immU = {i[31:12], 12'd0}; endfunction
-    function [31:0] immJ; input [31:0] i;
-        immJ = {{12{i[31]}}, i[19:12], i[20], i[30:21], 1'b0}; endfunction
+    function [31:0] immI;
+    input [31:0] i;
+    immI = {{20{i[31]}}, i[31:20]};
+    endfunction
+    function [31:0] immS;
+    input [31:0] i;
+    immS = {{20{i[31]}}, i[31:25], i[11:7]};
+    endfunction
+    function [31:0] immB;
+    input [31:0] i;
+        immB = {{19{i[31]}}, i[31], i[7], i[30:25], i[11:8], 1'b0};
+        endfunction
+    function [31:0] immU;
+    input [31:0] i;
+    immU = {i[31:12], 12'd0};
+    endfunction
+    function [31:0] immJ;
+    input [31:0] i;
+        immJ = {{12{i[31]}}, i[19:12], i[20], i[30:21], 1'b0};
+        endfunction
 
 //==============================================================================
 //  dsq 载荷拆字段
@@ -108,44 +121,71 @@ module idu(
 //    [18] 世代 | [24:19] phys_a | [30:25] phys_b | [36:31] phys_d |
 //    [68:37] 地址 | [100:69] jalr 预测 | [132:101] 原始指令
 //==============================================================================
-    wire [31:0] p0_inst = dq0_data[132:101];
-    wire [31:0] p0_jlr  = dq0_data[100:69];
-    wire [31:0] p0_addr = dq0_data[68:37];
-    wire [5:0]  p0_pd   = dq0_data[36:31];
-    wire [5:0]  p0_pb   = dq0_data[30:25];
-    wire [5:0]  p0_pa   = dq0_data[24:19];
-    wire        p0_gen  = dq0_data[18];
-    wire [4:0]  p0_idx  = dq0_data[17:13];
-    wire        p0_bp   = dq0_data[12];
-    wire [4:0]  p0_rs2  = dq0_data[11:7];
-    wire [4:0]  p0_rs1  = dq0_data[6:2];
-    wire [1:0]  p0_cls  = dq0_data[1:0];
+    reg [31:0] p0_inst, p0_jlr, p0_addr;
+    reg [5:0] p0_pd, p0_pb, p0_pa;
+    reg p0_gen;
+    reg [4:0] p0_idx;
+    reg p0_bp;
+    reg [4:0] p0_rs2, p0_rs1;
+    reg [1:0] p0_cls;
+    always @(*) begin
+        p0_inst = dq0_data[132:101];
+        p0_jlr = dq0_data[100:69];
+        p0_addr = dq0_data[68:37];
+        p0_pd = dq0_data[36:31];
+        p0_pb = dq0_data[30:25];
+        p0_pa = dq0_data[24:19];
+        p0_gen = dq0_data[18];
+        p0_idx = dq0_data[17:13];
+        p0_bp = dq0_data[12];
+        p0_rs2 = dq0_data[11:7];
+        p0_rs1 = dq0_data[6:2];
+        p0_cls = dq0_data[1:0];
+    end
 
-    wire [31:0] p1_inst = dq1_data[132:101];
-    wire [31:0] p1_jlr  = dq1_data[100:69];
-    wire [31:0] p1_addr = dq1_data[68:37];
-    wire [5:0]  p1_pd   = dq1_data[36:31];
-    wire [5:0]  p1_pb   = dq1_data[30:25];
-    wire [5:0]  p1_pa   = dq1_data[24:19];
-    wire        p1_gen  = dq1_data[18];
-    wire [4:0]  p1_idx  = dq1_data[17:13];
-    wire        p1_bp   = dq1_data[12];
-    wire [4:0]  p1_rs2  = dq1_data[11:7];
-    wire [4:0]  p1_rs1  = dq1_data[6:2];
-    wire [1:0]  p1_cls  = dq1_data[1:0];
+    reg [31:0] p1_inst, p1_jlr, p1_addr;
+    reg [5:0] p1_pd, p1_pb, p1_pa;
+    reg p1_gen;
+    reg [4:0] p1_idx;
+    reg p1_bp;
+    reg [4:0] p1_rs2, p1_rs1;
+    reg [1:0] p1_cls;
+    always @(*) begin
+        p1_inst = dq1_data[132:101];
+        p1_jlr = dq1_data[100:69];
+        p1_addr = dq1_data[68:37];
+        p1_pd = dq1_data[36:31];
+        p1_pb = dq1_data[30:25];
+        p1_pa = dq1_data[24:19];
+        p1_gen = dq1_data[18];
+        p1_idx = dq1_data[17:13];
+        p1_bp = dq1_data[12];
+        p1_rs2 = dq1_data[11:7];
+        p1_rs1 = dq1_data[6:2];
+        p1_cls = dq1_data[1:0];
+    end
 
-    wire [31:0] pm_inst = dqm_data[132:101];
-    wire [31:0] pm_jlr  = dqm_data[100:69];
-    wire [31:0] pm_addr = dqm_data[68:37];
-    wire [5:0]  pm_pd   = dqm_data[36:31];
-    wire [5:0]  pm_pb   = dqm_data[30:25];
-    wire [5:0]  pm_pa   = dqm_data[24:19];
-    wire        pm_gen  = dqm_data[18];
-    wire [4:0]  pm_idx  = dqm_data[17:13];
-    wire        pm_bp   = dqm_data[12];
-    wire [4:0]  pm_rs2  = dqm_data[11:7];
-    wire [4:0]  pm_rs1  = dqm_data[6:2];
-    wire [1:0]  pm_cls  = dqm_data[1:0];
+    reg [31:0] pm_inst, pm_jlr, pm_addr;
+    reg [5:0] pm_pd, pm_pb, pm_pa;
+    reg pm_gen;
+    reg [4:0] pm_idx;
+    reg pm_bp;
+    reg [4:0] pm_rs2, pm_rs1;
+    reg [1:0] pm_cls;
+    always @(*) begin
+        pm_inst = dqm_data[132:101];
+        pm_jlr = dqm_data[100:69];
+        pm_addr = dqm_data[68:37];
+        pm_pd = dqm_data[36:31];
+        pm_pb = dqm_data[30:25];
+        pm_pa = dqm_data[24:19];
+        pm_gen = dqm_data[18];
+        pm_idx = dqm_data[17:13];
+        pm_bp = dqm_data[12];
+        pm_rs2 = dqm_data[11:7];
+        pm_rs1 = dqm_data[6:2];
+        pm_cls = dqm_data[1:0];
+    end
 
 //---- 三套译码的寄存器（后缀 s0 / s1 / sm）----
     reg [4:0]  destination_decoded_s0, destination_decoded_s1, destination_decoded_sm;
@@ -275,7 +315,7 @@ module idu(
         csr_exists_dec_s0    = 1'b0;
         case (p0_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_s0 = 1'b1;
             default: csr_exists_dec_s0 = 1'b0;
@@ -288,27 +328,39 @@ module idu(
             case (p0_inst[6:0])
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec_s0 = 1'b0;
                 OPCODE_LOAD: begin
-                    if (p0_inst[14:12] == 3'b011) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b110) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b111) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b110)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b111)
+                        exc_illegal_dec_s0 = 1'b1;
                 end
                 OPCODE_STORE: begin
-                    if (p0_inst[14:12] == 3'b011) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b100) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b101) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b110) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b111) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b100)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b101)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b110)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b111)
+                        exc_illegal_dec_s0 = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (p0_inst[14:12] != 3'b000) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] != 3'b000)
+                        exc_illegal_dec_s0 = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (p0_inst[14:12] == 3'b010) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b011) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b010)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s0 = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (p0_inst[14:12] == 3'b001) begin
-                        if (p0_inst[31:25] != 7'd0) exc_illegal_dec_s0 = 1'b1;
+                        if (p0_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s0 = 1'b1;
                     end
                     if (p0_inst[14:12] == 3'b101) begin
                         if ((p0_inst[31:25] != 7'd0) && (p0_inst[31:25] != 7'b0100000))
@@ -316,28 +368,34 @@ module idu(
                     end
                 end
                 OPCODE_OP: begin
-                    if (p0_inst[31:25] == 7'b0000001) exc_illegal_dec_s0 = 1'b0;
+                    if (p0_inst[31:25] == 7'b0000001)
+                        exc_illegal_dec_s0 = 1'b0;
                     else if (p0_inst[14:12] == 3'b000) begin
                         if ((p0_inst[31:25] != 7'd0) && (p0_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_s0 = 1'b1;
                     end
                     else if (p0_inst[14:12] == 3'b001) begin
-                        if (p0_inst[31:25] != 7'd0) exc_illegal_dec_s0 = 1'b1;
+                        if (p0_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s0 = 1'b1;
                     end
                     else if (p0_inst[14:12] == 3'b101) begin
                         if ((p0_inst[31:25] != 7'd0) && (p0_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_s0 = 1'b1;
                     end
                     else begin
-                        if (p0_inst[31:25] != 7'd0) exc_illegal_dec_s0 = 1'b1;
+                        if (p0_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s0 = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (p0_inst[14:12] == 3'b010) exc_illegal_dec_s0 = 1'b1;
-                    if (p0_inst[14:12] == 3'b011) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b010)
+                        exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s0 = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (p0_inst[14:12] == 3'b100) exc_illegal_dec_s0 = 1'b1;
+                    if (p0_inst[14:12] == 3'b100)
+                        exc_illegal_dec_s0 = 1'b1;
                     if (p0_inst[14:12] == 3'b000) begin
                         case (p0_inst[31:20])
                             12'h000, 12'h001, 12'h302, 12'h105: ;   // ecall / ebreak / mret / wfi（wfi 当 NOP）
@@ -345,9 +403,11 @@ module idu(
                         endcase
                     end
                     if (csr_is_access_dec_s0) begin
-                        if (!csr_exists_dec_s0) exc_illegal_dec_s0 = 1'b1;
+                        if (!csr_exists_dec_s0)
+                            exc_illegal_dec_s0 = 1'b1;
                         if (csr_ro_dec_s0) begin
-                            if (csr_wr_dec_s0) exc_illegal_dec_s0 = 1'b1;
+                            if (csr_wr_dec_s0)
+                                exc_illegal_dec_s0 = 1'b1;
                         end
                     end
                 end
@@ -462,12 +522,23 @@ module idu(
         source_a_immediate_value_decoded_s0 = 32'd0;
         source_b_immediate_value_decoded_s0 = 32'd0;
         case (p0_inst[6:0])
-            OPCODE_OP_IMM: begin source_b_immediate_decoded_s0 = 1'b1; source_b_immediate_value_decoded_s0 = immediate_decoded_s0; end
-            OPCODE_JALR:   begin source_b_immediate_decoded_s0 = 1'b1; source_b_immediate_value_decoded_s0 = immediate_decoded_s0; end
-            OPCODE_LUI:    begin source_b_immediate_decoded_s0 = 1'b1; source_b_immediate_value_decoded_s0 = immediate_decoded_s0; end
-            OPCODE_AUIPC:  begin
-                source_a_immediate_decoded_s0  = 1'b1; source_a_immediate_value_decoded_s0 = p0_addr;
-                source_b_immediate_decoded_s0  = 1'b1; source_b_immediate_value_decoded_s0 = immediate_decoded_s0;
+            OPCODE_OP_IMM: begin
+                source_b_immediate_decoded_s0 = 1'b1;
+                source_b_immediate_value_decoded_s0 = immediate_decoded_s0;
+            end
+            OPCODE_JALR: begin
+                source_b_immediate_decoded_s0 = 1'b1;
+                source_b_immediate_value_decoded_s0 = immediate_decoded_s0;
+            end
+            OPCODE_LUI: begin
+                source_b_immediate_decoded_s0 = 1'b1;
+                source_b_immediate_value_decoded_s0 = immediate_decoded_s0;
+            end
+            OPCODE_AUIPC: begin
+                source_a_immediate_decoded_s0  = 1'b1;
+                source_a_immediate_value_decoded_s0 = p0_addr;
+                source_b_immediate_decoded_s0  = 1'b1;
+                source_b_immediate_value_decoded_s0 = immediate_decoded_s0;
             end
             OPCODE_SYSTEM: begin
                 if ((p0_inst[14:12] == 3'b101) | (p0_inst[14:12] == 3'b110) | (p0_inst[14:12] == 3'b111)) begin
@@ -561,7 +632,7 @@ module idu(
         csr_exists_dec_s1    = 1'b0;
         case (p1_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_s1 = 1'b1;
             default: csr_exists_dec_s1 = 1'b0;
@@ -574,27 +645,39 @@ module idu(
             case (p1_inst[6:0])
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec_s1 = 1'b0;
                 OPCODE_LOAD: begin
-                    if (p1_inst[14:12] == 3'b011) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b110) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b111) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b110)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b111)
+                        exc_illegal_dec_s1 = 1'b1;
                 end
                 OPCODE_STORE: begin
-                    if (p1_inst[14:12] == 3'b011) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b100) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b101) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b110) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b111) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b100)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b101)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b110)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b111)
+                        exc_illegal_dec_s1 = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (p1_inst[14:12] != 3'b000) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] != 3'b000)
+                        exc_illegal_dec_s1 = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (p1_inst[14:12] == 3'b010) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b011) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b010)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s1 = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (p1_inst[14:12] == 3'b001) begin
-                        if (p1_inst[31:25] != 7'd0) exc_illegal_dec_s1 = 1'b1;
+                        if (p1_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s1 = 1'b1;
                     end
                     if (p1_inst[14:12] == 3'b101) begin
                         if ((p1_inst[31:25] != 7'd0) && (p1_inst[31:25] != 7'b0100000))
@@ -602,28 +685,34 @@ module idu(
                     end
                 end
                 OPCODE_OP: begin
-                    if (p1_inst[31:25] == 7'b0000001) exc_illegal_dec_s1 = 1'b0;
+                    if (p1_inst[31:25] == 7'b0000001)
+                        exc_illegal_dec_s1 = 1'b0;
                     else if (p1_inst[14:12] == 3'b000) begin
                         if ((p1_inst[31:25] != 7'd0) && (p1_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_s1 = 1'b1;
                     end
                     else if (p1_inst[14:12] == 3'b001) begin
-                        if (p1_inst[31:25] != 7'd0) exc_illegal_dec_s1 = 1'b1;
+                        if (p1_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s1 = 1'b1;
                     end
                     else if (p1_inst[14:12] == 3'b101) begin
                         if ((p1_inst[31:25] != 7'd0) && (p1_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_s1 = 1'b1;
                     end
                     else begin
-                        if (p1_inst[31:25] != 7'd0) exc_illegal_dec_s1 = 1'b1;
+                        if (p1_inst[31:25] != 7'd0)
+                            exc_illegal_dec_s1 = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (p1_inst[14:12] == 3'b010) exc_illegal_dec_s1 = 1'b1;
-                    if (p1_inst[14:12] == 3'b011) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b010)
+                        exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b011)
+                        exc_illegal_dec_s1 = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (p1_inst[14:12] == 3'b100) exc_illegal_dec_s1 = 1'b1;
+                    if (p1_inst[14:12] == 3'b100)
+                        exc_illegal_dec_s1 = 1'b1;
                     if (p1_inst[14:12] == 3'b000) begin
                         case (p1_inst[31:20])
                             12'h000, 12'h001, 12'h302, 12'h105: ;   // ecall / ebreak / mret / wfi（wfi 当 NOP）
@@ -631,9 +720,11 @@ module idu(
                         endcase
                     end
                     if (csr_is_access_dec_s1) begin
-                        if (!csr_exists_dec_s1) exc_illegal_dec_s1 = 1'b1;
+                        if (!csr_exists_dec_s1)
+                            exc_illegal_dec_s1 = 1'b1;
                         if (csr_ro_dec_s1) begin
-                            if (csr_wr_dec_s1) exc_illegal_dec_s1 = 1'b1;
+                            if (csr_wr_dec_s1)
+                                exc_illegal_dec_s1 = 1'b1;
                         end
                     end
                 end
@@ -748,12 +839,23 @@ module idu(
         source_a_immediate_value_decoded_s1 = 32'd0;
         source_b_immediate_value_decoded_s1 = 32'd0;
         case (p1_inst[6:0])
-            OPCODE_OP_IMM: begin source_b_immediate_decoded_s1 = 1'b1; source_b_immediate_value_decoded_s1 = immediate_decoded_s1; end
-            OPCODE_JALR:   begin source_b_immediate_decoded_s1 = 1'b1; source_b_immediate_value_decoded_s1 = immediate_decoded_s1; end
-            OPCODE_LUI:    begin source_b_immediate_decoded_s1 = 1'b1; source_b_immediate_value_decoded_s1 = immediate_decoded_s1; end
-            OPCODE_AUIPC:  begin
-                source_a_immediate_decoded_s1  = 1'b1; source_a_immediate_value_decoded_s1 = p1_addr;
-                source_b_immediate_decoded_s1  = 1'b1; source_b_immediate_value_decoded_s1 = immediate_decoded_s1;
+            OPCODE_OP_IMM: begin
+                source_b_immediate_decoded_s1 = 1'b1;
+                source_b_immediate_value_decoded_s1 = immediate_decoded_s1;
+            end
+            OPCODE_JALR: begin
+                source_b_immediate_decoded_s1 = 1'b1;
+                source_b_immediate_value_decoded_s1 = immediate_decoded_s1;
+            end
+            OPCODE_LUI: begin
+                source_b_immediate_decoded_s1 = 1'b1;
+                source_b_immediate_value_decoded_s1 = immediate_decoded_s1;
+            end
+            OPCODE_AUIPC: begin
+                source_a_immediate_decoded_s1  = 1'b1;
+                source_a_immediate_value_decoded_s1 = p1_addr;
+                source_b_immediate_decoded_s1  = 1'b1;
+                source_b_immediate_value_decoded_s1 = immediate_decoded_s1;
             end
             OPCODE_SYSTEM: begin
                 if ((p1_inst[14:12] == 3'b101) | (p1_inst[14:12] == 3'b110) | (p1_inst[14:12] == 3'b111)) begin
@@ -847,7 +949,7 @@ module idu(
         csr_exists_dec_sm    = 1'b0;
         case (pm_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_cache_flush
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_sm = 1'b1;
             default: csr_exists_dec_sm = 1'b0;
@@ -860,27 +962,39 @@ module idu(
             case (pm_inst[6:0])
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec_sm = 1'b0;
                 OPCODE_LOAD: begin
-                    if (pm_inst[14:12] == 3'b011) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b110) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b111) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b011)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b110)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b111)
+                        exc_illegal_dec_sm = 1'b1;
                 end
                 OPCODE_STORE: begin
-                    if (pm_inst[14:12] == 3'b011) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b100) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b101) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b110) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b111) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b011)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b100)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b101)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b110)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b111)
+                        exc_illegal_dec_sm = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (pm_inst[14:12] != 3'b000) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] != 3'b000)
+                        exc_illegal_dec_sm = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (pm_inst[14:12] == 3'b010) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b011) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b010)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b011)
+                        exc_illegal_dec_sm = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (pm_inst[14:12] == 3'b001) begin
-                        if (pm_inst[31:25] != 7'd0) exc_illegal_dec_sm = 1'b1;
+                        if (pm_inst[31:25] != 7'd0)
+                            exc_illegal_dec_sm = 1'b1;
                     end
                     if (pm_inst[14:12] == 3'b101) begin
                         if ((pm_inst[31:25] != 7'd0) && (pm_inst[31:25] != 7'b0100000))
@@ -888,28 +1002,34 @@ module idu(
                     end
                 end
                 OPCODE_OP: begin
-                    if (pm_inst[31:25] == 7'b0000001) exc_illegal_dec_sm = 1'b0;
+                    if (pm_inst[31:25] == 7'b0000001)
+                        exc_illegal_dec_sm = 1'b0;
                     else if (pm_inst[14:12] == 3'b000) begin
                         if ((pm_inst[31:25] != 7'd0) && (pm_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_sm = 1'b1;
                     end
                     else if (pm_inst[14:12] == 3'b001) begin
-                        if (pm_inst[31:25] != 7'd0) exc_illegal_dec_sm = 1'b1;
+                        if (pm_inst[31:25] != 7'd0)
+                            exc_illegal_dec_sm = 1'b1;
                     end
                     else if (pm_inst[14:12] == 3'b101) begin
                         if ((pm_inst[31:25] != 7'd0) && (pm_inst[31:25] != 7'b0100000))
                             exc_illegal_dec_sm = 1'b1;
                     end
                     else begin
-                        if (pm_inst[31:25] != 7'd0) exc_illegal_dec_sm = 1'b1;
+                        if (pm_inst[31:25] != 7'd0)
+                            exc_illegal_dec_sm = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (pm_inst[14:12] == 3'b010) exc_illegal_dec_sm = 1'b1;
-                    if (pm_inst[14:12] == 3'b011) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b010)
+                        exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b011)
+                        exc_illegal_dec_sm = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (pm_inst[14:12] == 3'b100) exc_illegal_dec_sm = 1'b1;
+                    if (pm_inst[14:12] == 3'b100)
+                        exc_illegal_dec_sm = 1'b1;
                     if (pm_inst[14:12] == 3'b000) begin
                         case (pm_inst[31:20])
                             12'h000, 12'h001, 12'h302, 12'h105: ;   // ecall / ebreak / mret / wfi（wfi 当 NOP）
@@ -917,9 +1037,11 @@ module idu(
                         endcase
                     end
                     if (csr_is_access_dec_sm) begin
-                        if (!csr_exists_dec_sm) exc_illegal_dec_sm = 1'b1;
+                        if (!csr_exists_dec_sm)
+                            exc_illegal_dec_sm = 1'b1;
                         if (csr_ro_dec_sm) begin
-                            if (csr_wr_dec_sm) exc_illegal_dec_sm = 1'b1;
+                            if (csr_wr_dec_sm)
+                                exc_illegal_dec_sm = 1'b1;
                         end
                     end
                 end
@@ -1034,12 +1156,23 @@ module idu(
         source_a_immediate_value_decoded_sm = 32'd0;
         source_b_immediate_value_decoded_sm = 32'd0;
         case (pm_inst[6:0])
-            OPCODE_OP_IMM: begin source_b_immediate_decoded_sm = 1'b1; source_b_immediate_value_decoded_sm = immediate_decoded_sm; end
-            OPCODE_JALR:   begin source_b_immediate_decoded_sm = 1'b1; source_b_immediate_value_decoded_sm = immediate_decoded_sm; end
-            OPCODE_LUI:    begin source_b_immediate_decoded_sm = 1'b1; source_b_immediate_value_decoded_sm = immediate_decoded_sm; end
-            OPCODE_AUIPC:  begin
-                source_a_immediate_decoded_sm  = 1'b1; source_a_immediate_value_decoded_sm = pm_addr;
-                source_b_immediate_decoded_sm  = 1'b1; source_b_immediate_value_decoded_sm = immediate_decoded_sm;
+            OPCODE_OP_IMM: begin
+                source_b_immediate_decoded_sm = 1'b1;
+                source_b_immediate_value_decoded_sm = immediate_decoded_sm;
+            end
+            OPCODE_JALR: begin
+                source_b_immediate_decoded_sm = 1'b1;
+                source_b_immediate_value_decoded_sm = immediate_decoded_sm;
+            end
+            OPCODE_LUI: begin
+                source_b_immediate_decoded_sm = 1'b1;
+                source_b_immediate_value_decoded_sm = immediate_decoded_sm;
+            end
+            OPCODE_AUIPC: begin
+                source_a_immediate_decoded_sm  = 1'b1;
+                source_a_immediate_value_decoded_sm = pm_addr;
+                source_b_immediate_decoded_sm  = 1'b1;
+                source_b_immediate_value_decoded_sm = immediate_decoded_sm;
             end
             OPCODE_SYSTEM: begin
                 if ((pm_inst[14:12] == 3'b101) | (pm_inst[14:12] == 3'b110) | (pm_inst[14:12] == 3'b111)) begin
@@ -1134,8 +1267,10 @@ module idu(
     reg reset_registered;
     always @(posedge clk) reset_registered <= rst;
 
-    assign dq0_pop = (~payload_valid_out_0 | accept_in_0) & dq0_valid;
-    assign dq1_pop = (~payload_valid_out_1 | accept_in_1) & dq1_valid;
+    always @(*) begin
+        dq0_pop = (~payload_valid_out_0 | accept_in_0) & dq0_valid;
+        dq1_pop = (~payload_valid_out_1 | accept_in_1) & dq1_valid;
+    end
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -1210,10 +1345,15 @@ module idu(
     reg [4:0]  lsu_head_index;
     reg        lsu_head_generation;
 
-    wire lsu_push = dqm_valid & (lsu_queue_count != 4'd8);
+    reg lsu_push;
+    always @(*) begin
+        lsu_push = dqm_valid & (lsu_queue_count != 4'd8);
+    end
     assign dqm_pop = lsu_push;
-    wire [LSU_QUEUE_WIDTH-1:0] lsu_entry_m = {pm_pd, pm_rs1, pm_rs2, pm_inst, pm_addr,
-                                              pm_idx, pm_gen, pm_pa, pm_pb};
+    reg [LSU_QUEUE_WIDTH-1:0] lsu_entry_m;
+    always @(*) begin
+        lsu_entry_m = {pm_pd, pm_rs1, pm_rs2, pm_inst, pm_addr, pm_idx, pm_gen, pm_pa, pm_pb};
+    end
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -1262,7 +1402,8 @@ module idu(
             lsu_queue_5 <= lsu_clear_5;
             lsu_queue_6 <= lsu_clear_6;
             lsu_queue_7 <= lsu_clear_7;
-            if (lsu_push) lsu_write_pointer <= lsu_write_pointer + 3'd1;
+            if (lsu_push)
+                lsu_write_pointer <= lsu_write_pointer + 3'd1;
             if (lsu_pop_in & (lsu_queue_count != 4'd0))
                 lsu_read_pointer <= lsu_read_pointer + 3'd1;
             lsu_queue_count <= lsu_queue_count + {3'd0, lsu_push}
@@ -1284,23 +1425,26 @@ module idu(
         lsu_head_generation  = lsu_head[12];
     end
 
-    assign lsu_instruction_out          = lsu_head_instruction;
-    assign lsu_auxiliary_address_out    = lsu_head_pc;
-    assign lsu_immediate_out            = lsu_head_instruction[6:0] == OPCODE_STORE
-                                        ? immS(lsu_head_instruction) : immI(lsu_head_instruction);
-    assign lsu_source_a_out             = lsu_head_instruction[19:15];
-    assign lsu_source_b_out             = lsu_head_instruction[24:20];
-    assign lsu_destination_register_out = (lsu_head_instruction[6:0] == OPCODE_STORE) ? 5'd0
-                                                                  : lsu_head_instruction[11:7];
-    assign lsu_load_store_function3_out = lsu_head_instruction[14:12];
-    assign lsu_is_store_out             = (lsu_head_instruction[6:0] == OPCODE_STORE);
-    assign lsu_write_enable_out         = (lsu_head_instruction[6:0] == OPCODE_LOAD)
-                                        & (lsu_head_instruction[11:7] != 5'd0);
-    assign lsu_index_out                = lsu_head_index;
-    assign lsu_generation_out           = lsu_head_generation;
-    assign lsu_valid_out                = (lsu_queue_count != 4'd0);
-    assign lsu_phys_d_out               = lsu_head[97:92];
-    assign lsu_phys_a_out               = lsu_head[11:6];
-    assign lsu_phys_b_out               = lsu_head[5:0];
+//---- LSU FIFO 队头 → 访存站载荷：一处译码，一次产生 ----
+    always @(*) begin
+        lsu_instruction_out = lsu_head_instruction;
+        lsu_auxiliary_address_out = lsu_head_pc;
+        lsu_immediate_out = (lsu_head_instruction[6:0] == OPCODE_STORE)
+                            ? immS(lsu_head_instruction) : immI(lsu_head_instruction);
+        lsu_source_a_out = lsu_head_instruction[19:15];
+        lsu_source_b_out = lsu_head_instruction[24:20];
+        lsu_destination_register_out = (lsu_head_instruction[6:0] == OPCODE_STORE)
+                                       ? 5'd0 : lsu_head_instruction[11:7];
+        lsu_load_store_function3_out = lsu_head_instruction[14:12];
+        lsu_is_store_out = (lsu_head_instruction[6:0] == OPCODE_STORE);
+        lsu_write_enable_out = (lsu_head_instruction[6:0] == OPCODE_LOAD)
+                               & (lsu_head_instruction[11:7] != 5'd0);
+        lsu_index_out = lsu_head_index;
+        lsu_generation_out = lsu_head_generation;
+        lsu_valid_out = (lsu_queue_count != 4'd0);
+        lsu_phys_d_out = lsu_head[97:92];
+        lsu_phys_a_out = lsu_head[11:6];
+        lsu_phys_b_out = lsu_head[5:0];
+    end
 
 endmodule

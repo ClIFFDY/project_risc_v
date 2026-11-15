@@ -41,13 +41,20 @@ module c_write_fifo(
     wire        empty_w;
     reg         rmw_q;      // 累加模式的读-改-写相位：0=发读，1=写回
 
-    wire [`NPU_CBUF_AW-1:0] head_addr = rdata[39:32];
-    wire [31:0]             head_data = rdata[31:0];
+    reg [`NPU_CBUF_AW-1:0] head_addr;
+    reg [31:0] head_data;
+    always @(*) begin
+        head_addr = rdata[39:32];
+        head_data = rdata[31:0];
+    end
 
     // 非累加模式只走写相位；累加模式先读原值再写和。队头在写回那一拍才出队，
     // 读相位期间队头保持不变，地址和数据都稳定。
-    wire do_read  = !empty_w && core_busy && accumulate && !rmw_q;
-    wire do_write = !empty_w && core_busy && (!accumulate || rmw_q);
+    reg do_read, do_write;
+    always @(*) begin
+        do_read = !empty_w && core_busy && accumulate && !rmw_q;
+        do_write = !empty_w && core_busy && (!accumulate || rmw_q);
+    end
 
     npu_sync_fifo #(.AW(`NPU_CWF_AW), .DW(40)) u_fifo(
         .clk(clk), .rst(rst),
@@ -59,7 +66,8 @@ module c_write_fifo(
         if (rst)
             rmw_q <= 1'b0;
         else if (!core_busy || empty_w)
-            rmw_q <= 1'b0;             // 空闲或队头处理完，下一个队头从读相位开始
+            rmw_q <= 1'b0;
+            // 空闲或队头处理完，下一个队头从读相位开始
         else if (accumulate)
             rmw_q <= !rmw_q;
     end

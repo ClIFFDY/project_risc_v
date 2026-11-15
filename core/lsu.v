@@ -63,10 +63,10 @@ module lsu(
     output reg dcache_valid_out,
 //---- B 口：ELSQ 排空（可缓存 store）→ dcache 的第二个口 ----
 //  三根载荷全是 ELSQ 的寄存器；valid 由【寄存器量】决定（队头是 store 且已退休且 B 口不忙）。
-    output [31:0] store_address_out,
-    output [31:0] store_data_out,
-    output [3:0]  store_byte_enable_out,
-    output        store_valid_out,
+    output reg [31:0] store_address_out,
+    output reg [31:0] store_data_out,
+    output reg [3:0]  store_byte_enable_out,
+    output reg        store_valid_out,
     output reg [31:0] stage1_address_out,
     output reg [31:0] stage1_data_out,
     output reg [3:0] stage1_byte_enable_out,
@@ -117,7 +117,7 @@ module lsu(
 //  只喂 ROB 提交口的排空判据，不进任何常规访存通路（见 docs/SPEC_fence_i_and_cache_range_2026-11-13.txt §2.3）。
 //  ★ 为什么不是"队列全空"：年轻 store 在队里时它退不了休（退休在队头），
 //    拿"全空"当判据会与队头的 fence 互相等待 ⇒ 死锁。已退休 = 比队头（fence）老，才是该等的。
-    output wire       elsq_retired_pending
+    output reg       elsq_retired_pending
     );
 //★★ 地址加法器位置宏（参数，不用 ifdef）：
 //  0 = 现结构：D 端只锁两个加数，地址在 Q 端现算（大核默认）
@@ -132,6 +132,25 @@ module lsu(
 
     localparam OPCODE_LOAD  = 7'b0000011;
     localparam OPCODE_STORE = 7'b0100011;
+
+//==============================================================================
+//  可缓存判据 —— 全仓**只有这一处**定义
+//
+//  字地址 [31:16] 全 0 ⇔ 落在 STCM 的 256 KB 内，与互联的 sel_stcm
+//  （字节地址 haddr[31:18]==0）是同一个口径。
+//
+//  ★ 为什么收成一处：这个表达式历史上散在四处（本来就是从 [31:14] 改到 [31:16]
+//    时四处一起改的），改一处漏三处不会有任何报错，只会让某条通路悄悄缓存/不缓存。
+//    dcache 的两处收请求判据是纯粹的重复 —— 它收到的 valid 本来就是下面两处判过
+//    之后才发出来的（dcache_valid_out / store_valid_out），所以那两处已删除，
+//    改成 dcache 里的仿真期自检（见 dcache.v 的 CFG_FAIL）。
+//  ★ 接 DDR 时只改这一行，加一项 `|| (word_address[31:30] == 2'b00)` 之类。
+    function lsuv_cacheable;
+        input [31:0] word_address;
+        begin
+            lsuv_cacheable = (word_address[31:16] == 16'd0);
+        end
+    endfunction
 
 //入队与总线选通都挂在同一个 flush_window 上，所以冲刷项必须是全集 —— 漏一项该来路的错路请求就照样上总线。
     reg flush_window;
@@ -167,8 +186,11 @@ module lsu(
     reg [2:0]  stage1_size;
     reg [31:0] stage1_base, stage1_imm, stage1_pc;
 //★ ADDER_AT_D=1 时 D 端就把地址算完，stage1_imm 恒 0（Q 端加法被常量折叠掉）
-    wire [31:0] stage1_base_next = ADDER_AT_D ? (source_a_data_final + source_imm) : source_a_data_final;
-    wire [31:0] stage1_imm_next  = ADDER_AT_D ? 32'd0 : source_imm;
+    reg [31:0] stage1_base_next, stage1_imm_next;
+    always @(*) begin
+        stage1_base_next = ADDER_AT_D ? (source_a_data_final + source_imm) : source_a_data_final;
+        stage1_imm_next = ADDER_AT_D ? 32'd0 : source_imm;
+    end
     reg        stage1_misalign;
 //★ store 流的一级：入口那一拍锁进来，下一拍进 ELSQ。
 //  它挡住自己的只有"ELSQ 没位 / 更老的外设 load 还没进队"，与总线无关。
@@ -207,7 +229,7 @@ module lsu(
 //★ 应答拍 = 返回级的装载条件（fo 48，单根 2.233 ns）⇒ 打散。
     reg        load_answer;
 //返回口仲裁的两条中间量（见下面返回级那段的注释）
-    wire       stage2_answer, elsq_return_deliver;
+    reg       stage2_answer, elsq_return_deliver;
 
 //组合判据
     reg mem_op, is_store, new_in, new_in_pre, new_go;
@@ -217,7 +239,7 @@ module lsu(
 //  把可见性从执行时刻挪到退休时刻，错路可直接丢弃。不前送：load 命中在队项就扣住（CoreMark 仅 1.98%）。
 //==============================================================================
     reg        store_queue_a_valid, store_queue_b_valid;
-    reg [31:0] store_queue_a_address, store_queue_a_write_data, store_queue_b_address, store_queue_b_write_data;
+    reg [31:0] store_queue_a_write_data, store_queue_b_address, store_queue_b_write_data;
     reg [4:0]  store_queue_a_index, store_queue_b_index;
     reg [5:0]  store_queue_a_phys,  store_queue_b_phys;
     reg        store_queue_a_generation, store_queue_b_generation;
@@ -240,8 +262,11 @@ module lsu(
 //★ 2026-11-12：入队要按【年龄】定位（见下面 SQ 次态 "口1/口2 按年龄追加" 那段的说明）。
 //  年龄 = 与 ROB 队头的距离。两个候选项同减队头，比较就退化成比两个差值。
     reg  [4:0] elsq_head_number;
-    wire [4:0] elsq_age_load_in  = stage1_index      - elsq_head_number;
-    wire [4:0] elsq_age_store_in = store_stage_index - elsq_head_number;
+    reg [4:0] elsq_age_load_in, elsq_age_store_in;
+    always @(*) begin
+        elsq_age_load_in = stage1_index      - elsq_head_number;
+        elsq_age_store_in = store_stage_index - elsq_head_number;
+    end
     reg [31:0] elsq_load_data;
 //★ ELSQ 外设 load 的返回口保持格：返回口一拍只送一笔，dcache 与 ELSQ 应答同拍时存这里。
     reg        elsq_return_hold;
@@ -294,11 +319,15 @@ module lsu(
 //非对齐：只看和的最低位（1 字节看 bit0，2 字节看 bit1:0）。
     always @(*) begin
         stage1_misalign = 1'b0;
-        if (stage1_size[1:0] == 2'b01 && stage1_sum[0] != 1'b0) stage1_misalign = 1'b1;
-        if (stage1_size[1:0] == 2'b10 && stage1_sum[1:0] != 2'd0) stage1_misalign = 1'b1;
+        if (stage1_size[1:0] == 2'b01 && stage1_sum[0] != 1'b0)
+            stage1_misalign = 1'b1;
+        if (stage1_size[1:0] == 2'b10 && stage1_sum[1:0] != 2'd0)
+            stage1_misalign = 1'b1;
         store_stage_misalign = 1'b0;
-        if (store_stage_size[1:0] == 2'b01 && store_stage_sum[0] != 1'b0) store_stage_misalign = 1'b1;
-        if (store_stage_size[1:0] == 2'b10 && store_stage_sum[1:0] != 2'd0) store_stage_misalign = 1'b1;
+        if (store_stage_size[1:0] == 2'b01 && store_stage_sum[0] != 1'b0)
+            store_stage_misalign = 1'b1;
+        if (store_stage_size[1:0] == 2'b10 && store_stage_sum[1:0] != 2'd0)
+            store_stage_misalign = 1'b1;
 //★ one-shot：报过一次就不再报（这条要多等一拍冲刷窗口）
         stage1_fault = stage1_valid & stage1_misalign & ~stage1_faulted;
     end
@@ -348,22 +377,32 @@ module lsu(
 //空总线（blank）：miss 在跑，或在途那笔读还没被应答（含级2 刚摆上、下一拍才进级3 的那笔）⇒ 不摆。
 //★ non_cacheable 必须在 load_out 之前赋值：否则 load_out 拿到的是上一条的译码 
 //  （前一条 store、本条外设 load ⇒ 两笔应答撞拍被吞）。
-//★ 可缓存判据 ≡ 内存译码（2026-11-13）：字地址 [31:16] 全 0 ⇔ 落在 STCM 的 256 KB 内。
-//  原来这里是 [31:14]（= 前 64 KB），那是 64 KB dtcm 年代的遗留 —— 统一 L2 顶上来之后
-//  没人跟着改，结果指令能在 256 KB 里任何位置被缓存、数据在 64 KB 以上却不能（取指走
-//  icache→L2，不经过这条判据）。dcache.v 的两处收请求判据必须与这里【同一个口径】，
-//  四处一起改；接 DDR 时在这里加一项即可，不要再散成四处。
-        stage1_non_cacheable = (stage1_word[31:16] != 16'd0);
+//★ 可缓存判据见文件上方的 lsuv_cacheable()：**全仓只有那一处定义**。
+//  dcache 那边不再自己抄一份（它收到的 valid 本来就是这里判过之后才发的）。
+        stage1_non_cacheable = !lsuv_cacheable(stage1_word);
 //★ st→ld 前送：级1 这条 load 的【字地址】命中 SQ 里一笔【整字】store ⇒ 数据现成
 //  （store 写满了整字，这条 load 要的字节全在里面），不必等它排空、更不必再去 dcache 读。
 //  只认 size==3'd2（sw）：sb/sh 没写满整字。试过按字节区间算覆盖（sb→lb、sh→lh 也前送），
 //  CoreMark 上只多认出 16 拍、一拍没省，却要多摆 6 个比较器在地址加法后面 —— 不做。
 //  两条 SQ 项都命中时取年轻的 B。SQ 里的项一定比级1 这条老（同一条顺序流水进来的）。
         store_forward_a = store_queue_a_valid & store_queue_a_kind & (store_queue_a_size == 3'd2)
-                        & (store_queue_a_address == stage1_word);
+                        & (store_address_out == stage1_word);
         store_forward_b = store_queue_b_valid & store_queue_b_kind & (store_queue_b_size == 3'd2)
                         & (store_queue_b_address == stage1_word);
-        store_forward_hit = stage1_valid & ~stage1_sent & ~stage1_misalign & (store_forward_a | store_forward_b);
+//★ 2026-11-13：**外设 load 不许走 store 前送**（`& ~stage1_non_cacheable`）。
+//  踩过的死锁（同地址 lw 紧跟 sw，比如 GPIO 的读-改-写）：
+//    · 这条 load 是 non_cacheable ⇒ `load_push_queue` 把它推进 ELSQ 排队（stage1_sent 随之置起）；
+//    · 同一条 load 又命中了下面这个前送（前一条 store 还在 ELSQ 里没走完）
+//      ⇒ `stage1_move` 放行 ⇒ 级2 用前送数据应答 ⇒ 写回口把 ROB 项标成"已写"⇒ 它退休了；
+//    · 而 ELSQ 那一项的发送资格是 `elsq_load_go = ... & head_one_hot_registered[a_index]`
+//      —— ROB 队头已经越过它，永远不再满足 ⇒ 这一项既发不出去也不出队 ⇒ 整核退休停死。
+//    （实测：PUSH idx=13 → 2 拍后同索引写回 data=GPIO_MODE → RET0 → 之后 static 卡住。）
+//  外设 load 只有一条路：进 ELSQ，按年龄顺序发上总线、应答回来才出队。
+//  语义上也更对：读外设要读"器件现在的值"，不要用队列里那条还没落地的 store 顶替。
+//  注意 `stage1_put`（走 dcache 那条）早在 2026-11-04 就带了 `~stage1_non_cacheable`，
+//  这里当初漏了同一项。
+        store_forward_hit = stage1_valid & ~stage1_sent & ~stage1_misalign & ~stage1_non_cacheable
+                          & (store_forward_a | store_forward_b);
         store_forward_word = store_forward_b ? store_queue_b_write_data : store_queue_a_write_data;
 //按这条 load 的宽度/偏移从那个整字里切（与级3 的 load_data_current 逐位同形）
         case (stage1_size)
@@ -404,28 +443,24 @@ module lsu(
         take_store = new_in & new_go &  is_store;
     end
 
-//排空那一笔该发给谁：dcache 认的地址范围 = (addr[31:24]==0 && addr[23:13]==11'h100)。
-//  ★ 与 dcache.v 的 read_request/write_request、以及入口的 stage1_non_cacheable 用【同一个表达式】，
-//    三处口径必须一致，否则同一条 store 会同时/都不被某个从设备接走。
-//  ★ 只由 store_queue_a_address（寄存器）译码，纯组合、不进地址路径。
+//排空那一笔该发给谁：与入口那条 stage1_non_cacheable 用的是**同一个函数**（见文件上方），
+//  不再各写一份表达式。只由 store_address_out（寄存器）译码，纯组合、不进地址路径。
 //  ★ mask/移位也只算一遍：两支寄存器装的是同一个值，不能一支读另一支的旧值。
     reg store_drain_non_cacheable;
-    reg [31:0] store_drain_data;
-    reg [3:0]  store_drain_byte_enable;
     always @(*) begin
-        store_drain_non_cacheable = (store_queue_a_address[31:16] != 16'd0);
+        store_drain_non_cacheable = !lsuv_cacheable(store_address_out);
         case (store_queue_a_size)
             3'b000: begin
-                store_drain_data        = {24'd0, store_queue_a_write_data[7:0]}  << (8 * store_queue_a_offset);
-                store_drain_byte_enable = 4'b0001 << store_queue_a_offset;
+                store_data_out        = {24'd0, store_queue_a_write_data[7:0]}  << (8 * store_queue_a_offset);
+                store_byte_enable_out = 4'b0001 << store_queue_a_offset;
             end
             3'b001: begin
-                store_drain_data        = {16'd0, store_queue_a_write_data[15:0]} << (16 * store_queue_a_offset[1]);
-                store_drain_byte_enable = 4'b0011 << (2 * store_queue_a_offset[1]);
+                store_data_out        = {16'd0, store_queue_a_write_data[15:0]} << (16 * store_queue_a_offset[1]);
+                store_byte_enable_out = 4'b0011 << (2 * store_queue_a_offset[1]);
             end
             default: begin
-                store_drain_data        = store_queue_a_write_data;
-                store_drain_byte_enable = 4'b1111;
+                store_data_out        = store_queue_a_write_data;
+                store_byte_enable_out = 4'b1111;
             end
         endcase
     end
@@ -442,18 +477,18 @@ module lsu(
     end
 
 //B 口（ELSQ 排空）的载荷：全是寄存器，直接连出去，不经过任何当拍的地址量。
-    assign store_address_out     = store_queue_a_address;
-    assign store_data_out        = store_drain_data;
-    assign store_byte_enable_out = store_drain_byte_enable;
-    assign store_valid_out       = store_queue_drain & ~store_drain_non_cacheable;
+    always @(*) begin
+        store_valid_out = store_queue_drain & ~store_drain_non_cacheable;
+    end
 
 //★ 2026-11-13（fence 排空判据）：还压着"比队头老、已退休、没排出去"的项。
 //  A 位是最老的，所以只要 A 位不够退休资格，队里剩下的就全是年轻项（与队头的 fence 无关）；
 //  fence 在队头时它自己不在 ELSQ 里 ⇒ 读到的每一项只要是 _ret，就一定是比 fence 老的。
 //  A 位的 _ret 包含"已发出去但还没收到落地确认"的那段（store_inflight 期间它保持 _ret）。
 //  纯寄存器量相与，没有任何地址参与 ⇒ 不给访存通路加级。
-    assign elsq_retired_pending = (store_queue_a_valid & store_queue_a_ret) |
-                                  (store_queue_b_valid & store_queue_b_ret_now);
+    always @(*) begin
+        elsq_retired_pending = (store_queue_a_valid & store_queue_a_ret) | (store_queue_b_valid & store_queue_b_ret_now);
+    end
 
 //外部口（AHB master + tim_in）：仍然寄存 —— 两个源都是 ELSQ 的寄存器
     always @(posedge clk) begin
@@ -472,16 +507,16 @@ module lsu(
             stage1_we_out <= 1'b0;
             stage1_valid_out <= 1'b0;
             if (elsq_load_go) begin
-                stage1_address_out  <= store_queue_a_address;
+                stage1_address_out  <= store_address_out;
                 stage1_data_out     <= 32'd0;
                 stage1_byte_enable_out <= 4'b1111;
                 stage1_we_out    <= 1'b0;
                 stage1_valid_out <= 1'b1;
             end
             else if (store_queue_drain) begin
-                stage1_address_out     <= store_queue_a_address;
-                stage1_data_out        <= store_drain_data;
-                stage1_byte_enable_out <= store_drain_byte_enable;
+                stage1_address_out     <= store_address_out;
+                stage1_data_out        <= store_data_out;
+                stage1_byte_enable_out <= store_byte_enable_out;
                 stage1_we_out          <= 1'b1;
                 stage1_valid_out       <= store_drain_non_cacheable;
             end
@@ -492,10 +527,10 @@ module lsu(
     always @(posedge clk) begin
         if (reset_registered) begin
             load_wake_registered <= 1'b0;
-            load_wake_index_registered <= 4'd0;
+            load_wake_index_registered <= 5'd0;
             load_wake_generation_registered <= 1'b0;
             load_nack_registered <= 1'b0;
-            load_nack_index_registered <= 4'd0;
+            load_nack_index_registered <= 5'd0;
             load_nack_generation_registered <= 1'b0;
         end
         else begin
@@ -514,9 +549,12 @@ module lsu(
 //  一笔 store 的在途位：起飞 → dcache B 口办完
 //==============================================================================
     always @(posedge clk) begin
-        if (reset_registered)      store_inflight <= 1'b0;
-        else if (store_queue_drain) store_inflight <= 1'b1;
-        else if (store_finish)      store_inflight <= 1'b0;
+        if (reset_registered)
+            store_inflight <= 1'b0;
+        else if (store_queue_drain)
+            store_inflight <= 1'b1;
+        else if (store_finish)
+            store_inflight <= 1'b0;
     end
 
 //===============================================================
@@ -535,7 +573,8 @@ module lsu(
             stage1_base <= 32'd0;
             stage1_imm  <= 32'd0;
             stage1_pc   <= 32'd0;
-            stage1_index <= 4'd0; stage1_phys <= 6'd0;
+            stage1_index <= 5'd0;
+            stage1_phys <= 6'd0;
             stage1_generation <= 1'b0;
             stage1_size <= 3'd0;
             stage1_cmt <= 1'b0;
@@ -544,7 +583,7 @@ module lsu(
         else begin
 //★ s2 的"出"与"进"必须在同一条优先级链里判：旧住户被冲刷作废的那拍，
 //  s1 里活着的那条正好前移进来，块尾独立的 kill 会把它一起抹掉 ⇒ 永不写回、卡队头 ⇒ 自锁。
-            if (stage1_move) begin                                          // 级2 → 级3（请求已摆过）
+            if (stage1_move) begin // 级2 → 级3（请求已摆过）
                 stage2_valid <= ~stage1_kill;                                       // 来的是错路就不许落进级3
                 stage2_size <= stage1_size;
                 stage2_off <= stage1_sum[1:0];
@@ -556,12 +595,13 @@ module lsu(
                 stage2_forward_data <= store_forward_data;
                 stage1_valid <= 1'b0;
             end
-            else if (stage2_done | stage2_kill) begin                           // 级3 走掉 / 被冲刷作废
+            else if (stage2_done | stage2_kill) begin // 级3 走掉 / 被冲刷作废
                 stage2_valid <= 1'b0;
             end
             if (stage1_sent_go)
-                stage1_sent <= 1'b1;  // 真的弄出去了（读上 dcache 口 / 进了 ELSQ）
-            if (take_load) begin                                        // 本条是 load：进 loadQ
+                stage1_sent <= 1'b1;
+                // 真的弄出去了（读上 dcache 口 / 进了 ELSQ）
+            if (take_load) begin // 本条是 load：进 loadQ
                 stage1_valid <= 1'b1;
                 stage1_size <= function10[2:0];
 //★ 只锁两个加数，地址由 Q 端加法器现算
@@ -571,7 +611,8 @@ module lsu(
                 stage1_index <= idx_in;
                 stage1_phys  <= phys_in;
                 stage1_generation <= gen_in;
-                stage1_sent <= 1'b0;                                        // 一律从'没发过'起步
+                stage1_sent <= 1'b0;
+                // 一律从'没发过'起步
                 stage1_faulted <= 1'b0;
 //★★ 2026-10-31 修（本次改造引入的 bug，代价是一次整核死锁）：
 //  loadQ 改成 load 专用之后，`stage1_cmt`（"这条已经退休、不允许再按年龄冲刷"）【没有在新条进来时清零】，
@@ -588,11 +629,13 @@ module lsu(
             stage1_valid <= 1'b0;
             stage1_sent  <= 1'b0;
         end
-        if (stage1_misalign & ~take_load) stage1_faulted <= 1'b1;
+        if (stage1_misalign & ~take_load)
+            stage1_faulted <= 1'b1;
 
 //★ 这里【不再】给 load 置 stage1_cmt：load 是"写回才算完"，不存在提前退休；
 //  置了就等于给它免死金牌，冲刷漏杀 ⇒ 过期项滞留在 ELSQ。见上面 take_load 分支的说明。
-        if (stage1_kill && ~take_load) stage1_valid <= 1'b0;
+        if (stage1_kill && ~take_load)
+            stage1_valid <= 1'b0;
     end
 
 //==============================================================================
@@ -607,7 +650,8 @@ module lsu(
             store_stage_imm <= 32'd0;
             store_stage_write_data <= 32'd0;
             store_stage_pc <= 32'd0;
-            store_stage_index <= 4'd0; store_stage_phys <= 6'd0;
+            store_stage_index <= 5'd0;
+            store_stage_phys <= 6'd0;
             store_stage_generation <= 1'b0;
             store_stage_size <= 3'd0;
         end
@@ -624,8 +668,10 @@ module lsu(
                 store_stage_size <= function10[2:0];
                 store_stage_cmt <= retire_hit_now;   // ★ 可能进 LSU 那一拍就已经退休了
             end
-            if (store_stage_leave & ~take_store) store_stage_valid <= 1'b0;
-            if (store_stage_ret & ~take_store)   store_stage_cmt <= 1'b1;
+            if (store_stage_leave & ~take_store)
+                store_stage_valid <= 1'b0;
+            if (store_stage_ret & ~take_store)
+                store_stage_cmt <= 1'b1;
         end
     end
 
@@ -641,8 +687,11 @@ module lsu(
 //★ 2026-11-04 精确冲刷：按槽查击杀掩码 —— 比分支更老的、还在排队的 store/load 必须留住。
 //  整窗那一档（异常 / 中断）掩码全亮，与改动前逐字等价。
 //  ★ ELSQ 里已经摆上总线的 store 本来就不可撤回（~store_queue_a_ret 之外还有 inflight 挡着），这条不变。
-        store_queue_a_drop = store_queue_a_valid & flush_window & ~store_queue_a_ret;
-        store_queue_b_drop = store_queue_b_valid & flush_window & ~store_queue_b_ret_now;
+//★ 2026-11-15：还要带年龄 —— 已经退休的 store 是架构上生效了的，改向边界在它后面，
+//  它不在冲刷窗口里。只吃 flush_window 会把【比边界更老的】store 一起抹掉。
+//  年龄判据取 *_ready（粘滞的"该 ROB 项已退休"），比 *_ret（一拍脉冲）宽，正好。
+        store_queue_a_drop = store_queue_a_valid & flush_window & ~store_queue_a_ready & ~store_queue_a_ret;
+        store_queue_b_drop = store_queue_b_valid & flush_window & ~store_queue_b_ready & ~store_queue_b_ret_now;
 //本拍是不是一笔【读】摆上总线
         load_go  = load_send_go;
 //★ 外设 load 的资格取【在 ROB 队头】：应答回来才出队、才退休 ⇒ 不再需要错路遮挡。
@@ -700,30 +749,42 @@ module lsu(
                           (ret1_valid & (ret1_index == idx_in) & (ret1_generation == gen_in));
 //★ 两边都是【字地址】，直接整字比较。曾在左侧又右移两位 ⇒ 两边差 4 倍 ⇒ store_queue_hit 恒 0
 //  ⇒「load 命中在册同一 word 就压住」这条门是死的（arch-test fence-01 读回旧值）。
-        store_queue_hit_stage1 = (store_queue_a_valid & (store_queue_a_address == stage1_word)) |
+        store_queue_hit_stage1 = (store_queue_a_valid & (store_address_out == stage1_word)) |
                     (store_queue_b_valid & (store_queue_b_address == stage1_word));
     end
 
 //SQ 次态：先丢/排空，再入队（两笔同拍时排空腾出的位置给新来的）
 //★ 2026-11-12：ROB 队头 one-hot → 槽号。只用寄存器的 Q 端，不进发射级入口门。
-    always @(*) begin : blk_elsq_head_number
+    always @(*) begin
+        : blk_elsq_head_number
         integer hb;
         elsq_head_number = 5'd0;
         for (hb = 0; hb < 32; hb = hb + 1)
-            if (head_one_hot_registered[hb]) elsq_head_number = hb[4:0];
+            if (head_one_hot_registered[hb])
+                elsq_head_number = hb[4:0];
     end
 
     always @(*) begin
 //1) 先把本拍命中的退休脉冲锁进每一项的 rdy（必须在移位之前）
-        next_a_valid = store_queue_a_valid; next_a_address = store_queue_a_address; next_a_write_data = store_queue_a_write_data;
-        next_a_kind = store_queue_a_kind; next_a_size = store_queue_a_size; next_a_offset = store_queue_a_offset;
-        next_a_index = store_queue_a_index; next_a_generation = store_queue_a_generation;
+        next_a_valid = store_queue_a_valid;
+        next_a_address = store_address_out;
+        next_a_write_data = store_queue_a_write_data;
+        next_a_kind = store_queue_a_kind;
+        next_a_size = store_queue_a_size;
+        next_a_offset = store_queue_a_offset;
+        next_a_index = store_queue_a_index;
+        next_a_generation = store_queue_a_generation;
         next_a_phys  = store_queue_a_phys;
         next_a_ready = store_queue_a_ready | (store_queue_a_valid & ((ret0_valid & (ret0_index == store_queue_a_index) & (ret0_generation == store_queue_a_generation)) |
                                       (ret1_valid & (ret1_index == store_queue_a_index) & (ret1_generation == store_queue_a_generation))));
-        next_b_valid = store_queue_b_valid; next_b_address = store_queue_b_address; next_b_write_data = store_queue_b_write_data;
-        next_b_kind = store_queue_b_kind; next_b_size = store_queue_b_size; next_b_offset = store_queue_b_offset;
-        next_b_index = store_queue_b_index; next_b_generation = store_queue_b_generation;
+        next_b_valid = store_queue_b_valid;
+        next_b_address = store_queue_b_address;
+        next_b_write_data = store_queue_b_write_data;
+        next_b_kind = store_queue_b_kind;
+        next_b_size = store_queue_b_size;
+        next_b_offset = store_queue_b_offset;
+        next_b_index = store_queue_b_index;
+        next_b_generation = store_queue_b_generation;
         next_b_phys  = store_queue_b_phys;
         next_a_sent = store_queue_a_sent | (store_queue_a_valid & ~store_queue_a_kind & elsq_load_go);
         next_b_sent = store_queue_b_sent;
@@ -731,10 +792,16 @@ module lsu(
                                       (ret1_valid & (ret1_index == store_queue_b_index) & (ret1_generation == store_queue_b_generation))));
         if (elsq_pop) begin
             next_a_valid = next_b_valid & ~store_queue_b_drop;
-            next_a_address = next_b_address; next_a_write_data = next_b_write_data;
-            next_a_index = next_b_index; next_a_generation = next_b_generation; next_a_ready = next_b_ready; next_a_sent = next_b_sent;
+            next_a_address = next_b_address;
+            next_a_write_data = next_b_write_data;
+            next_a_index = next_b_index;
+            next_a_generation = next_b_generation;
+            next_a_ready = next_b_ready;
+            next_a_sent = next_b_sent;
             next_a_phys = next_b_phys;
-            next_a_kind = next_b_kind; next_a_size = next_b_size; next_a_offset = next_b_offset;
+            next_a_kind = next_b_kind;
+            next_a_size = next_b_size;
+            next_a_offset = next_b_offset;
             next_b_valid = 1'b0;
         end
         else if (store_queue_b_drop) begin
@@ -755,74 +822,146 @@ module lsu(
 //   B 位此刻必空：能入队 ⇒ elsq_free != 0；A 位有货 ⇒ 占用只可能是 1。
         if (load_push_queue) begin
             if (!next_a_valid) begin
-                next_a_valid = 1'b1; next_a_address = stage1_word; next_a_write_data = 32'd0;
-                next_a_index = stage1_index; next_a_generation = stage1_generation; next_a_phys = stage1_phys;
-                next_a_kind = 1'b0; next_a_size = stage1_size; next_a_offset = stage1_sum[1:0];
-                next_a_ready = 1'b0; next_a_sent = 1'b0;   // 外设 load 不预置 ready：它是「写回才算完」
+                next_a_valid = 1'b1;
+                next_a_address = stage1_word;
+                next_a_write_data = 32'd0;
+                next_a_index = stage1_index;
+                next_a_generation = stage1_generation;
+                next_a_phys = stage1_phys;
+                next_a_kind = 1'b0;
+                next_a_size = stage1_size;
+                next_a_offset = stage1_sum[1:0];
+                next_a_ready = 1'b0;
+                next_a_sent = 1'b0; // 外设 load 不预置 ready：它是「写回才算完」
             end
             else if (~next_a_sent & ~next_a_ready & (~store_inflight | elsq_pop)
                      & (elsq_age_load_in < (next_a_index - elsq_head_number))) begin
-                next_b_valid = 1'b1; next_b_address = next_a_address; next_b_write_data = next_a_write_data;
-                next_b_index = next_a_index; next_b_generation = next_a_generation; next_b_phys = next_a_phys;
-                next_b_kind = next_a_kind; next_b_size = next_a_size; next_b_offset = next_a_offset;
-                next_b_ready = next_a_ready; next_b_sent = next_a_sent;
-                next_a_valid = 1'b1; next_a_address = stage1_word; next_a_write_data = 32'd0;
-                next_a_index = stage1_index; next_a_generation = stage1_generation; next_a_phys = stage1_phys;
-                next_a_kind = 1'b0; next_a_size = stage1_size; next_a_offset = stage1_sum[1:0];
-                next_a_ready = 1'b0; next_a_sent = 1'b0;
+                next_b_valid = 1'b1;
+                next_b_address = next_a_address;
+                next_b_write_data = next_a_write_data;
+                next_b_index = next_a_index;
+                next_b_generation = next_a_generation;
+                next_b_phys = next_a_phys;
+                next_b_kind = next_a_kind;
+                next_b_size = next_a_size;
+                next_b_offset = next_a_offset;
+                next_b_ready = next_a_ready;
+                next_b_sent = next_a_sent;
+                next_a_valid = 1'b1;
+                next_a_address = stage1_word;
+                next_a_write_data = 32'd0;
+                next_a_index = stage1_index;
+                next_a_generation = stage1_generation;
+                next_a_phys = stage1_phys;
+                next_a_kind = 1'b0;
+                next_a_size = stage1_size;
+                next_a_offset = stage1_sum[1:0];
+                next_a_ready = 1'b0;
+                next_a_sent = 1'b0;
             end
             else begin
-                next_b_valid = 1'b1; next_b_address = stage1_word; next_b_write_data = 32'd0;
-                next_b_index = stage1_index; next_b_generation = stage1_generation; next_b_phys = stage1_phys;
-                next_b_kind = 1'b0; next_b_size = stage1_size; next_b_offset = stage1_sum[1:0];
-                next_b_ready = 1'b0; next_b_sent = 1'b0;
+                next_b_valid = 1'b1;
+                next_b_address = stage1_word;
+                next_b_write_data = 32'd0;
+                next_b_index = stage1_index;
+                next_b_generation = stage1_generation;
+                next_b_phys = stage1_phys;
+                next_b_kind = 1'b0;
+                next_b_size = stage1_size;
+                next_b_offset = stage1_sum[1:0];
+                next_b_ready = 1'b0;
+                next_b_sent = 1'b0;
             end
         end
         if (store_stage_push) begin
             if (!next_a_valid) begin
-                next_a_valid = 1'b1; next_a_address = store_stage_word; next_a_write_data = store_stage_write_data;
-                next_a_index = store_stage_index; next_a_generation = store_stage_generation; next_a_phys = store_stage_phys;
-                next_a_kind = 1'b1; next_a_size = store_stage_size; next_a_offset = store_stage_sum[1:0];
-                next_a_ready = store_queue_push_ready; next_a_sent = 1'b0;
+                next_a_valid = 1'b1;
+                next_a_address = store_stage_word;
+                next_a_write_data = store_stage_write_data;
+                next_a_index = store_stage_index;
+                next_a_generation = store_stage_generation;
+                next_a_phys = store_stage_phys;
+                next_a_kind = 1'b1;
+                next_a_size = store_stage_size;
+                next_a_offset = store_stage_sum[1:0];
+                next_a_ready = store_queue_push_ready;
+                next_a_sent = 1'b0;
             end
             else if (~next_a_sent & ~next_a_ready & (~store_inflight | elsq_pop)
                      & (elsq_age_store_in < (next_a_index - elsq_head_number))) begin
-                next_b_valid = 1'b1; next_b_address = next_a_address; next_b_write_data = next_a_write_data;
-                next_b_index = next_a_index; next_b_generation = next_a_generation; next_b_phys = next_a_phys;
-                next_b_kind = next_a_kind; next_b_size = next_a_size; next_b_offset = next_a_offset;
-                next_b_ready = next_a_ready; next_b_sent = next_a_sent;
-                next_a_valid = 1'b1; next_a_address = store_stage_word; next_a_write_data = store_stage_write_data;
-                next_a_index = store_stage_index; next_a_generation = store_stage_generation; next_a_phys = store_stage_phys;
-                next_a_kind = 1'b1; next_a_size = store_stage_size; next_a_offset = store_stage_sum[1:0];
-                next_a_ready = store_queue_push_ready; next_a_sent = 1'b0;
+                next_b_valid = 1'b1;
+                next_b_address = next_a_address;
+                next_b_write_data = next_a_write_data;
+                next_b_index = next_a_index;
+                next_b_generation = next_a_generation;
+                next_b_phys = next_a_phys;
+                next_b_kind = next_a_kind;
+                next_b_size = next_a_size;
+                next_b_offset = next_a_offset;
+                next_b_ready = next_a_ready;
+                next_b_sent = next_a_sent;
+                next_a_valid = 1'b1;
+                next_a_address = store_stage_word;
+                next_a_write_data = store_stage_write_data;
+                next_a_index = store_stage_index;
+                next_a_generation = store_stage_generation;
+                next_a_phys = store_stage_phys;
+                next_a_kind = 1'b1;
+                next_a_size = store_stage_size;
+                next_a_offset = store_stage_sum[1:0];
+                next_a_ready = store_queue_push_ready;
+                next_a_sent = 1'b0;
             end
             else begin
-                next_b_valid = 1'b1; next_b_address = store_stage_word; next_b_write_data = store_stage_write_data;
-                next_b_index = store_stage_index; next_b_generation = store_stage_generation; next_b_phys = store_stage_phys;
-                next_b_kind = 1'b1; next_b_size = store_stage_size; next_b_offset = store_stage_sum[1:0];
-                next_b_ready = store_queue_push_ready; next_b_sent = 1'b0;
+                next_b_valid = 1'b1;
+                next_b_address = store_stage_word;
+                next_b_write_data = store_stage_write_data;
+                next_b_index = store_stage_index;
+                next_b_generation = store_stage_generation;
+                next_b_phys = store_stage_phys;
+                next_b_kind = 1'b1;
+                next_b_size = store_stage_size;
+                next_b_offset = store_stage_sum[1:0];
+                next_b_ready = store_queue_push_ready;
+                next_b_sent = 1'b0;
             end
         end
     end
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            store_done <= 1'b0; store_index_out <= 4'd0; store_generation_out <= 1'b0;
-            store_queue_a_valid <= 1'b0; store_queue_b_valid <= 1'b0;
-            store_queue_a_address <= 32'd0; store_queue_b_address <= 32'd0;
-            store_queue_a_write_data <= 32'd0; store_queue_b_write_data <= 32'd0;
-            store_queue_a_index <= 4'd0; store_queue_b_index <= 4'd0;
-            store_queue_a_phys  <= 6'd0; store_queue_b_phys  <= 6'd0;
-            store_queue_a_generation <= 1'b0; store_queue_b_generation <= 1'b0;
-            store_queue_a_kind <= 1'b0; store_queue_b_kind <= 1'b0;
-            store_queue_a_size <= 3'd0; store_queue_b_size <= 3'd0;
-            store_queue_a_offset <= 2'd0; store_queue_b_offset <= 2'd0;
-            store_queue_a_ready <= 1'b0; store_queue_b_ready <= 1'b0;
-            store_queue_a_sent <= 1'b0;  store_queue_b_sent <= 1'b0;
+            store_done <= 1'b0;
+            store_index_out <= 5'd0;
+            store_generation_out <= 1'b0;
+            store_queue_a_valid <= 1'b0;
+            store_queue_b_valid <= 1'b0;
+            store_address_out <= 32'd0;
+            store_queue_b_address <= 32'd0;
+            store_queue_a_write_data <= 32'd0;
+            store_queue_b_write_data <= 32'd0;
+            store_queue_a_index <= 5'd0;
+            store_queue_b_index <= 5'd0;
+            store_queue_a_phys  <= 6'd0;
+            store_queue_b_phys  <= 6'd0;
+            store_queue_a_generation <= 1'b0;
+            store_queue_b_generation <= 1'b0;
+            store_queue_a_kind <= 1'b0;
+            store_queue_b_kind <= 1'b0;
+            store_queue_a_size <= 3'd0;
+            store_queue_b_size <= 3'd0;
+            store_queue_a_offset <= 2'd0;
+            store_queue_b_offset <= 2'd0;
+            store_queue_a_ready <= 1'b0;
+            store_queue_b_ready <= 1'b0;
+            store_queue_a_sent <= 1'b0;
+            store_queue_b_sent <= 1'b0;
         end
         else begin
-            store_queue_a_valid <= next_a_valid; store_queue_a_address <= next_a_address; store_queue_a_write_data <= next_a_write_data;
-            store_queue_a_index <= next_a_index; store_queue_a_generation <= next_a_generation;
+            store_queue_a_valid <= next_a_valid;
+            store_address_out <= next_a_address;
+            store_queue_a_write_data <= next_a_write_data;
+            store_queue_a_index <= next_a_index;
+            store_queue_a_generation <= next_a_generation;
             store_queue_a_phys  <= next_a_phys;
 //★ 完成口必须是一拍脉冲 + 同拍锁存的载荷：idx/gen 无条件跟输入口走会认错槽 ⇒ 那条 store 永远退不了。
 //★ 完成口现在挂在【入口收下 store 那一拍】：它后面一定会进 ELSQ（没有"被拒"这条路），
@@ -832,12 +971,20 @@ module lsu(
                 store_index_out <= idx_in;
                 store_generation_out <= gen_in;
             end
-            store_queue_a_kind <= next_a_kind; store_queue_a_size <= next_a_size; store_queue_a_offset <= next_a_offset;
-            store_queue_b_kind <= next_b_kind; store_queue_b_size <= next_b_size; store_queue_b_offset <= next_b_offset;
+            store_queue_a_kind <= next_a_kind;
+            store_queue_a_size <= next_a_size;
+            store_queue_a_offset <= next_a_offset;
+            store_queue_b_kind <= next_b_kind;
+            store_queue_b_size <= next_b_size;
+            store_queue_b_offset <= next_b_offset;
             store_queue_a_ready <= next_a_ready;
-            store_queue_a_sent <= next_a_sent; store_queue_b_sent <= next_b_sent;
-            store_queue_b_valid <= next_b_valid; store_queue_b_address <= next_b_address; store_queue_b_write_data <= next_b_write_data;
-            store_queue_b_index <= next_b_index; store_queue_b_generation <= next_b_generation;
+            store_queue_a_sent <= next_a_sent;
+            store_queue_b_sent <= next_b_sent;
+            store_queue_b_valid <= next_b_valid;
+            store_queue_b_address <= next_b_address;
+            store_queue_b_write_data <= next_b_write_data;
+            store_queue_b_index <= next_b_index;
+            store_queue_b_generation <= next_b_generation;
             store_queue_b_phys  <= next_b_phys;
             store_queue_b_ready <= next_b_ready;
         end
@@ -849,8 +996,10 @@ module lsu(
 // 写回 / 提交
 //===============================================================
     always @(*) begin
-        if (stage2_forward) load_data_current = stage2_forward_data;
-        else case (stage2_size)
+        if (stage2_forward)
+            load_data_current = stage2_forward_data;
+        else
+            case (stage2_size)
             3'b000: load_data_current = {{24{bus_data_in[8*stage2_off + 7]}}, bus_data_in[8*stage2_off +: 8]};
             3'b001: load_data_current = {{16{bus_data_in[16*stage2_off[1] + 15]}}, bus_data_in[16*stage2_off[1] +: 16]};
             3'b010: load_data_current = bus_data_in;
@@ -877,9 +1026,13 @@ module lsu(
 //★ 2026-10-30 修：dcache 与 ELSQ 外设 load 可能【同拍】应答。原来 D 端按 elsq 优先 ⇒
 //  dcache 那笔写回被静默吞掉 ⇒ ROB 项 entry_written 永为 0 ⇒ 死锁（看着像后面的 mul 卡死）。
 //  修法：撞拍时把 ELSQ 这笔抓进一格保持寄存器。一格够用（ELSQ 同时只一笔在途，且 go 已挡在 hold 满时）。
-    assign stage2_answer = stage2_valid & (ready_in | stage2_forward);
+    always @(*) begin
+        stage2_answer = stage2_valid & (ready_in | stage2_forward);
+    end
 //ELSQ 那一笔的交付：必须等返回口空（这一拍既没有级3 应答、也没有新的 ELSQ 应答）
-    assign elsq_return_deliver = elsq_return_hold & ~stage2_answer & ~elsq_load_answer;
+    always @(*) begin
+        elsq_return_deliver = elsq_return_hold & ~stage2_answer & ~elsq_load_answer;
+    end
 
     always @(*) begin
         load_answer = stage2_answer | elsq_load_answer | elsq_return_deliver;
@@ -887,10 +1040,16 @@ module lsu(
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            return_valid <= 1'b0; return_index <= 4'd0; return_generation <= 1'b0; return_data <= 32'd0;
+            return_valid <= 1'b0;
+            return_index <= 5'd0;
+            return_generation <= 1'b0;
+            return_data <= 32'd0;
             return_phys <= 6'd0;
-            elsq_return_hold <= 1'b0; elsq_return_data <= 32'd0;
-            elsq_return_index <= 4'd0; elsq_return_generation <= 1'b0; elsq_return_phys <= 6'd0;
+            elsq_return_hold <= 1'b0;
+            elsq_return_data <= 32'd0;
+            elsq_return_index <= 5'd0;
+            elsq_return_generation <= 1'b0;
+            elsq_return_phys <= 6'd0;
         end
         else begin
             return_valid <= load_answer;
@@ -977,7 +1136,7 @@ module lsu(
             exception_load_store_misalign_out <= 1'b0;
             exception_load_store_store_out <= 1'b0;
             exception_load_store_address_out <= 32'd0;
-            exception_load_store_index_out <= 4'd0;
+            exception_load_store_index_out <= 5'd0;
             exception_load_store_pc_out <= 32'd0;
         end
         else begin

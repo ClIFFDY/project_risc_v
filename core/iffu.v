@@ -162,8 +162,10 @@ module iffu(
     end
 
     always @(posedge clk) begin
-        if (reset_registered) full_registered <= 1'b0;
-        else full_registered <= full;
+        if (reset_registered)
+            full_registered <= 1'b0;
+        else
+            full_registered <= full;
     end
 
     always @(*) begin
@@ -217,12 +219,18 @@ module iffu(
 //本拍实际弹几条 = min(下一级的请求, 消费者手上真正有效的条数)。
 //advance 是 idu 按自己的 free 算出来的【请求】（0/1/2/3），不是保证：队里没有那么多就给多少。
     always @(*) begin
-        if (!exec_in | ~half0_valid)  pop = 3'd0;
-        else if (advance == 3'd0) pop = 3'd0;
-        else if (!half1_valid)    pop = 3'd1;
-        else if (advance == 3'd1) pop = 3'd1;
-        else if (!half2_valid)    pop = 3'd2;
-        else                      pop = advance;
+        if (!exec_in | ~half0_valid)
+            pop = 3'd0;
+        else if (advance == 3'd0)
+            pop = 3'd0;
+        else if (!half1_valid)
+            pop = 3'd1;
+        else if (advance == 3'd1)
+            pop = 3'd1;
+        else if (!half2_valid)
+            pop = 3'd2;
+        else
+            pop = advance;
     end
 
 //读指针：清队时不动（那些条目由 write_pointer 作废）；正常按实际弹出的条数（0..3）走

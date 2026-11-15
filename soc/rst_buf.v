@@ -45,18 +45,18 @@ module rst_buf(
             IDLE: begin
                 rst_cnt <= 22'b0;
                 rst_stable <= 1'b0;
-                if (rst_s2 && ~rst_s1) begin 
+                if (rst_s2 && ~rst_s1) begin
                     stage <= PUSH;
                     rst_stable <= 1'b1;
                 end
             end
             PUSH: begin
                 rst_stable <= 1'b1;
-                if (~rst_s2 && rst_s1) begin       
+                if (~rst_s2 && rst_s1) begin
                     rst_cnt <= 22'b0;
                 end
-                else if (rst_s1) begin            
-                    if (rst_cnt[21]) begin          
+                else if (rst_s1) begin
+                    if (rst_cnt[21]) begin
                         stage <= IDLE;
                         rst_cnt <= 22'b0;
                         rst_stable <= 1'b0;

@@ -45,9 +45,12 @@ module control_regs(
     // req_valid 只在 ahb_lite_slave 发布一笔已锁存的请求时有效一个周期。
     // 配置寄存器均位于一个 32 位字的低字节，只接受 byte_en[0] 有效的写入，
     // 这样字节写和整字写行为一致，也不会误改高位保留字段。
-    wire wr       = req_valid && sel_ctrl && req_we;
-    wire byte0_wr = wr && req_byte_en[0];
-    wire wgt_wr   = req_valid && sel_wgt_cfg && req_we && req_byte_en[0];
+    reg wr, byte0_wr, wgt_wr;
+    always @(*) begin
+        wr = req_valid && sel_ctrl && req_we;
+        wgt_wr = req_valid && sel_wgt_cfg && req_we && req_byte_en[0];
+        byte0_wr = wr && req_byte_en[0];
+    end
 
     // 两个命令脉冲：只有写 0x00 CTRL 且低字节有效时才产生。
     // 若同时写 CTRL=0x03，两个命令都会产生；start_ctrl 只在对应状态接受命令。
@@ -67,13 +70,15 @@ module control_regs(
             cfg_bank       <= 1'b0;
             cfg_wgt_base   <= {`NPU_WGT_AW{1'b0}};
             cfg_wgt_en     <= 1'b0;
-        end else if (wgt_wr) begin
+        end
+        else if (wgt_wr) begin
             case (wgt_reg_off)
                 2'd0: cfg_wgt_base <= req_wdata[`NPU_WGT_AW-1:0];
                 2'd1: cfg_wgt_en   <= req_wdata[0];
                 default: ;
             endcase
-        end else if (byte0_wr) begin
+        end
+        else if (byte0_wr) begin
             case (ctrl_reg_off)
                 3'd1: cfg_m          <= req_wdata[`NPU_DIM_W-1:0];
                 3'd2: cfg_n          <= req_wdata[`NPU_DIM_W-1:0];

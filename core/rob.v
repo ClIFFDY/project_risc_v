@@ -44,16 +44,13 @@ module rob(
     input        allocation_ecall_0, allocation_ebreak_0, allocation_illegal_0, allocation_mret_0,
     input        allocation_ecall_1, allocation_ebreak_1, allocation_illegal_1, allocation_mret_1,
     input        allocation_ecall_2, allocation_ebreak_2, allocation_illegal_2, allocation_mret_2,
-//★ 2026-11-13（fence）：MISC-MEM 的两条。随分配写进项里，队头就是"这道栅栏"。
-//  fence 只要求排空（写队列可见），fence.i 还要求把 icache 整表作废并重取。
-    input        allocation_fence_0, allocation_fence_i_0,
-    input        allocation_fence_1, allocation_fence_i_1,
-    input        allocation_fence_2, allocation_fence_i_2,
-//★ 2026-11-13（P4）：写 CSR 0x7C0 = 三层缓存全失效（软件一致性原语）。
-//  提交口的时序与 fence.i 同构，只是多走一步"等 L2 的 maint_done"。
-    input        allocation_cache_flush_0,
-    input        allocation_cache_flush_1,
-    input        allocation_cache_flush_2,
+//★ 2026-11-13（fence / fence.i / CSR 0x7C0）：三者是同一件事的三档 ——
+//  排队、年龄、排空判据完全一样，只差"退役那一拍做什么" ⇒ 收成一个 2 位字段。
+//  以前是一个语义一根线（三根 × 三 lane = 九根），改一档要动九处。
+//  编码见下面的 BARRIER_*。
+    input  [1:0]  allocation_barrier_0,
+    input  [1:0]  allocation_barrier_1,
+    input  [1:0]  allocation_barrier_2,
 //分到的槽号与世代（随载荷走到执行单元，完成上报时带回校验）
     output reg [4:0]  allocation_index_0,
     output reg [4:0]  allocation_index_1,
@@ -169,7 +166,7 @@ module rob(
     output reg [31:0]  squash_survive_hit,
 //★ 判定拍与后端击杀那两拍都不许分配：本拍新进来的项不在 kill 掩码里，会被当成幸存项把尾指针算歪。
 //★ 2026-11-05：改向一经判定就冻住分配，直到那条分支自己提交 ⇒ rat 回滚退化成提交拍整片抄回 arch_map。
-    output             redirect_stop_alloc,
+    output reg             redirect_stop_alloc,
 //★ 真 PRF：三个写回口的物理号 + 存活判据。live = 本项还有效且世代对得上 ——
 //  冲刷后在飞的结果还会落完，那些号可能已被回收再分配，晚到的死写不许进阵列。
     input        prf_wb_en_0, input [4:0] prf_wb_index_0, input prf_wb_generation_0,
@@ -179,12 +176,12 @@ module rob(
     input        prf_alu_early_generation_0, prf_alu_early_generation_1,
     input [4:0]  prf_ld_early_index, input prf_ld_early_generation,
     input [4:0]  prf_div_wake_index_0, prf_div_wake_index_1,
-    output [5:0] prf_ld_early_phys, output prf_ld_early_live,
+    output [5:0] prf_ld_early_phys, output reg prf_ld_early_live,
     output [5:0] prf_alu_early_phys_0, prf_alu_early_phys_1,
-    output       prf_alu_early_live_0, prf_alu_early_live_1,
+    output reg       prf_alu_early_live_0, prf_alu_early_live_1,
     output [5:0] prf_div_wake_phys_0, prf_div_wake_phys_1,
     output [5:0] prf_wb_phys_0, prf_wb_phys_1, prf_ld_phys,
-    output       prf_wb_live_0, prf_wb_live_1, prf_ld_live,
+    output reg       prf_wb_live_0, prf_wb_live_1, prf_ld_live,
 //状态
 //★ 提交口改向：队头这一项判错过了 ⇒ 本拍改 PC、杀掉它之后的全部（队头即边界，消费端不再需要年龄判据）。
 //★ "已判定、还没排到队头"的改向在册：给 isq 挡【新的访存发射】—— 错路访存可能打到没有从设备的
@@ -305,12 +302,15 @@ reg        entry_exception [0:DEPTH-1];
 reg        entry_judged  [0:DEPTH-1];
 //mret 标签：第二种【队头改向】，落点不由项携带（取 mepc）
 reg        entry_mret [0:DEPTH-1];
-//★ 2026-11-13（fence）：与 entry_mret 同型 —— 随分配落地，队头读到就是"这一项是栅栏"。
-//  fence_i 是"栅栏 + 作废 icache"；两者的区别只在退役那一拍做什么，排队与年龄语义完全一样。
-reg        entry_fence    [0:DEPTH-1];
-reg        entry_fence_i  [0:DEPTH-1];
-//★ 2026-11-13（P4）：写 CSR 0x7C0 ⇒ 三层全失效。队头读到它就走那条两拍的状态机。
-reg        entry_cache_flush [0:DEPTH-1];
+//★ 2026-11-13（fence / fence.i / CSR 0x7C0）：与 entry_mret 同型 —— 随分配落地，
+//  队头读到就知道"这一项是屏障"。三档的排队/年龄/排空判据完全一样，
+//  只差退役那一拍做什么 ⇒ 一个 2 位字段。
+localparam [1:0] BARRIER_NONE    = 2'd0,   // 普通指令
+                 BARRIER_FENCE   = 2'd1,   // 退役要等排空
+                 BARRIER_FENCE_I = 2'd2,   // 上同 + 翻 icache 代次 + 前端改向 pc+4
+                 BARRIER_FLUSH   = 2'd3;
+                 // 上同 + 等 L2 maint + 作废 dcache
+reg [1:0]  entry_barrier  [0:DEPTH-1];
 //排空判据的打拍版（见端口注释：不打拍就是组合环）
 reg        drain_ok_registered;
 //"队头这道 fence.i 这一拍真的走"：在组合提交口里算，下一沿变成 icache 作废 + 改向。
@@ -352,9 +352,13 @@ reg [3:0]  entry_exc [0:DEPTH-1];
 //可退 = 在册且已完成。exc 标记项不算可退（它不写寄存器堆，由陷阱交付交上级）；
 //★ 同拍标记（exc_en 正落在 head 上）必须【组合】压掉退，否则会在 entry_exception 落盘前退掉。
 //★ 异常/中断优先于误预测改向：队头是故障项时，它的 mepc 必须取故障指令自己的 pc，被改向一掺就错。
-    wire head_is_exception = (entry_count != 5'd0) && entry_valid[head_pointer] && entry_exception[head_pointer];
-    wire [4:0] judge0_age = bju_index             - head_pointer;
-    wire [4:0] judge1_age = branch_unit_lane1_index - head_pointer;
+    reg head_is_exception;
+    reg [4:0] judge0_age, judge1_age;
+    always @(*) begin
+        head_is_exception = (entry_count != 5'd0) && entry_valid[head_pointer] && entry_exception[head_pointer];
+        judge0_age = bju_index             - head_pointer;
+        judge1_age = branch_unit_lane1_index - head_pointer;
+    end
     reg        boundary_now;
 
 always @(posedge clk) reset_registered <= rst;
@@ -412,21 +416,21 @@ always @(*) begin
         end
         if ((redir_backend_0 | irq_kill)) begin
 //★ 2026-11-05：改向 / 异常 / 中断都在提交口发，前端和整张 ROB 同一拍一起作废 ⇒ 恒为整窗。
-            entry_count_next  = 5'd0;
+            entry_count_next  = 6'd0;
             tail_pointer_next = head_pointer;
         end
 //陷阱交付：队头那条故障指令【不写寄存器堆】地退掉，比它年轻的项全部作废。
 //★ 必须放在冲刷赋值之后：中断的队头是重跑，陷阱的队头是走掉。
         if (redir_backend_0 && (redir_cause == REDIR_CAUSE_TRAP)) begin
             tail_pointer_next = (head_pointer + 5'd1) & DEPTH_MASK;
-            entry_count_next  = 5'd0;
+            entry_count_next  = 6'd0;
         end
     end
 
     always @(posedge clk) begin
         if (reset_registered) begin
             tail_pointer <= 5'd0;
-            entry_count  <= 5'd0;
+            entry_count  <= 6'd0;
         end
         else begin
             tail_pointer <= tail_pointer_next;
@@ -443,36 +447,62 @@ localparam integer DEPTH_AW = (DEPTH > 16) ? 5 : 4;   // 槽号位宽
 localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 
 //---- 分配口三份数据（rd=x0 或本来就不写回的，目的号与物理号都记 0）----
-    wire [31:0] alloc_pc_0       = allocation_pc_0;
-    wire        alloc_we_valid_0 = allocation_we_0 && (allocation_rd_0 != 5'd0);
-    wire [5:0]  alloc_phys_0     = alloc_we_valid_0 ? allocation_phys_0 : 6'd0;
-    wire [4:0]  alloc_dest_0     = alloc_we_valid_0 ? allocation_rd_0   : 5'd0;
-    wire        alloc_sys_0      = allocation_ecall_0 | allocation_ebreak_0 | allocation_illegal_0 | allocation_mret_0;
+    reg [31:0] alloc_pc_0;
+    reg alloc_we_valid_0;
+    reg [5:0] alloc_phys_0;
+    reg [4:0] alloc_dest_0;
+    reg alloc_sys_0;
+    always @(*) begin
+        alloc_pc_0 = allocation_pc_0;
+        alloc_we_valid_0 = allocation_we_0 && (allocation_rd_0 != 5'd0);
+        alloc_sys_0 = allocation_ecall_0 | allocation_ebreak_0 | allocation_illegal_0 | allocation_mret_0;
+        alloc_dest_0 = alloc_we_valid_0 ? allocation_rd_0   : 5'd0;
+        alloc_phys_0 = alloc_we_valid_0 ? allocation_phys_0 : 6'd0;
+    end
 
-    wire [31:0] alloc_pc_1       = allocation_pc_1;
-    wire        alloc_we_valid_1 = allocation_we_1 && (allocation_rd_1 != 5'd0);
-    wire [5:0]  alloc_phys_1     = alloc_we_valid_1 ? allocation_phys_1 : 6'd0;
-    wire [4:0]  alloc_dest_1     = alloc_we_valid_1 ? allocation_rd_1   : 5'd0;
-    wire        alloc_sys_1      = allocation_ecall_1 | allocation_ebreak_1 | allocation_illegal_1 | allocation_mret_1;
+    reg [31:0] alloc_pc_1;
+    reg alloc_we_valid_1;
+    reg [5:0] alloc_phys_1;
+    reg [4:0] alloc_dest_1;
+    reg alloc_sys_1;
+    always @(*) begin
+        alloc_pc_1 = allocation_pc_1;
+        alloc_we_valid_1 = allocation_we_1 && (allocation_rd_1 != 5'd0);
+        alloc_sys_1 = allocation_ecall_1 | allocation_ebreak_1 | allocation_illegal_1 | allocation_mret_1;
+        alloc_dest_1 = alloc_we_valid_1 ? allocation_rd_1   : 5'd0;
+        alloc_phys_1 = alloc_we_valid_1 ? allocation_phys_1 : 6'd0;
+    end
 
-    wire [31:0] alloc_pc_2       = allocation_pc_2;
-    wire        alloc_we_valid_2 = allocation_we_2 && (allocation_rd_2 != 5'd0);
-    wire [5:0]  alloc_phys_2     = alloc_we_valid_2 ? allocation_phys_2 : 6'd0;
-    wire [4:0]  alloc_dest_2     = alloc_we_valid_2 ? allocation_rd_2   : 5'd0;
-    wire        alloc_sys_2      = allocation_ecall_2 | allocation_ebreak_2 | allocation_illegal_2 | allocation_mret_2;
+    reg [31:0] alloc_pc_2;
+    reg alloc_we_valid_2;
+    reg [5:0] alloc_phys_2;
+    reg [4:0] alloc_dest_2;
+    reg alloc_sys_2;
+    always @(*) begin
+        alloc_pc_2 = allocation_pc_2;
+        alloc_we_valid_2 = allocation_we_2 && (allocation_rd_2 != 5'd0);
+        alloc_sys_2 = allocation_ecall_2 | allocation_ebreak_2 | allocation_illegal_2 | allocation_mret_2;
+        alloc_dest_2 = alloc_we_valid_2 ? allocation_rd_2   : 5'd0;
+        alloc_phys_2 = alloc_we_valid_2 ? allocation_phys_2 : 6'd0;
+    end
 //---- entry_target 的读选择：源表 -> 一位热码 -> 掩码或 ----
-    wire [2:0]  entry_target_source_of_head = entry_target_source[head_pointer];
-    wire [4:0]  entry_target_pick           = 5'd1 << entry_target_source_of_head;
-    wire [31:0] entry_target_of_head =
-        ({32{entry_target_pick[0]}} & entry_target_jump_lane0        [head_pointer]) |
-        ({32{entry_target_pick[1]}} & entry_target_jump_lane1        [head_pointer]) |
-        ({32{entry_target_pick[2]}} & entry_target_exception_lane0   [head_pointer]) |
-        ({32{entry_target_pick[3]}} & entry_target_exception_lane1   [head_pointer]) |
-        ({32{entry_target_pick[4]}} & entry_target_exception_selected[head_pointer]);
+    reg [2:0] entry_target_source_of_head;
+    reg [4:0] entry_target_pick;
+    always @(*) begin
+        entry_target_source_of_head = entry_target_source[head_pointer];
+        entry_target_pick = 5'd1 << entry_target_source_of_head;
+    end
+    reg [31:0] entry_target_of_head;
+    always @(*) begin
+        entry_target_of_head = ({32{entry_target_pick[0]}} & entry_target_jump_lane0        [head_pointer]) | ({32{entry_target_pick[1]}} & entry_target_jump_lane1        [head_pointer]) | ({32{entry_target_pick[2]}} & entry_target_exception_lane0   [head_pointer]) | ({32{entry_target_pick[3]}} & entry_target_exception_lane1   [head_pointer]) | ({32{entry_target_pick[4]}} & entry_target_exception_selected[head_pointer]);
+    end
 
-    wire [DEPTH_AW-1:0] alloc_slot_0 = tail_pointer;
-    wire [DEPTH_AW-1:0] alloc_slot_1 = allocation_index_1;
-    wire [DEPTH_AW-1:0] alloc_slot_2 = allocation_index_2;
+    reg [DEPTH_AW-1:0] alloc_slot_0, alloc_slot_1, alloc_slot_2;
+    always @(*) begin
+        alloc_slot_0 = tail_pointer;
+        alloc_slot_1 = allocation_index_1;
+        alloc_slot_2 = allocation_index_2;
+    end
 
     reg [31:0] entry_pc_bank0 [0:DEPTH/4-1];
     reg [31:0] entry_pc_bank1 [0:DEPTH/4-1];
@@ -500,24 +530,40 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     reg  entry_system_bank3 [0:DEPTH/4-1];
 
 //---- 银行 0 ----
-    wire alloc_hit_bank0_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd0);
-    wire alloc_hit_bank0_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd0);
-    wire alloc_hit_bank0_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd0);
-    wire [ROW_AW-1:0] alloc_row_bank0 = alloc_hit_bank0_port2 ? alloc_slot_2[DEPTH_AW-1:2] :
-                                        alloc_hit_bank0_port1 ? alloc_slot_1[DEPTH_AW-1:2] :
-                                                                  alloc_slot_0[DEPTH_AW-1:2];
-    wire [31:0] alloc_pc_bank0   = alloc_hit_bank0_port2 ? alloc_pc_2   :
-                                    alloc_hit_bank0_port1 ? alloc_pc_1 : alloc_pc_0;
-    wire [5:0]  alloc_phys_bank0 = alloc_hit_bank0_port2 ? alloc_phys_2 :
-                                    alloc_hit_bank0_port1 ? alloc_phys_1 : alloc_phys_0;
-    wire [4:0]  alloc_dest_bank0 = alloc_hit_bank0_port2 ? alloc_dest_2 :
-                                    alloc_hit_bank0_port1 ? alloc_dest_1 : alloc_dest_0;
-    wire        alloc_csr_bank0  = alloc_hit_bank0_port2 ? allocation_csr_2 :
-                                    alloc_hit_bank0_port1 ? allocation_csr_1 : allocation_csr_0;
-    wire        alloc_pend_bank0 = alloc_hit_bank0_port2 ? allocation_pend_2 :
-                                    alloc_hit_bank0_port1 ? allocation_pend_1 : allocation_pend_0;
-    wire        alloc_sys_bank0  = alloc_hit_bank0_port2 ? alloc_sys_2 :
-                                    alloc_hit_bank0_port1 ? alloc_sys_1 : alloc_sys_0;
+    reg alloc_hit_bank0_port0, alloc_hit_bank0_port1, alloc_hit_bank0_port2;
+    always @(*) begin
+        alloc_hit_bank0_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd0);
+        alloc_hit_bank0_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd0);
+        alloc_hit_bank0_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd0);
+    end
+    reg [ROW_AW-1:0] alloc_row_bank0;
+    always @(*) begin
+        alloc_row_bank0 = alloc_hit_bank0_port2 ? alloc_slot_2[DEPTH_AW-1:2] : alloc_hit_bank0_port1 ? alloc_slot_1[DEPTH_AW-1:2] : alloc_slot_0[DEPTH_AW-1:2];
+    end
+    reg [31:0] alloc_pc_bank0;
+    always @(*) begin
+        alloc_pc_bank0 = alloc_hit_bank0_port2 ? alloc_pc_2   : alloc_hit_bank0_port1 ? alloc_pc_1 : alloc_pc_0;
+    end
+    reg [5:0] alloc_phys_bank0;
+    always @(*) begin
+        alloc_phys_bank0 = alloc_hit_bank0_port2 ? alloc_phys_2 : alloc_hit_bank0_port1 ? alloc_phys_1 : alloc_phys_0;
+    end
+    reg [4:0] alloc_dest_bank0;
+    always @(*) begin
+        alloc_dest_bank0 = alloc_hit_bank0_port2 ? alloc_dest_2 : alloc_hit_bank0_port1 ? alloc_dest_1 : alloc_dest_0;
+    end
+    reg alloc_csr_bank0;
+    always @(*) begin
+        alloc_csr_bank0 = alloc_hit_bank0_port2 ? allocation_csr_2 : alloc_hit_bank0_port1 ? allocation_csr_1 : allocation_csr_0;
+    end
+    reg alloc_pend_bank0;
+    always @(*) begin
+        alloc_pend_bank0 = alloc_hit_bank0_port2 ? allocation_pend_2 : alloc_hit_bank0_port1 ? allocation_pend_1 : allocation_pend_0;
+    end
+    reg alloc_sys_bank0;
+    always @(*) begin
+        alloc_sys_bank0 = alloc_hit_bank0_port2 ? alloc_sys_2 : alloc_hit_bank0_port1 ? alloc_sys_1 : alloc_sys_0;
+    end
 
     always @(posedge clk) begin
         if (alloc_hit_bank0_port0 | alloc_hit_bank0_port1 | alloc_hit_bank0_port2) begin
@@ -531,24 +577,40 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     end
 
 //---- 银行 1 ----
-    wire alloc_hit_bank1_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd1);
-    wire alloc_hit_bank1_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd1);
-    wire alloc_hit_bank1_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd1);
-    wire [ROW_AW-1:0] alloc_row_bank1 = alloc_hit_bank1_port2 ? alloc_slot_2[DEPTH_AW-1:2] :
-                                        alloc_hit_bank1_port1 ? alloc_slot_1[DEPTH_AW-1:2] :
-                                                                  alloc_slot_0[DEPTH_AW-1:2];
-    wire [31:0] alloc_pc_bank1   = alloc_hit_bank1_port2 ? alloc_pc_2   :
-                                    alloc_hit_bank1_port1 ? alloc_pc_1 : alloc_pc_0;
-    wire [5:0]  alloc_phys_bank1 = alloc_hit_bank1_port2 ? alloc_phys_2 :
-                                    alloc_hit_bank1_port1 ? alloc_phys_1 : alloc_phys_0;
-    wire [4:0]  alloc_dest_bank1 = alloc_hit_bank1_port2 ? alloc_dest_2 :
-                                    alloc_hit_bank1_port1 ? alloc_dest_1 : alloc_dest_0;
-    wire        alloc_csr_bank1  = alloc_hit_bank1_port2 ? allocation_csr_2 :
-                                    alloc_hit_bank1_port1 ? allocation_csr_1 : allocation_csr_0;
-    wire        alloc_pend_bank1 = alloc_hit_bank1_port2 ? allocation_pend_2 :
-                                    alloc_hit_bank1_port1 ? allocation_pend_1 : allocation_pend_0;
-    wire        alloc_sys_bank1  = alloc_hit_bank1_port2 ? alloc_sys_2 :
-                                    alloc_hit_bank1_port1 ? alloc_sys_1 : alloc_sys_0;
+    reg alloc_hit_bank1_port0, alloc_hit_bank1_port1, alloc_hit_bank1_port2;
+    always @(*) begin
+        alloc_hit_bank1_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd1);
+        alloc_hit_bank1_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd1);
+        alloc_hit_bank1_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd1);
+    end
+    reg [ROW_AW-1:0] alloc_row_bank1;
+    always @(*) begin
+        alloc_row_bank1 = alloc_hit_bank1_port2 ? alloc_slot_2[DEPTH_AW-1:2] : alloc_hit_bank1_port1 ? alloc_slot_1[DEPTH_AW-1:2] : alloc_slot_0[DEPTH_AW-1:2];
+    end
+    reg [31:0] alloc_pc_bank1;
+    always @(*) begin
+        alloc_pc_bank1 = alloc_hit_bank1_port2 ? alloc_pc_2   : alloc_hit_bank1_port1 ? alloc_pc_1 : alloc_pc_0;
+    end
+    reg [5:0] alloc_phys_bank1;
+    always @(*) begin
+        alloc_phys_bank1 = alloc_hit_bank1_port2 ? alloc_phys_2 : alloc_hit_bank1_port1 ? alloc_phys_1 : alloc_phys_0;
+    end
+    reg [4:0] alloc_dest_bank1;
+    always @(*) begin
+        alloc_dest_bank1 = alloc_hit_bank1_port2 ? alloc_dest_2 : alloc_hit_bank1_port1 ? alloc_dest_1 : alloc_dest_0;
+    end
+    reg alloc_csr_bank1;
+    always @(*) begin
+        alloc_csr_bank1 = alloc_hit_bank1_port2 ? allocation_csr_2 : alloc_hit_bank1_port1 ? allocation_csr_1 : allocation_csr_0;
+    end
+    reg alloc_pend_bank1;
+    always @(*) begin
+        alloc_pend_bank1 = alloc_hit_bank1_port2 ? allocation_pend_2 : alloc_hit_bank1_port1 ? allocation_pend_1 : allocation_pend_0;
+    end
+    reg alloc_sys_bank1;
+    always @(*) begin
+        alloc_sys_bank1 = alloc_hit_bank1_port2 ? alloc_sys_2 : alloc_hit_bank1_port1 ? alloc_sys_1 : alloc_sys_0;
+    end
 
     always @(posedge clk) begin
         if (alloc_hit_bank1_port0 | alloc_hit_bank1_port1 | alloc_hit_bank1_port2) begin
@@ -562,24 +624,40 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     end
 
 //---- 银行 2 ----
-    wire alloc_hit_bank2_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd2);
-    wire alloc_hit_bank2_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd2);
-    wire alloc_hit_bank2_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd2);
-    wire [ROW_AW-1:0] alloc_row_bank2 = alloc_hit_bank2_port2 ? alloc_slot_2[DEPTH_AW-1:2] :
-                                        alloc_hit_bank2_port1 ? alloc_slot_1[DEPTH_AW-1:2] :
-                                                                  alloc_slot_0[DEPTH_AW-1:2];
-    wire [31:0] alloc_pc_bank2   = alloc_hit_bank2_port2 ? alloc_pc_2   :
-                                    alloc_hit_bank2_port1 ? alloc_pc_1 : alloc_pc_0;
-    wire [5:0]  alloc_phys_bank2 = alloc_hit_bank2_port2 ? alloc_phys_2 :
-                                    alloc_hit_bank2_port1 ? alloc_phys_1 : alloc_phys_0;
-    wire [4:0]  alloc_dest_bank2 = alloc_hit_bank2_port2 ? alloc_dest_2 :
-                                    alloc_hit_bank2_port1 ? alloc_dest_1 : alloc_dest_0;
-    wire        alloc_csr_bank2  = alloc_hit_bank2_port2 ? allocation_csr_2 :
-                                    alloc_hit_bank2_port1 ? allocation_csr_1 : allocation_csr_0;
-    wire        alloc_pend_bank2 = alloc_hit_bank2_port2 ? allocation_pend_2 :
-                                    alloc_hit_bank2_port1 ? allocation_pend_1 : allocation_pend_0;
-    wire        alloc_sys_bank2  = alloc_hit_bank2_port2 ? alloc_sys_2 :
-                                    alloc_hit_bank2_port1 ? alloc_sys_1 : alloc_sys_0;
+    reg alloc_hit_bank2_port0, alloc_hit_bank2_port1, alloc_hit_bank2_port2;
+    always @(*) begin
+        alloc_hit_bank2_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd2);
+        alloc_hit_bank2_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd2);
+        alloc_hit_bank2_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd2);
+    end
+    reg [ROW_AW-1:0] alloc_row_bank2;
+    always @(*) begin
+        alloc_row_bank2 = alloc_hit_bank2_port2 ? alloc_slot_2[DEPTH_AW-1:2] : alloc_hit_bank2_port1 ? alloc_slot_1[DEPTH_AW-1:2] : alloc_slot_0[DEPTH_AW-1:2];
+    end
+    reg [31:0] alloc_pc_bank2;
+    always @(*) begin
+        alloc_pc_bank2 = alloc_hit_bank2_port2 ? alloc_pc_2   : alloc_hit_bank2_port1 ? alloc_pc_1 : alloc_pc_0;
+    end
+    reg [5:0] alloc_phys_bank2;
+    always @(*) begin
+        alloc_phys_bank2 = alloc_hit_bank2_port2 ? alloc_phys_2 : alloc_hit_bank2_port1 ? alloc_phys_1 : alloc_phys_0;
+    end
+    reg [4:0] alloc_dest_bank2;
+    always @(*) begin
+        alloc_dest_bank2 = alloc_hit_bank2_port2 ? alloc_dest_2 : alloc_hit_bank2_port1 ? alloc_dest_1 : alloc_dest_0;
+    end
+    reg alloc_csr_bank2;
+    always @(*) begin
+        alloc_csr_bank2 = alloc_hit_bank2_port2 ? allocation_csr_2 : alloc_hit_bank2_port1 ? allocation_csr_1 : allocation_csr_0;
+    end
+    reg alloc_pend_bank2;
+    always @(*) begin
+        alloc_pend_bank2 = alloc_hit_bank2_port2 ? allocation_pend_2 : alloc_hit_bank2_port1 ? allocation_pend_1 : allocation_pend_0;
+    end
+    reg alloc_sys_bank2;
+    always @(*) begin
+        alloc_sys_bank2 = alloc_hit_bank2_port2 ? alloc_sys_2 : alloc_hit_bank2_port1 ? alloc_sys_1 : alloc_sys_0;
+    end
 
     always @(posedge clk) begin
         if (alloc_hit_bank2_port0 | alloc_hit_bank2_port1 | alloc_hit_bank2_port2) begin
@@ -593,24 +671,40 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     end
 
 //---- 银行 3 ----
-    wire alloc_hit_bank3_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd3);
-    wire alloc_hit_bank3_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd3);
-    wire alloc_hit_bank3_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd3);
-    wire [ROW_AW-1:0] alloc_row_bank3 = alloc_hit_bank3_port2 ? alloc_slot_2[DEPTH_AW-1:2] :
-                                        alloc_hit_bank3_port1 ? alloc_slot_1[DEPTH_AW-1:2] :
-                                                                  alloc_slot_0[DEPTH_AW-1:2];
-    wire [31:0] alloc_pc_bank3   = alloc_hit_bank3_port2 ? alloc_pc_2   :
-                                    alloc_hit_bank3_port1 ? alloc_pc_1 : alloc_pc_0;
-    wire [5:0]  alloc_phys_bank3 = alloc_hit_bank3_port2 ? alloc_phys_2 :
-                                    alloc_hit_bank3_port1 ? alloc_phys_1 : alloc_phys_0;
-    wire [4:0]  alloc_dest_bank3 = alloc_hit_bank3_port2 ? alloc_dest_2 :
-                                    alloc_hit_bank3_port1 ? alloc_dest_1 : alloc_dest_0;
-    wire        alloc_csr_bank3  = alloc_hit_bank3_port2 ? allocation_csr_2 :
-                                    alloc_hit_bank3_port1 ? allocation_csr_1 : allocation_csr_0;
-    wire        alloc_pend_bank3 = alloc_hit_bank3_port2 ? allocation_pend_2 :
-                                    alloc_hit_bank3_port1 ? allocation_pend_1 : allocation_pend_0;
-    wire        alloc_sys_bank3  = alloc_hit_bank3_port2 ? alloc_sys_2 :
-                                    alloc_hit_bank3_port1 ? alloc_sys_1 : alloc_sys_0;
+    reg alloc_hit_bank3_port0, alloc_hit_bank3_port1, alloc_hit_bank3_port2;
+    always @(*) begin
+        alloc_hit_bank3_port0 = alloc_take_0 && (alloc_slot_0[1:0] == 2'd3);
+        alloc_hit_bank3_port1 = alloc_take_1 && (alloc_slot_1[1:0] == 2'd3);
+        alloc_hit_bank3_port2 = alloc_take_2 && (alloc_slot_2[1:0] == 2'd3);
+    end
+    reg [ROW_AW-1:0] alloc_row_bank3;
+    always @(*) begin
+        alloc_row_bank3 = alloc_hit_bank3_port2 ? alloc_slot_2[DEPTH_AW-1:2] : alloc_hit_bank3_port1 ? alloc_slot_1[DEPTH_AW-1:2] : alloc_slot_0[DEPTH_AW-1:2];
+    end
+    reg [31:0] alloc_pc_bank3;
+    always @(*) begin
+        alloc_pc_bank3 = alloc_hit_bank3_port2 ? alloc_pc_2   : alloc_hit_bank3_port1 ? alloc_pc_1 : alloc_pc_0;
+    end
+    reg [5:0] alloc_phys_bank3;
+    always @(*) begin
+        alloc_phys_bank3 = alloc_hit_bank3_port2 ? alloc_phys_2 : alloc_hit_bank3_port1 ? alloc_phys_1 : alloc_phys_0;
+    end
+    reg [4:0] alloc_dest_bank3;
+    always @(*) begin
+        alloc_dest_bank3 = alloc_hit_bank3_port2 ? alloc_dest_2 : alloc_hit_bank3_port1 ? alloc_dest_1 : alloc_dest_0;
+    end
+    reg alloc_csr_bank3;
+    always @(*) begin
+        alloc_csr_bank3 = alloc_hit_bank3_port2 ? allocation_csr_2 : alloc_hit_bank3_port1 ? allocation_csr_1 : allocation_csr_0;
+    end
+    reg alloc_pend_bank3;
+    always @(*) begin
+        alloc_pend_bank3 = alloc_hit_bank3_port2 ? allocation_pend_2 : alloc_hit_bank3_port1 ? allocation_pend_1 : allocation_pend_0;
+    end
+    reg alloc_sys_bank3;
+    always @(*) begin
+        alloc_sys_bank3 = alloc_hit_bank3_port2 ? alloc_sys_2 : alloc_hit_bank3_port1 ? alloc_sys_1 : alloc_sys_0;
+    end
 
     always @(posedge clk) begin
         if (alloc_hit_bank3_port0 | alloc_hit_bank3_port1 | alloc_hit_bank3_port2) begin
@@ -624,146 +718,150 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     end
 
 //---- 读口：一位热码 + 三目或 ----
-    wire [ROW_AW-1:0] row_of_head_next_pointer  = head_next_pointer[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_head_next_pointer = 4'd1 << head_next_pointer[1:0];
-    wire [ROW_AW-1:0] row_of_head_pointer  = head_pointer[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_head_pointer = 4'd1 << head_pointer[1:0];
-    wire [ROW_AW-1:0] row_of_issue_index_0  = issue_index_0[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_issue_index_0 = 4'd1 << issue_index_0[1:0];
-    wire [ROW_AW-1:0] row_of_issue_index_1  = issue_index_1[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_issue_index_1 = 4'd1 << issue_index_1[1:0];
-    wire [ROW_AW-1:0] row_of_prf_alu_early_index_0  = prf_alu_early_index_0[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_alu_early_index_0 = 4'd1 << prf_alu_early_index_0[1:0];
-    wire [ROW_AW-1:0] row_of_prf_alu_early_index_1  = prf_alu_early_index_1[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_alu_early_index_1 = 4'd1 << prf_alu_early_index_1[1:0];
-    wire [ROW_AW-1:0] row_of_prf_div_wake_index_0  = prf_div_wake_index_0[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_div_wake_index_0 = 4'd1 << prf_div_wake_index_0[1:0];
-    wire [ROW_AW-1:0] row_of_prf_div_wake_index_1  = prf_div_wake_index_1[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_div_wake_index_1 = 4'd1 << prf_div_wake_index_1[1:0];
-    wire [ROW_AW-1:0] row_of_prf_ld_early_index  = prf_ld_early_index[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_ld_early_index = 4'd1 << prf_ld_early_index[1:0];
-    wire [ROW_AW-1:0] row_of_prf_ld_index  = prf_ld_index[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_ld_index = 4'd1 << prf_ld_index[1:0];
-    wire [ROW_AW-1:0] row_of_prf_wb_index_0  = prf_wb_index_0[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_wb_index_0 = 4'd1 << prf_wb_index_0[1:0];
-    wire [ROW_AW-1:0] row_of_prf_wb_index_1  = prf_wb_index_1[DEPTH_AW-1:2];
-    wire [3:0]        bank_of_prf_wb_index_1 = 4'd1 << prf_wb_index_1[1:0];
+    reg [ROW_AW-1:0] row_of_head_next_pointer;
+    reg [3:0] bank_of_head_next_pointer;
+    reg [ROW_AW-1:0] row_of_head_pointer;
+    reg [3:0] bank_of_head_pointer;
+    reg [ROW_AW-1:0] row_of_issue_index_0;
+    reg [3:0] bank_of_issue_index_0;
+    reg [ROW_AW-1:0] row_of_issue_index_1;
+    reg [3:0] bank_of_issue_index_1;
+    reg [ROW_AW-1:0] row_of_prf_alu_early_index_0;
+    reg [3:0] bank_of_prf_alu_early_index_0;
+    reg [ROW_AW-1:0] row_of_prf_alu_early_index_1;
+    reg [3:0] bank_of_prf_alu_early_index_1;
+    reg [ROW_AW-1:0] row_of_prf_div_wake_index_0;
+    reg [3:0] bank_of_prf_div_wake_index_0;
+    reg [ROW_AW-1:0] row_of_prf_div_wake_index_1;
+    reg [3:0] bank_of_prf_div_wake_index_1;
+    reg [ROW_AW-1:0] row_of_prf_ld_early_index;
+    reg [3:0] bank_of_prf_ld_early_index;
+    reg [ROW_AW-1:0] row_of_prf_ld_index;
+    reg [3:0] bank_of_prf_ld_index;
+    reg [ROW_AW-1:0] row_of_prf_wb_index_0;
+    reg [3:0] bank_of_prf_wb_index_0;
+    reg [ROW_AW-1:0] row_of_prf_wb_index_1;
+    reg [3:0] bank_of_prf_wb_index_1;
+    always @(*) begin
+        row_of_head_next_pointer = head_next_pointer[DEPTH_AW-1:2];
+        bank_of_head_next_pointer = 4'd1 << head_next_pointer[1:0];
+        row_of_head_pointer = head_pointer[DEPTH_AW-1:2];
+        bank_of_head_pointer = 4'd1 << head_pointer[1:0];
+        row_of_issue_index_0 = issue_index_0[DEPTH_AW-1:2];
+        bank_of_issue_index_0 = 4'd1 << issue_index_0[1:0];
+        row_of_issue_index_1 = issue_index_1[DEPTH_AW-1:2];
+        bank_of_issue_index_1 = 4'd1 << issue_index_1[1:0];
+        row_of_prf_alu_early_index_0 = prf_alu_early_index_0[DEPTH_AW-1:2];
+        bank_of_prf_alu_early_index_0 = 4'd1 << prf_alu_early_index_0[1:0];
+        row_of_prf_alu_early_index_1 = prf_alu_early_index_1[DEPTH_AW-1:2];
+        bank_of_prf_alu_early_index_1 = 4'd1 << prf_alu_early_index_1[1:0];
+        row_of_prf_div_wake_index_0 = prf_div_wake_index_0[DEPTH_AW-1:2];
+        bank_of_prf_div_wake_index_0 = 4'd1 << prf_div_wake_index_0[1:0];
+        row_of_prf_div_wake_index_1 = prf_div_wake_index_1[DEPTH_AW-1:2];
+        bank_of_prf_div_wake_index_1 = 4'd1 << prf_div_wake_index_1[1:0];
+        row_of_prf_ld_early_index = prf_ld_early_index[DEPTH_AW-1:2];
+        bank_of_prf_ld_early_index = 4'd1 << prf_ld_early_index[1:0];
+        row_of_prf_ld_index = prf_ld_index[DEPTH_AW-1:2];
+        bank_of_prf_ld_index = 4'd1 << prf_ld_index[1:0];
+        row_of_prf_wb_index_0 = prf_wb_index_0[DEPTH_AW-1:2];
+        bank_of_prf_wb_index_0 = 4'd1 << prf_wb_index_0[1:0];
+        row_of_prf_wb_index_1 = prf_wb_index_1[DEPTH_AW-1:2];
+        bank_of_prf_wb_index_1 = 4'd1 << prf_wb_index_1[1:0];
+    end
 
-    wire [31:0] entry_pc_rd_head_pointer =
-        (bank_of_head_pointer[0] ? entry_pc_bank0[row_of_head_pointer] : 32'd0) |
-        (bank_of_head_pointer[1] ? entry_pc_bank1[row_of_head_pointer] : 32'd0) |
-        (bank_of_head_pointer[2] ? entry_pc_bank2[row_of_head_pointer] : 32'd0) |
-        (bank_of_head_pointer[3] ? entry_pc_bank3[row_of_head_pointer] : 32'd0);
+    reg [31:0] entry_pc_rd_head_pointer;
+    always @(*) begin
+        entry_pc_rd_head_pointer = (bank_of_head_pointer[0] ? entry_pc_bank0[row_of_head_pointer] : 32'd0) | (bank_of_head_pointer[1] ? entry_pc_bank1[row_of_head_pointer] : 32'd0) | (bank_of_head_pointer[2] ? entry_pc_bank2[row_of_head_pointer] : 32'd0) | (bank_of_head_pointer[3] ? entry_pc_bank3[row_of_head_pointer] : 32'd0);
+    end
 
-    wire [5:0] entry_phys_rd_head_next_pointer =
-        (bank_of_head_next_pointer[0] ? entry_phys_bank0[row_of_head_next_pointer] : 6'd0) |
-        (bank_of_head_next_pointer[1] ? entry_phys_bank1[row_of_head_next_pointer] : 6'd0) |
-        (bank_of_head_next_pointer[2] ? entry_phys_bank2[row_of_head_next_pointer] : 6'd0) |
-        (bank_of_head_next_pointer[3] ? entry_phys_bank3[row_of_head_next_pointer] : 6'd0);
-    wire [5:0] entry_phys_rd_head_pointer =
-        (bank_of_head_pointer[0] ? entry_phys_bank0[row_of_head_pointer] : 6'd0) |
-        (bank_of_head_pointer[1] ? entry_phys_bank1[row_of_head_pointer] : 6'd0) |
-        (bank_of_head_pointer[2] ? entry_phys_bank2[row_of_head_pointer] : 6'd0) |
-        (bank_of_head_pointer[3] ? entry_phys_bank3[row_of_head_pointer] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_alu_early_index_0 =
-        (bank_of_prf_alu_early_index_0[0] ? entry_phys_bank0[row_of_prf_alu_early_index_0] : 6'd0) |
-        (bank_of_prf_alu_early_index_0[1] ? entry_phys_bank1[row_of_prf_alu_early_index_0] : 6'd0) |
-        (bank_of_prf_alu_early_index_0[2] ? entry_phys_bank2[row_of_prf_alu_early_index_0] : 6'd0) |
-        (bank_of_prf_alu_early_index_0[3] ? entry_phys_bank3[row_of_prf_alu_early_index_0] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_alu_early_index_1 =
-        (bank_of_prf_alu_early_index_1[0] ? entry_phys_bank0[row_of_prf_alu_early_index_1] : 6'd0) |
-        (bank_of_prf_alu_early_index_1[1] ? entry_phys_bank1[row_of_prf_alu_early_index_1] : 6'd0) |
-        (bank_of_prf_alu_early_index_1[2] ? entry_phys_bank2[row_of_prf_alu_early_index_1] : 6'd0) |
-        (bank_of_prf_alu_early_index_1[3] ? entry_phys_bank3[row_of_prf_alu_early_index_1] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_div_wake_index_0 =
-        (bank_of_prf_div_wake_index_0[0] ? entry_phys_bank0[row_of_prf_div_wake_index_0] : 6'd0) |
-        (bank_of_prf_div_wake_index_0[1] ? entry_phys_bank1[row_of_prf_div_wake_index_0] : 6'd0) |
-        (bank_of_prf_div_wake_index_0[2] ? entry_phys_bank2[row_of_prf_div_wake_index_0] : 6'd0) |
-        (bank_of_prf_div_wake_index_0[3] ? entry_phys_bank3[row_of_prf_div_wake_index_0] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_div_wake_index_1 =
-        (bank_of_prf_div_wake_index_1[0] ? entry_phys_bank0[row_of_prf_div_wake_index_1] : 6'd0) |
-        (bank_of_prf_div_wake_index_1[1] ? entry_phys_bank1[row_of_prf_div_wake_index_1] : 6'd0) |
-        (bank_of_prf_div_wake_index_1[2] ? entry_phys_bank2[row_of_prf_div_wake_index_1] : 6'd0) |
-        (bank_of_prf_div_wake_index_1[3] ? entry_phys_bank3[row_of_prf_div_wake_index_1] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_ld_early_index =
-        (bank_of_prf_ld_early_index[0] ? entry_phys_bank0[row_of_prf_ld_early_index] : 6'd0) |
-        (bank_of_prf_ld_early_index[1] ? entry_phys_bank1[row_of_prf_ld_early_index] : 6'd0) |
-        (bank_of_prf_ld_early_index[2] ? entry_phys_bank2[row_of_prf_ld_early_index] : 6'd0) |
-        (bank_of_prf_ld_early_index[3] ? entry_phys_bank3[row_of_prf_ld_early_index] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_ld_index =
-        (bank_of_prf_ld_index[0] ? entry_phys_bank0[row_of_prf_ld_index] : 6'd0) |
-        (bank_of_prf_ld_index[1] ? entry_phys_bank1[row_of_prf_ld_index] : 6'd0) |
-        (bank_of_prf_ld_index[2] ? entry_phys_bank2[row_of_prf_ld_index] : 6'd0) |
-        (bank_of_prf_ld_index[3] ? entry_phys_bank3[row_of_prf_ld_index] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_wb_index_0 =
-        (bank_of_prf_wb_index_0[0] ? entry_phys_bank0[row_of_prf_wb_index_0] : 6'd0) |
-        (bank_of_prf_wb_index_0[1] ? entry_phys_bank1[row_of_prf_wb_index_0] : 6'd0) |
-        (bank_of_prf_wb_index_0[2] ? entry_phys_bank2[row_of_prf_wb_index_0] : 6'd0) |
-        (bank_of_prf_wb_index_0[3] ? entry_phys_bank3[row_of_prf_wb_index_0] : 6'd0);
-    wire [5:0] entry_phys_rd_prf_wb_index_1 =
-        (bank_of_prf_wb_index_1[0] ? entry_phys_bank0[row_of_prf_wb_index_1] : 6'd0) |
-        (bank_of_prf_wb_index_1[1] ? entry_phys_bank1[row_of_prf_wb_index_1] : 6'd0) |
-        (bank_of_prf_wb_index_1[2] ? entry_phys_bank2[row_of_prf_wb_index_1] : 6'd0) |
-        (bank_of_prf_wb_index_1[3] ? entry_phys_bank3[row_of_prf_wb_index_1] : 6'd0);
+    reg [5:0] entry_phys_rd_head_next_pointer;
+    always @(*) begin
+        entry_phys_rd_head_next_pointer = (bank_of_head_next_pointer[0] ? entry_phys_bank0[row_of_head_next_pointer] : 6'd0) | (bank_of_head_next_pointer[1] ? entry_phys_bank1[row_of_head_next_pointer] : 6'd0) | (bank_of_head_next_pointer[2] ? entry_phys_bank2[row_of_head_next_pointer] : 6'd0) | (bank_of_head_next_pointer[3] ? entry_phys_bank3[row_of_head_next_pointer] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_head_pointer;
+    always @(*) begin
+        entry_phys_rd_head_pointer = (bank_of_head_pointer[0] ? entry_phys_bank0[row_of_head_pointer] : 6'd0) | (bank_of_head_pointer[1] ? entry_phys_bank1[row_of_head_pointer] : 6'd0) | (bank_of_head_pointer[2] ? entry_phys_bank2[row_of_head_pointer] : 6'd0) | (bank_of_head_pointer[3] ? entry_phys_bank3[row_of_head_pointer] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_alu_early_index_0;
+    always @(*) begin
+        entry_phys_rd_prf_alu_early_index_0 = (bank_of_prf_alu_early_index_0[0] ? entry_phys_bank0[row_of_prf_alu_early_index_0] : 6'd0) | (bank_of_prf_alu_early_index_0[1] ? entry_phys_bank1[row_of_prf_alu_early_index_0] : 6'd0) | (bank_of_prf_alu_early_index_0[2] ? entry_phys_bank2[row_of_prf_alu_early_index_0] : 6'd0) | (bank_of_prf_alu_early_index_0[3] ? entry_phys_bank3[row_of_prf_alu_early_index_0] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_alu_early_index_1;
+    always @(*) begin
+        entry_phys_rd_prf_alu_early_index_1 = (bank_of_prf_alu_early_index_1[0] ? entry_phys_bank0[row_of_prf_alu_early_index_1] : 6'd0) | (bank_of_prf_alu_early_index_1[1] ? entry_phys_bank1[row_of_prf_alu_early_index_1] : 6'd0) | (bank_of_prf_alu_early_index_1[2] ? entry_phys_bank2[row_of_prf_alu_early_index_1] : 6'd0) | (bank_of_prf_alu_early_index_1[3] ? entry_phys_bank3[row_of_prf_alu_early_index_1] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_div_wake_index_0;
+    always @(*) begin
+        entry_phys_rd_prf_div_wake_index_0 = (bank_of_prf_div_wake_index_0[0] ? entry_phys_bank0[row_of_prf_div_wake_index_0] : 6'd0) | (bank_of_prf_div_wake_index_0[1] ? entry_phys_bank1[row_of_prf_div_wake_index_0] : 6'd0) | (bank_of_prf_div_wake_index_0[2] ? entry_phys_bank2[row_of_prf_div_wake_index_0] : 6'd0) | (bank_of_prf_div_wake_index_0[3] ? entry_phys_bank3[row_of_prf_div_wake_index_0] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_div_wake_index_1;
+    always @(*) begin
+        entry_phys_rd_prf_div_wake_index_1 = (bank_of_prf_div_wake_index_1[0] ? entry_phys_bank0[row_of_prf_div_wake_index_1] : 6'd0) | (bank_of_prf_div_wake_index_1[1] ? entry_phys_bank1[row_of_prf_div_wake_index_1] : 6'd0) | (bank_of_prf_div_wake_index_1[2] ? entry_phys_bank2[row_of_prf_div_wake_index_1] : 6'd0) | (bank_of_prf_div_wake_index_1[3] ? entry_phys_bank3[row_of_prf_div_wake_index_1] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_ld_early_index;
+    always @(*) begin
+        entry_phys_rd_prf_ld_early_index = (bank_of_prf_ld_early_index[0] ? entry_phys_bank0[row_of_prf_ld_early_index] : 6'd0) | (bank_of_prf_ld_early_index[1] ? entry_phys_bank1[row_of_prf_ld_early_index] : 6'd0) | (bank_of_prf_ld_early_index[2] ? entry_phys_bank2[row_of_prf_ld_early_index] : 6'd0) | (bank_of_prf_ld_early_index[3] ? entry_phys_bank3[row_of_prf_ld_early_index] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_ld_index;
+    always @(*) begin
+        entry_phys_rd_prf_ld_index = (bank_of_prf_ld_index[0] ? entry_phys_bank0[row_of_prf_ld_index] : 6'd0) | (bank_of_prf_ld_index[1] ? entry_phys_bank1[row_of_prf_ld_index] : 6'd0) | (bank_of_prf_ld_index[2] ? entry_phys_bank2[row_of_prf_ld_index] : 6'd0) | (bank_of_prf_ld_index[3] ? entry_phys_bank3[row_of_prf_ld_index] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_wb_index_0;
+    always @(*) begin
+        entry_phys_rd_prf_wb_index_0 = (bank_of_prf_wb_index_0[0] ? entry_phys_bank0[row_of_prf_wb_index_0] : 6'd0) | (bank_of_prf_wb_index_0[1] ? entry_phys_bank1[row_of_prf_wb_index_0] : 6'd0) | (bank_of_prf_wb_index_0[2] ? entry_phys_bank2[row_of_prf_wb_index_0] : 6'd0) | (bank_of_prf_wb_index_0[3] ? entry_phys_bank3[row_of_prf_wb_index_0] : 6'd0);
+    end
+    reg [5:0] entry_phys_rd_prf_wb_index_1;
+    always @(*) begin
+        entry_phys_rd_prf_wb_index_1 = (bank_of_prf_wb_index_1[0] ? entry_phys_bank0[row_of_prf_wb_index_1] : 6'd0) | (bank_of_prf_wb_index_1[1] ? entry_phys_bank1[row_of_prf_wb_index_1] : 6'd0) | (bank_of_prf_wb_index_1[2] ? entry_phys_bank2[row_of_prf_wb_index_1] : 6'd0) | (bank_of_prf_wb_index_1[3] ? entry_phys_bank3[row_of_prf_wb_index_1] : 6'd0);
+    end
 
-    wire [4:0] entry_destination_register_rd_head_next_pointer =
-        (bank_of_head_next_pointer[0] ? entry_destination_register_bank0[row_of_head_next_pointer] : 5'd0) |
-        (bank_of_head_next_pointer[1] ? entry_destination_register_bank1[row_of_head_next_pointer] : 5'd0) |
-        (bank_of_head_next_pointer[2] ? entry_destination_register_bank2[row_of_head_next_pointer] : 5'd0) |
-        (bank_of_head_next_pointer[3] ? entry_destination_register_bank3[row_of_head_next_pointer] : 5'd0);
-    wire [4:0] entry_destination_register_rd_head_pointer =
-        (bank_of_head_pointer[0] ? entry_destination_register_bank0[row_of_head_pointer] : 5'd0) |
-        (bank_of_head_pointer[1] ? entry_destination_register_bank1[row_of_head_pointer] : 5'd0) |
-        (bank_of_head_pointer[2] ? entry_destination_register_bank2[row_of_head_pointer] : 5'd0) |
-        (bank_of_head_pointer[3] ? entry_destination_register_bank3[row_of_head_pointer] : 5'd0);
-    wire [4:0] entry_destination_register_rd_issue_index_0 =
-        (bank_of_issue_index_0[0] ? entry_destination_register_bank0[row_of_issue_index_0] : 5'd0) |
-        (bank_of_issue_index_0[1] ? entry_destination_register_bank1[row_of_issue_index_0] : 5'd0) |
-        (bank_of_issue_index_0[2] ? entry_destination_register_bank2[row_of_issue_index_0] : 5'd0) |
-        (bank_of_issue_index_0[3] ? entry_destination_register_bank3[row_of_issue_index_0] : 5'd0);
-    wire [4:0] entry_destination_register_rd_issue_index_1 =
-        (bank_of_issue_index_1[0] ? entry_destination_register_bank0[row_of_issue_index_1] : 5'd0) |
-        (bank_of_issue_index_1[1] ? entry_destination_register_bank1[row_of_issue_index_1] : 5'd0) |
-        (bank_of_issue_index_1[2] ? entry_destination_register_bank2[row_of_issue_index_1] : 5'd0) |
-        (bank_of_issue_index_1[3] ? entry_destination_register_bank3[row_of_issue_index_1] : 5'd0);
+    reg [4:0] entry_destination_register_rd_head_next_pointer;
+    always @(*) begin
+        entry_destination_register_rd_head_next_pointer = (bank_of_head_next_pointer[0] ? entry_destination_register_bank0[row_of_head_next_pointer] : 5'd0) | (bank_of_head_next_pointer[1] ? entry_destination_register_bank1[row_of_head_next_pointer] : 5'd0) | (bank_of_head_next_pointer[2] ? entry_destination_register_bank2[row_of_head_next_pointer] : 5'd0) | (bank_of_head_next_pointer[3] ? entry_destination_register_bank3[row_of_head_next_pointer] : 5'd0);
+    end
+    reg [4:0] entry_destination_register_rd_head_pointer;
+    always @(*) begin
+        entry_destination_register_rd_head_pointer = (bank_of_head_pointer[0] ? entry_destination_register_bank0[row_of_head_pointer] : 5'd0) | (bank_of_head_pointer[1] ? entry_destination_register_bank1[row_of_head_pointer] : 5'd0) | (bank_of_head_pointer[2] ? entry_destination_register_bank2[row_of_head_pointer] : 5'd0) | (bank_of_head_pointer[3] ? entry_destination_register_bank3[row_of_head_pointer] : 5'd0);
+    end
+    reg [4:0] entry_destination_register_rd_issue_index_0;
+    always @(*) begin
+        entry_destination_register_rd_issue_index_0 = (bank_of_issue_index_0[0] ? entry_destination_register_bank0[row_of_issue_index_0] : 5'd0) | (bank_of_issue_index_0[1] ? entry_destination_register_bank1[row_of_issue_index_0] : 5'd0) | (bank_of_issue_index_0[2] ? entry_destination_register_bank2[row_of_issue_index_0] : 5'd0) | (bank_of_issue_index_0[3] ? entry_destination_register_bank3[row_of_issue_index_0] : 5'd0);
+    end
+    reg [4:0] entry_destination_register_rd_issue_index_1;
+    always @(*) begin
+        entry_destination_register_rd_issue_index_1 = (bank_of_issue_index_1[0] ? entry_destination_register_bank0[row_of_issue_index_1] : 5'd0) | (bank_of_issue_index_1[1] ? entry_destination_register_bank1[row_of_issue_index_1] : 5'd0) | (bank_of_issue_index_1[2] ? entry_destination_register_bank2[row_of_issue_index_1] : 5'd0) | (bank_of_issue_index_1[3] ? entry_destination_register_bank3[row_of_issue_index_1] : 5'd0);
+    end
 
-    wire  entry_csr_rd_head_pointer =
-        (bank_of_head_pointer[0] ? entry_csr_bank0[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[1] ? entry_csr_bank1[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[2] ? entry_csr_bank2[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[3] ? entry_csr_bank3[row_of_head_pointer] : 1'd0);
-    wire  entry_csr_rd_issue_index_0 =
-        (bank_of_issue_index_0[0] ? entry_csr_bank0[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[1] ? entry_csr_bank1[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[2] ? entry_csr_bank2[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[3] ? entry_csr_bank3[row_of_issue_index_0] : 1'd0);
-    wire  entry_csr_rd_issue_index_1 =
-        (bank_of_issue_index_1[0] ? entry_csr_bank0[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[1] ? entry_csr_bank1[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[2] ? entry_csr_bank2[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[3] ? entry_csr_bank3[row_of_issue_index_1] : 1'd0);
+    reg entry_csr_rd_head_pointer;
+    always @(*) begin
+        entry_csr_rd_head_pointer = (bank_of_head_pointer[0] ? entry_csr_bank0[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[1] ? entry_csr_bank1[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[2] ? entry_csr_bank2[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[3] ? entry_csr_bank3[row_of_head_pointer] : 1'd0);
+    end
+    reg entry_csr_rd_issue_index_0;
+    always @(*) begin
+        entry_csr_rd_issue_index_0 = (bank_of_issue_index_0[0] ? entry_csr_bank0[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[1] ? entry_csr_bank1[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[2] ? entry_csr_bank2[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[3] ? entry_csr_bank3[row_of_issue_index_0] : 1'd0);
+    end
+    reg entry_csr_rd_issue_index_1;
+    always @(*) begin
+        entry_csr_rd_issue_index_1 = (bank_of_issue_index_1[0] ? entry_csr_bank0[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[1] ? entry_csr_bank1[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[2] ? entry_csr_bank2[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[3] ? entry_csr_bank3[row_of_issue_index_1] : 1'd0);
+    end
 
-    wire  entry_pending_rd_issue_index_0 =
-        (bank_of_issue_index_0[0] ? entry_pending_bank0[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[1] ? entry_pending_bank1[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[2] ? entry_pending_bank2[row_of_issue_index_0] : 1'd0) |
-        (bank_of_issue_index_0[3] ? entry_pending_bank3[row_of_issue_index_0] : 1'd0);
-    wire  entry_pending_rd_issue_index_1 =
-        (bank_of_issue_index_1[0] ? entry_pending_bank0[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[1] ? entry_pending_bank1[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[2] ? entry_pending_bank2[row_of_issue_index_1] : 1'd0) |
-        (bank_of_issue_index_1[3] ? entry_pending_bank3[row_of_issue_index_1] : 1'd0);
+    reg entry_pending_rd_issue_index_0;
+    always @(*) begin
+        entry_pending_rd_issue_index_0 = (bank_of_issue_index_0[0] ? entry_pending_bank0[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[1] ? entry_pending_bank1[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[2] ? entry_pending_bank2[row_of_issue_index_0] : 1'd0) | (bank_of_issue_index_0[3] ? entry_pending_bank3[row_of_issue_index_0] : 1'd0);
+    end
+    reg entry_pending_rd_issue_index_1;
+    always @(*) begin
+        entry_pending_rd_issue_index_1 = (bank_of_issue_index_1[0] ? entry_pending_bank0[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[1] ? entry_pending_bank1[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[2] ? entry_pending_bank2[row_of_issue_index_1] : 1'd0) | (bank_of_issue_index_1[3] ? entry_pending_bank3[row_of_issue_index_1] : 1'd0);
+    end
 
-    wire  entry_system_rd_head_next_pointer =
-        (bank_of_head_next_pointer[0] ? entry_system_bank0[row_of_head_next_pointer] : 1'd0) |
-        (bank_of_head_next_pointer[1] ? entry_system_bank1[row_of_head_next_pointer] : 1'd0) |
-        (bank_of_head_next_pointer[2] ? entry_system_bank2[row_of_head_next_pointer] : 1'd0) |
-        (bank_of_head_next_pointer[3] ? entry_system_bank3[row_of_head_next_pointer] : 1'd0);
-    wire  entry_system_rd_head_pointer =
-        (bank_of_head_pointer[0] ? entry_system_bank0[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[1] ? entry_system_bank1[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[2] ? entry_system_bank2[row_of_head_pointer] : 1'd0) |
-        (bank_of_head_pointer[3] ? entry_system_bank3[row_of_head_pointer] : 1'd0);
+    reg entry_system_rd_head_next_pointer;
+    always @(*) begin
+        entry_system_rd_head_next_pointer = (bank_of_head_next_pointer[0] ? entry_system_bank0[row_of_head_next_pointer] : 1'd0) | (bank_of_head_next_pointer[1] ? entry_system_bank1[row_of_head_next_pointer] : 1'd0) | (bank_of_head_next_pointer[2] ? entry_system_bank2[row_of_head_next_pointer] : 1'd0) | (bank_of_head_next_pointer[3] ? entry_system_bank3[row_of_head_next_pointer] : 1'd0);
+    end
+    reg entry_system_rd_head_pointer;
+    always @(*) begin
+        entry_system_rd_head_pointer = (bank_of_head_pointer[0] ? entry_system_bank0[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[1] ? entry_system_bank1[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[2] ? entry_system_bank2[row_of_head_pointer] : 1'd0) | (bank_of_head_pointer[3] ? entry_system_bank3[row_of_head_pointer] : 1'd0);
+    end
 //入项：rd / 世代 / 是否会跳 / 会不会报完成口 —— 这四张表只有【复位 + 分配】两个写源。
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -791,13 +889,14 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 
 //S5 判定口的两条 lane（组合）：这一拍判定出来、真要改向的项。
 //  判据与旧结构逐项同门，只是把"判定过 && 要改向"两项换成当拍判定口给出的值。
-    wire judge0_ok = bju_judged & entry_jump[bju_index] & bju_redir &
-                     entry_valid[bju_index] & ~entry_exception[bju_index] &
-                     (entry_generation[bju_index] == bju_generation);
-    wire judge1_ok = branch_unit_lane1_judged & entry_jump[branch_unit_lane1_index] &
-                     branch_unit_lane1_redir &
-                     entry_valid[branch_unit_lane1_index] & ~entry_exception[branch_unit_lane1_index] &
-                     (entry_generation[branch_unit_lane1_index] == branch_unit_lane1_generation);
+    reg judge0_ok;
+    always @(*) begin
+        judge0_ok = bju_judged & entry_jump[bju_index] & bju_redir & entry_valid[bju_index] & ~entry_exception[bju_index] & (entry_generation[bju_index] == bju_generation);
+    end
+    reg judge1_ok;
+    always @(*) begin
+        judge1_ok = branch_unit_lane1_judged & entry_jump[branch_unit_lane1_index] & branch_unit_lane1_redir & entry_valid[branch_unit_lane1_index] & ~entry_exception[branch_unit_lane1_index] & (entry_generation[branch_unit_lane1_index] == branch_unit_lane1_generation);
+    end
 
     always @(*) begin
         head_next_pointer   = (head_pointer + 5'd1) & DEPTH_MASK;
@@ -816,15 +915,15 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //★ 2026-11-13（fence）：栅栏的语义 = "比它老的访存都可见了才许退休"。判据是 drain_ok_registered，
 //  由 cpu_top 组合给出、在这里打了拍（见端口注释）。★ 它【不进 kill_any】：栅栏是一道要走的指令，
 //  不是一次作废；没等到排空就只是"这一拍还不许退"。
-        head_is_fence   = (entry_count != 5'd0) && entry_valid[head_pointer] && entry_fence  [head_pointer] &&
-                          !entry_exception[head_pointer];
-        head_is_fence_i = (entry_count != 5'd0) && entry_valid[head_pointer] && entry_fence_i[head_pointer] &&
-                          !entry_exception[head_pointer];
+        head_is_fence   = (entry_count != 5'd0) && entry_valid[head_pointer] &&
+                          (entry_barrier[head_pointer] == BARRIER_FENCE) && !entry_exception[head_pointer];
+        head_is_fence_i = (entry_count != 5'd0) && entry_valid[head_pointer] &&
+                          (entry_barrier[head_pointer] == BARRIER_FENCE_I) && !entry_exception[head_pointer];
         fence_head      = head_is_fence | head_is_fence_i;
 //★ 2026-11-13（P4）：CSR 0x7C0 的那一项。它也要等排空（语义与 fence 相同），
 //  而且要等 L2 把 maint 办完才许退。
         head_is_cache_flush = (entry_count != 5'd0) && entry_valid[head_pointer] &&
-                              entry_cache_flush[head_pointer] && !entry_exception[head_pointer];
+                              (entry_barrier[head_pointer] == BARRIER_FLUSH) && !entry_exception[head_pointer];
 //★ S5：判定拍只出 A；边界那条要走到队头自己退休才发 B。
 //★ 改向那一拍【要退】：队头就是那条分支、它是正确路径，改向/退休/杀后续是同一个事件；吃 kill_any 会自锁。
 //★ 三条标记口各自成项、不合成一根：命中队头就在 head_ok 里逐条取反。
@@ -843,8 +942,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                     !entry_mret[head_next_pointer] &&
 //★ 2026-11-13（fence）：栅栏一拍一道。同拍退第二道会把 fence.i 的作废/改向相位搞乱，
 //  代价只是多一拍（栅栏本来就极少）。
-                    !entry_fence[head_next_pointer] && !entry_fence_i[head_next_pointer] &&
-                    !entry_cache_flush[head_next_pointer] &&
+                    (entry_barrier[head_next_pointer] == BARRIER_NONE) &&
                     (entry_count >= 5'd2) && entry_valid[head_next_pointer] && entry_written[head_next_pointer] &&
                     (entry_judged[head_next_pointer] || (!entry_jump[head_next_pointer] && !entry_system_rd_head_next_pointer)) &&
                     !entry_exception[head_next_pointer] &&
@@ -920,10 +1018,15 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            redir_backend_0 <= 1'b0; kill_redirect_mret <= 1'b0; kill_redirect_target <= 32'd0;
-            redir_frontend <= 1'b0; redir_cause <= REDIR_CAUSE_BRANCH;
+            redir_backend_0 <= 1'b0;
+            kill_redirect_mret <= 1'b0;
+            kill_redirect_target <= 32'd0;
+            redir_frontend <= 1'b0;
+            redir_cause <= REDIR_CAUSE_BRANCH;
             icache_invalidate <= 1'b0;
-            trap_cause <= 4'd0; trap_pc <= 32'd0; trap_value <= 32'd0;
+            trap_cause <= 4'd0;
+            trap_pc <= 32'd0;
+            trap_value <= 32'd0;
         end
         else begin
 //A 域（判定拍 / mret / 陷阱）：改 PC + 清前端。不门 redir_backend_0（judge_accept 已吃过 kill_any，再门会吞掉刚受理的边界）。
@@ -931,15 +1034,21 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //  ★ 额外一根 icache_invalidate 【同一沿】：世代位翻在改向那拍，重取的第一条指令就按新世代查。
             redir_frontend <= judge_accept | mret_now | exc_now | fence_i_now | cache_flush_now;
             icache_invalidate <= fence_i_now | cache_flush_invalidate;
-            if (judge_accept)  kill_redirect_target <= judge_target;
+            if (judge_accept)
+                kill_redirect_target <= judge_target;
 //fence.i 的落点就是顺序下一条（项里存的是"指令地址 + 4"，与 mepc 同一个口径）
-            if (fence_i_now)   kill_redirect_target <= entry_pc_rd_head_pointer;
+            if (fence_i_now)
+                kill_redirect_target <= entry_pc_rd_head_pointer;
 //CSR 0x7C0 也一样：落在本项 pc+4，把更年轻的指令全部冲掉重取（它们可能读过旧数据）
-            if (cache_flush_now) kill_redirect_target <= entry_pc_rd_head_pointer;
+            if (cache_flush_now)
+                kill_redirect_target <= entry_pc_rd_head_pointer;
 //改向原因跟事件同沿寄存（pc 按它选落点，本模块按它选"陷阱要不要跳过队头"）
-            if (exc_now)             redir_cause <= REDIR_CAUSE_TRAP;
-            else if (mret_now)       redir_cause <= REDIR_CAUSE_MRET;
-            else if (judge_accept | boundary_now | fence_i_now | cache_flush_now) redir_cause <= REDIR_CAUSE_BRANCH;
+            if (exc_now)
+                redir_cause <= REDIR_CAUSE_TRAP;
+            else if (mret_now)
+                redir_cause <= REDIR_CAUSE_MRET;
+            else if (judge_accept | boundary_now | fence_i_now | cache_flush_now)
+                redir_cause <= REDIR_CAUSE_BRANCH;
             if (!redir_backend_0) begin
 //B 域（提交口）：在册边界走到队列头 ⇒ 整表 + 后端一起作废。
 //★ mret 的 B 跟 A 同拍；陷阱也同构 —— 清表和改 PC 不许错开。
@@ -960,15 +1069,19 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 
 //影子那根：上面那一笔打一拍。给 isq / idu 这些晚一拍才清的模块，以及自己的 redirect_stop_alloc。
     always @(posedge clk) begin
-        if (reset_registered) redir_backend_1 <= 1'b0;
-        else                  redir_backend_1 <= (redir_backend_0 | irq_kill);
+        if (reset_registered)
+            redir_backend_1 <= 1'b0;
+        else
+            redir_backend_1 <= (redir_backend_0 | irq_kill);
     end
 
 //在册边界：判定拍受理时锁下，提交口（以及异常/中断交付）那一拍撤掉
 
     always @(posedge clk) begin
-        if (reset_registered) flush_boundary_valid <= 1'b0;
-        else if ((redir_backend_0 | irq_kill)) flush_boundary_valid <= 1'b0;
+        if (reset_registered)
+            flush_boundary_valid <= 1'b0;
+        else if ((redir_backend_0 | irq_kill))
+            flush_boundary_valid <= 1'b0;
         else if (judge_accept) begin
             flush_boundary_valid <= 1'b1;
             flush_boundary_index <= judge_index;
@@ -988,7 +1101,9 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 
 //击杀：改向只在提交口发一次 ⇒ 每次冲刷都是整窗的；消费端一律判"这一拍有没有冲刷"。
 //★ S5：判定拍发 A 之后分配就冻住，解冻在提交口那一拍之后（那拍本来就被 后端击杀 挡着）。
-    assign redirect_stop_alloc = flush_boundary_valid | redir_backend_1;
+    always @(*) begin
+        redirect_stop_alloc = flush_boundary_valid | redir_backend_1;
+    end
 
 //---- 中断返回点：队头的指令地址（组合读）----
 //★ 逐项列成 case，不写 entry_pc_rd_head_pointer：数组元素在 always @(*) 里进不了敏感表。
@@ -1001,16 +1116,20 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //★ S5：改向在册（寄存一拍）给 isq 挡新的访存发射，就是"边界在册"本身 + 事件那片 dly。
 //  挡"新发"就够：已在 s2/s3 的会在提交口那一拍被击杀掩码杀干净。
     always @(posedge clk) begin
-        if (reset_registered) redirect_any <= 1'b0;
-        else                  redirect_any <= flush_boundary_valid | redir_backend_0;
+        if (reset_registered)
+            redirect_any <= 1'b0;
+        else
+            redirect_any <= flush_boundary_valid | redir_backend_0;
     end
 
 //★ 2026-11-13（fence）：排空判据就地打一拍。它只喂提交口的 head_ok / fence_i_now，
 //  打进来的目的是断环（SQ 的 _ret 里含 ret0_valid，而 ret0_valid 就是 head_ok）。
 //  代价 = 每道栅栏多等一拍；常规 load/store 一根线都不碰。
     always @(posedge clk) begin
-        if (reset_registered) drain_ok_registered <= 1'b0;
-        else                  drain_ok_registered <= drain_ok;
+        if (reset_registered)
+            drain_ok_registered <= 1'b0;
+        else
+            drain_ok_registered <= drain_ok;
     end
 
 //★ 2026-11-13（P4）：CSR 0x7C0 的两拍状态机（软件的一致性原语，给 DMA 用）。
@@ -1068,11 +1187,15 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //队头指针：退 0/1/2 笔；陷阱交付也前进一格（盖过上面）。
 // P1: 前进格数算一次存进 retire_step，csr 的 minstret 直接吃它。
     always @(*) begin
-        if (head_next_ok)      retire_step_next = 2'd2;
-        else if (head_ok)  retire_step_next = 2'd1;
-        else               retire_step_next = 2'd0;
+        if (head_next_ok)
+            retire_step_next = 2'd2;
+        else if (head_ok)
+            retire_step_next = 2'd1;
+        else
+            retire_step_next = 2'd0;
 //陷阱交付：队头那条自己算走（tail 也指向 head+1），所以这条分支必须盖过 kill_any 的 0。
-        if (redir_backend_0 && (redir_cause == REDIR_CAUSE_TRAP)) retire_step_next = 2'd1;
+        if (redir_backend_0 && (redir_cause == REDIR_CAUSE_TRAP))
+            retire_step_next = 2'd1;
         head_pointer_next = (head_pointer + {4'b0000, retire_step_next}) & DEPTH_MASK;
     end
 
@@ -1135,9 +1258,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_exc[ri] <= 4'd0;
                 entry_judged[ri]  <= 1'b0;
                 entry_mret[ri]  <= 1'b0;
-                entry_fence[ri]     <= 1'b0;
-                entry_fence_i[ri]   <= 1'b0;
-                entry_cache_flush[ri] <= 1'b0;
+                entry_barrier[ri]   <= BARRIER_NONE;
             end
             csr_side_valid <= 1'b0;
         end
@@ -1163,9 +1284,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
 //  原来那条路（cont 的 mret_mark/mret_index）实测会被同窗口别人的异常标志压掉（seed36：标签丢了，
 //  那条 mret 当普通指令退休、PC 顺延到下一条，整段 body 重跑）。
                 entry_mret[tail_pointer]  <= allocation_mret_0;
-                entry_fence[tail_pointer]   <= allocation_fence_0;
-                entry_fence_i[tail_pointer] <= allocation_fence_i_0;
-                entry_cache_flush[tail_pointer] <= allocation_cache_flush_0;
+                entry_barrier[tail_pointer]        <= allocation_barrier_0;
             end
             if (alloc_take_1) begin
                 entry_valid[allocation_index_1]  <= 1'b1;
@@ -1173,9 +1292,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_exception[allocation_index_1] <= 1'b0;
                 entry_judged[allocation_index_1]  <= 1'b0;
                 entry_mret[allocation_index_1]  <= allocation_mret_1;
-                entry_fence[allocation_index_1]   <= allocation_fence_1;
-                entry_fence_i[allocation_index_1] <= allocation_fence_i_1;
-                entry_cache_flush[allocation_index_1] <= allocation_cache_flush_1;
+                entry_barrier[allocation_index_1]    <= allocation_barrier_1;
             end
             if (alloc_take_2) begin
                 entry_valid[allocation_index_2]  <= 1'b1;
@@ -1183,9 +1300,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_exception[allocation_index_2] <= 1'b0;
                 entry_judged[allocation_index_2]  <= 1'b0;
                 entry_mret[allocation_index_2]  <= allocation_mret_2;
-                entry_fence[allocation_index_2]   <= allocation_fence_2;
-                entry_fence_i[allocation_index_2] <= allocation_fence_i_2;
-                entry_cache_flush[allocation_index_2] <= allocation_cache_flush_2;
+                entry_barrier[allocation_index_2]    <= allocation_barrier_2;
             end
 //完成回填：wr 与 data 必须【同条件、同一沿】写入（拆开会出现"wr 已置、data 还是旧值"的一拍窗口）。
 //★ 世代校验必需：被冲刷/已释放的槽在新住户身上的迟到上报只有它能挡（entry_valid 挡不住"新住户也 valid"）。
@@ -1256,7 +1371,8 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
             end
 //★ mret 必须是一发：不清的话事件还拉 ⇒ 冲刷永远不退、队头永远退不掉。
 //★ 清在【它自己那一槽】上：吃寄存版的事件信号会清到邻居的槽，撞上一条真的 mret 就把改向吞掉。
-            if (mret_now) entry_mret [head_pointer] <= 1'b0;
+            if (mret_now)
+                entry_mret [head_pointer] <= 1'b0;
 //★ 标记陷阱时必须【同时置 wr】：故障指令不会再有单元回报它，只置 exc 不置 wr 就退不掉 ⇒ 整核挂死。
 //★ S4：标记即写项，必须排在所有 acc_*/判定口之后（同一槽同一沿，后写者赢）。
             if (exc0_en && entry_valid[exc0_index]) begin
@@ -1280,9 +1396,12 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                 entry_target_exception_selected[exception_selected_index] <= exception_selected_trap_value;
                 entry_target_source            [exception_selected_index] <= TARGET_FROM_EXC_SELECTED;
             end
-            if (alloc_take_0) entry_written[tail_pointer] <= 1'b0;
-            if (alloc_take_1) entry_written[allocation_index_1] <= 1'b0;
-            if (alloc_take_2) entry_written[allocation_index_2] <= 1'b0;
+            if (alloc_take_0)
+                entry_written[tail_pointer] <= 1'b0;
+            if (alloc_take_1)
+                entry_written[allocation_index_1] <= 1'b0;
+            if (alloc_take_2)
+                entry_written[allocation_index_2] <= 1'b0;
 //★ 冲刷 = 整窗作废（改向 / 异常 / 中断都在提交口发，边界恒为队头）。
 //  冲刷拍分配口被 后端击杀 挡住，不会误清同拍新进来的项。
             if ((redir_backend_0 | irq_kill)) begin
@@ -1291,9 +1410,7 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
                     entry_written[ri]    <= 1'b0;
                     entry_exception[ri]    <= 1'b0;
                     entry_mret[ri]  <= 1'b0;
-                    entry_fence[ri]     <= 1'b0;
-                    entry_fence_i[ri]   <= 1'b0;
-                    entry_cache_flush[ri] <= 1'b0;
+                    entry_barrier[ri]   <= BARRIER_NONE;
                 end
                 csr_side_valid <= 1'b0;
             end
@@ -1306,15 +1423,21 @@ localparam integer ROW_AW   = DEPTH_AW - 2;           // 行内地址位宽
     assign prf_ld_phys   = entry_phys_rd_prf_ld_index;
     assign prf_alu_early_phys_0 = entry_phys_rd_prf_alu_early_index_0;
     assign prf_ld_early_phys    = entry_phys_rd_prf_ld_early_index;
-    assign prf_ld_early_live    = entry_valid[prf_ld_early_index] & (entry_generation[prf_ld_early_index] == prf_ld_early_generation);
+    always @(*) begin
+        prf_ld_early_live = entry_valid[prf_ld_early_index] & (entry_generation[prf_ld_early_index] == prf_ld_early_generation);
+    end
     assign prf_alu_early_phys_1 = entry_phys_rd_prf_alu_early_index_1;
 //★ ALU 有自己值表写口 ⇒ 也有存活判据（与 load 早口逐字同形）
-    assign prf_alu_early_live_0 = entry_valid[prf_alu_early_index_0] & (entry_generation[prf_alu_early_index_0] == prf_alu_early_generation_0);
-    assign prf_alu_early_live_1 = entry_valid[prf_alu_early_index_1] & (entry_generation[prf_alu_early_index_1] == prf_alu_early_generation_1);
+    always @(*) begin
+        prf_alu_early_live_0 = entry_valid[prf_alu_early_index_0] & (entry_generation[prf_alu_early_index_0] == prf_alu_early_generation_0);
+        prf_alu_early_live_1 = entry_valid[prf_alu_early_index_1] & (entry_generation[prf_alu_early_index_1] == prf_alu_early_generation_1);
+    end
     assign prf_div_wake_phys_0  = entry_phys_rd_prf_div_wake_index_0;
     assign prf_div_wake_phys_1  = entry_phys_rd_prf_div_wake_index_1;
-    assign prf_wb_live_0 = prf_wb_en_0 & entry_valid[prf_wb_index_0] & (entry_generation[prf_wb_index_0] == prf_wb_generation_0);
-    assign prf_wb_live_1 = prf_wb_en_1 & entry_valid[prf_wb_index_1] & (entry_generation[prf_wb_index_1] == prf_wb_generation_1);
-    assign prf_ld_live   = entry_valid[prf_ld_index]   & (entry_generation[prf_ld_index]   == prf_ld_generation);
+    always @(*) begin
+        prf_wb_live_0 = prf_wb_en_0 & entry_valid[prf_wb_index_0] & (entry_generation[prf_wb_index_0] == prf_wb_generation_0);
+        prf_wb_live_1 = prf_wb_en_1 & entry_valid[prf_wb_index_1] & (entry_generation[prf_wb_index_1] == prf_wb_generation_1);
+        prf_ld_live = entry_valid[prf_ld_index]   & (entry_generation[prf_ld_index]   == prf_ld_generation);
+    end
 
 endmodule

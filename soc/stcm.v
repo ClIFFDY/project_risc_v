@@ -58,16 +58,24 @@ module stcm #(
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/image.hex", mem);
     end
 
-    wire accept = (htrans != 2'b00);
-    wire [AW-1:0] word_index = haddr[AW+1:2];
+    reg accept;
+    reg [AW-1:0] word_index;
+    always @(*) begin
+        accept = (htrans != 2'b00);
+        word_index = haddr[AW+1:2];
+    end
 
 //写：地址相位那一拍直接落
     always @(posedge clk) begin
         if (accept & hwrite) begin
-            if (hwstrb[0]) mem[word_index][7:0]   <= hwdata[7:0];
-            if (hwstrb[1]) mem[word_index][15:8]  <= hwdata[15:8];
-            if (hwstrb[2]) mem[word_index][23:16] <= hwdata[23:16];
-            if (hwstrb[3]) mem[word_index][31:24] <= hwdata[31:24];
+            if (hwstrb[0])
+                mem[word_index][7:0]   <= hwdata[7:0];
+            if (hwstrb[1])
+                mem[word_index][15:8]  <= hwdata[15:8];
+            if (hwstrb[2])
+                mem[word_index][23:16] <= hwdata[23:16];
+            if (hwstrb[3])
+                mem[word_index][31:24] <= hwdata[31:24];
         end
     end
 

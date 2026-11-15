@@ -74,7 +74,7 @@ module clint(
     input [31:0] pc_address_in,
     input        exti, timi, softi,
 //流水线状态（寄存输出）
-    output       irq_kill,          // 中断受理（受理判据打一拍再发）
+    output reg       irq_kill,          // 中断受理（受理判据打一拍再发）
     output reg [4:0] flush_index,
 //异常报告口 ×3：lane0 / lane1 / lsu。各带各的槽号，直接进 ROB 的三个标记口，本模块不做仲裁。
     output reg        exc0_en,
@@ -131,12 +131,6 @@ module clint(
     reg [31:0] isr_addr2_i, mcause_judged, csr_data_combinational_judged;
     reg exc_irq_act_i;
     reg [31:0] iret_addr2_i;
-    
-    wire exc_irq_ret_i;
-    assign exc_irq_ret_i = exception_interrupt_return_ok;
-
-//其它
-    reg [1:0] interrupt_request_timer;
 
 //===============================================================
 // 控制位译码（本模块最前）
@@ -146,17 +140,23 @@ module clint(
 //  ★ 发的那一拍再和 redir_backend_0 排一次：B 改向那拍不许受理（否则 pc 去 mtvec、分支落的账没人认）。
     reg irq_candidate;
     always @(posedge clk) begin
-        if (reset_registered) irq_candidate <= 1'b0;
-        else if (irq_kill)    irq_candidate <= 1'b0;   // 这一拍就发了 → 撤
-        else                  irq_candidate <= exc_irq_act_i;
+        if (reset_registered)
+            irq_candidate <= 1'b0;
+        else if (irq_kill)
+            irq_candidate <= 1'b0;
+        // 这一拍就发了 → 撤
+        else
+            irq_candidate <= exc_irq_act_i;
     end
-    assign irq_kill = irq_candidate & ~redir_backend_0;
+    always @(*) begin
+        irq_kill = irq_candidate & ~redir_backend_0;
+    end
 
     always @(*) begin
         if (irq_kill)
             flush_index = interrupt_head_index_in;
         else
-            flush_index = 4'd0;
+            flush_index = 5'd0;
     end
 
     always @(posedge clk) begin
@@ -217,12 +217,6 @@ module clint(
     reg exception_external_interrupt_pending, exception_timer_interrupt_pending, exception_software_interrupt_pending, exception_interrupt_process, exception_global_pending;
     reg [31:0] isr_addr_reg1, isr_addr_reg2, mcause_registered, mcycle_registered, minstret_registered, mscratch_registered, mtval_registered;
     reg [31:0] interrupt_return_address_1;
-
-//输入合流（按"上层不运算"下放至此）：中断闸门
-    reg exception_interrupt_gate;
-    always @(*) begin
-        exception_interrupt_gate = (interrupt_request_timer != 2'd0);
-    end
 
 //CSR 读表写两份（执行级一份、提交口一份），不是偷懒：
 //  ★ 本仓实测过，iverilog 的 @* 不把【函数体内读的信号】算进敏感表（见记忆
@@ -427,8 +421,8 @@ module clint(
 //  旧设计判定拍就是改向拍，成立；改向搬到提交拍后它们先到、改向后到 ⇒
 //  判定拍白挡一次中断，真正改向那一拍反倒没人挡（中断与分支改向可能同拍打架）。
 //  改成用【真正改向那一拍的事件】redir_backend_0（= 提交口改向）。
-            exc_irq_act_i = exception_interrupt_enable_registered && exception_global_pending && !exception_interrupt_process && !exception_interrupt_gate &&
-                          !(exc_irq_ret_i | redir_backend_0) && interrupt_head_valid;
+            exc_irq_act_i = exception_interrupt_enable_registered && exception_global_pending && !exception_interrupt_process &&
+                          !(exception_interrupt_return_ok | redir_backend_0) && interrupt_head_valid;
             mcause_judged = mcause_registered;
             isr_addr2_i = isr_addr_reg2;
         end
@@ -465,17 +459,13 @@ module clint(
 //mret 标签不再从这里出：它是 idu 的译码位，随分配直接写进 ROB 项（rob: allocation_mret_*）。
 //  原来这里报的是 bju 判定级的 1 拍脉冲 + 槽号，会被同一窗口里别人的异常标志压掉（seed36）。
 
-//===============================================================
-// 序号与执行位
-//===============================================================
-//写序号（乱序写回用，逻辑就放在本模块内）：发射级要不要发号 + 三个单元的滞留兜底请求
-    always @(posedge clk) begin
-        if (reset_registered)
-            interrupt_request_timer <= 2'd0;
-        else if ((jump_link | np_take) && !(irq_kill | redir_backend_0))
-            interrupt_request_timer <= 2'd3;
-        else if (interrupt_request_timer != 2'd0)
-            interrupt_request_timer <= interrupt_request_timer - 2'd1;
-    end
+//中断闸门已删（2026-11-15）：原来是 interrupt_request_timer + exception_interrupt_gate。
+//  它是【可重触发】的 one-shot：`(jump_link | np_take)` 每来一次就把它顶回 3，而 jump_link 早已
+//  被 tie 成 0，活着的 np_take 又是 BPU 的【预测】taken —— 紧跳循环里连续为真，计数永远到不了
+//  0，闸门永远关着，中断永不进。实测（vsys 红构建，RTL 冻结，只改 APP_AREA_LIMIT）：超时点
+//  gate=1 pending=1 MIE=1 head_valid=1，36 ms 之后 18,200,000 拍里闸门开 0 拍。
+//  它挡的本来是"判定拍即改向拍"那套；改向搬到提交口之后，这件事已经由 redir_backend_0 承担
+//  （见上面 S3 那条），而且 pc.v 的优先级是 irq_kill > redir_frontend > btb_take —— 中断本来就
+//  压预测一头，整窗冲刷后从 mtvec 重取，预测在不在飞无所谓。所以删掉不影响任何正确性。
 
 endmodule

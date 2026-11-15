@@ -84,10 +84,14 @@ module dtcm(
             request_write_delayed <= mem_req & mem_we;
 //写：单拍，字节使能直接落到 BRAM 的字节写口
             if (write_now) begin
-                if (mem_byte_enable[0]) dtcm[mem_addr[14:2]][7:0]   <= mem_write_data[7:0];
-                if (mem_byte_enable[1]) dtcm[mem_addr[14:2]][15:8]  <= mem_write_data[15:8];
-                if (mem_byte_enable[2]) dtcm[mem_addr[14:2]][23:16] <= mem_write_data[23:16];
-                if (mem_byte_enable[3]) dtcm[mem_addr[14:2]][31:24] <= mem_write_data[31:24];
+                if (mem_byte_enable[0])
+                    dtcm[mem_addr[14:2]][7:0]   <= mem_write_data[7:0];
+                if (mem_byte_enable[1])
+                    dtcm[mem_addr[14:2]][15:8]  <= mem_write_data[15:8];
+                if (mem_byte_enable[2])
+                    dtcm[mem_addr[14:2]][23:16] <= mem_write_data[23:16];
+                if (mem_byte_enable[3])
+                    dtcm[mem_addr[14:2]][31:24] <= mem_write_data[31:24];
             end
 //读：锁行首地址，按行连吐 8 个字
             if (start & ~mem_we) begin

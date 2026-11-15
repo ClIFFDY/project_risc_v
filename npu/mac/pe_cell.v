@@ -32,7 +32,10 @@ module pe_cell(
 
     // 两路清零合成一根：rst 与 clear_acc 对累加器的效果完全一样，只是优先级不同，
     // 而"或"起来以后不存在优先级问题。
-    wire acc_clear_now = rst | clear_acc;
+    reg acc_clear_now;
+    always @(*) begin
+        acc_clear_now = rst | clear_acc;
+    end
 
     // ★ 乘积必须是 32 位上下文！直接写 acc + $signed(a_in)*$signed(bt_in) 时，
     //   iverilog 按"乘法结果是最大操作数宽度"取 8 位再扩展 ⇒ 结果全错（实测 17/27 挂）。
@@ -41,14 +44,22 @@ module pe_cell(
 
     always @(posedge clk) begin
         if (rst) begin
-            a_out <= 8'd0; a_v_out <= 1'b0;
-            bt_out <= 8'd0; bt_v_out <= 1'b0;
-        end else if (clear_acc) begin
-            a_v_out <= 1'b0; bt_v_out <= 1'b0;   // 冲刷残留波前
-            a_out <= 8'd0;  bt_out <= 8'd0;
-        end else if (enable) begin
-            a_out <= a_in;   a_v_out <= a_v_in;
-            bt_out <= bt_in; bt_v_out <= bt_v_in;
+            a_out <= 8'd0;
+            a_v_out <= 1'b0;
+            bt_out <= 8'd0;
+            bt_v_out <= 1'b0;
+        end
+        else if (clear_acc) begin
+            a_v_out <= 1'b0;
+            bt_v_out <= 1'b0; // 冲刷残留波前
+            a_out <= 8'd0;
+            bt_out <= 8'd0;
+        end
+        else if (enable) begin
+            a_out <= a_in;
+            a_v_out <= a_v_in;
+            bt_out <= bt_in;
+            bt_v_out <= bt_v_in;
         end
     end
 

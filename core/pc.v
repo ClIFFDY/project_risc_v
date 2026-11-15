@@ -35,11 +35,11 @@ module pc(
     input        btb_take_0, btb_take_1,
     input [31:0] btb_target_0,  btb_target_1,
 //给 icache：下一条要执行的指令的地址（可能不是 8B 对齐）
-    output [31:0] pc_address_0,
+    output reg [31:0] pc_address_0,
 //给 bpu：这一块里两个取指地址（块基址 + 0/4）
-    output [31:0] pc_block_0, pc_block_1,
+    output reg [31:0] pc_block_0, pc_block_1,
 //给 bpu：块内起始偏移（比它老的那条不该参与仲裁）
-    output        pc_offset
+    output reg        pc_offset
     );
 
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
@@ -54,12 +54,17 @@ module pc(
 //==============================================================================
     reg  [31:0] next;
     always @(*) begin
-        if (irq_kill)               next = irq_target;
-        else if (redir_frontend)    next = jump_target;
-        else if (btb_take_0)        next = {btb_target_0[31:3] + 1'b1, 3'd0};
-        else if (btb_take_1)        next = {btb_target_1[31:3] + 1'b1, 3'd0};
+        if (irq_kill)
+            next = irq_target;
+        else if (redir_frontend)
+            next = jump_target;
+        else if (btb_take_0)
+            next = {btb_target_0[31:3] + 1'b1, 3'd0};
+        else if (btb_take_1)
+            next = {btb_target_1[31:3] + 1'b1, 3'd0};
 //★ 顺序推进 = 跳过整块：这一拍的 2 条（或从块内偏移起的那条）都已经取回来了。
-        else                        next = {pc_registered[31:3] + 1'b1, 3'd0};
+        else
+            next = {pc_registered[31:3] + 1'b1, 3'd0};
     end
 
 //==============================================================================
@@ -78,16 +83,24 @@ module pc(
 
 //★ 这一拍的取指地址：预测跳就吃落点，覆盖 pc_registered。
 //  同一个式子写两份 —— _0 只喂 icache，_1 只喂 bpu。
-    wire        take_any    = btb_take_0 | btb_take_1;
-    wire [31:0] take_target = btb_take_0 ? btb_target_0 : btb_target_1;
-    wire [31:0] pc_address_1;
-    assign pc_address_0 = take_any ? take_target : pc_registered;
-    assign pc_address_1 = take_any ? take_target : pc_registered;
+    reg take_any;
+    reg [31:0] take_target;
+    always @(*) begin
+        take_any = btb_take_0 | btb_take_1;
+        take_target = btb_take_0 ? btb_target_0 : btb_target_1;
+    end
+    reg [31:0] pc_address_1;
+    always @(*) begin
+        pc_address_0 = take_any ? take_target : pc_registered;
+        pc_address_1 = take_any ? take_target : pc_registered;
+    end
 
 //★ 给 bpu 的是同一块里四个地址 + 块内偏移（偏移用来把比它老的那几条挡在仲裁之外）。
 //★ 2026-11-11 取指回 2 宽：块 = 8B，只给 bpu 两个地址。
-    assign pc_block_0 = {pc_address_1[31:3], 3'd0};
-    assign pc_block_1 = {pc_address_1[31:3], 3'd4};
-    assign pc_offset  = pc_address_1[2];
+    always @(*) begin
+        pc_block_0 = {pc_address_1[31:3], 3'd0};
+        pc_block_1 = {pc_address_1[31:3], 3'd4};
+        pc_offset = pc_address_1[2];
+    end
 
 endmodule

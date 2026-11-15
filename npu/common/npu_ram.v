@@ -26,13 +26,15 @@ module npu_ram #(parameter AW = 6) (
     // 每拍都把 raddr 对应的内容送入 rdata，真正的请求门控由上层完成。
 
     initial begin
-        for (i = 0; i < (1<<AW); i = i + 1) mem[i] = 32'd0;
+        for (i = 0; i < (1<<AW); i = i + 1)
+            mem[i] = 32'd0;
         rdata = 32'd0;
     end
 
     // 非阻塞赋值保证写入和读出都在同一个时钟沿更新，符合同步 RAM 行为。
     always @(posedge clk) begin
-        if (we) mem[waddr] <= wdata;
+        if (we)
+            mem[waddr] <= wdata;
         rdata <= mem[raddr];
     end
 

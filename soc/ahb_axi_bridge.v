@@ -69,12 +69,12 @@ module ahb_axi_bridge #(
     input      [3:0]    HWSTRB,
     input      [31:0]   HWDATA,
     output     [31:0]   HRDATA,
-    output              HREADYOUT,
-    output              HRESP,
-    output              rd_valid,
+    output reg              HREADYOUT,
+    output reg              HRESP,
+    output reg              rd_valid,
 
     //---- AXI4 主设备口 ----
-    output [AXI_ID_WIDTH-1:0]     M_AXI_AWID,
+    output reg [AXI_ID_WIDTH-1:0]     M_AXI_AWID,
     output [AXI_ADDR_WIDTH-1:0]   M_AXI_AWADDR,
     output [7:0]                  M_AXI_AWLEN,
     output [2:0]                  M_AXI_AWSIZE,
@@ -83,18 +83,18 @@ module ahb_axi_bridge #(
     output [3:0]                  M_AXI_AWCACHE,
     output [2:0]                  M_AXI_AWPROT,
     output [3:0]                  M_AXI_AWQOS,
-    output                        M_AXI_AWVALID,
+    output reg                        M_AXI_AWVALID,
     input                         M_AXI_AWREADY,
-    output [AXI_DATA_WIDTH-1:0]   M_AXI_WDATA,
+    output reg [AXI_DATA_WIDTH-1:0]   M_AXI_WDATA,
     output [AXI_DATA_WIDTH/8-1:0] M_AXI_WSTRB,
     output                        M_AXI_WLAST,
-    output                        M_AXI_WVALID,
+    output reg                        M_AXI_WVALID,
     input                         M_AXI_WREADY,
     input  [AXI_ID_WIDTH-1:0]     M_AXI_BID,
     input  [1:0]                  M_AXI_BRESP,
     input                         M_AXI_BVALID,
-    output                        M_AXI_BREADY,
-    output [AXI_ID_WIDTH-1:0]     M_AXI_ARID,
+    output reg                        M_AXI_BREADY,
+    output reg [AXI_ID_WIDTH-1:0]     M_AXI_ARID,
     output [AXI_ADDR_WIDTH-1:0]   M_AXI_ARADDR,
     output [7:0]                  M_AXI_ARLEN,
     output [2:0]                  M_AXI_ARSIZE,
@@ -103,14 +103,14 @@ module ahb_axi_bridge #(
     output [3:0]                  M_AXI_ARCACHE,
     output [2:0]                  M_AXI_ARPROT,
     output [3:0]                  M_AXI_ARQOS,
-    output                        M_AXI_ARVALID,
+    output reg                        M_AXI_ARVALID,
     input                         M_AXI_ARREADY,
     input  [AXI_ID_WIDTH-1:0]     M_AXI_RID,
     input  [AXI_DATA_WIDTH-1:0]   M_AXI_RDATA,
     input  [1:0]                  M_AXI_RRESP,
     input                         M_AXI_RLAST,
     input                         M_AXI_RVALID,
-    output                        M_AXI_RREADY
+    output reg                        M_AXI_RREADY
 );
 
     function integer clog2;
@@ -141,7 +141,8 @@ module ahb_axi_bridge #(
         S_DONE     = 4'd6,   // 完成拍：HREADYOUT=1，读给 rd_valid
         S_TAIL     = 4'd7,   // 主设备撤请求的那一拍（不许就地再接受一笔）
         S_ERR1     = 4'd8,   // 错误响应第 1 拍：HRESP=1, HREADYOUT=0
-        S_ERR2     = 4'd9;   // 错误响应第 2 拍：HRESP=1, HREADYOUT=1
+        S_ERR2     = 4'd9;
+        // 错误响应第 2 拍：HRESP=1, HREADYOUT=1
 
     reg [3:0]  state;
     reg [31:0] offset_q;      // 相对 DDR_BASE 的字节偏移（AHB 侧算一次）
@@ -153,19 +154,34 @@ module ahb_axi_bridge #(
     reg        aw_done, w_done;
     reg        read_bad;
 
-    wire       selected_phase = HSEL && (HTRANS != 2'b00);
-    wire [32:0] offset        = {1'b0, HADDR} - {1'b0, DDR_BASE};
-    wire       bad_addr       = ({1'b0, HADDR} < {1'b0, DDR_BASE}) || (offset >= DDR_BYTES);
-    wire       bad_size       = (HSIZE > 3'd2) ||
-                                ((HSIZE == 3'd1) && HADDR[0]) ||
-                                ((HSIZE == 3'd2) && (HADDR[1:0] != 2'b00));
-    wire       accept         = (state == S_IDLE) && selected_phase;
+    reg selected_phase;
+    reg [32:0] offset;
+    reg bad_addr;
+    always @(*) begin
+        selected_phase = HSEL && (HTRANS != 2'b00);
+        offset = {1'b0, HADDR} - {1'b0, DDR_BASE};
+        bad_addr = ({1'b0, HADDR} < {1'b0, DDR_BASE}) || (offset >= DDR_BYTES);
+    end
+    reg bad_size;
+    always @(*) begin
+        bad_size = (HSIZE > 3'd2) || ((HSIZE == 3'd1) && HADDR[0]) || ((HSIZE == 3'd2) && (HADDR[1:0] != 2'b00));
+    end
+    reg accept;
+    always @(*) begin
+        accept = (state == S_IDLE) && selected_phase;
+    end
 
     //每拍一发，地址对齐到拍边界；拍内偏移只取 4 字节对齐的那一档
-    wire [31:0] beat_addr  = AXI_BASE_ADDR + ((offset_q >> LANE_BITS) << LANE_BITS);
-    wire [31:0] word_shift = ((offset_q & (AXI_BYTES - 1)) & 32'hFFFF_FFFC) * 8;
+    reg [31:0] beat_addr, word_shift;
+    always @(*) begin
+        beat_addr = AXI_BASE_ADDR + ((offset_q >> LANE_BITS) << LANE_BITS);
+        word_shift = ((offset_q & (AXI_BYTES - 1)) & 32'hFFFF_FFFC) * 8;
+    end
     //整拍读回来，把目标那个 32 位字挪到低位（截到 32 位是故意的）
-    wire [31:0] rdata_word = M_AXI_RDATA[word_shift +: 32];
+    reg [31:0] rdata_word;
+    always @(*) begin
+        rdata_word = M_AXI_RDATA[word_shift +: 32];
+    end
 
     //4 个字节使能摆到拍内正确的那一段
     reg  [AXI_BYTES-1:0] wstrb_build;
@@ -174,13 +190,19 @@ module ahb_axi_bridge #(
         wstrb_build[(word_shift / 8) +: 4] = strb_q;
     end
 
-    assign HREADYOUT = (state == S_DONE) || (state == S_ERR2) || !selected_phase;
-    assign HRESP     = (state == S_ERR1) || (state == S_ERR2);
+    always @(*) begin
+        HREADYOUT = (state == S_DONE) || (state == S_ERR2) || !selected_phase;
+        HRESP = (state == S_ERR1) || (state == S_ERR2);
+    end
     assign HRDATA    = read_q;
-    assign rd_valid  = ((state == S_DONE) || (state == S_ERR2)) && !write_q;
+    always @(*) begin
+        rd_valid = ((state == S_DONE) || (state == S_ERR2)) && !write_q;
+    end
 
-    assign M_AXI_AWID    = {AXI_ID_WIDTH{1'b0}};
-    assign M_AXI_ARID    = {AXI_ID_WIDTH{1'b0}};
+    always @(*) begin
+        M_AXI_AWID = {AXI_ID_WIDTH{1'b0}};
+        M_AXI_ARID = {AXI_ID_WIDTH{1'b0}};
+    end
     assign M_AXI_AWADDR  = beat_addr;
     assign M_AXI_ARADDR  = beat_addr;
     assign M_AXI_AWLEN   = 8'd0;
@@ -199,14 +221,18 @@ module ahb_axi_bridge #(
     assign M_AXI_ARQOS   = 4'd0;
 
     //DDR_PRESENT=0 时 AXI 侧必须闭嘴（参数为 0 时这几根综合成常 0）
-    assign M_AXI_AWVALID = DDR_ON && (state == S_WRITE) && !aw_done;
-    assign M_AXI_WVALID  = DDR_ON && (state == S_WRITE) && !w_done;
-    assign M_AXI_BREADY  = DDR_ON && (state == S_BRESP);
-    assign M_AXI_ARVALID = DDR_ON && (state == S_ARADDR);
-    assign M_AXI_RREADY  = DDR_ON && (state == S_RDATA);
+    always @(*) begin
+        M_AXI_AWVALID = DDR_ON && (state == S_WRITE) && !aw_done;
+        M_AXI_WVALID = DDR_ON && (state == S_WRITE) && !w_done;
+        M_AXI_BREADY = DDR_ON && (state == S_BRESP);
+        M_AXI_ARVALID = DDR_ON && (state == S_ARADDR);
+        M_AXI_RREADY = DDR_ON && (state == S_RDATA);
+    end
     assign M_AXI_WLAST   = 1'b1;
     //整字复制到每一段，WSTRB 只留目标那一段 ⇒ 不需要宽带移位器
-    assign M_AXI_WDATA   = {(AXI_DATA_WIDTH/32){wdata_q}};
+    always @(*) begin
+        M_AXI_WDATA = {(AXI_DATA_WIDTH/32){wdata_q}};
+    end
     assign M_AXI_WSTRB   = wstrb_build;
 
     always @(posedge HCLK) begin
@@ -249,8 +275,10 @@ module ahb_axi_bridge #(
             S_WAIT_MEM: if (MEM_READY) state <= write_q ? S_WRITE : S_ARADDR;
 //------------------------------------------------------------------ 写
             S_WRITE: begin
-                if (M_AXI_AWREADY) aw_done <= 1'b1;
-                if (M_AXI_WREADY)  w_done  <= 1'b1;
+                if (M_AXI_AWREADY)
+                    aw_done <= 1'b1;
+                if (M_AXI_WREADY)
+                    w_done  <= 1'b1;
                 if ((aw_done || M_AXI_AWREADY) && (w_done || M_AXI_WREADY))
                     state <= S_BRESP;
             end

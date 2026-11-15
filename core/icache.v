@@ -119,7 +119,8 @@ module icache(
     localparam integer IC_ADDR_B = 1 + IC_INDEX_B + IC_WG_B + IC_HALF_B;// {way, index, block_group, half}
     localparam integer IC_WORDS  = IC_SETS << (IC_WORD_B + 1);         // iram 字数 = 2 路 × 组数 × 行字数
     localparam integer IC_ROWS   = IC_WORDS >> 1;                      // 每份阵列的行数（每份装 8B 块的一侧）
-    localparam [IC_WORD_B-1:0] IC_WORD_LAST = {IC_WORD_B{1'b1}};       // 行内末字号
+    localparam [IC_WORD_B-1:0] IC_WORD_LAST = {IC_WORD_B{1'b1}};
+    // 行内末字号
 //复位就地打一拍：rst 由 rst_buf 单点扇出到全核约 2900 个触发器，工具只能在布局阶段自己复制
 //14 份，而那时芯片已经快满了。每个模块各自打一拍，寄存器就落在本模块旁边；全核都只打一拍，
 //彼此没有相位差，是一起晚一拍出复位（同步复位晚一拍发布是安全的）。
@@ -130,8 +131,10 @@ module icache(
     reg ipvalid;
 //  阵列初值全 0（ipvalid=0 / valid=0），复位后 ipvalid=0 ⇒ 天然不命中。
     always @(posedge clk) begin
-        if (reset_registered) ipvalid <= 1'b0;
-        else if (invalidate)  ipvalid <= ~ipvalid;
+        if (reset_registered)
+            ipvalid <= 1'b0;
+        else if (invalidate)
+            ipvalid <= ~ipvalid;
     end
 //寄存器（按级分组）
 //第 0 级：本拍组合
@@ -185,12 +188,16 @@ module icache(
     reg                fill_ipvalid;
     (* max_fanout = 32 *) reg [IC_INDEX_B-1:0] fill_index;
 //★ 回填替换路：只依赖【寄存好的 fill_index】，不依赖缺失检测那一拍的任何东西。
-    wire [IC_TAGW-1:0] fill_tag_way1 = way1_tag[fill_index];
-    wire [IC_TAGW-1:0] fill_tag_way2 = way2_tag[fill_index];
+    reg [IC_TAGW-1:0] fill_tag_way1, fill_tag_way2;
+    always @(*) begin
+        fill_tag_way1 = way1_tag[fill_index];
+        fill_tag_way2 = way2_tag[fill_index];
+    end
 //★ 两路：先挑没效的，两路都有效才按 LRU。`lru[idx]` 存的就是【下次该换哪一路】。
-    wire fill_way = (!fill_tag_way1[IC_TAG_B]) ? 1'b0 :
-                    (!fill_tag_way2[IC_TAG_B]) ? 1'b1 :
-                    lru[fill_index];
+    reg fill_way;
+    always @(*) begin
+        fill_way = (!fill_tag_way1[IC_TAG_B]) ? 1'b0 : (!fill_tag_way2[IC_TAG_B]) ? 1'b1 : lru[fill_index];
+    end
     integer i;
 //阵列初值：未写过的格位最高位是 0，与 {1'b1, tag} 永不相等 ⇒ 天然不命中。
 //不用复位沿：复位会给 2x128x20 位各长一根复位线，撑爆 slice 打包（原注释的同一笔账）。
@@ -219,8 +226,10 @@ module icache(
     end
     always @(posedge clk) begin
         if (write_enable) begin
-            if (fill_count[0]) iram_word_high[write_address] <= mem_data;
-            else               iram_word_low [write_address] <= mem_data;
+            if (fill_count[0])
+                iram_word_high[write_address] <= mem_data;
+            else
+                iram_word_low [write_address] <= mem_data;
         end
     end
     always @(*) begin
@@ -296,28 +305,40 @@ module icache(
 //  标成错路交给 iffu 丢掉（rand seed1：0x2d0）。
     reg flush_bubble;
     always @(posedge clk) begin
-        if (reset_registered)       flush_bubble <= 1'b0;
-        else                        flush_bubble <= (irq_kill | redir_frontend);
+        if (reset_registered)
+            flush_bubble <= 1'b0;
+        else
+            flush_bubble <= (irq_kill | redir_frontend);
     end
 //★ 交付寄存器：四条指令 + 四个地址 + 四份预测 + 块内偏移，一个沿、一个门。
 //  冲刷（irq_kill / redir_frontend）：整组清；
 //  队满：整组保持；缺失/回填：出 NOP；其余：装这一块。
     always @(posedge clk) begin
         if (reset_registered) begin
-            instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
+            instruction_0 <= 32'd0;
+            instruction_1 <= 32'd0;
+            instruction_address_0 <= 32'd0;
+            instruction_address_1 <= 32'd0;
+            prediction_taken_0 <= 1'b0;
+            prediction_taken_1 <= 1'b0;
+            prediction_jump_target_0 <= 32'd0;
+            prediction_jump_target_1 <= 32'd0;
+            instruction_valid_0 <= 1'b0;
+            instruction_valid_1 <= 1'b0;
             deliver_wrong_path <= 1'b0;
             block_offset <= 2'd0;
         end
         else if (irq_kill | redir_frontend) begin
-            instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
+            instruction_0 <= 32'd0;
+            instruction_1 <= 32'd0;
+            instruction_address_0 <= 32'd0;
+            instruction_address_1 <= 32'd0;
+            prediction_taken_0 <= 1'b0;
+            prediction_taken_1 <= 1'b0;
+            prediction_jump_target_0 <= 32'd0;
+            prediction_jump_target_1 <= 32'd0;
+            instruction_valid_0 <= 1'b0;
+            instruction_valid_1 <= 1'b0;
             deliver_wrong_path <= 1'b0;
         end
         else if (~(icache_miss | fifo_full | busy)) begin
@@ -341,21 +362,31 @@ module icache(
         end
 //交付口的契约：每拍都放一样东西 —— 新指令，或者 NOP。唯一保持的场合是队满（收不走就别换）。
         else if (fifo_full) begin
-            instruction_0 <= instruction_0; instruction_1 <= instruction_1;
-            instruction_address_0 <= instruction_address_0; instruction_address_1 <= instruction_address_1;
-            prediction_taken_0 <= prediction_taken_0; prediction_taken_1 <= prediction_taken_1;
-            prediction_jump_target_0 <= prediction_jump_target_0; prediction_jump_target_1 <= prediction_jump_target_1;
-            instruction_valid_0 <= instruction_valid_0; instruction_valid_1 <= instruction_valid_1;
+            instruction_0 <= instruction_0;
+            instruction_1 <= instruction_1;
+            instruction_address_0 <= instruction_address_0;
+            instruction_address_1 <= instruction_address_1;
+            prediction_taken_0 <= prediction_taken_0;
+            prediction_taken_1 <= prediction_taken_1;
+            prediction_jump_target_0 <= prediction_jump_target_0;
+            prediction_jump_target_1 <= prediction_jump_target_1;
+            instruction_valid_0 <= instruction_valid_0;
+            instruction_valid_1 <= instruction_valid_1;
             deliver_wrong_path <= deliver_wrong_path;
             block_offset <= block_offset;
         end
         else begin
 // 缺失 / 回填中：这一拍没有有效块，出 NOP。
-            instruction_0 <= 32'd0; instruction_1 <= 32'd0;
-            instruction_address_0 <= 32'd0; instruction_address_1 <= 32'd0;
-            prediction_taken_0 <= 1'b0; prediction_taken_1 <= 1'b0;
-            prediction_jump_target_0 <= 32'd0; prediction_jump_target_1 <= 32'd0;
-            instruction_valid_0 <= 1'b0; instruction_valid_1 <= 1'b0;
+            instruction_0 <= 32'd0;
+            instruction_1 <= 32'd0;
+            instruction_address_0 <= 32'd0;
+            instruction_address_1 <= 32'd0;
+            prediction_taken_0 <= 1'b0;
+            prediction_taken_1 <= 1'b0;
+            prediction_jump_target_0 <= 32'd0;
+            prediction_jump_target_1 <= 32'd0;
+            instruction_valid_0 <= 1'b0;
+            instruction_valid_1 <= 1'b0;
             deliver_wrong_path <= 1'b0;
         end
     end
@@ -364,8 +395,10 @@ module icache(
 //===============================================================
 //fill_way ∈ {0,1}：两路对称，没效优先，否则按 LRU（`lru[idx]` 就是"下次换哪一路"）。
     always @(posedge clk) begin
-        if (reset_registered) reset_period_flag <= 1'b1;
-        else reset_period_flag <= 1'b0;
+        if (reset_registered)
+            reset_period_flag <= 1'b1;
+        else
+            reset_period_flag <= 1'b0;
     end
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -382,7 +415,8 @@ module icache(
             if (stage == 1'b0) begin
                 fill_end <= 1'b0;
                 if (hit_way_0[0])
-                    lru[index_registered_0] <= 1'b1;   // 用了 way0 ⇒ 下次该换 way1
+                    lru[index_registered_0] <= 1'b1;
+                    // 用了 way0 ⇒ 下次该换 way1
                 else if (hit_way_0[1])
                     lru[index_registered_0] <= 1'b0;
 //★ ~fill_done：收尾那一拍 R0 里还是旧有效位，不许据此重开一次回填。
@@ -417,8 +451,10 @@ module icache(
     end
 //★ 回填收尾之后的一拍（见上面 r0 重读）。
     always @(posedge clk) begin
-        if (reset_registered) fill_done <= 1'b0;
-        else       fill_done <= fill_end;
+        if (reset_registered)
+            fill_done <= 1'b0;
+        else
+            fill_done <= fill_end;
     end
     always @(posedge clk) begin
         if (reset_registered)

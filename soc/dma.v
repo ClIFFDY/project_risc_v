@@ -18,7 +18,12 @@
 //      0x08 LEN    字节长度
 //      0x0C CTRL   [0]=start(写 1 启动) [1]=inc_src [2]=inc_dst
 //                  [4:3]=burst 字数选择 [5]=irq_en
-//      0x10 STAT   [0]=busy [1]=done(写 1 清) [7:0]=剩余字数（低 8 位）
+//      0x10 STAT   [0]=busy [1]=done(写 1 清) [15:8]=剩余字数（低 8 位）
+//                  ★ 2026-11-13：剩余字数原来放在 [7:0]，和 busy/done 叠在一起。
+//                    每减一次 chunk_now 就把这两位一起改写 ⇒ done 变成假信号：
+//                    轮询提前退出、pick_valid 判据错乱，一笔传输会在"清 done"之后
+//                    又被重新启动。实测轨迹 stat 0xCE → 清 → 0xCD → 0xCC → 0xCE，
+//                    中间 FSM 跑了一遍。现在挪到 [15:8]，低两位只归 busy/done。
 //
 //   ── 中断 ───────────────────────────────────────────────────────────────────
 //   irq = 任一通道的 (done ∧ irq_en)，是组合电平，不是"置起后等软件清"的寄存器。
@@ -41,7 +46,7 @@ module dma(
     output reg [31:0] reg_rdata,
 
 //---- 中断 ----
-    output            irq,
+    output reg            irq,
 
 //---- AHB 主口 ----
     output reg [31:0] m_haddr,
@@ -58,7 +63,7 @@ module dma(
     input             m_hgrant,
     input             m_hresp,
     input             m_rd_valid,
-    output            m_busy
+    output reg            m_busy
     );
 
     localparam [1:0] HTRANS_IDLE = 2'b00, HTRANS_NOSEQ = 2'b10, HTRANS_SEQ = 2'b11;
@@ -93,17 +98,25 @@ module dma(
 //     中断永远挂着，claim 清完下一拍又被置回来（中断风暴 + 别的源永远抢不到）。
 //     这里让中断源跟着 done 位走，软件写 1 清 done 就自然清掉中断；
 //     四个通道互不影响（原来单根 irq 分不出是哪个通道完成的）。
-    assign irq = (ch_stat[0][1] & ch_ctrl[0][5]) | (ch_stat[1][1] & ch_ctrl[1][5])
-               | (ch_stat[2][1] & ch_ctrl[2][5]) | (ch_stat[3][1] & ch_ctrl[3][5]);
+    always @(*) begin
+        irq = (ch_stat[0][1] & ch_ctrl[0][5]) | (ch_stat[1][1] & ch_ctrl[1][5]) | (ch_stat[2][1] & ch_ctrl[2][5]) | (ch_stat[3][1] & ch_ctrl[3][5]);
+    end
 
-    wire [1:0] sel_ch  = reg_addr[6:5];
-    wire [4:0] sel_reg = reg_addr[4:0];
+    reg [1:0] sel_ch;
+    reg [4:0] sel_reg;
+    always @(*) begin
+        sel_ch = reg_addr[6:5];
+        sel_reg = reg_addr[4:0];
+    end
 
     integer c;
     initial begin
         for (c = 0; c < 4; c = c + 1) begin
-            ch_src[c] = 32'd0; ch_dst[c] = 32'd0; ch_len[c] = 32'd0;
-            ch_ctrl[c] = 32'd0; ch_stat[c] = 32'd0;
+            ch_src[c] = 32'd0;
+            ch_dst[c] = 32'd0;
+            ch_len[c] = 32'd0;
+            ch_ctrl[c] = 32'd0;
+            ch_stat[c] = 32'd0;
         end
     end
 
@@ -147,16 +160,20 @@ module dma(
     reg [31:0] burst_buf [0:15];
 
 //本块字数：剩余与突发字数取小（remain/chunk 在整块期间不变，直接组合用）
-    wire [4:0] words_left = (remain >= 32'd16) ? 5'd16 : remain[4:0];
-    wire [4:0] burst_now  = burst_words(ch_ctrl[act][4:3]);
-    wire [4:0] chunk_now  = (words_left > burst_now) ? burst_now : words_left;
+    reg [4:0] words_left, burst_now, chunk_now;
+    always @(*) begin
+        words_left = (remain >= 32'd16) ? 5'd16 : remain[4:0];
+        burst_now = burst_words(ch_ctrl[act][4:3]);
+        chunk_now = (words_left > burst_now) ? burst_now : words_left;
+    end
 
     always @(*) begin
         m_haddr  = 32'd0;
         m_htrans = HTRANS_IDLE;
         m_hwrite = 1'b0;
         m_hsize  = 3'b010;
-        m_hburst = 3'b001;                       // INCR
+        m_hburst = 3'b001;
+        // INCR
 //HPROT/HMASTLOCK：按 ARM IHI 0033A §3.7 的推荐值 4'b0011；DMA 不发锁传输 ⇒ 0。
         m_hprot  = 4'b0011;
         m_hmastlock = 1'b0;
@@ -188,7 +205,6 @@ module dma(
             burst_buf[recv_cnt[3:0]] <= m_hrdata;
     end
 
-    reg busy_flag;
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -200,8 +216,9 @@ module dma(
             issue_cnt <= 5'd0;
             recv_cnt  <= 5'd0;
             wr_cnt    <= 5'd0;
-            busy_flag <= 1'b0;
-            for (c = 0; c < 4; c = c + 1) ch_stat[c] <= 32'd0;
+            m_busy <= 1'b0;
+            for (c = 0; c < 4; c = c + 1)
+                ch_stat[c] <= 32'd0;
         end
         else begin
 //---- 寄存器写 ----
@@ -219,7 +236,7 @@ module dma(
             case (state)
 //--------------------------------------------------------------- 等启动
             S_IDLE: begin
-                busy_flag <= 1'b0;
+                m_busy <= 1'b0;
                 if (pick_valid) begin
                     act       <= pick;
                     src_addr  <= ch_src[pick];
@@ -228,15 +245,19 @@ module dma(
                     issue_cnt <= 5'd0;
                     recv_cnt  <= 5'd0;
                     wr_cnt    <= 5'd0;
-                    ch_stat[pick][0] <= 1'b1;              // busy
+                    ch_stat[pick][0] <= 1'b1;
+                    // busy
                     state     <= S_RD;
                 end
             end
 //--------------------------------------------------------------- 读块
             S_RD: begin
-                busy_flag <= 1'b1;
-                if (issue_cnt != chunk_now && m_hready) issue_cnt <= issue_cnt + 5'd1;   // 未授权就停住
-                if (m_rd_valid && recv_cnt != chunk_now) recv_cnt <= recv_cnt + 5'd1;
+                m_busy <= 1'b1;
+                if (issue_cnt != chunk_now && m_hready)
+                    issue_cnt <= issue_cnt + 5'd1;
+                // 未授权就停住
+                if (m_rd_valid && recv_cnt != chunk_now)
+                    recv_cnt <= recv_cnt + 5'd1;
                 if (recv_cnt == chunk_now) begin
                     issue_cnt <= 5'd0;
                     recv_cnt  <= 5'd0;
@@ -246,14 +267,14 @@ module dma(
             end
 //--------------------------------------------------------------- 写块
             S_WR: begin
-                busy_flag <= 1'b1;
-                if (m_hready) begin                       // 拿到总线才推进写拍
+                m_busy <= 1'b1;
+                if (m_hready) begin // 拿到总线才推进写拍
                 wr_cnt <= wr_cnt + 5'd1;
                 if (wr_cnt == chunk_now - 5'd1) begin
                     src_addr <= ch_ctrl[act][1] ? (src_addr + {chunk_now, 2'b00}) : src_addr;
                     dst_addr <= ch_ctrl[act][2] ? (dst_addr + {chunk_now, 2'b00}) : dst_addr;
                     remain   <= remain - {27'd0, chunk_now};
-                    ch_stat[act][7:0] <= ch_stat[act][7:0] - {3'd0, chunk_now};
+                    ch_stat[act][15:8] <= ch_stat[act][15:8] - {3'd0, chunk_now};
                     if (remain == {27'd0, chunk_now}) begin
                         state <= S_FIN;
                     end
@@ -268,10 +289,13 @@ module dma(
             end
 //--------------------------------------------------------------- 收尾
             S_FIN: begin
-                busy_flag <= 1'b0;
-                ch_stat[act][0] <= 1'b0;                  // busy 清
-                ch_stat[act][1] <= 1'b1;                  // done
-                ch_ctrl[act][0] <= 1'b0;                  // 清 start
+                m_busy <= 1'b0;
+                ch_stat[act][0] <= 1'b0;
+                // busy 清
+                ch_stat[act][1] <= 1'b1;
+                // done
+                ch_ctrl[act][0] <= 1'b0;
+                // 清 start
                 state <= S_IDLE;
             end
             default: state <= S_IDLE;
@@ -279,6 +303,5 @@ module dma(
         end
     end
 
-    assign m_busy = busy_flag;
 
 endmodule

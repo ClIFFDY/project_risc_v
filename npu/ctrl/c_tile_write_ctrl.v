@@ -183,7 +183,8 @@ module c_tile_write_ctrl(
             else if (advance) begin
                 idx_q <= idx_q + 5'd1;
                 if (idx_q == 5'd15)
-                    active_q <= 1'b0;      // 最后一项已送出，本 bank 在下拍置闲
+                    active_q <= 1'b0;
+                    // 最后一项已送出，本 bank 在下拍置闲
             end
         end
     end

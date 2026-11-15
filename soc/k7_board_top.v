@@ -10,7 +10,9 @@
 //        双向接到对应 bit（gpio_8 = J1-8 球号未解出，跳过）
 //
 //   ★ 哪根脚当 UART：由 gpio_group 的 MODE 寄存器配（TX = 4'b0101 / RX = 4'b0110），
-//     不是在这里硬连。软件把 pin0 配 TX、pin1 配 RX。
+//     不是在这里硬连。软件把 pin0 配 TX、pin1 配 RX；I2C 同理（SCL = 4'b1001 /
+//     SDA = 4'b1010），本仓的上板实验用 pin2 = J1-3、pin3 = J1-4。
+//     ★ I2C 是开漏，模块只会拉低 ⇒ SCL/SDA 到 3.3V 必须有上拉电阻（4.7k）。
 //   ★ bit 映射按排针号：J1-N → gpio_pin_bus[N-1]（N = 1..7, 11..18）。
 //     UART 用的就是 J1-1（AD21，bit0 = TX）与 J1-2（AB21，bit1 = RX）。
 //////////////////////////////////////////////////////////////////////////////////
@@ -23,6 +25,7 @@ module k7_board_top(
 
 //--------------------------------------------------------------- 时钟
     wire clk_50;
+    wire [31:0] gpio_bus;
 
     IBUFDS #(
         .DIFF_TERM   ("TRUE"),
@@ -45,7 +48,7 @@ module k7_board_top(
 
     always @(posedge clk_50) begin
         case (power_on_state)
-        2'd0: begin                       // 高 1.3 ms
+        2'd0: begin // 高 1.3 ms
             rst_por <= 1'b1;
             if (power_on_count == 16'hFFFF) begin
                 power_on_count <= 16'd0;
@@ -55,7 +58,7 @@ module k7_board_top(
                 power_on_count <= power_on_count + 16'd1;
             end
         end
-        2'd1: begin                       // 低 1.3 ms：下降沿把复位压住
+        2'd1: begin // 低 1.3 ms：下降沿把复位压住
             rst_por <= 1'b0;
             if (power_on_count == 16'hFFFF) begin
                 power_on_count <= 16'd0;
@@ -65,7 +68,7 @@ module k7_board_top(
                 power_on_count <= power_on_count + 16'd1;
             end
         end
-        default: begin                    // 之后恒高：rst_buf 数 42 ms 才放开
+        default: begin // 之后恒高：rst_buf 数 42 ms 才放开
             rst_por <= 1'b1;
         end
         endcase
@@ -81,11 +84,10 @@ module k7_board_top(
         end
     endfunction
 
-    wire [31:0] gpio_bus;
-
     genvar g;
     generate
-        for (g = 0; g < 15; g = g + 1) begin : j1_pad
+        for (g = 0; g < 15; g = g + 1) begin
+            : j1_pad
             tran (j1[g], gpio_bus[j1_bit(g)]);
         end
     endgenerate
@@ -95,7 +97,12 @@ module k7_board_top(
 //   的传输都会被回成总线 ERROR（错误日志 plic 0x0900_0000 能看见），不挂死、不静默回 0。
 //   MIG 将来例化在 mcu_top 里面（AXI 链路不出 mcu_top 的边界）—— 顶层的 200 多根
 //   AXI 脚没有引脚约束时布局器会直接死，别再引出来。
-    mcu_top u_mcu (
+    mcu_top #(
+// ★ 2026-11-13：板子不挂 PLL，IBUFDS 出来的就是 50 MHz ⇒ 核时钟参数必须是 50。
+//   这个参数是 UART 波特率 / I2C SCL / SPI 分频的唯一来源，漏掉它会全偏 2.4 倍
+//   （mcu_top 的默认值是 120）。
+        .CLK_MHZ(50)
+    ) u_mcu (
         .clk           (clk_50),
         .rst           (rst_por),
         .gpio_pin_bus  (gpio_bus)

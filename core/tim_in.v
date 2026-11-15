@@ -65,10 +65,14 @@ module tim_in(
             if (bus_valid_in && bus_address_in[31:24] == 8'd0 && bus_address_in[23:20] == 4'd1) begin
                 if (bus_address_in[3:0] == 4'd1) begin
                     if (bus_write_enable_in) begin
-                        if (bus_byte_enable_in[0]) count_set[7:0] <= bus_data_in[7:0];
-                        if (bus_byte_enable_in[1]) count_set[15:8] <= bus_data_in[15:8];
-                        if (bus_byte_enable_in[2]) count_set[23:16] <= bus_data_in[23:16];
-                        if (bus_byte_enable_in[3]) count_set[31:24] <= bus_data_in[31:24];
+                        if (bus_byte_enable_in[0])
+                            count_set[7:0] <= bus_data_in[7:0];
+                        if (bus_byte_enable_in[1])
+                            count_set[15:8] <= bus_data_in[15:8];
+                        if (bus_byte_enable_in[2])
+                            count_set[23:16] <= bus_data_in[23:16];
+                        if (bus_byte_enable_in[3])
+                            count_set[31:24] <= bus_data_in[31:24];
                     end
                     else begin
                         bus_data_out <= count_set;

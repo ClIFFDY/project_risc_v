@@ -28,6 +28,11 @@ module plic(
     //
     input [31:0] bus_addr_in,
     input [31:0] bus_data_in,
+    // ★ 2026-11-14（总线审计）：事务选通。claim 是"读一次取走一个源"，而地址在事务
+    //   结束后不撤 ⇒ 原来的电平判据会让一次 claim 读连绵不断地把后面几个 pending
+    //   一起清掉（plic.h 里"脉冲不会丢"那条契约就是这么被破坏的）。
+    //   现在 claim 的取源只在被选中那一拍的第一拍发生。
+    input bus_sel,
     input [3:0] bus_be_in,
     input bus_we_in,
     output reg [31:0] bus_data_out,
@@ -52,6 +57,7 @@ module plic(
     reg [2:0] max_prio;
     reg global_pending;
     reg irq_valid;
+    reg bus_sel_q;              // 上一拍是否选中本槽（claim 只用第一拍取源）
 
     integer i;
     integer j;
@@ -73,8 +79,10 @@ module plic(
     end
 
     always @(posedge clk) begin
-        if (rst) exti <= 1'b0;
-        else     exti <= irq_valid;
+        if (rst)
+            exti <= 1'b0;
+        else
+            exti <= irq_valid;
     end
 
     always @(posedge clk) begin
@@ -83,6 +91,7 @@ module plic(
             bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
             err_clear <= 1'b0;
+            bus_sel_q <= 1'b0;
             threshold <= 3'd0;
             for (i = 1; i < 32; i = i + 1) begin
                 irq_prio[i] <= 3'd0;
@@ -91,11 +100,13 @@ module plic(
         end
         else begin
             for (i = 1; i < 32; i = i + 1) begin
-                if (irq_sources[i]) pending[i] <= 1'b1;
+                if (irq_sources[i])
+                    pending[i] <= 1'b1;
             end
             bus_data_out <= 32'd0;
             ld_ready <= 1'b0;
             err_clear <= 1'b0;
+            bus_sel_q <= bus_sel;
             if (bus_addr_in[31:24] == 8'd2) begin
                 if (bus_addr_in[23:20] == 4'd0) begin
                     if (bus_addr_in[5:0] >= 1 && bus_addr_in[5:0] <= 31) begin
@@ -114,9 +125,15 @@ module plic(
                             ld_ready <= 1'b1;
                         end
                     end
+                    else if (!bus_we_in) begin
+                        // 越界 id（0 或 >31）的读也必须应答，否则桥不出 rd_valid ⇒ 整核挂死
+                        bus_data_out <= 32'd0;
+                        ld_ready <= 1'b1;
+                    end
                 end
                 else if (bus_addr_in[23:20] == 4'd1) begin
-                    if (bus_we_in && bus_be_in[0]) threshold <= bus_data_in[2:0];
+                    if (bus_we_in && bus_be_in[0])
+                        threshold <= bus_data_in[2:0];
                     else if (!bus_we_in) begin
                         bus_data_out <= {29'd0, threshold};
                         ld_ready <= 1'b1;
@@ -124,25 +141,35 @@ module plic(
                 end
                 else if (bus_addr_in[23:20] == 4'd2) begin
                     if (bus_addr_in[4:0] >= 1 && bus_addr_in[4:0] <= 31) begin
-                        if (bus_we_in && bus_be_in[0]) pending[bus_addr_in[4:0]] <= 1'd0;
+                        if (bus_we_in && bus_be_in[0])
+                            pending[bus_addr_in[4:0]] <= 1'd0;
                         else if (!bus_we_in) begin
                             bus_data_out <= {31'd0, pending[bus_addr_in[4:0]]};
                             ld_ready <= 1'b1;
                         end
+                    end
+                    else if (!bus_we_in) begin
+                        bus_data_out <= 32'd0;
+                        // 越界 id：应答 0，不挂死
+                        ld_ready <= 1'b1;
                     end
                 end
                 else if (bus_addr_in[23:20] == 4'd3) begin
                     if (!bus_we_in) begin
                         bus_data_out <= super_id;
                         ld_ready <= 1'b1;
-                        if (sel_id != 6'd0) pending[sel_id] <= 1'd0;
+                        // ★ 一笔 claim 只取走一个源：bus_sel 只有一拍，再加第一拍判据
+                        //   是为了将来出现等待态时也不会一次清多个 pending。
+                        if (bus_sel && !bus_sel_q && sel_id != 6'd0)
+                            pending[sel_id] <= 1'd0;
                     end
                 end
                 else if (bus_addr_in[23:20] == 4'd4) begin
 //错误日志：0x0900_0000 控制 / 0x0900_0004 出错地址。厂商扩展。
                     if (bus_addr_in[5:0] == 6'd0) begin
                         if (bus_we_in && bus_be_in[0] && bus_data_in[0])
-                            err_clear <= 1'b1;          // 写 1 清（自清，不锁存）
+                            err_clear <= 1'b1;
+                            // 写 1 清（自清，不锁存）
                         else if (!bus_we_in) begin
                             bus_data_out <= {28'd0, err_owner, err_write, err_valid};
                             ld_ready <= 1'b1;
@@ -154,6 +181,17 @@ module plic(
                             ld_ready <= 1'b1;
                         end
                     end
+                    else if (!bus_we_in) begin
+                        bus_data_out <= 32'd0;
+                        // 子区 4 的其余偏移：应答 0
+                        ld_ready <= 1'b1;
+                    end
+                end
+                else if (!bus_we_in) begin
+                    // 子区 5..15 没有寄存器：读也一律应答 0。
+                    // 原来这些地址一条 ld_ready 都不产生 ⇒ 一条 load 永远不完成 ⇒ 整核挂死。
+                    bus_data_out <= 32'd0;
+                    ld_ready <= 1'b1;
                 end
             end
         end

@@ -35,8 +35,10 @@ module pe_array(
     genvar r, c;
 
     generate
-        for (r = 0; r < `NPU_P; r = r + 1) begin : g_pe_row
-            for (c = 0; c < `NPU_Q; c = c + 1) begin : g_pe_col
+        for (r = 0; r < `NPU_P; r = r + 1) begin
+            : g_pe_row
+            for (c = 0; c < `NPU_Q; c = c + 1) begin
+                : g_pe_col
                 // 上游 PE 的下标；边界取 0 是为了避免生成负下标（该分支不会被选到）。
                 localparam integer R_UP = (r == 0) ? 0 : (r - 1);
                 localparam integer C_UP = (c == 0) ? 0 : (c - 1);

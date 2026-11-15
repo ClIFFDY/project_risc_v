@@ -52,19 +52,29 @@ module start_ctrl(
     reg [1:0] state;
 
     // ---- 配置校验（组合）----
-    wire dim_ok = (cfg_m != 0) && (cfg_n != 0) && (cfg_k != 0);
-    wire tk_ok  = (cfg_tk != 0) && (cfg_tk <= `NPU_TK_MAX);
+    reg dim_ok, tk_ok;
+    always @(*) begin
+        dim_ok = (cfg_m != 0) && (cfg_n != 0) && (cfg_k != 0);
+        tk_ok = (cfg_tk != 0) && (cfg_tk <= `NPU_TK_MAX);
+    end
 
     // ceil(x/4) = (x+3)>>2，先除后乘避免中间量位宽爆炸。
-    wire [`NPU_WORD_W-1:0] a_words  = ((cfg_m + 6'd3) >> 2) * cfg_k;
-    wire [`NPU_WORD_W-1:0] bt_words = ((cfg_n + 6'd3) >> 2) * cfg_k;
-    wire buf_ok  = (a_words <= `NPU_ABUF_WORDS) && (bt_words <= `NPU_BBUF_WORDS);
-    wire cbuf_ok = (cfg_m * cfg_n) <= `NPU_CBUF_WORDS;
+    reg [`NPU_WORD_W-1:0] a_words, bt_words;
+    reg buf_ok, cbuf_ok;
+    always @(*) begin
+        a_words = ((cfg_m + 6'd3) >> 2) * cfg_k;
+        bt_words = ((cfg_n + 6'd3) >> 2) * cfg_k;
+        cbuf_ok = (cfg_m * cfg_n) <= `NPU_CBUF_WORDS;
+        buf_ok = (a_words <= `NPU_ABUF_WORDS) && (bt_words <= `NPU_BBUF_WORDS);
+    end
     // 跨任务累加在 C 写回路径上做"原值 + 本段结果"，所以每段结果必须是未经量化
     // 的原始部分和，否则多次分段会累积舍入误差。qshift!=0 时直接拒绝，而不是
     // 静默忽略量化配置。
-    wire acc_ok  = !(cfg_accumulate && (cfg_qshift != 0));
-    wire cfg_ok  = dim_ok && tk_ok && buf_ok && cbuf_ok && acc_ok;
+    reg acc_ok, cfg_ok;
+    always @(*) begin
+        acc_ok = !(cfg_accumulate && (cfg_qshift != 0));
+        cfg_ok = dim_ok && tk_ok && buf_ok && cbuf_ok && acc_ok;
+    end
 
     always @(*) begin
         done_status  = (state == ST_DONE);
@@ -81,7 +91,8 @@ module start_ctrl(
             tk_l         <= 5'd0;
             qs_l         <= 5'd0;
             accumulate_l <= 1'b0;
-        end else begin
+        end
+        else begin
             start_pulse <= 1'b0;
             case (state)
                 // ST_DONE 也接受新任务：启动即进入 ST_RUN，DONE 随之清除。
@@ -97,10 +108,12 @@ module start_ctrl(
                             accumulate_l <= cfg_accumulate;
                             start_pulse  <= 1'b1;
                             state        <= ST_RUN;
-                        end else begin
+                        end
+                        else begin
                             state <= ST_ERROR;
                         end
-                    end else if (clear_done_req) begin
+                    end
+                    else if (clear_done_req) begin
                         state <= ST_IDLE;
                     end
                 end

@@ -68,8 +68,8 @@ module uart_tx(
                     else begin
                         busy <= 1'b0;
                     end
-                end                
-            end            
+                end
+            end
         end
     end
 endmodule

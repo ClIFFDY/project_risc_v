@@ -63,9 +63,11 @@ module boot_loader #(
     localparam [31:0] R_RXDATA = SPI_BASE + 32'h0c;
     localparam [31:0] R_CS     = SPI_BASE + 32'h10;
 
-    localparam [31:0] MAGIC    = 32'h3153_5652;   // 'R','V','S','1' 小端
+    localparam [31:0] MAGIC    = 32'h3153_5652;
+    // 'R','V','S','1' 小端
     localparam [31:0] MAX_LEN  = 32'd65536;
-    localparam [31:0] POLL_MAX = 32'd65536;       // 一个字节最多轮询这么多拍
+    localparam [31:0] POLL_MAX = 32'd65536;
+    // 一个字节最多轮询这么多拍
 
 //==============================================================================
 //  一、单拍 AHB 主设备
@@ -79,7 +81,10 @@ module boot_loader #(
     reg [3:0]  lat_strb;
     reg        lat_we;
 
-    wire accepted = pend & hgrant & hready;
+    reg accepted;
+    always @(*) begin
+        accepted = pend & hgrant & hready;
+    end
 
 //发起：bus_go 一拍脉冲；完成：写=被接受那一拍，读=rd_valid 那一拍
     reg        bus_go, bus_we, op_busy;
@@ -146,7 +151,8 @@ module boot_loader #(
     S_STORE  = 4'd6,    // 攒字节 / 写 STCM / 写头部
     S_NEXT   = 4'd7,    // 决定下一个字节
     S_FIN    = 4'd8,
-    S_DESEL  = 4'd9;    // 一段结束：先抬 CS，下一段再拉低（flash 靠 CS 边沿分事务）
+    S_DESEL  = 4'd9;
+    // 一段结束：先抬 CS，下一段再拉低（flash 靠 CS 边沿分事务）
 
     reg [3:0]  st;
     reg [2:0]  cmd_idx;        // 已装入 tx_byte 的命令前缀字节数（0..4）
@@ -163,7 +169,10 @@ module boot_loader #(
 //  否则 hdr0 会先吃到 0x03/地址那几拍的空回读（实测 hdr0 变成 FEFFFFFF）。
     reg        data_byte;
 
-    wire header_phase = (phase == 2'd0);
+    reg header_phase;
+    always @(*) begin
+        header_phase = (phase == 2'd0);
+    end
 
     // 累加：SPI 先出的字节落在最低位（小端，与内存布局一致）
     reg [31:0] acc_next;
@@ -176,8 +185,12 @@ module boot_loader #(
         endcase
     end
 
-    wire block_full = (byte_idx == 2'd3);
-    wire block_end  = block_full | (len_left == 17'd0);   // 凑满 4 字节，或这是最后一个字节
+    reg block_full, block_end;
+    always @(*) begin
+        block_full = (byte_idx == 2'd3);
+        block_end = block_full | (len_left == 17'd0);
+    end
+    // 凑满 4 字节，或这是最后一个字节
 
     // 数据字节的字节使能：最后一块可能只有 1~3 个有效字节
     reg [3:0] data_strb;
@@ -190,8 +203,12 @@ module boot_loader #(
         endcase
     end
 
-    wire [31:0] hdr_len = hdr1;
-    wire hdr_ok = (hdr0 == MAGIC) && (hdr_len != 32'd0);
+    reg [31:0] hdr_len;
+    reg hdr_ok;
+    always @(*) begin
+        hdr_len = hdr1;
+        hdr_ok = (hdr0 == MAGIC) && (hdr_len != 32'd0);
+    end
 
     // 本拍的总线动作（由 st 挑）
     reg [31:0] op_addr, op_wdata;
@@ -207,7 +224,8 @@ module boot_loader #(
         case (st)
         S_SEL: begin
             op_addr  = R_CS;
-            op_wdata = 32'h0000_0002;    // bit0=0：flash 选中；bit1=1：SD 不选
+            op_wdata = 32'h0000_0002;
+            // bit0=0：flash 选中；bit1=1：SD 不选
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
@@ -219,7 +237,8 @@ module boot_loader #(
         end
         S_GO: begin
             op_addr  = R_CTRL;
-            op_wdata = 32'h0000_0001;    // bit0=start
+            op_wdata = 32'h0000_0001;
+            // bit0=start
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
@@ -242,13 +261,15 @@ module boot_loader #(
         end
         S_DESEL: begin
             op_addr  = R_CS;
-            op_wdata = 32'h0000_0003;    // 两路 CS 都拉高
+            op_wdata = 32'h0000_0003;
+            // 两路 CS 都拉高
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
         S_FIN: begin
             op_addr  = R_CS;
-            op_wdata = 32'h0000_0003;    // 两路 CS 都拉高
+            op_wdata = 32'h0000_0003;
+            // 两路 CS 都拉高
             op_we    = 1'b1;
             op_go    = ~boot_done;       // ★ 抬起 CS 只发一次：done 之后就闭嘴，
                                          //   否则状态机停在 S_FIN 会一直重发这笔写，
@@ -284,7 +305,7 @@ module boot_loader #(
             data_byte <= 1'b0;
             boot_done <= 1'b0;
             boot_err <= 1'b0;
-            boot_count <= 16'd0;
+            boot_count <= 17'd0;
             bus_go <= 1'b0;
             bus_we <= 1'b0;
             bus_addr <= 32'd0;
@@ -314,7 +335,8 @@ module boot_loader #(
                 word_idx <= 16'd0;
                 acc <= 32'd0;
                 byte_idx <= 2'd0;
-                tx_byte <= 32'h0000_0003;    // READ 命令
+                tx_byte <= 32'h0000_0003;
+                // READ 命令
                 poll_cnt <= 32'd0;
                 data_byte <= 1'b0;
                 st <= S_SEL;
@@ -332,7 +354,8 @@ module boot_loader #(
 
             S_GO: begin
                 if (bus_done) begin
-                    poll_cnt <= 32'd0;      // ★ 超时是"这一个字节"的超时，不能跨字节累加
+                    poll_cnt <= 32'd0;
+                    // ★ 超时是"这一个字节"的超时，不能跨字节累加
                     st <= S_POLL;
                 end
             end
@@ -423,7 +446,8 @@ module boot_loader #(
                         acc <= 32'd0;
                         byte_idx <= 2'd0;
                         tx_byte <= 32'h0000_0003;
-                        data_byte <= 1'b0;      // ★ 换段后第一个字节是命令，不是数据
+                        data_byte <= 1'b0;
+                        // ★ 换段后第一个字节是命令，不是数据
                         st <= S_DESEL;
                     end
                 end

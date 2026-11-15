@@ -56,14 +56,23 @@ module npu_buffer(
     // ---- A RAM 端口归属 ----
     // 双缓冲：写口地址直接带 bank 位（CPU 能往任意一组写，包括核没在读的那组）；
     // 读口在运行时锁死在 core_bank 那一组。
-    wire [`NPU_ABUF_REG_AW-1:0] a_ram_waddr = cpu_a_addr;
-    wire                        a_ram_we    = cpu_a_we;
-    wire [`NPU_ABUF_REG_AW-1:0] a_ram_raddr = core_busy ? {core_bank, npu_a_addr} : cpu_a_addr;
-    wire                     a_ram_re    = core_busy ? npu_a_re    : cpu_a_re;
+    reg [`NPU_ABUF_REG_AW-1:0] a_ram_waddr;
+    reg a_ram_we;
+    reg [`NPU_ABUF_REG_AW-1:0] a_ram_raddr;
+    reg a_ram_re;
+    always @(*) begin
+        a_ram_waddr = cpu_a_addr;
+        a_ram_we = cpu_a_we;
+        a_ram_raddr = core_busy ? {core_bank, npu_a_addr} : cpu_a_addr;
+        a_ram_re = core_busy ? npu_a_re    : cpu_a_re;
+    end
     wire [31:0]              a_ram_rdata;
 
     // ---- 权重块 RAM：和 A Buffer 同构的同步读（一拍延迟），所以 FIFO 时序不变 ----
-    wire [`NPU_WGT_AW-1:0] wgt_raddr = wgt_base + npu_a_addr;
+    reg [`NPU_WGT_AW-1:0] wgt_raddr;
+    always @(*) begin
+        wgt_raddr = wgt_base + npu_a_addr;
+    end
     wire [31:0] wgt_rdata;
     npu_ram #(.AW(`NPU_WGT_AW)) u_wgt_ram(
         .clk(clk),
@@ -71,7 +80,10 @@ module npu_buffer(
         .re(core_busy && wgt_en), .raddr(wgt_raddr), .rdata(wgt_rdata)
     );
     // A 侧数据来源：驻留模式读权重块，否则读 A Buffer
-    wire [31:0] a_src_rdata = (core_busy && wgt_en) ? wgt_rdata : a_ram_rdata;
+    reg [31:0] a_src_rdata;
+    always @(*) begin
+        a_src_rdata = (core_busy && wgt_en) ? wgt_rdata : a_ram_rdata;
+    end
 
     npu_ram #(.AW(`NPU_ABUF_REG_AW)) u_a_buffer(
         .clk(clk),
@@ -79,10 +91,16 @@ module npu_buffer(
         .re(a_ram_re), .raddr(a_ram_raddr), .rdata(a_ram_rdata)
     );
     // ---- BT RAM 端口归属：与 A RAM 同构 ----
-    wire [`NPU_BBUF_REG_AW-1:0] bt_ram_waddr = cpu_bt_addr;
-    wire                        bt_ram_we    = cpu_bt_we;
-    wire [`NPU_BBUF_REG_AW-1:0] bt_ram_raddr = core_busy ? {core_bank, npu_bt_addr} : cpu_bt_addr;
-    wire                     bt_ram_re    = core_busy ? npu_bt_re    : cpu_bt_re;
+    reg [`NPU_BBUF_REG_AW-1:0] bt_ram_waddr;
+    reg bt_ram_we;
+    reg [`NPU_BBUF_REG_AW-1:0] bt_ram_raddr;
+    reg bt_ram_re;
+    always @(*) begin
+        bt_ram_waddr = cpu_bt_addr;
+        bt_ram_we = cpu_bt_we;
+        bt_ram_raddr = core_busy ? {core_bank, npu_bt_addr} : cpu_bt_addr;
+        bt_ram_re = core_busy ? npu_bt_re    : cpu_bt_re;
+    end
     wire [31:0]              bt_ram_rdata;
 
     npu_ram #(.AW(`NPU_BBUF_REG_AW)) u_bt_buffer(
@@ -100,11 +118,18 @@ module npu_buffer(
     wire                     cwf_re;
     wire [`NPU_CBUF_AW-1:0] cwf_raddr;
 
-    wire [`NPU_CBUF_AW-1:0] c_ram_waddr = core_busy ? cwf_addr : cpu_c_addr;
-    wire                     c_ram_we    = core_busy ? cwf_we    : cpu_c_we;
-    wire [31:0]              c_ram_wdata = core_busy ? cwf_data  : cpu_c_wdata;
-    wire [`NPU_CBUF_AW-1:0] c_ram_raddr = core_busy ? cwf_raddr : cpu_c_addr;
-    wire                     c_ram_re    = core_busy ? cwf_re    : cpu_c_re;
+    reg [`NPU_CBUF_AW-1:0] c_ram_waddr;
+    reg c_ram_we;
+    reg [31:0] c_ram_wdata;
+    reg [`NPU_CBUF_AW-1:0] c_ram_raddr;
+    reg c_ram_re;
+    always @(*) begin
+        c_ram_waddr = core_busy ? cwf_addr : cpu_c_addr;
+        c_ram_we = core_busy ? cwf_we    : cpu_c_we;
+        c_ram_wdata = core_busy ? cwf_data  : cpu_c_wdata;
+        c_ram_raddr = core_busy ? cwf_raddr : cpu_c_addr;
+        c_ram_re = core_busy ? cwf_re    : cpu_c_re;
+    end
     wire [31:0]              c_ram_rdata;
 
     npu_ram #(.AW(`NPU_CBUF_AW)) u_c_buffer(
@@ -126,7 +151,8 @@ module npu_buffer(
         if (rst) begin
             a_re_d  <= 1'b0;
             bt_re_d <= 1'b0;
-        end else begin
+        end
+        else begin
             a_re_d  <= npu_a_re  && core_busy;
             bt_re_d <= npu_bt_re && core_busy;
         end

@@ -10,7 +10,9 @@
 //
 // 2) 数据布局、位宽和单位
 //    HADDR   ：字节地址，本从机只接受 32 位字访问，因此 HADDR[1:0] 必须为 0。
-//    HWDATA  ：32 位写数据，只在数据阶段有效（地址阶段不必驱动）。
+//    HWDATA  ：32 位写数据。★ 本 SoC 的实际约定是【地址与数据同拍】
+//              （LSU 主口 / DMA 主口 / STCM 从口都是这么做的），所以这里在
+//              地址阶段就把它锁存进 wdata_q，数据阶段用锁存值。详见 req_wdata。
 //    HRDATA  ：32 位读数据，只要求在 HREADYOUT=1 那一拍有效，其余时间不关心。
 //    req_addr：相对 ADDR_BASE 的字节地址（= HADDR - ADDR_BASE），字索引为
 //              req_addr[NPU_*BUF_AW+1:2]；req_wdata/req_byte_en 与它同拍有效。
@@ -69,7 +71,7 @@ module ahb_lite_slave #(
     output reg         HREADYOUT,
     output reg  [1:0]  HRESP,
     // ★ 本仓互联约定的完成脉冲：读数据有效的这一拍为 1（与 stcm/ahb_apb_bridge 同口径）
-    output             rd_valid,      // 连续赋值（本仓互联约定的读完成脉冲）
+    output reg             rd_valid,      // 连续赋值（本仓互联约定的读完成脉冲）
     // ---- NPU 运行状态 ----
     input              core_busy,
     input              core_bank,      // 核正在读的那一组 A/BT
@@ -124,6 +126,8 @@ module ahb_lite_slave #(
     reg [31:0] addr_q;      // 本笔传输的内部字节地址(已减基址)
     reg        write_q;     // 本笔传输的方向
     reg        size_ok_q;   // 地址阶段采到的 HSIZE / 对齐检查结果
+//★ 2026-11-13：写数据也在【地址拍】锁存，见下方 req_wdata 那一段的理由。
+    reg [31:0] wdata_q;
 
     // 组合中间结果。全部在 always @(*) 中赋值，无隐含锁存器。
     reg [31:0] addr_off;    // HADDR 减基址后的内部字节地址
@@ -154,7 +158,14 @@ module ahb_lite_slave #(
         // Only legal DATA transactions may reach the core. An ERROR response
         // must suppress register, RAM, and CTRL.START side effects.
         req_addr    = addr_q;
-        req_wdata   = HWDATA;
+//★ 2026-11-13：写数据用【地址拍锁存下来的】wdata_q，不再直接用当拍的 HWDATA。
+//  理由：ARM AHB 规定写数据比地址晚一拍，可本 SoC 里 LSU 主口、DMA 主口、
+//  STCM 从口全都是"地址与数据同拍"的约定（lsu_ahb_master.v:84/99、
+//  dma.v:173-179、stcm.v:64）。CPU 一笔一笔发，数据在整个传输期间不变，
+//  两种约定看到的是同一个值，所以一直没暴露；而 DMA 是流水地每拍换数据，
+//  用当拍 HWDATA 就会让第 k 个地址拿到第 k+1 拍的数据（实测 NPU[3] 收到 0）。
+//  在地址拍锁存之后，本模块和其余模块对齐；CPU 那条路径行为逐拍不变。
+        req_wdata   = wdata_q;
         req_we      = write_q;
         req_byte_en = write_q ? 4'hF : 4'h0;
         // An ERROR response must never issue a register write, RAM access or START.
@@ -176,6 +187,7 @@ module ahb_lite_slave #(
             addr_q    <= 32'd0;
             write_q   <= 1'b0;
             size_ok_q <= 1'b0;
+            wdata_q   <= 32'd0;
         end
         else begin
             // 完成拍就地锁存下一笔地址(见 cap_now 的说明)
@@ -183,6 +195,7 @@ module ahb_lite_slave #(
                 addr_q    <= addr_off;
                 write_q   <= HWRITE;
                 size_ok_q <= (HSIZE == 3'b010) && (HADDR[1:0] == 2'd0);
+                wdata_q   <= HWDATA;      // ★ 与地址同拍锁存，见 req_wdata 的注释
             end
             case (state)
                 S_IDLE: begin
@@ -216,7 +229,13 @@ module ahb_lite_slave #(
     end
     // 读完成的定义：处于数据阶段（含 Buffer 读等待后的 S_RDD）且 HREADYOUT 已放开、
     // 方向是读、且不是错误响应。放在模块末尾是因为 iverilog 不允许先声明后用。
-    assign rd_valid = ((state == S_DATA) || (state == S_RDD)) && HREADYOUT
-                      && !write_q && !err_now;
+    // ★ 2026-11-14（总线审计）：**出错的那一笔读也必须给一个完成脉冲**。
+    //   互联的 npu_read_pending 只在 s2_rd_valid 时清零；NPU 出错不给 ⇒ 这个标志
+    //   永久为 1 ⇒ 之后所有读应答都被强制选成 NPU、owner FIFO 也不出队 ⇒
+    //   整条读通道死锁到复位。给一个假完成（数据由上层当 0 处理）比挂死好。
+    //   写错误不给：那会弹掉 owner FIFO 里别人的读项。
+    always @(*) begin
+        rd_valid = (((state == S_DATA) || (state == S_RDD)) && HREADYOUT && !write_q && !err_now) || ((state == S_ERR1) && !write_q);
+    end
 
 endmodule

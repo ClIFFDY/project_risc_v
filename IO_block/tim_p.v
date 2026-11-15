@@ -53,17 +53,21 @@ module tim_p(
 
 //槽号：本模块看到的 bus_addr_in 是【字地址】（字节地址 >> 2），所以槽号落在 [31:24]。
 //  6 号槽 = 0x1800_0000（1 UART / 2 PLIC / 3 DMA / 4 GPIO / 5 I2C / 6 TIM）
-    wire sel = (bus_addr_in[31:24] == 8'd6);
-    wire wr  = sel & bus_we_in & (|bus_be_in);
-    wire rd  = sel & ~bus_we_in;
-    wire run = (cnt_set != 32'd0) & ~halted;
-    wire wr_cnt_set = wr & (bus_addr_in[3:0] == R_CNT_SET);
+    reg sel, wr, rd, run, wr_cnt_set;
+    always @(*) begin
+        sel = (bus_addr_in[31:24] == 8'd6);
+        run = (cnt_set != 32'd0) & ~halted;
+        wr = sel & bus_we_in & (|bus_be_in);
+        rd = sel & ~bus_we_in;
+        wr_cnt_set = wr & (bus_addr_in[3:0] == R_CNT_SET);
+    end
 
     always @(posedge clk) begin
         if (rst) begin
             cnt_set <= 32'd0;
             cnt <= 32'd0;
-            for (i = 0; i < 4; i = i + 1) pwm_duty[i] <= 32'd0;
+            for (i = 0; i < 4; i = i + 1)
+                pwm_duty[i] <= 32'd0;
             periodic <= 1'b0;
             pwm_en <= 4'd0;
             halted <= 1'b0;
@@ -84,7 +88,8 @@ module tim_p(
                 if (cnt + 32'd1 == cnt_set) begin
                     cnt <= 32'd0;
                     tim_p_irq <= 1'b1;
-                    if (~periodic) halted <= 1'b1;
+                    if (~periodic)
+                        halted <= 1'b1;
                 end
                 else begin
                     cnt <= cnt + 32'd1;
@@ -101,10 +106,14 @@ module tim_p(
             if (wr) begin
                 case (bus_addr_in[3:0])
                 R_CNT_SET: begin
-                    if (bus_be_in[0]) cnt_set[7:0]   <= bus_data_in[7:0];
-                    if (bus_be_in[1]) cnt_set[15:8]  <= bus_data_in[15:8];
-                    if (bus_be_in[2]) cnt_set[23:16] <= bus_data_in[23:16];
-                    if (bus_be_in[3]) cnt_set[31:24] <= bus_data_in[31:24];
+                    if (bus_be_in[0])
+                        cnt_set[7:0]   <= bus_data_in[7:0];
+                    if (bus_be_in[1])
+                        cnt_set[15:8]  <= bus_data_in[15:8];
+                    if (bus_be_in[2])
+                        cnt_set[23:16] <= bus_data_in[23:16];
+                    if (bus_be_in[3])
+                        cnt_set[31:24] <= bus_data_in[31:24];
                     cnt <= 32'd0;
                     halted <= 1'b0;
                 end
@@ -117,10 +126,14 @@ module tim_p(
                 R_DUTY1, R_DUTY2, R_DUTY3, R_DUTY4: begin
                     for (i = 0; i < 4; i = i + 1) begin
                         if (bus_addr_in[3:0] == R_DUTY1 + i[3:0]) begin
-                            if (bus_be_in[0]) pwm_duty[i][7:0]   <= bus_data_in[7:0];
-                            if (bus_be_in[1]) pwm_duty[i][15:8]  <= bus_data_in[15:8];
-                            if (bus_be_in[2]) pwm_duty[i][23:16] <= bus_data_in[23:16];
-                            if (bus_be_in[3]) pwm_duty[i][31:24] <= bus_data_in[31:24];
+                            if (bus_be_in[0])
+                                pwm_duty[i][7:0]   <= bus_data_in[7:0];
+                            if (bus_be_in[1])
+                                pwm_duty[i][15:8]  <= bus_data_in[15:8];
+                            if (bus_be_in[2])
+                                pwm_duty[i][23:16] <= bus_data_in[23:16];
+                            if (bus_be_in[3])
+                                pwm_duty[i][31:24] <= bus_data_in[31:24];
                         end
                     end
                 end

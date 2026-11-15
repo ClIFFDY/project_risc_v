@@ -71,7 +71,8 @@ module uart_rx(
                     clk_cnt <= 16'b0;
                     bit_cnt <= 4'b0;
                 end
-                else if (clk_cnt < mcnt - 1) clk_cnt <= clk_cnt + 1;
+                else if (clk_cnt < mcnt - 1)
+                    clk_cnt <= clk_cnt + 1;
                 else begin
                     clk_cnt <= 16'b0;
                     if (bit_cnt <= 4'd8) begin

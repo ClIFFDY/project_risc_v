@@ -42,14 +42,22 @@ module mcu_top #(
     parameter integer DDR_PRESENT       = 0
 ) (
     input clk, rst,
-    inout wire [31:0] gpio_pin_bus,
+    input  spi_miso,
 //---- SPI 主机（7 号槽）：接板上的 SPI NOR flash，直出、不经 gpio ----
     output spi_cs_n,
     output spi_cs_sd,
     output spi_sck,
     output spi_mosi,
-    input  spi_miso
+    inout wire [31:0] gpio_pin_bus
     );
+
+//L2 维护与"非缓存窗口"（走总线的 DMA 缓冲区用）。
+//★ 现在没有任何软件通路去写它们：maint 恒 0（不失效），非缓存窗口设成永不命中。
+//  ⇒ DMA 直接改 STCM 之后，L2 里若有同一行的旧副本，CPU 会读到旧值。
+//  这块要接上"某个能从软件写的寄存器"（PLIC 旁边加一个槽，或者拿一条 CSR），
+//  在那之前 DMA 只能用于"搬完就不由 CPU 再读"的场景。
+    reg [1:0] l2_maint_w;
+    reg [31:0] l2_unc_base_w, l2_unc_mask_w;
 
     wire rst_cpu;        // CPU / DMA 域（boot 搬运期间压着）
     wire rst_sys;        // 总线 / STCM / APB / SPI 域
@@ -66,6 +74,9 @@ module mcu_top #(
 
     wire [31:0] uart_data_w, plic_data_w, gpio_data_w, i2c_data_w, tim_data_w, spi_data_w;
     wire        uart_ready_w, plic_ready_w, gpio_ready_w, i2c_ready_w, tim_ready_w, spi_ready_w;
+//9 号槽：DPU（显示引擎）。它只是 io_block 里的一个从设备，和别的一样经 APB 桥。
+    wire [31:0] dpu_data_w;
+    wire        dpu_ready_w;
     wire        plic_exti;
     wire        dma_irq_w;
 
@@ -83,14 +94,12 @@ module mcu_top #(
     wire [1:0]  err_owner_w;
     wire [31:0] err_addr_w;
 
-//L2 维护与"非缓存窗口"（走总线的 DMA 缓冲区用）。
-//★ 现在没有任何软件通路去写它们：maint 恒 0（不失效），非缓存窗口设成永不命中。
-//  ⇒ DMA 直接改 STCM 之后，L2 里若有同一行的旧副本，CPU 会读到旧值。
-//  这块要接上"某个能从软件写的寄存器"（PLIC 旁边加一个槽，或者拿一条 CSR），
-//  在那之前 DMA 只能用于"搬完就不由 CPU 再读"的场景。
-    wire [1:0]  l2_maint_w   = 2'b00;
-    wire [31:0] l2_unc_base_w = 32'hFFFF_FFFF;
-    wire [31:0] l2_unc_mask_w = 32'h0000_0000;
+//L2 维护与"非缓存窗口"恒为安全值（见上方声明处的说明）
+    always @(*) begin
+        l2_maint_w = 2'b00;
+        l2_unc_base_w = 32'hFFFF_FFFF;
+        l2_unc_mask_w = 32'h0000_0000;
+    end
 
     cpu_top #(.LANES(LANES), .ROB_DEPTH(ROB_DEPTH), .IFFU_DEPTH(IFFU_DEPTH), .VALUE_TABLE_DEPTH(VALUE_TABLE_DEPTH), .IC_INDEX_B(IC_INDEX_B), .BHT_B(BHT_B), .BTB_B(BTB_B), .ADDER_AT_D(ADDER_AT_D), .DC_SETS_B(DC_SETS_B), .ITCM_AW(ITCM_AW)) u_cpu_top (
         .clk(clk),
@@ -149,6 +158,8 @@ module mcu_top #(
         .tim_ready(tim_ready_w),
         .spi_data(spi_data_w),
         .spi_ready(spi_ready_w),
+        .dpu_data(dpu_data_w),
+        .dpu_ready(dpu_ready_w),
         .dma_irq(dma_irq_w),
         .m1_haddr(l2_haddr_w), .m1_htrans(l2_htrans_w), .m1_hwrite(l2_hwrite_w),
         .m1_hsize(l2_hsize_w), .m1_hburst(l2_hburst_w),
@@ -197,14 +208,15 @@ module mcu_top #(
         .tim_ready(tim_ready_w),
         .spi_data(spi_data_w),
         .spi_ready(spi_ready_w),
-        .spi_cs_n(spi_cs_n),
-        .spi_cs_sd(spi_cs_sd),
+        .spi_cs_n(spi_cs_n),        .spi_cs_sd(spi_cs_sd),
         .spi_sck(spi_sck),
         .spi_mosi(spi_mosi),
         .spi_miso(spi_miso),
         .boot_done(boot_done_w),
         .boot_err(boot_err_w),
         .boot_count(boot_count_w),
+        .dpu_data(dpu_data_w),
+        .dpu_ready(dpu_ready_w),
         .plic_exti(plic_exti),
         .dma_irq(dma_irq_w),
         .err_valid(err_valid_w), .err_write(err_write_w), .err_owner(err_owner_w),

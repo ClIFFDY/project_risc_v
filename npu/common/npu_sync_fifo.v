@@ -39,7 +39,8 @@ module npu_sync_fifo #(parameter AW = `NPU_FIFO_AW, DW = 32) (
             rd_ptr <= {AW{1'b0}};
             wr_ptr <= {AW{1'b0}};
             cnt    <= {(AW + 1){1'b0}};
-        end else begin
+        end
+        else begin
             case ({push && !full, pop && !empty})
                 2'b10: begin
                     mem[wr_ptr] <= wdata;

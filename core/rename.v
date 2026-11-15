@@ -23,7 +23,7 @@ module rename #(
 //  因为 advance 与 iffu 的弹出是【同一拍的 1:1 契约】（我这一拍从你那几格收 N 条，你走 N 格），
 //  晚一拍就重复/漏发。要断这条环得改契约本身，不是插一个寄存器。
     output reg [3:0] advance,
-input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,    output        push1_valid, output [132:0] push1_data,    output        push2_valid, output [132:0] push2_data,
+input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_data,    output reg        push1_valid, output [132:0] push1_data,    output reg        push2_valid, output [132:0] push2_data,
 //★ 保留站的空位（isq 出口）：站满就把本 lane 的分配门关掉。
     input        station_room_0_valid,
     input        station_room_1_valid,
@@ -61,13 +61,11 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output reg        alloc_pend_0,
 //SYSTEM 类（分配拍译码）：这几类的异常/改向标记在 bju 判定延迟级才出 ⇒ ROB 退休要等那一级。
     output reg        alloc_ecall_0, alloc_ebreak_0, alloc_illegal_0, alloc_mret_0,
-//★ 2026-11-13（fence）：MISC-MEM 的两条。fence 只要求"更老的写都可见了才许退"，
-//  fence.i 还要求把 icache 整表作废并重取。在这里按 MISC-MEM 的 funct3 直接译，
-//  不走 idu 的 SYSTEM 那一路 —— 它们不是异常，也不改 PC 的控制流来源。
-    output reg        alloc_fence_0, alloc_fence_i_0,
-//★ 2026-11-13（P4）：写自定义 CSR 0x7C0 = "把三层缓存全部作废"（软件的一致性原语，
-//  给 DMA 用）。它和 fence.i 走同一套提交口机构，只是多作废 dcache 和 L2。
-    output reg        alloc_cache_flush_0,
+//★ 2026-11-13（fence / fence.i / CSR 0x7C0）：一条 2 位的屏障字段（编码见 rob.v 的
+//  BARRIER_*）。三者排队/年龄/排空判据完全一样，只差退役那一拍做什么，
+//  所以不再一个语义一根线。在这里按 MISC-MEM 的 funct3 与 0x7C0 直接译 ——
+//  它们不是异常，也不改 PC 的控制流来源。
+    output reg [1:0]  alloc_barrier_0,
     output reg [4:0]  alloc_rd_0,
 //★ 2026-11-04（CSR 步骤 C）：这条是 CSR 指令，以及随 ROB 项走的载荷
     output reg        alloc_csr_0,
@@ -75,7 +73,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output [5:0]      alloc_phys_0,
 //★ 2026-11-11：ROB 口 1 的 PC。口 1 在 lane0 没吃的拍上装的是 h0，不能直接接 h1_address。
 //  注意也不能用 address_stage1 —— 那个是 lane1 站的口（h1 是访存时它是 h2）。
-    output [31:0]     alloc_pc_1,
+    output reg [31:0]     alloc_pc_1,
 //★ 2026-11-04（精确冲刷第 1 步）：这一条分配时顶掉的那个映射（= rat[rd] 的旧值），随 ROB 项走。
     output [63:0]     alloc_onehot_0,
     output [63:0]     arch_next_onehot_0,
@@ -134,7 +132,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output reg        alloc_jmp_1,
     output reg        alloc_pend_1,
     output reg        alloc_ecall_1, alloc_ebreak_1, alloc_illegal_1, alloc_mret_1,
-    output reg        alloc_fence_1, alloc_fence_i_1, alloc_cache_flush_1,
+    output reg [1:0]  alloc_barrier_1,
     output reg [4:0]  alloc_rd_1,
 //★ 同 lane0：CSR / 载荷
     output reg        alloc_csr_1,
@@ -145,14 +143,14 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     output reg        alloc_jmp_2,
     output reg        alloc_pend_2,
     output reg        alloc_ecall_2, alloc_ebreak_2, alloc_illegal_2, alloc_mret_2,
-    output reg        alloc_fence_2, alloc_fence_i_2, alloc_cache_flush_2,
+    output reg [1:0]  alloc_barrier_2,
     output reg [4:0]  alloc_rd_2,
     output reg        alloc_csr_2,
     output reg [5:0]  alloc_phys_2,
 //★ 2026-11-10：这一条将来由【哪个 PRF 写口】写（PRF 的 owner 表在分配那一拍记下，发射时按它选阵列）。
-    output [2:0]      alloc_owner_0,
-    output [2:0]      alloc_owner_1,
-    output [2:0]      alloc_owner_2,
+    output reg [2:0]      alloc_owner_0,
+    output reg [2:0]      alloc_owner_1,
+    output reg [2:0]      alloc_owner_2,
 //★ 同 lane0：分配时顶掉的旧映射
     output reg [1:0]  dec_class_1,
     output reg        dec_we_1,
@@ -209,20 +207,20 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //==============================================================================
 // 与 top 的 rename 之间的口（rename 在 cpu_top 例化，位置是 F 级寄存器与 S 级寄存器之间）
 //  出去：四个分配口（0=lane0, 1=第二格, 2=h2 走访存, 3=h2 走 lane1）+ 六个源查询地址
-    output        rename_alloc_en_0, rename_alloc_en_1, rename_alloc_en_2, rename_alloc_en_3,
-    output        rename_alloc_we_0, rename_alloc_we_1, rename_alloc_we_2, rename_alloc_we_3,
+    output reg        rename_alloc_en_0, rename_alloc_en_1, rename_alloc_en_2, rename_alloc_en_3,
+    output reg        rename_alloc_we_0, rename_alloc_we_1, rename_alloc_we_2, rename_alloc_we_3,
     output [4:0] rename_alloc_rd_0, rename_alloc_rd_1, rename_alloc_rd_2, rename_alloc_rd_3,
     output [4:0] rename_alloc_rs1_0, rename_alloc_rs1_1, rename_alloc_rs1_2, rename_alloc_rs1_3,
     output [4:0] rename_alloc_rs2_0, rename_alloc_rs2_1, rename_alloc_rs2_2, rename_alloc_rs2_3,
     output [4:0] rename_lookup_a, rename_lookup_b, rename_lookup_c,
-    output [4:0] rename_lookup_d, rename_lookup_e, rename_lookup_f,
+    output reg [4:0] rename_lookup_d, rename_lookup_e, rename_lookup_f,
 //  回来：目的物理号、六个源查到的物理号、bank 空位、分配 one-hot 与提交拍架构映射
     output  [5:0]  phys_rd_0, phys_rd_1, phys_rd_2, phys_rd_3,
     output  [5:0]  lookup_a_phys, lookup_b_phys, lookup_c_phys,
-    output  [5:0]  lookup_d_phys, lookup_e_phys, lookup_f_phys,
-    output         bank_empty_0, bank_empty_1,
-    output         bank_empty_2, bank_empty_3,
-    output         bank_low_even, bank_low_odd,
+    output reg  [5:0]  lookup_d_phys, lookup_e_phys, lookup_f_phys,
+    output reg         bank_empty_0, bank_empty_1,
+    output reg         bank_empty_2, bank_empty_3,
+    output reg         bank_low_even, bank_low_odd,
     output  [63:0] alloc_onehot, arch_next_onehot
     );
 
@@ -259,144 +257,89 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     localparam integer LSU_AW    = 3;
 
 //复位就地打一拍（每个模块各一份，相位一致）。
-    reg reset_registered;
+  reg  reset_registered;
 //控制位译码（行为块，放本模块最前）：冲刷位与停顿位可同时为 1，故保持【冲刷优先于停顿】。
-    reg exec;
+  reg  exec;
 //★ 本拍算、下一拍生效的"最多收几条"（见下面 credit 那一段）
-    reg [3:0] grant;
+  reg [3:0] grant;
 //★ 两条 lane 各自的"已发射"位。lane0/lane1 的发射彼此独立之后，"寄存器内容的消费"与"寄存器装载"
-    reg lane0_free, lane1_free, lane2_free, go, load_lane0, load_lane1;
+  reg  lane0_free, lane1_free, lane2_free, go;
 //★ 声明必须在使用之前（Vivado 报 VRFC 10-3380；Verilator 不管）：这三根在分配判据（下面的
-    reg        pick_from_h2;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_queue_0, lsu_queue_1, lsu_queue_2, lsu_queue_3;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_queue_4, lsu_queue_5, lsu_queue_6, lsu_queue_7;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_entry_0, lsu_entry_1, lsu_entry_2;
-    reg        lsu_push_0, lsu_push_1, lsu_push_2;
-    reg        lsu_h1_taken;
-    reg [2:0]  lsu_slot_1, lsu_slot_2;
-    reg [3:0]  lsu_room;
-    reg        is_mem_0, is_mem_1, is_mem_2;
-    reg        h1_is_mem, h1_store, h2_store, pick_bank_empty, pick_mem;
-    reg [4:0]  h2_rs1, h2_rs2, h2_rd;
-    reg [4:0]  destination_decoded, destination_decoded_1;
-    reg [31:0] instruction_stage1, address_stage1, jump_link_register_stage1;
-    reg        alloc_lane0, alloc_lane1, lane0_store, lane1_store;
+  reg  pick_from_h2;
+  reg [LSU_QUEUE_WIDTH-1:0] lsu_entry_0, lsu_entry_1, lsu_entry_2;
+  reg  lsu_push_0, lsu_push_1, lsu_push_2;
+  reg  lsu_h1_taken;
+  reg [3:0] lsu_room;
+  reg  is_mem_0, is_mem_1, is_mem_2;
+  reg  h1_is_mem, h1_store, h2_store, pick_bank_empty, pick_mem;
+  reg [4:0] h2_rs1, h2_rs2, h2_rd;
+  reg [4:0] destination_decoded, destination_decoded_1;
+  reg [31:0] instruction_stage1, address_stage1, jump_link_register_stage1;
+  reg  alloc_lane0, alloc_lane1, lane0_store, lane1_store;
 //==============================================================================
 // S 级载荷的 2 深 FIFO（2026-10-31）
-    reg        skid_valid_0, skid_valid_1;
-    reg        lane0_push, lane1_push, lane0_head_after_pop, lane1_head_after_pop;
+  reg  skid_valid_0, skid_valid_1;
+  reg  lane0_push, lane1_push, lane0_head_after_pop, lane1_head_after_pop;
 //（tag 的提交清见下面 lane 载荷块之前那一段）
-    reg [31:0] skid_instruction_out_0;
-    reg [31:0] skid_auxiliary_address_out_0;
-    reg        skid_branch_prediction_taken_out_0;
-    reg [4:0]  skid_source_a_out_0, skid_source_b_out_0;
-    reg [4:0]  skid_index_out_0;
-    reg        skid_generation_out_0;
 //★ 2026-11-04 真 PRF：与 prod 同生命周期的物理号（prod 被提交清掉时它【不清】，号是稳定的）
-    reg [5:0]  skid_phys_a_out_0, skid_phys_b_out_0, skid_phys_a_out_1, skid_phys_b_out_1;
-    reg [5:0]  skid_phys_d_out_0, skid_phys_d_out_1;
-    reg [1:0]  skid_dec_class_0;
-    reg        skid_dec_we_0;
-    reg [4:0]  skid_dec_rd_0;
-    reg        skid_dec_is_st_0;
-    reg [2:0]  skid_dec_mulop_0, skid_dec_lsf3_0, skid_dec_csrf3_0;
-    reg [3:0]  skid_dec_func4_0;
-    reg        skid_dec_csrw_en_0, skid_dec_csrw_wr_0;
-    reg [11:0] skid_dec_csra_0;
-    reg [31:0] skid_dec_jval_0;
-    reg        skid_dec_brf_0, skid_dec_jalf_0, skid_dec_jalfr_0;
-    reg [3:0]  skid_dec_bjuf4_0;
-    reg        skid_dec_r1_imm_0, skid_dec_r2_imm_0;
-    reg [31:0] skid_dec_r1_immv_0, skid_dec_r2_immv_0;
-    reg [31:0] skid_instruction_out_1;
-    reg [31:0] skid_auxiliary_address_out_1;
-    reg        skid_branch_prediction_taken_out_1;
-    reg [4:0]  skid_source_a_out_1, skid_source_b_out_1;
-    reg [4:0]  skid_index_out_1;
-    reg        skid_generation_out_1;
-    reg [1:0]  skid_dec_class_1;
-    reg        skid_dec_we_1;
-    reg [4:0]  skid_dec_rd_1;
-    reg        skid_dec_is_st_1;
-    reg [2:0]  skid_dec_mulop_1, skid_dec_lsf3_1, skid_dec_csrf3_1;
-    reg [3:0]  skid_dec_func4_1;
-    reg        skid_dec_csrw_en_1, skid_dec_csrw_wr_1;
-    reg [11:0] skid_dec_csra_1;
-    reg [31:0] skid_dec_jval_1;
-    reg        skid_dec_brf_1, skid_dec_jalf_1, skid_dec_jalfr_1;
-    reg [3:0]  skid_dec_bjuf4_1;
-    reg        skid_dec_r1_imm_1, skid_dec_r2_imm_1;
-    reg [31:0] skid_dec_r1_immv_1, skid_dec_r2_immv_1;
-    reg [31:0] instruction_pick, address_pick;
-    reg [4:0]  index_pick;
-    reg        generation_pick;
+  reg [31:0] instruction_pick, address_pick;
+  reg [4:0] index_pick;
+  reg  generation_pick;
 //★ 2026-11-11：载荷队列回到 2 深（头 + 影子），没有指针、没有环。
     localparam integer LNQ_W = 240;   // = 一条完整载荷的打包宽度
-    wire [LNQ_W-1:0] lane0_pack, lane1_pack;
-    wire lane0_skid_load, lane1_skid_load;
-    wire lane0_skid_vac, lane1_skid_vac, lane0_skid_hold, lane1_skid_hold;
-    reg [2:0]  lsu_read_pointer, lsu_write_pointer;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_head;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_clear_0, lsu_clear_1, lsu_clear_2, lsu_clear_3;
-    reg [LSU_QUEUE_WIDTH-1:0] lsu_clear_4, lsu_clear_5, lsu_clear_6, lsu_clear_7;
-    reg        lsu_tag_hit_0a, lsu_tag_hit_0b, lsu_tag_hit_1a, lsu_tag_hit_1b;
-    reg        lsu_tag_hit_2a, lsu_tag_hit_2b, lsu_tag_hit_3a, lsu_tag_hit_3b;
 //★ lane1 这一拍拿 fifo 的哪一格：lane0 也在装 ⇒ 拿第二格；lane0 没装（在等操作数）⇒ 拿队头。
-    reg [4:0]  source_a_stage1, source_b_stage1;
-    reg [4:0]  source_a_dec_0, source_b_dec_0, source_a_dec_1, source_b_dec_1;
-    reg [4:0]  index_stage1;
-    reg        branch_prediction_stage1, generation_stage1;
+  reg [4:0] source_a_stage1, source_b_stage1;
+  reg [4:0] source_a_dec_0, source_b_dec_0, source_a_dec_1, source_b_dec_1;
+  reg [4:0] index_stage1;
+  reg  branch_prediction_stage1, generation_stage1;
 //译码字段的组合解算：源是本级的输入（F 级的指令字），口径与原来那一段逐条一致。
-    reg [9:0]  function10_decoded;
-    reg [31:0] immediate_decoded;
-    reg        jump_decoded;
-    reg csr_is_access_dec, csr_exists_dec, csr_ro_dec, csr_wr_dec;
-    reg exc_illegal_dec, exception_jump_misalign_decoded;
+  reg [9:0] function10_decoded;
+  reg [31:0] immediate_decoded;
+  reg  jump_decoded;
+  reg  csr_is_access_dec, csr_exists_dec, csr_ro_dec, csr_wr_dec;
+  reg  exc_illegal_dec, exception_jump_misalign_decoded;
 //入站分类 + 各类字段装配
-    reg [1:0]  class_decoded;
-    reg        write_enable_decoded, csr_write_enable_decoded, csr_write_commit_decoded;
-    reg [4:0]  destination_pick_decoded;
-    reg        is_store_decoded;
-    reg [2:0]  multiply_operation_decoded, load_store_function3_decoded, csr_function3_decoded;
-    reg [3:0]  function4_decoded;
-    reg [11:0] csr_address_decoded;
-    reg [31:0] jump_value_decoded;
-    reg        branch_flag_decoded, jump_link_flag_decoded, jump_link_register_flag_decoded;
+  reg [1:0] class_decoded;
+  reg  write_enable_decoded, csr_write_enable_decoded, csr_write_commit_decoded;
+  reg [4:0] destination_pick_decoded;
+  reg  is_store_decoded;
+  reg [2:0] multiply_operation_decoded, load_store_function3_decoded, csr_function3_decoded;
+  reg [3:0] function4_decoded;
+  reg [11:0] csr_address_decoded;
+  reg [31:0] jump_value_decoded;
+  reg  branch_flag_decoded, jump_link_flag_decoded, jump_link_register_flag_decoded;
 //非寄存器操作数的覆盖（立即数在这里并进操作数）
-    reg source_a_immediate_decoded, source_b_immediate_decoded;
-    reg [31:0] source_a_immediate_value_decoded, source_b_immediate_value_decoded;
+  reg  source_a_immediate_decoded, source_b_immediate_decoded;
+  reg [31:0] source_a_immediate_value_decoded, source_b_immediate_value_decoded;
 //异常标记（ecall/ebreak/mret）
-    reg exc_ecall_dec, exc_ebreak_dec, exc_irq_ret_dec;
+  reg  exc_ecall_dec, exc_ebreak_dec, exc_irq_ret_dec;
 //bju 功能码：这条指令在 bju 里算什么。
-    reg [3:0] branch_jump_function4_decoded;
+  reg [3:0] branch_jump_function4_decoded;
 //lane1 的译码（与 lane0 一模，源换成 instruction_stage1 / address_stage1 / jump_link_register_stage1）
-    reg [9:0]  function10_decoded_1;
-    reg [31:0] immediate_decoded_1;
-    reg        jump_decoded_1;
-    reg csr_is_access_dec_1, csr_exists_dec_1, csr_ro_dec_1, csr_wr_dec_1;
-    reg exc_illegal_dec_1, exception_jump_misalign_decoded_1;
-    reg [1:0]  class_decoded_1;
-    reg        write_enable_decoded_1, csr_write_enable_decoded_1, csr_write_commit_decoded_1;
-    reg [4:0]  destination_pick_decoded_1;
-    reg        is_store_decoded_1;
-    reg [2:0]  multiply_operation_decoded_1, load_store_function3_decoded_1, csr_function3_decoded_1;
-    reg [3:0]  function4_decoded_1;
-    reg [11:0] csr_address_decoded_1;
-    reg [31:0] jump_value_decoded_1;
-    reg        branch_flag_decoded_1, jump_link_flag_decoded_1, jump_link_register_flag_decoded_1;
-    reg source_a_immediate_decoded_1, source_b_immediate_decoded_1;
-    reg [31:0] source_a_immediate_value_decoded_1, source_b_immediate_value_decoded_1;
-    reg exc_ecall_dec_1, exc_ebreak_dec_1, exc_irq_ret_dec_1;
+  reg [9:0] function10_decoded_1;
+  reg [31:0] immediate_decoded_1;
+  reg  jump_decoded_1;
+  reg  csr_is_access_dec_1, csr_exists_dec_1, csr_ro_dec_1, csr_wr_dec_1;
+  reg  exc_illegal_dec_1, exception_jump_misalign_decoded_1;
+  reg [1:0] class_decoded_1;
+  reg  write_enable_decoded_1, csr_write_enable_decoded_1, csr_write_commit_decoded_1;
+  reg [4:0] destination_pick_decoded_1;
+  reg  is_store_decoded_1;
+  reg [2:0] multiply_operation_decoded_1, load_store_function3_decoded_1, csr_function3_decoded_1;
+  reg [3:0] function4_decoded_1;
+  reg [11:0] csr_address_decoded_1;
+  reg [31:0] jump_value_decoded_1;
+  reg  branch_flag_decoded_1, jump_link_flag_decoded_1, jump_link_register_flag_decoded_1;
+  reg  source_a_immediate_decoded_1, source_b_immediate_decoded_1;
+  reg [31:0] source_a_immediate_value_decoded_1, source_b_immediate_value_decoded_1;
+  reg  exc_ecall_dec_1, exc_ebreak_dec_1, exc_irq_ret_dec_1;
 //bju 功能码（与 lane0 逐条同形）
-    reg [3:0] branch_jump_function4_decoded_1;
+  reg [3:0] branch_jump_function4_decoded_1;
 //==============================================================================
 // 访存 FIFO 的队头译码 + 时序
-    reg [31:0] lsu_head_instruction, lsu_head_pc;
-    reg [4:0]  lsu_head_index;
-    reg        lsu_head_generation;
 //★ 2026-11-04 真 PRF：进队条目带的是两个源的【物理号】，在进队这一拍由 rename 查出。
-    wire [4:0]  lsu_push_source_a, lsu_push_source_b;
-    wire [4:0]  push1_source_a, push1_source_b;
+  wire [4:0] lsu_push_source_a, lsu_push_source_b;
+  reg [4:0] push1_source_a, push1_source_b;
 //★ 冲刷：按击杀掩码【截断】尾部，不再整条清（rob 的 flush_partial 恒 0 那一套已经不成立了）。
 
     always @(posedge clk) reset_registered <= rst;
@@ -428,7 +371,7 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     endfunction
 
 
-    reg alloc_block;
+  reg  alloc_block;
     (* max_fanout = 32 *) reg [3:0] lsu_queue_count;
     always @(*) begin
         exec    = exec_in;
@@ -456,7 +399,8 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         h2_rs2 = h2_store ? instruction_in_2[24:20] : 5'd0;
         h2_rd  = h2_store ? 5'd0 : instruction_in_2[11:7];
 //★ 只看本地计数器：不许再依赖 isq 当拍弹不弹（那会把 lsu 的 stage_free 拉进 iffu 的推进锥）
-        lsu_room = 4'd8;   //★ 2026-11-11：LSU FIFO 已搬到后半段，这里恒给满额；真正的限制是 dsq 空位
+        lsu_room = 4'd8;
+        //★ 2026-11-11：LSU FIFO 已搬到后半段，这里恒给满额；真正的限制是 dsq 空位
 //★ 2026-11-05：改向一经判定，分配冻结到那条分支提交。冻结住 alloc_lane0 就把
 //★ lane0_free（dsq 有空位）对所有类别都必须门：访存条原来只查 lsu_room（拆环后恒 8），
 //  dsq 满的时候照样分配 ⇒ 条目推不进去、ROB 那槽永远等不到完成。
@@ -662,27 +606,39 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
             case (instruction_in_0[6:0])
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec = 1'b0;
                 OPCODE_LOAD: begin
-                    if (instruction_in_0[14:12] == 3'b011) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b110) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b111) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b011)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b110)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b111)
+                        exc_illegal_dec = 1'b1;
                 end
                 OPCODE_STORE: begin
-                    if (instruction_in_0[14:12] == 3'b011) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b100) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b101) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b110) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b111) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b011)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b100)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b101)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b110)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b111)
+                        exc_illegal_dec = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (instruction_in_0[14:12] != 3'b000) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] != 3'b000)
+                        exc_illegal_dec = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (instruction_in_0[14:12] == 3'b010) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b010)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b011)
+                        exc_illegal_dec = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (instruction_in_0[14:12] == 3'b001) begin
-                        if (instruction_in_0[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                        if (instruction_in_0[31:25] != 7'd0)
+                            exc_illegal_dec = 1'b1;
                     end
                     if (instruction_in_0[14:12] == 3'b101) begin
                         if ((instruction_in_0[31:25] != 7'd0) && (instruction_in_0[31:25] != 7'b0100000))
@@ -690,28 +646,34 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                     end
                 end
                 OPCODE_OP: begin
-                    if (instruction_in_0[31:25] == 7'b0000001) exc_illegal_dec = 1'b0;
+                    if (instruction_in_0[31:25] == 7'b0000001)
+                        exc_illegal_dec = 1'b0;
                     else if (instruction_in_0[14:12] == 3'b000) begin
                         if ((instruction_in_0[31:25] != 7'd0) && (instruction_in_0[31:25] != 7'b0100000))
                             exc_illegal_dec = 1'b1;
                     end
                     else if (instruction_in_0[14:12] == 3'b001) begin
-                        if (instruction_in_0[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                        if (instruction_in_0[31:25] != 7'd0)
+                            exc_illegal_dec = 1'b1;
                     end
                     else if (instruction_in_0[14:12] == 3'b101) begin
                         if ((instruction_in_0[31:25] != 7'd0) && (instruction_in_0[31:25] != 7'b0100000))
                             exc_illegal_dec = 1'b1;
                     end
                     else begin
-                        if (instruction_in_0[31:25] != 7'd0) exc_illegal_dec = 1'b1;
+                        if (instruction_in_0[31:25] != 7'd0)
+                            exc_illegal_dec = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (instruction_in_0[14:12] == 3'b010) exc_illegal_dec = 1'b1;
-                    if (instruction_in_0[14:12] == 3'b011) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b010)
+                        exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b011)
+                        exc_illegal_dec = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (instruction_in_0[14:12] == 3'b100) exc_illegal_dec = 1'b1;
+                    if (instruction_in_0[14:12] == 3'b100)
+                        exc_illegal_dec = 1'b1;
                     if (instruction_in_0[14:12] == 3'b000) begin
                         case (instruction_in_0[31:20])
                             12'h000, 12'h001, 12'h302, 12'h105: ;   // ecall / ebreak / mret / wfi（wfi 当 NOP）
@@ -719,9 +681,11 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                         endcase
                     end
                     if (csr_is_access_dec) begin
-                        if (!csr_exists_dec) exc_illegal_dec = 1'b1;
+                        if (!csr_exists_dec)
+                            exc_illegal_dec = 1'b1;
                         if (csr_ro_dec) begin
-                            if (csr_wr_dec) exc_illegal_dec = 1'b1;
+                            if (csr_wr_dec)
+                                exc_illegal_dec = 1'b1;
                         end
                     end
                 end
@@ -838,12 +802,23 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         source_a_immediate_value_decoded = 32'd0;
         source_b_immediate_value_decoded = 32'd0;
         case (instruction_in_0[6:0])
-            OPCODE_OP_IMM: begin source_b_immediate_decoded = 1'b1; source_b_immediate_value_decoded = immediate_decoded; end
-            OPCODE_JALR:   begin source_b_immediate_decoded = 1'b1; source_b_immediate_value_decoded = immediate_decoded; end
-            OPCODE_LUI:    begin source_b_immediate_decoded = 1'b1; source_b_immediate_value_decoded = immediate_decoded; end
-            OPCODE_AUIPC:  begin
-                source_a_immediate_decoded  = 1'b1; source_a_immediate_value_decoded = address_in_0;
-                source_b_immediate_decoded  = 1'b1; source_b_immediate_value_decoded = immediate_decoded;
+            OPCODE_OP_IMM: begin
+                source_b_immediate_decoded = 1'b1;
+                source_b_immediate_value_decoded = immediate_decoded;
+            end
+            OPCODE_JALR: begin
+                source_b_immediate_decoded = 1'b1;
+                source_b_immediate_value_decoded = immediate_decoded;
+            end
+            OPCODE_LUI: begin
+                source_b_immediate_decoded = 1'b1;
+                source_b_immediate_value_decoded = immediate_decoded;
+            end
+            OPCODE_AUIPC: begin
+                source_a_immediate_decoded  = 1'b1;
+                source_a_immediate_value_decoded = address_in_0;
+                source_b_immediate_decoded  = 1'b1;
+                source_b_immediate_value_decoded = immediate_decoded;
             end
             OPCODE_SYSTEM: begin
                 if ((instruction_in_0[14:12] == 3'b101) | (instruction_in_0[14:12] == 3'b110) | (instruction_in_0[14:12] == 3'b111)) begin
@@ -890,11 +865,17 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_ebreak_0  = exc_ebreak_dec;
         alloc_illegal_0 = exc_illegal_dec;
         alloc_mret_0    = exc_irq_ret_dec;
-        alloc_fence_0   = (instruction_in_0[6:0] == 7'b0001111) && (instruction_in_0[14:12] == 3'b000);
-        alloc_fence_i_0 = (instruction_in_0[6:0] == 7'b0001111) && (instruction_in_0[14:12] == 3'b001);
-//CSR 0x7C0：写（funct3 != 000 的三条都算）就触发三层失效。见 Tools/sw/include/memmap.h 的 dma_sync_after()
-        alloc_cache_flush_0 = (instruction_in_0[6:0] == 7'b1110011) && (instruction_in_0[14:12] != 3'b000) &&
-                              (instruction_in_0[31:20] == 12'h7C0);
+//屏障：MISC-MEM 的 000/001，以及 CSR 0x7C0 的写（funct3 != 000 的三条都算）。
+//  ★ 编码与 rob.v 的 BARRIER_* 是同一张表：0 无 / 1 fence / 2 fence.i / 3 三层全失效。
+        if (instruction_in_0[6:0] == 7'b0001111 && instruction_in_0[14:12] == 3'b001)
+            alloc_barrier_0 = 2'd2;
+        else if (instruction_in_0[6:0] == 7'b0001111 && instruction_in_0[14:12] == 3'b000)
+            alloc_barrier_0 = 2'd1;
+        else if (instruction_in_0[6:0] == 7'b1110011 && instruction_in_0[14:12] != 3'b000 &&
+                 instruction_in_0[31:20] == 12'h7C0)
+            alloc_barrier_0 = 2'd3;
+        else
+            alloc_barrier_0 = 2'd0;
         alloc_pend_0 = (instruction_in_0[6:0] == OPCODE_LOAD) | (instruction_in_0[6:0] == 7'b0100011) |
                      ((instruction_in_0[6:0] == OPCODE_OP) && (instruction_in_0[31:25] == 7'b0000001));
     end
@@ -971,27 +952,39 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
             case (instruction_stage1[6:0])
                 OPCODE_LUI, OPCODE_AUIPC, OPCODE_JAL: exc_illegal_dec_1 = 1'b0;
                 OPCODE_LOAD: begin
-                    if (instruction_stage1[14:12] == 3'b011) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b110) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b111) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b011)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b110)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b111)
+                        exc_illegal_dec_1 = 1'b1;
                 end
                 OPCODE_STORE: begin
-                    if (instruction_stage1[14:12] == 3'b011) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b100) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b101) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b110) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b111) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b011)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b100)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b101)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b110)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b111)
+                        exc_illegal_dec_1 = 1'b1;
                 end
                 OPCODE_JALR: begin
-                    if (instruction_stage1[14:12] != 3'b000) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] != 3'b000)
+                        exc_illegal_dec_1 = 1'b1;
                 end
                 OPCODE_BRANCH: begin
-                    if (instruction_stage1[14:12] == 3'b010) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b011) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b010)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b011)
+                        exc_illegal_dec_1 = 1'b1;
                 end
                 OPCODE_OP_IMM: begin
                     if (instruction_stage1[14:12] == 3'b001) begin
-                        if (instruction_stage1[31:25] != 7'd0) exc_illegal_dec_1 = 1'b1;
+                        if (instruction_stage1[31:25] != 7'd0)
+                            exc_illegal_dec_1 = 1'b1;
                     end
                     if (instruction_stage1[14:12] == 3'b101) begin
                         if ((instruction_stage1[31:25] != 7'd0) && (instruction_stage1[31:25] != 7'b0100000))
@@ -999,28 +992,34 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                     end
                 end
                 OPCODE_OP: begin
-                    if (instruction_stage1[31:25] == 7'b0000001) exc_illegal_dec_1 = 1'b0;
+                    if (instruction_stage1[31:25] == 7'b0000001)
+                        exc_illegal_dec_1 = 1'b0;
                     else if (instruction_stage1[14:12] == 3'b000) begin
                         if ((instruction_stage1[31:25] != 7'd0) && (instruction_stage1[31:25] != 7'b0100000))
                             exc_illegal_dec_1 = 1'b1;
                     end
                     else if (instruction_stage1[14:12] == 3'b001) begin
-                        if (instruction_stage1[31:25] != 7'd0) exc_illegal_dec_1 = 1'b1;
+                        if (instruction_stage1[31:25] != 7'd0)
+                            exc_illegal_dec_1 = 1'b1;
                     end
                     else if (instruction_stage1[14:12] == 3'b101) begin
                         if ((instruction_stage1[31:25] != 7'd0) && (instruction_stage1[31:25] != 7'b0100000))
                             exc_illegal_dec_1 = 1'b1;
                     end
                     else begin
-                        if (instruction_stage1[31:25] != 7'd0) exc_illegal_dec_1 = 1'b1;
+                        if (instruction_stage1[31:25] != 7'd0)
+                            exc_illegal_dec_1 = 1'b1;
                     end
                 end
                 OPCODE_MISC_MEM: begin
-                    if (instruction_stage1[14:12] == 3'b010) exc_illegal_dec_1 = 1'b1;
-                    if (instruction_stage1[14:12] == 3'b011) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b010)
+                        exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b011)
+                        exc_illegal_dec_1 = 1'b1;
                 end
                 OPCODE_SYSTEM: begin
-                    if (instruction_stage1[14:12] == 3'b100) exc_illegal_dec_1 = 1'b1;
+                    if (instruction_stage1[14:12] == 3'b100)
+                        exc_illegal_dec_1 = 1'b1;
                     if (instruction_stage1[14:12] == 3'b000) begin
                         case (instruction_stage1[31:20])
                             12'h000, 12'h001, 12'h302, 12'h105: ;
@@ -1028,9 +1027,11 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
                         endcase
                     end
                     if (csr_is_access_dec_1) begin
-                        if (!csr_exists_dec_1) exc_illegal_dec_1 = 1'b1;
+                        if (!csr_exists_dec_1)
+                            exc_illegal_dec_1 = 1'b1;
                         if (csr_ro_dec_1) begin
-                            if (csr_wr_dec_1) exc_illegal_dec_1 = 1'b1;
+                            if (csr_wr_dec_1)
+                                exc_illegal_dec_1 = 1'b1;
                         end
                     end
                 end
@@ -1145,12 +1146,23 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         source_a_immediate_value_decoded_1 = 32'd0;
         source_b_immediate_value_decoded_1 = 32'd0;
         case (instruction_stage1[6:0])
-            OPCODE_OP_IMM: begin source_b_immediate_decoded_1 = 1'b1; source_b_immediate_value_decoded_1 = immediate_decoded_1; end
-            OPCODE_JALR:   begin source_b_immediate_decoded_1 = 1'b1; source_b_immediate_value_decoded_1 = immediate_decoded_1; end
-            OPCODE_LUI:    begin source_b_immediate_decoded_1 = 1'b1; source_b_immediate_value_decoded_1 = immediate_decoded_1; end
-            OPCODE_AUIPC:  begin
-                source_a_immediate_decoded_1  = 1'b1; source_a_immediate_value_decoded_1 = address_stage1;
-                source_b_immediate_decoded_1  = 1'b1; source_b_immediate_value_decoded_1 = immediate_decoded_1;
+            OPCODE_OP_IMM: begin
+                source_b_immediate_decoded_1 = 1'b1;
+                source_b_immediate_value_decoded_1 = immediate_decoded_1;
+            end
+            OPCODE_JALR: begin
+                source_b_immediate_decoded_1 = 1'b1;
+                source_b_immediate_value_decoded_1 = immediate_decoded_1;
+            end
+            OPCODE_LUI: begin
+                source_b_immediate_decoded_1 = 1'b1;
+                source_b_immediate_value_decoded_1 = immediate_decoded_1;
+            end
+            OPCODE_AUIPC: begin
+                source_a_immediate_decoded_1  = 1'b1;
+                source_a_immediate_value_decoded_1 = address_stage1;
+                source_b_immediate_decoded_1  = 1'b1;
+                source_b_immediate_value_decoded_1 = immediate_decoded_1;
             end
             OPCODE_SYSTEM: begin
                 if ((instruction_stage1[14:12] == 3'b101) | (instruction_stage1[14:12] == 3'b110) | (instruction_stage1[14:12] == 3'b111)) begin
@@ -1198,10 +1210,11 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_ebreak_1  = pick_mem ? 1'b0 : exc_ebreak_dec_1;
         alloc_illegal_1 = pick_mem ? 1'b0 : exc_illegal_dec_1;
         alloc_mret_1    = pick_mem ? 1'b0 : exc_irq_ret_dec_1;
-        alloc_fence_1   = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b000));
-        alloc_fence_i_1 = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b001));
-        alloc_cache_flush_1 = pick_mem ? 1'b0 : ((instruction_stage1[6:0] == 7'b1110011) &&
-                              (instruction_stage1[14:12] != 3'b000) && (instruction_stage1[31:20] == 12'h7C0));
+        alloc_barrier_1 = pick_mem ? 2'd0 :
+                          (instruction_stage1[6:0] == 7'b0001111 && instruction_stage1[14:12] == 3'b001) ? 2'd2 :
+                          (instruction_stage1[6:0] == 7'b0001111 && instruction_stage1[14:12] == 3'b000) ? 2'd1 :
+                          (instruction_stage1[6:0] == 7'b1110011 && instruction_stage1[14:12] != 3'b000 &&
+                           instruction_stage1[31:20] == 12'h7C0) ? 2'd3 : 2'd0;
         alloc_pend_1 = pick_mem ? 1'b1
                    : ((instruction_stage1[6:0] == OPCODE_LOAD) | (instruction_stage1[6:0] == 7'b0100011) |
                      ((instruction_stage1[6:0] == OPCODE_OP) && (instruction_stage1[31:25] == 7'b0000001)));
@@ -1218,50 +1231,68 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         alloc_ebreak_2  = lsu_push_2 ? 1'b0 : exc_ebreak_dec_1;
         alloc_illegal_2 = lsu_push_2 ? 1'b0 : exc_illegal_dec_1;
         alloc_mret_2    = lsu_push_2 ? 1'b0 : exc_irq_ret_dec_1;
-        alloc_fence_2   = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b000));
-        alloc_fence_i_2 = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b0001111) && (instruction_stage1[14:12] == 3'b001));
-        alloc_cache_flush_2 = lsu_push_2 ? 1'b0 : ((instruction_stage1[6:0] == 7'b1110011) &&
-                              (instruction_stage1[14:12] != 3'b000) && (instruction_stage1[31:20] == 12'h7C0));
+        alloc_barrier_2 = lsu_push_2 ? 2'd0 :
+                          (instruction_stage1[6:0] == 7'b0001111 && instruction_stage1[14:12] == 3'b001) ? 2'd2 :
+                          (instruction_stage1[6:0] == 7'b0001111 && instruction_stage1[14:12] == 3'b000) ? 2'd1 :
+                          (instruction_stage1[6:0] == 7'b1110011 && instruction_stage1[14:12] != 3'b000 &&
+                           instruction_stage1[31:20] == 12'h7C0) ? 2'd3 : 2'd0;
         alloc_pend_2 = lsu_push_2 ? 1'b1
                                   : ((instruction_stage1[6:0] == OPCODE_LOAD) | (instruction_stage1[6:0] == 7'b0100011) |
                                      ((instruction_stage1[6:0] == OPCODE_OP) && (instruction_stage1[31:25] == 7'b0000001)));
     end
 
-    reg [PHYS_BITS-1:0] rat      [0:ARCH_COUNT-1];
-    reg [PHYS_BITS-1:0] arch_map [0:ARCH_COUNT-1];
-    reg [PHYS_COUNT-1:0] free_vector;
+  reg [PHYS_BITS-1:0] rat  [0:ARCH_COUNT-1];
+  reg [PHYS_BITS-1:0] arch_map [0:ARCH_COUNT-1];
+  reg [PHYS_COUNT-1:0] free_vector;
 
 //偶数位掩码 / 奇数位掩码 = 两个 bank
     localparam [PHYS_COUNT-1:0] EVEN_MASK = {PHYS_COUNT/2{2'b01}};
     localparam [PHYS_COUNT-1:0] ODD_MASK  = {PHYS_COUNT/2{2'b10}};
 
-    wire [PHYS_COUNT-1:0] free_even = free_vector & EVEN_MASK;
-    wire [PHYS_COUNT-1:0] free_odd  = free_vector & ODD_MASK;
+  reg [PHYS_COUNT-1:0] free_even, free_odd;
+    always @(*) begin
+        free_even = free_vector & EVEN_MASK;
+        free_odd = free_vector & ODD_MASK;
+    end
 
 //★ 每 bank 的空闲号个数（寄存版）。给前端背压的只有"这个 bank 还剩几个"这一个状态量，
 //  不再让 free_vector 的选号扫描钻进 idu 的分配门（那条路会一路拖到 iffu 的推进上）。
     localparam [5:0] BANK_FREE_INIT = (PHYS_COUNT - ARCH_COUNT) / 2;
-    reg [5:0] free_count_even, free_count_odd;
-    wire [5:0] flush_count_even = flush_count_even_comb;
-    wire [5:0] flush_count_odd  = flush_count_odd_comb;
+  reg [5:0] free_count_even, free_count_odd;
+//★ 2026-11-15：这几根 wire 原来是在下面（fce/fco 加法树旁边）带赋值声明的，而这行先用后声明。
+//  iverilog -g2001 不认 ⇒ 整棵树 elaborate 不过 ⇒ Tools/test 下 166 支台子全是"死门"（Verilator 认，
+//  所以整核台子一直是绿的）。这里只把【声明】挪上来，赋值仍留在原处（改成 assign），逻辑一字未动。
+  wire [5:0] flush_count_even_comb, flush_count_odd_comb;
+  reg [5:0] flush_count_even, flush_count_odd;
+    always @(*) begin
+        flush_count_even = flush_count_even_comb;
+        flush_count_odd = flush_count_odd_comb;
+    end
 
 //这一条要不要发号：有写回、且不是 x0
-    wire need_0 = rename_alloc_en_0 & rename_alloc_we_0 & (rename_alloc_rd_0 != 5'd0);
-    wire need_1 = rename_alloc_en_1 & rename_alloc_we_1 & (rename_alloc_rd_1 != 5'd0);
-    wire need_2 = rename_alloc_en_2 & rename_alloc_we_2 & (rename_alloc_rd_2 != 5'd0);
-    wire need_3 = rename_alloc_en_3 & rename_alloc_we_3 & (rename_alloc_rd_3 != 5'd0);
+  reg  need_0, need_1, need_2, need_3;
+    always @(*) begin
+        need_0 = rename_alloc_en_0 & rename_alloc_we_0 & (rename_alloc_rd_0 != 5'd0);
+        need_1 = rename_alloc_en_1 & rename_alloc_we_1 & (rename_alloc_rd_1 != 5'd0);
+        need_2 = rename_alloc_en_2 & rename_alloc_we_2 & (rename_alloc_rd_2 != 5'd0);
+        need_3 = rename_alloc_en_3 & rename_alloc_we_3 & (rename_alloc_rd_3 != 5'd0);
+    end
 
 //每个 bank 每拍要发【两个】号（口 0/2 取偶数 bank，口 1/3 取奇数 bank）。
 //  第一轮照旧取最低空闲位；把它从空闲向量里抠掉再取一次，就是第二个号。
 //  倒序 for 让最低位最后赋值 ⇒ 低位优先（与原写法同一个技巧）。
-    reg [PHYS_BITS-1:0]   pick_e0, pick_e1, pick_o0, pick_o1;
-    reg [PHYS_COUNT-1:0]  pick_e0_onehot, pick_e1_onehot, pick_o0_onehot, pick_o1_onehot;
-    reg                   found_e0, found_e1, found_o0, found_o1;
-    reg [PHYS_COUNT-1:0]  free_even_2nd, free_odd_2nd;
+  reg [PHYS_BITS-1:0] pick_e0, pick_e1, pick_o0, pick_o1;
+  reg [PHYS_COUNT-1:0] pick_e0_onehot, pick_e1_onehot, pick_o0_onehot, pick_o1_onehot;
+  reg  found_e0, found_e1, found_o0, found_o1;
+  reg [PHYS_COUNT-1:0] free_even_2nd, free_odd_2nd;
     integer k;
     always @(*) begin
-        pick_e0 = {PHYS_BITS{1'b0}}; pick_e0_onehot = {PHYS_COUNT{1'b0}}; found_e0 = 1'b0;
-        pick_o0 = {PHYS_BITS{1'b0}}; pick_o0_onehot = {PHYS_COUNT{1'b0}}; found_o0 = 1'b0;
+        pick_e0 = {PHYS_BITS{1'b0}};
+        pick_e0_onehot = {PHYS_COUNT{1'b0}};
+        found_e0 = 1'b0;
+        pick_o0 = {PHYS_BITS{1'b0}};
+        pick_o0_onehot = {PHYS_COUNT{1'b0}};
+        found_o0 = 1'b0;
         for (k = PHYS_COUNT - 1; k >= 0; k = k - 1) begin
             if (free_even[k]) begin
                 pick_e0        = k;
@@ -1276,8 +1307,12 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         end
         free_even_2nd = free_even & ~pick_e0_onehot;
         free_odd_2nd  = free_odd  & ~pick_o0_onehot;
-        pick_e1 = {PHYS_BITS{1'b0}}; pick_e1_onehot = {PHYS_COUNT{1'b0}}; found_e1 = 1'b0;
-        pick_o1 = {PHYS_BITS{1'b0}}; pick_o1_onehot = {PHYS_COUNT{1'b0}}; found_o1 = 1'b0;
+        pick_e1 = {PHYS_BITS{1'b0}};
+        pick_e1_onehot = {PHYS_COUNT{1'b0}};
+        found_e1 = 1'b0;
+        pick_o1 = {PHYS_BITS{1'b0}};
+        pick_o1_onehot = {PHYS_COUNT{1'b0}};
+        found_o1 = 1'b0;
         for (k = PHYS_COUNT - 1; k >= 0; k = k - 1) begin
             if (free_even_2nd[k]) begin
                 pick_e1        = k;
@@ -1293,55 +1328,36 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
     end
 
 //★ 口 0 没要号时口 2 直接顶上【第一个】号：不让它空等"第二个"。
-    wire alloc_ok_0 = need_0 & found_e0;
-    wire alloc_ok_1 = need_1 & found_o0;
-    wire [PHYS_BITS-1:0]  pick_b0_1 = alloc_ok_0 ? pick_e1 : pick_e0;
-    wire [PHYS_BITS-1:0]  pick_b1_1 = alloc_ok_1 ? pick_o1 : pick_o0;
-    wire [PHYS_COUNT-1:0] pick_b0_1_onehot = alloc_ok_0 ? pick_e1_onehot : pick_e0_onehot;
-    wire [PHYS_COUNT-1:0] pick_b1_1_onehot = alloc_ok_1 ? pick_o1_onehot : pick_o0_onehot;
-    wire                  found_b0_1 = alloc_ok_0 ? found_e1 : found_e0;
-    wire                  found_b1_1 = alloc_ok_1 ? found_o1 : found_o0;
-    wire alloc_ok_2 = need_2 & found_b0_1;
-    wire alloc_ok_3 = need_3 & found_b1_1;
+  reg  alloc_ok_0, alloc_ok_1;
+  reg [PHYS_BITS-1:0] pick_b0_1, pick_b1_1;
+  reg [PHYS_COUNT-1:0] pick_b0_1_onehot, pick_b1_1_onehot;
+  reg  found_b0_1, found_b1_1, alloc_ok_2, alloc_ok_3;
+    always @(*) begin
+        alloc_ok_0 = need_0 & found_e0;
+        alloc_ok_1 = need_1 & found_o0;
+        found_b0_1 = alloc_ok_0 ? found_e1 : found_e0;
+        pick_b0_1_onehot = alloc_ok_0 ? pick_e1_onehot : pick_e0_onehot;
+        pick_b0_1 = alloc_ok_0 ? pick_e1 : pick_e0;
+        pick_b1_1 = alloc_ok_1 ? pick_o1 : pick_o0;
+        found_b1_1 = alloc_ok_1 ? found_o1 : found_o0;
+        pick_b1_1_onehot = alloc_ok_1 ? pick_o1_onehot : pick_o0_onehot;
+        alloc_ok_2 = need_2 & found_b0_1;
+        alloc_ok_3 = need_3 & found_b1_1;
+    end
 
 //★ 纯状态：本 bank 已经没有空号（口 2/3 是"只剩一个"，因为口 0/1 进来还要给它留一个）。
 //  给前端做保守门（与 alloc_en 无组合环），防止"发了号但 ROB 那边没接"⇒ 号漏光
 //  ⇒ 输出物理 0 ⇒ 架构映射被写成 x0 那一格。
 //  ★ 判据只吃 free_count_* 这两个寄存器，不再从 free_vector 现扫一遍。
-    assign bank_empty_0 = (free_count_even == 6'd0);
-    assign bank_empty_1 = (free_count_odd  == 6'd0);
-    assign bank_empty_2 = (free_count_even == 6'd0) | ((free_count_even == 6'd1) & need_0);
-    assign bank_empty_3 = (free_count_odd  == 6'd0) | ((free_count_odd  == 6'd1) & need_1);
-    assign bank_low_even = (free_count_even <= 6'd2);
-    assign bank_low_odd  = (free_count_odd  <= 6'd2);
-    assign alloc_stall_0 = need_0 & bank_empty_0;
-    assign alloc_stall_1 = need_1 & bank_empty_1;
-    assign alloc_stall_2 = need_2 & bank_empty_2;
-    assign alloc_stall_3 = need_3 & bank_empty_3;
+    always @(*) begin
+        bank_empty_0 = (free_count_even == 6'd0);
+        bank_empty_1 = (free_count_odd  == 6'd0);
+        bank_empty_2 = (free_count_even == 6'd0) | ((free_count_even == 6'd1) & need_0);
+        bank_empty_3 = (free_count_odd  == 6'd0) | ((free_count_odd  == 6'd1) & need_1);
+        bank_low_even = (free_count_even <= 6'd2);
+        bank_low_odd = (free_count_odd  <= 6'd2);
+    end
 
-//---- 源操作数：查 rat，带【只对更老的写】旁路 ----
-//  ★ 自己这一条的写不能旁路到自己的读：`add x5, x5, x1` 的源必须是旧 x5。
-//    lane0 最老 ⇒ 看不到任何本拍写；lane1 只看到 lane0 的写。
-    assign phys_rs1_0 = rat[rename_alloc_rs1_0];
-    assign phys_rs2_0 = rat[rename_alloc_rs2_0];
-    assign phys_rs1_1 = (need_0 & (rename_alloc_rd_0 == rename_alloc_rs1_1)) ? pick_e0 : rat[rename_alloc_rs1_1];
-    assign phys_rs2_1 = (need_0 & (rename_alloc_rd_0 == rename_alloc_rs2_1)) ? pick_e0 : rat[rename_alloc_rs2_1];
-//★ 口 2 看得见口 0/1 的写，口 3 看得见口 0/1/2 的写；同一个 rs 上更年轻的那个赢。
-//  （门用 alloc_ok：没抢到号的那条根本不会写 rat，拿它的号去旁路是错的。）
-    assign phys_rs1_2 = (alloc_ok_1 & (rename_alloc_rd_1 == rename_alloc_rs1_2)) ? pick_o0
-                      : (alloc_ok_0 & (rename_alloc_rd_0 == rename_alloc_rs1_2)) ? pick_e0
-                      : rat[rename_alloc_rs1_2];
-    assign phys_rs2_2 = (alloc_ok_1 & (rename_alloc_rd_1 == rename_alloc_rs2_2)) ? pick_o0
-                      : (alloc_ok_0 & (rename_alloc_rd_0 == rename_alloc_rs2_2)) ? pick_e0
-                      : rat[rename_alloc_rs2_2];
-    assign phys_rs1_3 = (alloc_ok_2 & (rename_alloc_rd_2 == rename_alloc_rs1_3)) ? pick_b0_1
-                      : (alloc_ok_1 & (rename_alloc_rd_1 == rename_alloc_rs1_3)) ? pick_o0
-                      : (alloc_ok_0 & (rename_alloc_rd_0 == rename_alloc_rs1_3)) ? pick_e0
-                      : rat[rename_alloc_rs1_3];
-    assign phys_rs2_3 = (alloc_ok_2 & (rename_alloc_rd_2 == rename_alloc_rs2_3)) ? pick_b0_1
-                      : (alloc_ok_1 & (rename_alloc_rd_1 == rename_alloc_rs2_3)) ? pick_o0
-                      : (alloc_ok_0 & (rename_alloc_rd_0 == rename_alloc_rs2_3)) ? pick_e0
-                      : rat[rename_alloc_rs2_3];
     assign phys_rd_0  = pick_e0;
     assign phys_rd_1  = pick_o0;
     assign phys_rd_2  = pick_b0_1;
@@ -1352,26 +1368,34 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //  口 1 = 第二格（h1）：它是访存时用它的访存字段，否则用 pick 的译码（此时 pick 就是 h1）。
 //  口 2 = h2 走 LSU；口 3 = h2 走 lane1。两者互斥。
 //==============================================================================
-    assign rename_alloc_en_0 = alloc_lane0 & ~rob_full_in;
-    assign rename_alloc_we_0 = (destination_decoded != 5'd0);
+    always @(*) begin
+        rename_alloc_en_0 = alloc_lane0 & ~rob_full_in;
+        rename_alloc_we_0 = (destination_decoded != 5'd0);
+    end
     assign rename_alloc_rd_0 = destination_decoded;
     assign rename_alloc_rs1_0 = source_a_dec_0;
     assign rename_alloc_rs2_0 = source_b_dec_0;
 
-    assign rename_alloc_en_1 = (alloc_lane0 ? (h1_is_mem ? lsu_push_1 : alloc_lane1) : alloc_lane1) & ~rob_full_in;
-    assign rename_alloc_we_1 = pick_mem ? (~h1_store & (instruction_in_1[11:7] != 5'd0)) : (destination_decoded_1 != 5'd0);
+    always @(*) begin
+        rename_alloc_en_1 = (alloc_lane0 ? (h1_is_mem ? lsu_push_1 : alloc_lane1) : alloc_lane1) & ~rob_full_in;
+        rename_alloc_we_1 = pick_mem ? (~h1_store & (instruction_in_1[11:7] != 5'd0)) : (destination_decoded_1 != 5'd0);
+    end
     assign rename_alloc_rd_1 = pick_mem ? instruction_in_1[11:7] : destination_decoded_1;
     assign rename_alloc_rs1_1 = pick_mem ? instruction_in_1[19:15] : source_a_dec_1;
     assign rename_alloc_rs2_1 = pick_mem ? (h1_store ? instruction_in_1[24:20] : 5'd0) : source_b_dec_1;
 
-    assign rename_alloc_en_2 = lsu_push_2 & ~rob_full_in;
-    assign rename_alloc_we_2 = (h2_rd != 5'd0);
+    always @(*) begin
+        rename_alloc_en_2 = lsu_push_2 & ~rob_full_in;
+        rename_alloc_we_2 = (h2_rd != 5'd0);
+    end
     assign rename_alloc_rd_2 = h2_rd;
     assign rename_alloc_rs1_2 = h2_rs1;
     assign rename_alloc_rs2_2 = h2_rs2;
 
-    assign rename_alloc_en_3 = (alloc_lane0 & h1_is_mem & alloc_lane1) & ~rob_full_in;
-    assign rename_alloc_we_3 = (destination_decoded_1 != 5'd0);
+    always @(*) begin
+        rename_alloc_en_3 = (alloc_lane0 & h1_is_mem & alloc_lane1) & ~rob_full_in;
+        rename_alloc_we_3 = (destination_decoded_1 != 5'd0);
+    end
     assign rename_alloc_rd_3 = destination_decoded_1;
     assign rename_alloc_rs1_3 = source_a_dec_1;
     assign rename_alloc_rs2_3 = source_b_dec_1;
@@ -1379,27 +1403,33 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //★ 2026-11-11：这四个是六个查询口的源地址，合并时整块漏了 ⇒ 全 0
     assign lsu_push_source_a = source_a_dec_0;
     assign lsu_push_source_b = source_b_dec_0;
-    assign push1_source_a    = alloc_lane0 ? source_a_dec_1 : source_a_dec_0;
-    assign push1_source_b    = alloc_lane0 ? source_b_dec_1 : source_b_dec_0;
+    always @(*) begin
+        push1_source_a = alloc_lane0 ? source_a_dec_1 : source_a_dec_0;
+        push1_source_b = alloc_lane0 ? source_b_dec_1 : source_b_dec_0;
+    end
 
     assign rename_lookup_a = lsu_push_source_a;
     assign rename_lookup_b = lsu_push_source_b;
     assign rename_lookup_c = pick_mem ? instruction_in_1[19:15] : push1_source_a;
-    assign rename_lookup_d = pick_mem ? (h1_store ? instruction_in_1[24:20] : 5'd0) : push1_source_b;
-    assign rename_lookup_e = lsu_push_2 ? h2_rs1 : source_a_dec_1;
-    assign rename_lookup_f = lsu_push_2 ? h2_rs2 : source_b_dec_1;
+    always @(*) begin
+        rename_lookup_d = pick_mem ? (h1_store ? instruction_in_1[24:20] : 5'd0) : push1_source_b;
+        rename_lookup_e = lsu_push_2 ? h2_rs1 : source_a_dec_1;
+        rename_lookup_f = lsu_push_2 ? h2_rs2 : source_b_dec_1;
+    end
 
     assign alloc_phys_0 = phys_rd_0;
     assign alloc_phys_1 = phys_rd_1;
 //ROB 口 1 装的是哪条：lane0 吃了就是 h1，没吃就是 h0。
-    assign alloc_pc_1   = alloc_lane0 ? address_in_1 : address_in_0;
+    always @(*) begin
+        alloc_pc_1 = alloc_lane0 ? address_in_1 : address_in_0;
+    end
 
 //★ 2026-11-10：owner = "这条指令的结果将来从哪个 PRF 写口落笔"。
-    assign alloc_owner_0 = (class_decoded == CLS_MUL) ? 3'd1 :
-                           (class_decoded == CLS_LSU) ? 3'd4 : 3'd0;
-    assign alloc_owner_1 = (pick_mem | (class_decoded_1 == CLS_LSU)) ? 3'd4 :
-                           ((class_decoded_1 == CLS_MUL) ? 3'd3 : 3'd2);
-    assign alloc_owner_2 = lsu_push_2 ? 3'd4 : ((class_decoded_1 == CLS_MUL) ? 3'd3 : 3'd2);
+    always @(*) begin
+        alloc_owner_0 = (class_decoded == CLS_MUL) ? 3'd1 : (class_decoded == CLS_LSU) ? 3'd4 : 3'd0;
+        alloc_owner_1 = (pick_mem | (class_decoded_1 == CLS_LSU)) ? 3'd4 : ((class_decoded_1 == CLS_MUL) ? 3'd3 : 3'd2);
+        alloc_owner_2 = lsu_push_2 ? 3'd4 : ((class_decoded_1 == CLS_MUL) ? 3'd3 : 3'd2);
+    end
 
     always @(*) begin
         alloc_csr_0 = csr_write_enable_decoded;
@@ -1412,128 +1442,159 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //    所以这里只查 rat，不做任何本拍写的旁路。
 //  a/b 那一组挂的是 lane0 自己（最老），没有更老的写要旁路；
 //  c/d 那一组可能落在 lane1 上，必须看见同拍 lane0 的分配，否则 `add x5,..` / `add ..,x5` 连发会拿到旧号。
-    wire bypass_0 = alloc_ok_0 & (rename_alloc_rd_0 != 5'd0);
+  reg  bypass_0;
+    always @(*) begin
+        bypass_0 = alloc_ok_0 & (rename_alloc_rd_0 != 5'd0);
+    end
     assign lookup_a_phys = rat[rename_lookup_a];
     assign lookup_b_phys = rat[rename_lookup_b];
     assign lookup_c_phys = (bypass_0 & (rename_alloc_rd_0 == rename_lookup_c)) ? pick_e0 : rat[rename_lookup_c];
-    assign lookup_d_phys = (bypass_0 & (rename_alloc_rd_0 == rename_lookup_d)) ? pick_e0 : rat[rename_lookup_d];
+    always @(*) begin
+        lookup_d_phys = (bypass_0 & (rename_alloc_rd_0 == rename_lookup_d)) ? pick_e0 : rat[rename_lookup_d];
+    end
 //★ 2026-11-09 三宽分配：第三条的查找口。它看得见口 0/1 的写（口 1 更新，赢）。
-    assign lookup_e_phys = (alloc_ok_1 & (rename_alloc_rd_1 == rename_lookup_e)) ? pick_o0
-                         : (alloc_ok_0 & (rename_alloc_rd_0 == rename_lookup_e)) ? pick_e0
-                         : rat[rename_lookup_e];
-    assign lookup_f_phys = (alloc_ok_1 & (rename_alloc_rd_1 == rename_lookup_f)) ? pick_o0
-                         : (alloc_ok_0 & (rename_alloc_rd_0 == rename_lookup_f)) ? pick_e0
-                         : rat[rename_lookup_f];
+    always @(*) begin
+        lookup_e_phys = (alloc_ok_1 & (rename_alloc_rd_1 == rename_lookup_e)) ? pick_o0 : (alloc_ok_0 & (rename_alloc_rd_0 == rename_lookup_e)) ? pick_e0 : rat[rename_lookup_e];
+        lookup_f_phys = (alloc_ok_1 & (rename_alloc_rd_1 == rename_lookup_f)) ? pick_o0 : (alloc_ok_0 & (rename_alloc_rd_0 == rename_lookup_f)) ? pick_e0 : rat[rename_lookup_f];
+    end
 
 
 //---- 提交口要释放的旧号 ----
 //  `old = arch_map[rd]` 现读现用，不在 ROB 里另存 old_phys。
 //  同拍两条写同一个 rd：后一条（B）释放的是 A 刚定格进去的号，不是原来的那个。
-    wire old_valid_a = write_enable_a_in & (commit_rd0_in != 5'd0);
-    wire old_valid_b = write_enable_b_in & (commit_rd1_in != 5'd0);
-    wire same_rd     = old_valid_a & old_valid_b & (commit_rd0_in == commit_rd1_in);
+  reg  old_valid_a, old_valid_b, same_rd;
+    always @(*) begin
+        old_valid_a = write_enable_a_in & (commit_rd0_in != 5'd0);
+        old_valid_b = write_enable_b_in & (commit_rd1_in != 5'd0);
+        same_rd = old_valid_a & old_valid_b & (commit_rd0_in == commit_rd1_in);
+    end
 
-    wire [PHYS_BITS-1:0] old_a = arch_map[commit_rd0_in];
-    wire [PHYS_BITS-1:0] old_b = same_rd ? commit_phys0_in : arch_map[commit_rd1_in];
+  reg [PHYS_BITS-1:0] old_a, old_b;
+    always @(*) begin
+        old_a = arch_map[commit_rd0_in];
+        old_b = same_rd ? commit_phys0_in : arch_map[commit_rd1_in];
+    end
 
-    wire [PHYS_COUNT-1:0] freed_a_onehot = old_valid_a ? ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << old_a) : {PHYS_COUNT{1'b0}};
-    wire [PHYS_COUNT-1:0] freed_b_onehot = old_valid_b ? ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << old_b) : {PHYS_COUNT{1'b0}};
-    wire [PHYS_COUNT-1:0] freed_mask     = freed_a_onehot | freed_b_onehot;
+  reg [PHYS_COUNT-1:0] freed_a_onehot, freed_b_onehot, freed_mask;
+    always @(*) begin
+        freed_a_onehot = old_valid_a ? ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << old_a) : {PHYS_COUNT{1'b0}};
+        freed_b_onehot = old_valid_b ? ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << old_b) : {PHYS_COUNT{1'b0}};
+        freed_mask = freed_a_onehot | freed_b_onehot;
+    end
 
-    wire [PHYS_COUNT-1:0] alloc_mask = (alloc_ok_0 ? pick_e0_onehot   : {PHYS_COUNT{1'b0}})
-                                     | (alloc_ok_1 ? pick_o0_onehot   : {PHYS_COUNT{1'b0}})
-                                     | (alloc_ok_2 ? pick_b0_1_onehot : {PHYS_COUNT{1'b0}})
-                                     | (alloc_ok_3 ? pick_b1_1_onehot : {PHYS_COUNT{1'b0}});
+  reg [PHYS_COUNT-1:0] alloc_mask;
+    always @(*) begin
+        alloc_mask = (alloc_ok_0 ? pick_e0_onehot   : {PHYS_COUNT{1'b0}}) | (alloc_ok_1 ? pick_o0_onehot   : {PHYS_COUNT{1'b0}}) | (alloc_ok_2 ? pick_b0_1_onehot : {PHYS_COUNT{1'b0}}) | (alloc_ok_3 ? pick_b1_1_onehot : {PHYS_COUNT{1'b0}});
+    end
     assign alloc_onehot = alloc_mask;
 
 //★ 2026-11-12：冲刷后的空闲表 = arch_map 那 32 个号的补集。
 //  晚一拍重建（用户定的）：T 拍冲刷时 arch_map 已经被那条提交更新过，
 //  所以 T+1 拍只读 arch_map 这个【寄存器】就能重建 —— 不再碰 rob 的提交口，
 //  跨模块那一跳 1.9ns 和提交口 mux 全部消失。
-    reg                  flush_pending_q;   // 冲刷打一拍：重建晚一拍落地
-    reg [PHYS_COUNT-1:0] arch_mask_now;
+  reg  flush_pending_q;  // 冲刷打一拍：重建晚一拍落地
+  reg [PHYS_COUNT-1:0] arch_mask_now;
     integer m;
     always @(*) begin
         arch_mask_now = {PHYS_COUNT{1'b0}};
         for (m = 0; m < ARCH_COUNT; m = m + 1)
             arch_mask_now = arch_mask_now | ({{(PHYS_COUNT-1){1'b0}}, 1'b1} << arch_map[m]);
     end
-    wire flush_pending = flush_pending_q;
-    wire [PHYS_COUNT-1:0] flush_free_mask = ~arch_mask_now;
+  reg  flush_pending;
+  reg [PHYS_COUNT-1:0] flush_free_mask;
+    always @(*) begin
+        flush_pending = flush_pending_q;
+        flush_free_mask = ~arch_mask_now;
+    end
     assign arch_next_onehot = ~arch_mask_now;
 
 //---- 两个 bank 的空闲号个数：按位向量同一套事件加减，冲刷时按构造重算 ----
 //  分配扣、提交还，口径与 free_vector 逐条同源 ⇒ 两者不会走散。
-    wire [3:0] alloc_cnt_even = {3'd0, alloc_ok_0} + {3'd0, alloc_ok_2};
-    wire [3:0] alloc_cnt_odd  = {3'd0, alloc_ok_1} + {3'd0, alloc_ok_3};
-    wire [3:0] freed_cnt_even = {3'd0, (old_valid_a & ~old_a[0])} + {3'd0, (old_valid_b & ~old_b[0])};
-    wire [3:0] freed_cnt_odd  = {3'd0, (old_valid_a &  old_a[0])} + {3'd0, (old_valid_b &  old_b[0])};
+  reg [3:0] alloc_cnt_even, alloc_cnt_odd, freed_cnt_even, freed_cnt_odd;
+    always @(*) begin
+        alloc_cnt_even = {3'd0, alloc_ok_0} + {3'd0, alloc_ok_2};
+        alloc_cnt_odd = {3'd0, alloc_ok_1} + {3'd0, alloc_ok_3};
+        freed_cnt_even = {3'd0, (old_valid_a & ~old_a[0])} + {3'd0, (old_valid_b & ~old_b[0])};
+        freed_cnt_odd = {3'd0, (old_valid_a &  old_a[0])} + {3'd0, (old_valid_b &  old_b[0])};
+    end
 
 //★ popcount 树：32 个偶位两两相加，5 级出 6 位。输入是寄存器量（arch_mask_now）。
-    wire [1:0] fce_l0_0 = flush_free_mask[0] + flush_free_mask[2];
-    wire [1:0] fce_l0_1 = flush_free_mask[4] + flush_free_mask[6];
-    wire [1:0] fce_l0_2 = flush_free_mask[8] + flush_free_mask[10];
-    wire [1:0] fce_l0_3 = flush_free_mask[12] + flush_free_mask[14];
-    wire [1:0] fce_l0_4 = flush_free_mask[16] + flush_free_mask[18];
-    wire [1:0] fce_l0_5 = flush_free_mask[20] + flush_free_mask[22];
-    wire [1:0] fce_l0_6 = flush_free_mask[24] + flush_free_mask[26];
-    wire [1:0] fce_l0_7 = flush_free_mask[28] + flush_free_mask[30];
-    wire [1:0] fce_l0_8 = flush_free_mask[32] + flush_free_mask[34];
-    wire [1:0] fce_l0_9 = flush_free_mask[36] + flush_free_mask[38];
-    wire [1:0] fce_l0_10 = flush_free_mask[40] + flush_free_mask[42];
-    wire [1:0] fce_l0_11 = flush_free_mask[44] + flush_free_mask[46];
-    wire [1:0] fce_l0_12 = flush_free_mask[48] + flush_free_mask[50];
-    wire [1:0] fce_l0_13 = flush_free_mask[52] + flush_free_mask[54];
-    wire [1:0] fce_l0_14 = flush_free_mask[56] + flush_free_mask[58];
-    wire [1:0] fce_l0_15 = flush_free_mask[60] + flush_free_mask[62];
-    wire [2:0] fce_l1_0 = fce_l0_0 + fce_l0_1;
-    wire [2:0] fce_l1_1 = fce_l0_2 + fce_l0_3;
-    wire [2:0] fce_l1_2 = fce_l0_4 + fce_l0_5;
-    wire [2:0] fce_l1_3 = fce_l0_6 + fce_l0_7;
-    wire [2:0] fce_l1_4 = fce_l0_8 + fce_l0_9;
-    wire [2:0] fce_l1_5 = fce_l0_10 + fce_l0_11;
-    wire [2:0] fce_l1_6 = fce_l0_12 + fce_l0_13;
-    wire [2:0] fce_l1_7 = fce_l0_14 + fce_l0_15;
-    wire [3:0] fce_l2_0 = fce_l1_0 + fce_l1_1;
-    wire [3:0] fce_l2_1 = fce_l1_2 + fce_l1_3;
-    wire [3:0] fce_l2_2 = fce_l1_4 + fce_l1_5;
-    wire [3:0] fce_l2_3 = fce_l1_6 + fce_l1_7;
-    wire [4:0] fce_l3_0 = fce_l2_0 + fce_l2_1;
-    wire [4:0] fce_l3_1 = fce_l2_2 + fce_l2_3;
-    wire [5:0] fce_l4_0 = fce_l3_0 + fce_l3_1;
-    wire [1:0] fco_l0_0 = flush_free_mask[1] + flush_free_mask[3];
-    wire [1:0] fco_l0_1 = flush_free_mask[5] + flush_free_mask[7];
-    wire [1:0] fco_l0_2 = flush_free_mask[9] + flush_free_mask[11];
-    wire [1:0] fco_l0_3 = flush_free_mask[13] + flush_free_mask[15];
-    wire [1:0] fco_l0_4 = flush_free_mask[17] + flush_free_mask[19];
-    wire [1:0] fco_l0_5 = flush_free_mask[21] + flush_free_mask[23];
-    wire [1:0] fco_l0_6 = flush_free_mask[25] + flush_free_mask[27];
-    wire [1:0] fco_l0_7 = flush_free_mask[29] + flush_free_mask[31];
-    wire [1:0] fco_l0_8 = flush_free_mask[33] + flush_free_mask[35];
-    wire [1:0] fco_l0_9 = flush_free_mask[37] + flush_free_mask[39];
-    wire [1:0] fco_l0_10 = flush_free_mask[41] + flush_free_mask[43];
-    wire [1:0] fco_l0_11 = flush_free_mask[45] + flush_free_mask[47];
-    wire [1:0] fco_l0_12 = flush_free_mask[49] + flush_free_mask[51];
-    wire [1:0] fco_l0_13 = flush_free_mask[53] + flush_free_mask[55];
-    wire [1:0] fco_l0_14 = flush_free_mask[57] + flush_free_mask[59];
-    wire [1:0] fco_l0_15 = flush_free_mask[61] + flush_free_mask[63];
-    wire [2:0] fco_l1_0 = fco_l0_0 + fco_l0_1;
-    wire [2:0] fco_l1_1 = fco_l0_2 + fco_l0_3;
-    wire [2:0] fco_l1_2 = fco_l0_4 + fco_l0_5;
-    wire [2:0] fco_l1_3 = fco_l0_6 + fco_l0_7;
-    wire [2:0] fco_l1_4 = fco_l0_8 + fco_l0_9;
-    wire [2:0] fco_l1_5 = fco_l0_10 + fco_l0_11;
-    wire [2:0] fco_l1_6 = fco_l0_12 + fco_l0_13;
-    wire [2:0] fco_l1_7 = fco_l0_14 + fco_l0_15;
-    wire [3:0] fco_l2_0 = fco_l1_0 + fco_l1_1;
-    wire [3:0] fco_l2_1 = fco_l1_2 + fco_l1_3;
-    wire [3:0] fco_l2_2 = fco_l1_4 + fco_l1_5;
-    wire [3:0] fco_l2_3 = fco_l1_6 + fco_l1_7;
-    wire [4:0] fco_l3_0 = fco_l2_0 + fco_l2_1;
-    wire [4:0] fco_l3_1 = fco_l2_2 + fco_l2_3;
-    wire [5:0] fco_l4_0 = fco_l3_0 + fco_l3_1;
-    wire [5:0] flush_count_even_comb = fce_l4_0;
-    wire [5:0] flush_count_odd_comb  = fco_l4_0;
+  reg [1:0] fce_l0_0, fce_l0_1, fce_l0_2, fce_l0_3, fce_l0_4, fce_l0_5, fce_l0_6, fce_l0_7, fce_l0_8, fce_l0_9, fce_l0_10, fce_l0_11, fce_l0_12, fce_l0_13, fce_l0_14, fce_l0_15;
+  reg [2:0] fce_l1_0, fce_l1_1, fce_l1_2, fce_l1_3, fce_l1_4, fce_l1_5, fce_l1_6, fce_l1_7;
+  reg [3:0] fce_l2_0, fce_l2_1, fce_l2_2, fce_l2_3;
+  reg [4:0] fce_l3_0, fce_l3_1;
+  reg [5:0] fce_l4_0;
+  reg [1:0] fco_l0_0, fco_l0_1, fco_l0_2, fco_l0_3, fco_l0_4, fco_l0_5, fco_l0_6, fco_l0_7, fco_l0_8, fco_l0_9, fco_l0_10, fco_l0_11, fco_l0_12, fco_l0_13, fco_l0_14, fco_l0_15;
+  reg [2:0] fco_l1_0, fco_l1_1, fco_l1_2, fco_l1_3, fco_l1_4, fco_l1_5, fco_l1_6, fco_l1_7;
+  reg [3:0] fco_l2_0, fco_l2_1, fco_l2_2, fco_l2_3;
+  reg [4:0] fco_l3_0, fco_l3_1;
+  reg [5:0] fco_l4_0;
+    always @(*) begin
+        fce_l0_0 = flush_free_mask[0] + flush_free_mask[2];
+        fce_l0_1 = flush_free_mask[4] + flush_free_mask[6];
+        fce_l0_2 = flush_free_mask[8] + flush_free_mask[10];
+        fce_l0_3 = flush_free_mask[12] + flush_free_mask[14];
+        fce_l0_4 = flush_free_mask[16] + flush_free_mask[18];
+        fce_l0_5 = flush_free_mask[20] + flush_free_mask[22];
+        fce_l0_6 = flush_free_mask[24] + flush_free_mask[26];
+        fce_l0_7 = flush_free_mask[28] + flush_free_mask[30];
+        fce_l0_8 = flush_free_mask[32] + flush_free_mask[34];
+        fce_l0_9 = flush_free_mask[36] + flush_free_mask[38];
+        fce_l0_10 = flush_free_mask[40] + flush_free_mask[42];
+        fce_l0_11 = flush_free_mask[44] + flush_free_mask[46];
+        fce_l0_12 = flush_free_mask[48] + flush_free_mask[50];
+        fce_l0_13 = flush_free_mask[52] + flush_free_mask[54];
+        fce_l0_14 = flush_free_mask[56] + flush_free_mask[58];
+        fce_l0_15 = flush_free_mask[60] + flush_free_mask[62];
+        fco_l0_0 = flush_free_mask[1] + flush_free_mask[3];
+        fco_l0_1 = flush_free_mask[5] + flush_free_mask[7];
+        fco_l0_2 = flush_free_mask[9] + flush_free_mask[11];
+        fco_l0_3 = flush_free_mask[13] + flush_free_mask[15];
+        fco_l0_4 = flush_free_mask[17] + flush_free_mask[19];
+        fco_l0_5 = flush_free_mask[21] + flush_free_mask[23];
+        fco_l0_6 = flush_free_mask[25] + flush_free_mask[27];
+        fco_l0_7 = flush_free_mask[29] + flush_free_mask[31];
+        fco_l0_8 = flush_free_mask[33] + flush_free_mask[35];
+        fco_l0_9 = flush_free_mask[37] + flush_free_mask[39];
+        fco_l0_10 = flush_free_mask[41] + flush_free_mask[43];
+        fco_l0_11 = flush_free_mask[45] + flush_free_mask[47];
+        fco_l0_12 = flush_free_mask[49] + flush_free_mask[51];
+        fco_l0_13 = flush_free_mask[53] + flush_free_mask[55];
+        fco_l0_14 = flush_free_mask[57] + flush_free_mask[59];
+        fco_l0_15 = flush_free_mask[61] + flush_free_mask[63];
+        fce_l1_0 = fce_l0_0 + fce_l0_1;
+        fce_l1_1 = fce_l0_2 + fce_l0_3;
+        fce_l1_2 = fce_l0_4 + fce_l0_5;
+        fce_l1_3 = fce_l0_6 + fce_l0_7;
+        fce_l1_4 = fce_l0_8 + fce_l0_9;
+        fce_l1_5 = fce_l0_10 + fce_l0_11;
+        fce_l1_6 = fce_l0_12 + fce_l0_13;
+        fce_l1_7 = fce_l0_14 + fce_l0_15;
+        fco_l1_0 = fco_l0_0 + fco_l0_1;
+        fco_l1_1 = fco_l0_2 + fco_l0_3;
+        fco_l1_2 = fco_l0_4 + fco_l0_5;
+        fco_l1_3 = fco_l0_6 + fco_l0_7;
+        fco_l1_4 = fco_l0_8 + fco_l0_9;
+        fco_l1_5 = fco_l0_10 + fco_l0_11;
+        fco_l1_6 = fco_l0_12 + fco_l0_13;
+        fco_l1_7 = fco_l0_14 + fco_l0_15;
+        fce_l2_0 = fce_l1_0 + fce_l1_1;
+        fce_l2_1 = fce_l1_2 + fce_l1_3;
+        fce_l2_2 = fce_l1_4 + fce_l1_5;
+        fce_l2_3 = fce_l1_6 + fce_l1_7;
+        fco_l2_0 = fco_l1_0 + fco_l1_1;
+        fco_l2_1 = fco_l1_2 + fco_l1_3;
+        fco_l2_2 = fco_l1_4 + fco_l1_5;
+        fco_l2_3 = fco_l1_6 + fco_l1_7;
+        fce_l3_0 = fce_l2_0 + fce_l2_1;
+        fce_l3_1 = fce_l2_2 + fce_l2_3;
+        fco_l3_0 = fco_l2_0 + fco_l2_1;
+        fco_l3_1 = fco_l2_2 + fco_l2_3;
+        fce_l4_0 = fce_l3_0 + fce_l3_1;
+        fco_l4_0 = fco_l3_0 + fco_l3_1;
+    end
+    assign flush_count_even_comb = fce_l4_0;      //声明已上移到 free_count 那一段
+    assign flush_count_odd_comb  = fco_l4_0;
     integer i;
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -1550,24 +1611,35 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
 //★ 2026-11-05：改向判定后分配一直冻到那条分支提交（rob 的 redirect_stop_alloc）
 
             for (i = 0; i < ARCH_COUNT; i = i + 1) begin
-                if      (old_valid_b && (commit_rd1_in == i)) rat[i] <= commit_phys1_in;
-                else if (old_valid_a && (commit_rd0_in == i)) rat[i] <= commit_phys0_in;
-                else                                        rat[i] <= arch_map[i];
+                if      (old_valid_b && (commit_rd1_in == i))
+                    rat[i] <= commit_phys1_in;
+                else if (old_valid_a && (commit_rd0_in == i))
+                    rat[i] <= commit_phys0_in;
+                else
+                    rat[i] <= arch_map[i];
             end
-            if (old_valid_a) arch_map[commit_rd0_in] <= commit_phys0_in;
-            if (old_valid_b) arch_map[commit_rd1_in] <= commit_phys1_in;
+            if (old_valid_a)
+                arch_map[commit_rd0_in] <= commit_phys0_in;
+            if (old_valid_b)
+                arch_map[commit_rd1_in] <= commit_phys1_in;
 
         end
         else begin
 //分配：同一个 rd 被同拍多条写时，最年轻的那条赢（按 age 次序赋值，后写覆盖先写）
-            if (alloc_ok_0) rat[rename_alloc_rd_0] <= pick_e0;
-            if (alloc_ok_1) rat[rename_alloc_rd_1] <= pick_o0;
-            if (alloc_ok_2) rat[rename_alloc_rd_2] <= pick_b0_1;
-            if (alloc_ok_3) rat[rename_alloc_rd_3] <= pick_b1_1;
+            if (alloc_ok_0)
+                rat[rename_alloc_rd_0] <= pick_e0;
+            if (alloc_ok_1)
+                rat[rename_alloc_rd_1] <= pick_o0;
+            if (alloc_ok_2)
+                rat[rename_alloc_rd_2] <= pick_b0_1;
+            if (alloc_ok_3)
+                rat[rename_alloc_rd_3] <= pick_b1_1;
 
 //提交：定格架构映射
-            if (old_valid_a) arch_map[commit_rd0_in] <= commit_phys0_in;
-            if (old_valid_b) arch_map[commit_rd1_in] <= commit_phys1_in;
+            if (old_valid_a)
+                arch_map[commit_rd0_in] <= commit_phys0_in;
+            if (old_valid_b)
+                arch_map[commit_rd1_in] <= commit_phys1_in;
 
 
         end
@@ -1616,37 +1688,62 @@ input  [1:0]  dsq_room,    output        push0_valid, output [132:0] push0_data,
         input        mem;
         input [31:0] inst;
         begin
-            if (mem)                             class_of = 2'd2;
-            else if (inst[6:0] == OPCODE_BRANCH) class_of = 2'd3;
-            else if (inst[6:0] == OPCODE_JAL)    class_of = 2'd3;
-            else if (inst[6:0] == OPCODE_JALR)   class_of = 2'd3;
-            else if ((inst[6:0] == OPCODE_OP) && (inst[31:25] == 7'b0000001)) class_of = 2'd1;
-            else                                 class_of = 2'd0;
+            if (mem)
+                class_of = 2'd2;
+            else if (inst[6:0] == OPCODE_BRANCH)
+                class_of = 2'd3;
+            else if (inst[6:0] == OPCODE_JAL)
+                class_of = 2'd3;
+            else if (inst[6:0] == OPCODE_JALR)
+                class_of = 2'd3;
+            else if ((inst[6:0] == OPCODE_OP) && (inst[31:25] == 7'b0000001))
+                class_of = 2'd1;
+            else
+                class_of = 2'd0;
         end
     endfunction
 
-    wire [4:0] h1_rs1 = instruction_in_1[19:15];
-    wire [4:0] h1_rs2 = h1_store ? 5'd0 : instruction_in_1[24:20];
+  reg [4:0] h1_rs1, h1_rs2;
+    always @(*) begin
+        h1_rs1 = instruction_in_1[19:15];
+        h1_rs2 = h1_store ? 5'd0 : instruction_in_1[24:20];
+    end
 //★ 2026-11-11：alloc_lane0=0 而 alloc_lane1=1 时，h0 是从 ROB 口 1 分配出去的
 //  （alloc_en_1 拿的是 alloc_lane1）。载荷必须带口 1 的目的号，不是口 0 的。
-    wire h0_via_port1 = ~alloc_lane0 & alloc_lane1;
-    wire [5:0] dest_phys_0 = writes_of(instruction_in_0)
-                           ? (h0_via_port1 ? phys_rd_1 : phys_rd_0) : 6'd0;
-    wire [5:0] dest_phys_1 = writes_of(instruction_in_1) ? phys_rd_1 : 6'd0;
-    wire [5:0] dest_phys_2 = writes_of(instruction_in_2)
-                           ? (is_mem_2 ? phys_rd_2 : phys_rd_3) : 6'd0;
+  reg  h0_via_port1;
+    always @(*) begin
+        h0_via_port1 = ~alloc_lane0 & alloc_lane1;
+    end
+  reg [5:0] dest_phys_0;
+    always @(*) begin
+        dest_phys_0 = writes_of(instruction_in_0) ? (h0_via_port1 ? phys_rd_1 : phys_rd_0) : 6'd0;
+    end
+  reg [5:0] dest_phys_1;
+    always @(*) begin
+        dest_phys_1 = writes_of(instruction_in_1) ? phys_rd_1 : 6'd0;
+    end
+  reg [5:0] dest_phys_2;
+    always @(*) begin
+        dest_phys_2 = writes_of(instruction_in_2) ? (is_mem_2 ? phys_rd_2 : phys_rd_3) : 6'd0;
+    end
 
-    assign push0_valid = alloc_lane0 | alloc_lane1;
+    always @(*) begin
+        push0_valid = alloc_lane0 | alloc_lane1;
+    end
     assign push0_data  = {instruction_in_0, jump_link_register_prediction_in_0, address_in_0,
                           dest_phys_0, lookup_b_phys, lookup_a_phys,
                           generation_in_0, index_in_0, branch_prediction_in_0,
                           source_b_dec_0, source_a_dec_0, class_decoded};
-    assign push1_valid = alloc_lane0 & (h1_is_mem ? lsu_push_1 : alloc_lane1);
+    always @(*) begin
+        push1_valid = alloc_lane0 & (h1_is_mem ? lsu_push_1 : alloc_lane1);
+    end
     assign push1_data  = {instruction_in_1, jump_link_register_prediction_in_1, address_in_1,
                           dest_phys_1, lookup_d_phys, lookup_c_phys,
                           generation_in_1, index_in_1, branch_prediction_in_1,
                           h1_rs2, h1_rs1, class_of(h1_is_mem, instruction_in_1)};
-    assign push2_valid = (alloc_lane0 & h1_is_mem & alloc_lane1) | lsu_push_2;
+    always @(*) begin
+        push2_valid = (alloc_lane0 & h1_is_mem & alloc_lane1) | lsu_push_2;
+    end
     assign push2_data  = {instruction_in_2, jump_link_register_prediction_in_2, address_in_2,
                           dest_phys_2, lookup_f_phys, lookup_e_phys,
                           generation_in_2, index_in_2, branch_prediction_in_2,

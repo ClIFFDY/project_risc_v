@@ -106,15 +106,20 @@ module npu_top(
 
     // ---- MMIO 地址译码：req_addr 由 ahb_lite_slave 在数据阶段给出 ----
     always @(*) begin
-        sel_ctrl    = (req_addr[31:5] == 27'd0);            // 0x0000-0x001F
-        sel_status  = (req_addr[31:4] == 28'h0000002);      // 0x0020-0x002F
+        sel_ctrl    = (req_addr[31:5] == 27'd0);
+        // 0x0000-0x001F
+        sel_status  = (req_addr[31:4] == 28'h0000002);
+        // 0x0020-0x002F
         // ★ 双缓冲：bank0 在 0x1000/0x2000，bank1 在 0x1800/0x2800，
         //   页内偏移仍是 [7:2]，bit[11] 选 bank（0x1400 这种中间页不认，保持原有空洞语义）。
         sel_a_buf   = (req_addr[31:12] == 20'h00001) && (req_addr[10:8] == 3'd0);
         sel_bt_buf  = (req_addr[31:12] == 20'h00002) && (req_addr[10:8] == 3'd0);
-        sel_c_buf   = (req_addr[31:10] == 22'h00000C);      // 0x3000-0x33FF
-        sel_wgt     = (req_addr[31:15] == 17'd0) && req_addr[14];  // 0x4000-0x7FFF
-        sel_wgt_cfg = (req_addr[31:4] == 28'h00000080);     // 0x0800-0x080F
+        sel_c_buf   = (req_addr[31:10] == 22'h00000C);
+        // 0x3000-0x33FF
+        sel_wgt     = (req_addr[31:15] == 17'd0) && req_addr[14];
+        // 0x4000-0x7FFF
+        sel_wgt_cfg = (req_addr[31:4] == 28'h00000080);
+        // 0x0800-0x080F
         a_local_addr  = {req_addr[11], req_addr[7:2]};
         bt_local_addr = {req_addr[11], req_addr[7:2]};
         c_local_addr  = req_addr[9:2];
@@ -129,8 +134,6 @@ module npu_top(
     wire [`NPU_QS_W-1:0]   cr_qs;
     wire                   cr_accumulate;
     wire                   cr_bank;
-    wire [`NPU_WGT_AW-1:0] cr_wgt_base;
-    wire                   cr_wgt_en;
 
     // ---- control_regs ----
     control_regs u_control_regs(
@@ -142,7 +145,7 @@ module npu_top(
         .cfg_tk(cr_tk), .cfg_qshift(cr_qs), .cfg_accumulate(cr_accumulate),
         .cfg_bank(cr_bank),
         .sel_wgt_cfg(sel_wgt_cfg), .wgt_reg_off(wgt_reg_off),
-        .cfg_wgt_base(cr_wgt_base), .cfg_wgt_en(cr_wgt_en),
+        .cfg_wgt_base(wgt_base), .cfg_wgt_en(wgt_en),
         .start_req(start_req), .clear_done_req(clear_done_req),
         .control_rdata(control_rdata_w)
     );
@@ -222,7 +225,5 @@ module npu_top(
         cpu_wgt_wdata   = cpu_wgt_wdata_w;
     end
 
-    assign wgt_base = cr_wgt_base;
-    assign wgt_en   = cr_wgt_en;
 
 endmodule

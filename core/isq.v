@@ -150,9 +150,9 @@ module isq(
 //  除法：串行除法的源唤醒本来就比写口早一拍，唤醒再往前提一拍 ⇒ 由 mdu 的提交链给号。
     input        divide_wake_valid, input [5:0] divide_wake_phys,
 //---- 真 PRF：读口地址出去，数据与就绪回来 ----
-    output [5:0] prf_read_a_0_phys, prf_read_b_0_phys,
-    output [5:0] prf_read_a_1_phys, prf_read_b_1_phys,
-    output [5:0] prf_read_a_m_phys, prf_read_b_m_phys,
+    output reg [5:0] prf_read_a_0_phys, prf_read_b_0_phys,
+    output reg [5:0] prf_read_a_1_phys, prf_read_b_1_phys,
+    output reg [5:0] prf_read_a_m_phys, prf_read_b_m_phys,
     input [31:0] prf_data_a_0, prf_data_b_0, prf_data_a_1, prf_data_b_1, prf_data_a_mem, prf_data_b_mem,
 //★ 在飞表的置位源：rename 本拍发出去的物理号（表按【发号】置位，不按入站）
     input [63:0] alloc_onehot_in,
@@ -169,8 +169,8 @@ module isq(
     input        mdu_mul_ok_0, mdu_div_ok_0, mdu_mul_ok_1, mdu_div_ok_1,
     input        bju_ok_0, bju_ok_1,
 //---- 给 idu 的推进门：本 lane 的站还有空位 ----
-    output       station_room_0_valid,
-    output       station_room_1_valid,
+    output reg       station_room_0_valid,
+    output reg       station_room_1_valid,
 
 //---- 出站 lane0 ----
     output reg        issue_valid_0,
@@ -223,7 +223,7 @@ module isq(
     output reg        accept_0, accept_1,
     output reg        issue_pop_0, issue_pop_1,
 //CSR 载荷（发射那一拍交给 ROB 锁一深）：{写使能 1, 地址 12, funct3 3, 源 6}
-    output [21:0]     csr_payload_0, csr_payload_1
+    output reg [21:0]     csr_payload_0, csr_payload_1
     );
 
 //==============================================================================
@@ -351,7 +351,7 @@ module isq(
 //---- 唤醒总线 ----
 //  A 组（发射拍，ALU / BJU）：消费者 t1 那一拍从 ALU 的早出口取值，所以发射拍就能叫。
 //  B 组（写口落笔，ALU / MUL / DIV / LOAD）：消费者 t1 那一拍从寄存器堆取值。
-    wire                    alu_issue_0, alu_issue_1;
+    reg                    alu_issue_0, alu_issue_1;
     reg                     result_wake_valid_q_0, result_wake_valid_q_1;
     reg  [5:0]              result_wake_phys_q_0, result_wake_phys_q_1;
 //---- 在飞表：1 = 这个物理号【已发号】但还没发唤醒（= 值下一拍还读不到）----
@@ -361,7 +361,7 @@ module isq(
 //  清位 = 唤醒那一拍（每个单元的唤醒都定义成"值下一拍可取"）；
 //  冲刷 = 整表清 0。
     reg  [63:0]             inflight_phys;
-    wire [63:0]             wake_onehot;
+    reg [63:0]             wake_onehot;
     reg                     q_take_0, q_take_1;
     reg  [31:0]             operand_a_0, operand_b_0, operand_a_1, operand_b_1;
     reg                     alu_lane0_forward_a_0, alu_lane0_forward_b_0, alu_lane1_forward_a_0, alu_lane1_forward_b_0;
@@ -383,9 +383,9 @@ module isq(
     reg                     decode_dead_0, decode_dead_1;
     reg                     decode_dead_mem;
 //---- Q 里那一格的载荷字段（从 q_data 拆出来）----
-    wire [31:0]             q_immediate_value_a_0, q_immediate_value_a_1;
+    reg [31:0]             q_immediate_value_a_0, q_immediate_value_a_1;
 //---- 前送命中 ----
-    wire                    alu_fwd_ok_0, alu_fwd_ok_1, ld_fwd_ok;
+    reg                    alu_fwd_ok_0, alu_fwd_ok_1, ld_fwd_ok;
 
 
 
@@ -409,9 +409,13 @@ module isq(
 // 三、Q 载荷字段拆线
 //==============================================================================
 //A 侧立即数只有两种：csrrwi 的 zimm（零扩展 5 位）和 AUIPC 的 PC —— 后者就是 AUX，不用另存
-    assign q_immediate_value_a_0      = (q_data_0[RS_IMMZSEL_LO +: 1]) ? {27'd0, (q_data_0[RS_IMMZ_LO  +: 5])} : (q_data_0[RS_AUX_LO   +: 32]);
+    always @(*) begin
+        q_immediate_value_a_0 = (q_data_0[RS_IMMZSEL_LO +: 1]) ? {27'd0, (q_data_0[RS_IMMZ_LO  +: 5])} : (q_data_0[RS_AUX_LO   +: 32]);
+    end
 
-    assign q_immediate_value_a_1      = (q_data_1[RS_IMMZSEL_LO +: 1]) ? {27'd0, (q_data_1[RS_IMMZ_LO  +: 5])} : (q_data_1[RS_AUX_LO   +: 32]);
+    always @(*) begin
+        q_immediate_value_a_1 = (q_data_1[RS_IMMZSEL_LO +: 1]) ? {27'd0, (q_data_1[RS_IMMZ_LO  +: 5])} : (q_data_1[RS_AUX_LO   +: 32]);
+    end
 
 //==============================================================================
 // 四、入队：两条 lane 各自推进
@@ -427,8 +431,10 @@ module isq(
         accept_0  = (rs_room_0 != 4'd0);
         accept_1  = (rs_room_1 != 4'd0);
     end
-    assign station_room_0_valid = (rs_room_0 != 4'd0);
-    assign station_room_1_valid = (rs_room_1 != 4'd0);
+    always @(*) begin
+        station_room_0_valid = (rs_room_0 != 4'd0);
+        station_room_1_valid = (rs_room_1 != 4'd0);
+    end
 
 
 
@@ -443,66 +449,60 @@ module isq(
 
 //A 侧立即数是 zimm 的唯一来源是 csrrwi（SYSTEM ⇒ class 恒为 CLS_BJU）；
 //  AUIPC 是 CLS_ALU，它的 A 侧立即数就是 PC（AUX）。这一位决定出站读 zimm 还是读 AUX。
-    wire imm_a_is_zimm_0 = decoded_r1_immediate & (decoded_class == CLS_BJU);
-    wire imm_a_is_zimm_1 = decoded_r1_immediate_lane1 & (decoded_class_lane1 == CLS_BJU);
+    reg imm_a_is_zimm_0, imm_a_is_zimm_1;
+    always @(*) begin
+        imm_a_is_zimm_0 = decoded_r1_immediate & (decoded_class == CLS_BJU);
+        imm_a_is_zimm_1 = decoded_r1_immediate_lane1 & (decoded_class_lane1 == CLS_BJU);
+    end
 
 //CSR 写 = 地址非 0 且 funct3 非 0（funct3=0 是 ecall/mret 那一类 SYSTEM，不是 CSR 访存）。
 //  只在入站算一次：选优锥里"CSR 写必须在 ROB 队头才能发"这条纪律要它，不能每拍每项再算。
-    wire decoded_is_csr_write_0 = (decoded_csr_address      != 12'd0) & (decoded_csr_function3      != 3'd0);
-    wire decoded_is_csr_write_1 = (decoded_csr_address_lane1 != 12'd0) & (decoded_csr_function3_lane1 != 3'd0);
+    reg decoded_is_csr_write_0, decoded_is_csr_write_1;
+    always @(*) begin
+        decoded_is_csr_write_0 = (decoded_csr_address      != 12'd0) & (decoded_csr_function3      != 3'd0);
+        decoded_is_csr_write_1 = (decoded_csr_address_lane1 != 12'd0) & (decoded_csr_function3_lane1 != 3'd0);
+    end
 
 //==============================================================================
 //  入站拍唤醒旁路
 //==============================================================================
-    wire enq_wake_a_0 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs1_phys_in))
-                      | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs1_phys_in))
-                      | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs1_phys_in))
-                      | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs1_phys_in))
-                      | (load_write     & (load_write_phys     == rs1_phys_in))
-                      | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs1_phys_in))
-                      | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs1_phys_in));
-    wire enq_wake_b_0 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs2_phys_in))
-                      | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs2_phys_in))
-                      | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs2_phys_in))
-                      | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs2_phys_in))
-                      | (load_write     & (load_write_phys     == rs2_phys_in))
-                      | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs2_phys_in))
-                      | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs2_phys_in));
-    wire enq_wake_a_1 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs1_phys_in_lane1))
-                      | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs1_phys_in_lane1))
-                      | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs1_phys_in_lane1))
-                      | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs1_phys_in_lane1))
-                      | (load_write     & (load_write_phys     == rs1_phys_in_lane1))
-                      | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs1_phys_in_lane1))
-                      | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs1_phys_in_lane1));
-    wire enq_wake_b_1 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs2_phys_in_lane1))
-                      | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs2_phys_in_lane1))
-                      | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs2_phys_in_lane1))
-                      | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs2_phys_in_lane1))
-                      | (load_write     & (load_write_phys     == rs2_phys_in_lane1))
-                      | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs2_phys_in_lane1))
-                      | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs2_phys_in_lane1));
-    wire enq_ready_a_0 = decoded_r1_immediate | ~inflight_phys[rs1_phys_in] | enq_wake_a_0;
-    wire enq_ready_b_0 = decoded_r2_immediate | ~inflight_phys[rs2_phys_in] | enq_wake_b_0;
-    wire enq_ready_a_1 = decoded_r1_immediate_lane1 | ~inflight_phys[rs1_phys_in_lane1] | enq_wake_a_1;
-    wire enq_ready_b_1 = decoded_r2_immediate_lane1 | ~inflight_phys[rs2_phys_in_lane1] | enq_wake_b_1;
+    reg enq_wake_a_0;
+    always @(*) begin
+        enq_wake_a_0 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs1_phys_in)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs1_phys_in)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs1_phys_in)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs1_phys_in)) | (load_write     & (load_write_phys     == rs1_phys_in)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs1_phys_in)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs1_phys_in));
+    end
+    reg enq_wake_b_0;
+    always @(*) begin
+        enq_wake_b_0 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs2_phys_in)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs2_phys_in)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs2_phys_in)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs2_phys_in)) | (load_write     & (load_write_phys     == rs2_phys_in)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs2_phys_in)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs2_phys_in));
+    end
+    reg enq_wake_a_1;
+    always @(*) begin
+        enq_wake_a_1 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs1_phys_in_lane1)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs1_phys_in_lane1)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs1_phys_in_lane1)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs1_phys_in_lane1)) | (load_write     & (load_write_phys     == rs1_phys_in_lane1)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs1_phys_in_lane1)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs1_phys_in_lane1));
+    end
+    reg enq_wake_b_1;
+    always @(*) begin
+        enq_wake_b_1 = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == rs2_phys_in_lane1)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == rs2_phys_in_lane1)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == rs2_phys_in_lane1)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == rs2_phys_in_lane1)) | (load_write     & (load_write_phys     == rs2_phys_in_lane1)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == rs2_phys_in_lane1)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == rs2_phys_in_lane1));
+    end
+    reg enq_ready_a_0, enq_ready_b_0, enq_ready_a_1, enq_ready_b_1;
+    always @(*) begin
+        enq_ready_a_0 = decoded_r1_immediate | ~inflight_phys[rs1_phys_in] | enq_wake_a_0;
+        enq_ready_b_0 = decoded_r2_immediate | ~inflight_phys[rs2_phys_in] | enq_wake_b_0;
+        enq_ready_a_1 = decoded_r1_immediate_lane1 | ~inflight_phys[rs1_phys_in_lane1] | enq_wake_a_1;
+        enq_ready_b_1 = decoded_r2_immediate_lane1 | ~inflight_phys[rs2_phys_in_lane1] | enq_wake_b_1;
+    end
 //访存队列那一格：store 的 B 侧是 rs2 真数据；load 的 B 侧是立即数域（当垃圾译码，与原来同悲观）
-    wire enq_wake_a_mem = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == mem_phys_a_in))
-                        | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == mem_phys_a_in))
-                        | (result_wake_valid_q_0 & (result_wake_phys_q_0 == mem_phys_a_in))
-                        | (result_wake_valid_q_1 & (result_wake_phys_q_1 == mem_phys_a_in))
-                        | (load_write     & (load_write_phys     == mem_phys_a_in))
-                        | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == mem_phys_a_in))
-                        | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == mem_phys_a_in));
-    wire enq_wake_b_mem = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == mem_phys_b_in))
-                        | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == mem_phys_b_in))
-                        | (result_wake_valid_q_0 & (result_wake_phys_q_0 == mem_phys_b_in))
-                        | (result_wake_valid_q_1 & (result_wake_phys_q_1 == mem_phys_b_in))
-                        | (load_write     & (load_write_phys     == mem_phys_b_in))
-                        | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == mem_phys_b_in))
-                        | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == mem_phys_b_in));
-    wire enq_ready_a_mem = ~inflight_phys[mem_phys_a_in] | enq_wake_a_mem;
-    wire enq_ready_b_mem = ~inflight_phys[mem_phys_b_in] | enq_wake_b_mem;
+    reg enq_wake_a_mem;
+    always @(*) begin
+        enq_wake_a_mem = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == mem_phys_a_in)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == mem_phys_a_in)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == mem_phys_a_in)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == mem_phys_a_in)) | (load_write     & (load_write_phys     == mem_phys_a_in)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == mem_phys_a_in)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == mem_phys_a_in));
+    end
+    reg enq_wake_b_mem;
+    always @(*) begin
+        enq_wake_b_mem = (alu_issue_0  & ((q_data_0[RS_PHYSD_LO +: 6])  == mem_phys_b_in)) | (alu_issue_1  & ((q_data_1[RS_PHYSD_LO +: 6])  == mem_phys_b_in)) | (result_wake_valid_q_0 & (result_wake_phys_q_0 == mem_phys_b_in)) | (result_wake_valid_q_1 & (result_wake_phys_q_1 == mem_phys_b_in)) | (load_write     & (load_write_phys     == mem_phys_b_in)) | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == mem_phys_b_in)) | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == mem_phys_b_in));
+    end
+    reg enq_ready_a_mem, enq_ready_b_mem;
+    always @(*) begin
+        enq_ready_a_mem = ~inflight_phys[mem_phys_a_in] | enq_wake_a_mem;
+        enq_ready_b_mem = ~inflight_phys[mem_phys_b_in] | enq_wake_b_mem;
+    end
 
     always @(*) begin
         enqueue_payload_0 = {
@@ -570,11 +570,14 @@ module isq(
 //     外设 load 永不回）。前送只留在操作数 mux 里 —— 那一拍的数据本身是对的。
 //   可发 = valid & 两源就绪 & 单元空闲 & 不在等 CSR 顺序 & 没被冲刷杀。
 //==============================================================================
-    assign alu_fwd_ok_0 = write_enable_alu_early        & (|phys_alu_early_0);
-    assign alu_fwd_ok_1 = write_enable_alu_lane1_early  & (|phys_alu_early_1);
-    assign ld_fwd_ok    = write_enable_ld_early         & (|ld_phys_early);
+    always @(*) begin
+        alu_fwd_ok_0 = write_enable_alu_early        & (|phys_alu_early_0);
+        alu_fwd_ok_1 = write_enable_alu_lane1_early  & (|phys_alu_early_1);
+        ld_fwd_ok = write_enable_ld_early         & (|ld_phys_early);
+    end
 
-    always @(*) begin : blk_rs_ready
+    always @(*) begin
+        : blk_rs_ready
         reg [5:0] entry_phys_a, entry_phys_b;
         reg [4:0] entry_index;
         reg [1:0] entry_class;
@@ -615,7 +618,8 @@ module isq(
         end
     end
 
-    always @(*) begin : blk_rs_ready_1
+    always @(*) begin
+        : blk_rs_ready_1
         reg [5:0] entry_phys_a, entry_phys_b;
         reg [4:0] entry_index;
         reg [1:0] entry_class;
@@ -705,7 +709,8 @@ module isq(
 //==============================================================================
 // 七、选优：每条 lane 各自从自己的 rs_head 起转一圈，取最老的可发项
 //==============================================================================
-    always @(*) begin : blk_select
+    always @(*) begin
+        : blk_select
         reg [RS_AW-1:0] scan_slot_0, scan_slot_1;
         integer j;
 //指针式：从 head 起转一圈取第一个可发项（孔自动跳过，pickable 对孔恒 0）。
@@ -734,7 +739,8 @@ module isq(
 //   单元肯不肯收 / 等不等 CSR 顺序 / 有没有被冲刷杀 —— 这三样按 Q 里那一条重判一遍。
 //   操作数不重判：能落进 Q 的项，t0 两源就已就绪（见文件头那条前提）。
 //==============================================================================
-    always @(*) begin : blk_q_exit_0
+    always @(*) begin
+        : blk_q_exit_0
         reg [4:0]  held_index;
         reg [1:0]  held_class;
         reg        held_div;
@@ -748,7 +754,8 @@ module isq(
                       & (~head_one_hot_registered[held_index] | csr_write_landing);
     end
 
-    always @(*) begin : blk_q_exit_1
+    always @(*) begin
+        : blk_q_exit_1
         reg [4:0]  held_index;
         reg [1:0]  held_class;
         reg        held_div;
@@ -810,15 +817,18 @@ module isq(
 // ALU+乘法静态唤醒
 //==============================================================================
 
-    assign alu_issue_0      = q_issue_0 & (q_data_0[RS_WE_LO    +: 1]) & ((q_data_0[RS_CLASS_LO +: 2]) != CLS_MUL)
-                             & ((q_data_0[RS_PHYSD_LO +: 6]) != 6'd0);
-    assign alu_issue_1      = q_issue_1 & (q_data_1[RS_WE_LO    +: 1]) & ((q_data_1[RS_CLASS_LO +: 2]) != CLS_MUL)
-                             & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
+    always @(*) begin
+        alu_issue_0 = q_issue_0 & (q_data_0[RS_WE_LO    +: 1]) & ((q_data_0[RS_CLASS_LO +: 2]) != CLS_MUL) & ((q_data_0[RS_PHYSD_LO +: 6]) != 6'd0);
+        alu_issue_1 = q_issue_1 & (q_data_1[RS_WE_LO    +: 1]) & ((q_data_1[RS_CLASS_LO +: 2]) != CLS_MUL) & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
+    end
 
 //★ 2026-11-11：这五个声明原来落在这里（第 452 行就开始用了）⇒ Vivado 报 8-6901
 //  "used before declaration"。全文件按"声明全部上移"的约定，声明一律放在上面那一块。
-    wire multiply_issue_0 = q_issue_0 & ((q_data_0[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_0[RS_MULOP_LO + 2]) & ((q_data_0[RS_PHYSD_LO +: 6]) != 6'd0);
-    wire multiply_issue_1 = q_issue_1 & ((q_data_1[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_1[RS_MULOP_LO + 2]) & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
+    reg multiply_issue_0, multiply_issue_1;
+    always @(*) begin
+        multiply_issue_0 = q_issue_0 & ((q_data_0[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_0[RS_MULOP_LO + 2]) & ((q_data_0[RS_PHYSD_LO +: 6]) != 6'd0);
+        multiply_issue_1 = q_issue_1 & ((q_data_1[RS_CLASS_LO +: 2]) == CLS_MUL) & ~(q_data_1[RS_MULOP_LO + 2]) & ((q_data_1[RS_PHYSD_LO +: 6]) != 6'd0);
+    end
 
     always @(posedge clk) begin
         if (reset_registered | flush_window | redir_backend_1) begin
@@ -855,14 +865,9 @@ module isq(
 //    载荷先落 idu 的 S 级寄存器，mem 条先落 LSU FIFO，两者都比发号晚至少一拍
 //    ⇒ 入站那一拍 inflight_phys 里已经有本周期发出去的号了。
 //    同拍发号的两条（槽 0/1）也都在同一个沿写进 inflight_phys，入站时看得到。
-    assign wake_onehot =
-          (alu_issue_0  ? (64'd1 << (q_data_0[RS_PHYSD_LO +: 6]))  : 64'd0)
-        | (alu_issue_1  ? (64'd1 << (q_data_1[RS_PHYSD_LO +: 6]))  : 64'd0)
-        | (result_wake_valid_q_0 ? (64'd1 << result_wake_phys_q_0) : 64'd0)
-        | (result_wake_valid_q_1 ? (64'd1 << result_wake_phys_q_1) : 64'd0)
-        | (load_write ? (64'd1 << load_write_phys) : 64'd0)
-        | (multiply_wake_valid_q_0[1] ? (64'd1 << multiply_wake_phys_q_0[1]) : 64'd0)
-        | (multiply_wake_valid_q_1[1] ? (64'd1 << multiply_wake_phys_q_1[1]) : 64'd0);
+    always @(*) begin
+        wake_onehot = (alu_issue_0  ? (64'd1 << (q_data_0[RS_PHYSD_LO +: 6]))  : 64'd0) | (alu_issue_1  ? (64'd1 << (q_data_1[RS_PHYSD_LO +: 6]))  : 64'd0) | (result_wake_valid_q_0 ? (64'd1 << result_wake_phys_q_0) : 64'd0) | (result_wake_valid_q_1 ? (64'd1 << result_wake_phys_q_1) : 64'd0) | (load_write ? (64'd1 << load_write_phys) : 64'd0) | (multiply_wake_valid_q_0[1] ? (64'd1 << multiply_wake_phys_q_0[1]) : 64'd0) | (multiply_wake_valid_q_1[1] ? (64'd1 << multiply_wake_phys_q_1[1]) : 64'd0);
+    end
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -883,10 +888,10 @@ module isq(
 //==============================================================================
 //CSR 载荷在发射那一拍交给 ROB（那边只锁一深）。源那一栏是 rs1 的物理号；
 //csrrwi 这类带立即数的，填立即数低 5 位（与 idu 分配时的口径逐字一致）。
-    assign csr_payload_0 = {(q_data_0[RS_CSRWR_LO +: 1]), (q_data_0[RS_CSRA_LO  +: 12]), (q_data_0[RS_CSRF3_LO +: 3]),
-                            (q_data_0[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_0[4:0]} : (q_data_0[RS_PHYSA_LO +: 6])};
-    assign csr_payload_1 = {(q_data_1[RS_CSRWR_LO +: 1]), (q_data_1[RS_CSRA_LO  +: 12]), (q_data_1[RS_CSRF3_LO +: 3]),
-                            (q_data_1[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_1[4:0]} : (q_data_1[RS_PHYSA_LO +: 6])};
+    always @(*) begin
+        csr_payload_0 = {(q_data_0[RS_CSRWR_LO +: 1]), (q_data_0[RS_CSRA_LO  +: 12]), (q_data_0[RS_CSRF3_LO +: 3]), (q_data_0[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_0[4:0]} : (q_data_0[RS_PHYSA_LO +: 6])};
+        csr_payload_1 = {(q_data_1[RS_CSRWR_LO +: 1]), (q_data_1[RS_CSRA_LO  +: 12]), (q_data_1[RS_CSRF3_LO +: 3]), (q_data_1[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_1[4:0]} : (q_data_1[RS_PHYSA_LO +: 6])};
+    end
     always @(*) begin
         load_forward_a_0 = ld_fwd_ok & (ld_phys_early == (q_data_0[RS_PHYSA_LO +: 6]));
         load_forward_b_0 = ld_fwd_ok & (ld_phys_early == (q_data_0[RS_PHYSB_LO +: 6]));
@@ -1014,8 +1019,10 @@ module isq(
             q_valid_1 <= 1'b0;
         end
         else begin
-            if (q_take_0) q_data_0 <= rs_data_0[pe0_idx];
-            if (q_take_1) q_data_1 <= rs_data_1[pe1_idx];
+            if (q_take_0)
+                q_data_0 <= rs_data_0[pe0_idx];
+            if (q_take_1)
+                q_data_1 <= rs_data_1[pe1_idx];
 //发出去腾出来；压着等单元的那一拍保持（那一拍 q_take 必为 0）。
             q_valid_0 <= q_take_0 | (q_valid_0 & ~q_issue_0);
             q_valid_1 <= q_take_1 | (q_valid_1 & ~q_issue_1);
@@ -1032,7 +1039,8 @@ module isq(
 //       · load 不许越过站里更老的 store —— 那条 store 的地址还没算，LSU 无从比较，
 //         放过去就只能读到旧值。
 //==============================================================================
-    always @(*) begin : blk_mem_pick
+    always @(*) begin
+        : blk_mem_pick
         reg [5:0] entry_phys_a, entry_phys_b;
         reg       entry_is_store;
         integer k;
@@ -1088,7 +1096,8 @@ module isq(
         end
     end
 //选优：槽号就是年龄，从 0 往上扫，最后一个命中的就是最老的可发项（与 lane 站同写法）。
-    always @(*) begin : blk_mem_select
+    always @(*) begin
+        : blk_mem_select
         integer j;
         mem_sel_found = 1'b0;
         mem_sel       = {MEM_AW{1'b0}};
@@ -1209,20 +1218,24 @@ module isq(
             dead_registered_1 <= 1'b1;
         end
         else begin
-            if (~stage_advance        | accept_0) dead_registered_0 <= 1'b0;
-            if (~stage_advance_lane1 | accept_1) dead_registered_1 <= 1'b0;
+            if (~stage_advance        | accept_0)
+                dead_registered_0 <= 1'b0;
+            if (~stage_advance_lane1 | accept_1)
+                dead_registered_1 <= 1'b0;
         end
     end
 
 //==============================================================================
 // 十四、PRF 读口（地址来自 Q 里的物理号，仍是寄存器）
 //==============================================================================
-    assign prf_read_a_0_phys = (q_data_0[RS_PHYSA_LO +: 6]);
-    assign prf_read_b_0_phys = (q_data_0[RS_PHYSB_LO +: 6]);
-    assign prf_read_a_1_phys = (q_data_1[RS_PHYSA_LO +: 6]);
-    assign prf_read_b_1_phys = (q_data_1[RS_PHYSB_LO +: 6]);
-    assign prf_read_a_m_phys = mem_data_m[mem_sel][MEM_PHYSA_LO +: 6];
-    assign prf_read_b_m_phys = mem_data_m[mem_sel][MEM_PHYSB_LO +: 6];
+    always @(*) begin
+        prf_read_a_0_phys = (q_data_0[RS_PHYSA_LO +: 6]);
+        prf_read_b_0_phys = (q_data_0[RS_PHYSB_LO +: 6]);
+        prf_read_a_1_phys = (q_data_1[RS_PHYSA_LO +: 6]);
+        prf_read_b_1_phys = (q_data_1[RS_PHYSB_LO +: 6]);
+        prf_read_a_m_phys = mem_data_m[mem_sel][MEM_PHYSA_LO +: 6];
+        prf_read_b_m_phys = mem_data_m[mem_sel][MEM_PHYSB_LO +: 6];
+    end
 
 //==============================================================================
 // 十五、出站字段

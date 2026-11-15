@@ -70,13 +70,19 @@ module tile_controller(
     reg [11:0] wr_cnt_next;
 
     // ---- 任务参数（start_ctrl 已经锁存，这里直接复用同一份快照）----
-    wire [`NPU_DIM_W-1:0] lb_m = cfg_m;
-    wire [`NPU_DIM_W-1:0] lb_n = cfg_n;
-    wire [`NPU_DIM_W-1:0] lb_k = cfg_k;
-    wire [`NPU_TK_W-1:0]  lb_tk = cfg_tk;
-    wire [`NPU_QS_W-1:0]  lb_qs = cfg_qshift;
-    wire [`NPU_TILE_W-1:0] lp_tm = `NPU_TM_TN;
-    wire [`NPU_TILE_W-1:0] lp_tn = `NPU_TM_TN;
+    reg [`NPU_DIM_W-1:0] lb_m, lb_n, lb_k;
+    reg [`NPU_TK_W-1:0] lb_tk;
+    reg [`NPU_QS_W-1:0] lb_qs;
+    reg [`NPU_TILE_W-1:0] lp_tm, lp_tn;
+    always @(*) begin
+        lb_m = cfg_m;
+        lb_n = cfg_n;
+        lb_k = cfg_k;
+        lb_tk = cfg_tk;
+        lb_qs = cfg_qshift;
+        lp_tm = `NPU_TM_TN;
+        lp_tn = `NPU_TM_TN;
+    end
 
     // ---- 三层 Tile 计数器 ----
     reg [`NPU_TIDX_W-1:0] tile_i, tile_j, tile_k;
@@ -88,8 +94,11 @@ module tile_controller(
     reg [`NPU_TIDX_W-1:0] nt_i_l, nt_j_l;   // 各方向上界 - 1
     reg [`NPU_DIM_W-1:0]  rem_k_l;          // 剩余 K（含当前这个 K Tile）
 
-    wire [`NPU_DIM_W-1:0] rem_m = lb_m - tile_i * lp_tm;
-    wire [`NPU_DIM_W-1:0] rem_n = lb_n - tile_j * lp_tn;
+    reg [`NPU_DIM_W-1:0] rem_m, rem_n;
+    always @(*) begin
+        rem_m = lb_m - tile_i * lp_tm;
+        rem_n = lb_n - tile_j * lp_tn;
+    end
 
     reg last_k_tile, last_out_tile;
     reg [`NPU_TILE_W-1:0] valid_tm, valid_tn;
@@ -100,23 +109,27 @@ module tile_controller(
             tile_i <= {`NPU_TIDX_W{1'b0}};
             tile_j <= {`NPU_TIDX_W{1'b0}};
             tile_k <= {`NPU_TIDX_W{1'b0}};
-        end else if (sched_init) begin
+        end
+        else if (sched_init) begin
             tile_i <= {`NPU_TIDX_W{1'b0}};
             tile_j <= {`NPU_TIDX_W{1'b0}};
             tile_k <= {`NPU_TIDX_W{1'b0}};
             nt_i_l <= (lb_m + lp_tm - 6'd1) / lp_tm - 6'd1;
             nt_j_l <= (lb_n + lp_tn - 6'd1) / lp_tn - 6'd1;
             rem_k_l <= lb_k;
-        end else if (next_k_req) begin
+        end
+        else if (next_k_req) begin
             tile_k <= tile_k + 6'd1;
             rem_k_l <= rem_k_l - {1'b0, lb_tk};
-        end else if (next_out_req) begin
+        end
+        else if (next_out_req) begin
             tile_k <= {`NPU_TIDX_W{1'b0}};
             rem_k_l <= lb_k;
             if (tile_j == nt_j_l) begin
                 tile_j <= {`NPU_TIDX_W{1'b0}};
                 tile_i <= tile_i + 6'd1;
-            end else begin
+            end
+            else begin
                 tile_j <= tile_j + 6'd1;
             end
         end
@@ -135,25 +148,40 @@ module tile_controller(
     // tile_j*K 起的连续 K 个字（数据布局见文件头）；一个输出 Tile 只需要这一整段，
     // K Tile 只是把这段切成喂数节拍，与预取地址无关。
     // 合法配置保证 tile_i*K + K <= ceil(M/4)*K <= 64，不会越过 Buffer 末尾。
-    wire [`NPU_DIM_W+`NPU_DIM_W-1:0] a_tile_off  = tile_i * lb_k;
-    wire [`NPU_DIM_W+`NPU_DIM_W-1:0] bt_tile_off = tile_j * lb_k;
+    reg [`NPU_DIM_W+`NPU_DIM_W-1:0] a_tile_off, bt_tile_off;
+    always @(*) begin
+        a_tile_off = tile_i * lb_k;
+        bt_tile_off = tile_j * lb_k;
+    end
 
-    wire [`NPU_ABUF_AW-1:0] a_base  = a_tile_off[`NPU_ABUF_AW-1:0];
-    wire [`NPU_BBUF_AW-1:0] bt_base = bt_tile_off[`NPU_BBUF_AW-1:0];
+    reg [`NPU_ABUF_AW-1:0] a_base;
+    reg [`NPU_BBUF_AW-1:0] bt_base;
+    always @(*) begin
+        a_base = a_tile_off[`NPU_ABUF_AW-1:0];
+        bt_base = bt_tile_off[`NPU_BBUF_AW-1:0];
+    end
 
     // ---- 下一个输出 Tile 的预测基址 ----
     // 排空期间状态机就启动下一块的预取（排空 6 拍正好遮住突发首字延迟），但那时
     // tile 计数器还没推进（next_out_req 要到同一拍才发出），所以这里组合预测：
     // 换输出 Tile 只是 tile_j 前进（末列则回 0 且 tile_i 前进），而 A 只跟 tile_i 走、
     // BT 只跟 tile_j 走，于是下一块的 A 基址在"不换行"时和本块相同。
-    wire next_row = (tile_j == nt_j_l);
-    wire [`NPU_TIDX_W-1:0] next_i = next_row ? (tile_i + 6'd1) : tile_i;
-    wire [`NPU_TIDX_W-1:0] next_j = next_row ? {`NPU_TIDX_W{1'b0}} : (tile_j + 6'd1);
-    wire [`NPU_DIM_W+`NPU_DIM_W-1:0] a_tile_off_next  = next_i * lb_k;
-    wire [`NPU_DIM_W+`NPU_DIM_W-1:0] bt_tile_off_next = next_j * lb_k;
-    wire [`NPU_ABUF_AW-1:0] a_base_next  = a_tile_off_next[`NPU_ABUF_AW-1:0];
-    wire [`NPU_BBUF_AW-1:0] bt_base_next = bt_tile_off_next[`NPU_BBUF_AW-1:0];
-    wire [`NPU_CBASE_W-1:0] c_base = (tile_i * lp_tm) * lb_n + tile_j * lp_tn;
+    reg next_row;
+    reg [`NPU_TIDX_W-1:0] next_i, next_j;
+    reg [`NPU_DIM_W+`NPU_DIM_W-1:0] a_tile_off_next, bt_tile_off_next;
+    reg [`NPU_ABUF_AW-1:0] a_base_next;
+    reg [`NPU_BBUF_AW-1:0] bt_base_next;
+    reg [`NPU_CBASE_W-1:0] c_base;
+    always @(*) begin
+        next_row = (tile_j == nt_j_l);
+        c_base = (tile_i * lp_tm) * lb_n + tile_j * lp_tn;
+        next_j = next_row ? {`NPU_TIDX_W{1'b0}} : (tile_j + 6'd1);
+        next_i = next_row ? (tile_i + 6'd1) : tile_i;
+        bt_tile_off_next = next_j * lb_k;
+        a_tile_off_next = next_i * lb_k;
+        bt_base_next = bt_tile_off_next[`NPU_BBUF_AW-1:0];
+        a_base_next = a_tile_off_next[`NPU_ABUF_AW-1:0];
+    end
 
     // ---- 主状态机 ----
     wire fsm_acc_clear, fsm_drain_en, fsm_array_enable, fsm_core_busy;
@@ -215,7 +243,11 @@ module tile_controller(
 
     // ---- 完成计数：只有真正写进 C RAM 的笔数才算完成 ----
     localparam TOTAL_W = 12;
-    wire [TOTAL_W-1:0] total_w = lb_m * lb_n;   // 配置校验保证 <= NPU_CBUF_WORDS
+    // 配置校验保证 <= NPU_CBUF_WORDS
+    reg [TOTAL_W-1:0] total_w;
+    always @(*) begin
+        total_w = lb_m * lb_n;
+    end
     reg [TOTAL_W-1:0] wr_cnt;
     reg done_seen;
     reg core_done_w;
@@ -225,12 +257,14 @@ module tile_controller(
             wr_cnt      <= {TOTAL_W{1'b0}};
             done_seen   <= 1'b0;
             core_done_w <= 1'b0;
-        end else begin
+        end
+        else begin
             core_done_w <= 1'b0;
             if (start_pulse) begin
                 wr_cnt    <= {TOTAL_W{1'b0}};
                 done_seen <= 1'b0;
-            end else begin
+            end
+            else begin
                 wr_cnt <= wr_cnt_next;
                 // 全部 C 元素都写进 RAM 且写回通路空闲，才算任务完成。
                 if (!done_seen && fsm_done && (wr_cnt_next >= total_w) && cwr_idle) begin

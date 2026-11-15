@@ -43,10 +43,12 @@ module drain_controller(
         if (rst) begin
             cnt_q          <= 4'd0;
             drain_done_out <= 1'b0;
-        end else if (!drain_en_in) begin
+        end
+        else if (!drain_en_in) begin
             cnt_q          <= 4'd0;
             drain_done_out <= 1'b0;
-        end else if (!drain_done_out) begin
+        end
+        else if (!drain_done_out) begin
             if (cnt_q == DRAIN_BEATS - 4'd1)
                 drain_done_out <= 1'b1;
             else
