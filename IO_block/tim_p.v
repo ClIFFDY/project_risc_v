@@ -62,6 +62,7 @@ module tim_p(
         wr_cnt_set = wr & (bus_addr_in[3:0] == R_CNT_SET);
     end
 
+//PWM：门限比较，占空 = duty/cnt_set
     always @(posedge clk) begin
         if (rst) begin
             cnt_set <= 32'd0;
@@ -96,7 +97,6 @@ module tim_p(
                 end
             end
 
-//PWM：门限比较，占空 = duty/cnt_set
             pwm1 <= pwm_en[0] & (pwm_duty[0] > cnt);
             pwm2 <= pwm_en[1] & (pwm_duty[1] > cnt);
             pwm3 <= pwm_en[2] & (pwm_duty[2] > cnt);

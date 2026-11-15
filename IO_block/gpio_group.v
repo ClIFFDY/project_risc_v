@@ -26,16 +26,10 @@ module gpio_group(
     input [31:0] bus_data_in,
     input [3:0] bus_be_in,
     input bus_we_in,
-    output reg [31:0] bus_data_out,
-    output reg ld_ready,
-    output reg gpio_irq,
-
-    inout wire [31:0] gpio_pin_bus,
     input sda_oe,
     input scl_oe,
     input tx,
     input pwm1, pwm2, pwm3, pwm4,
-    output reg rx, sda_in, scl_in,
 
 //---- 用户 SPI 的四根线（7 号槽 sub1 的引擎，见 IO_block/spi.v）----
 //  ★ 2026-11-13 新增。四根线默认不接到任何引脚上，软件把对应 mode 配出来才生效。
@@ -43,7 +37,13 @@ module gpio_group(
     input  spi_user_cs,
     input  spi_user_sck,
     input  spi_user_mosi,
-    output reg spi_user_miso
+    output reg [31:0] bus_data_out,
+    output reg ld_ready,
+    output reg gpio_irq,
+    output reg rx, sda_in, scl_in,
+    output reg spi_user_miso,
+
+    inout wire [31:0] gpio_pin_bus
     );
 
     localparam [3:0]

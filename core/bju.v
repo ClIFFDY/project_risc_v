@@ -302,20 +302,20 @@ module bju(
 //拉总线、推乘法流水，等寄存器清已经收不回来 —— lsu 因此在入口多挡一拍，挡位由 isq 的 bju_in_flight 给。
 //★ 进本级的操作数不受任何 stall 门控：装载那一拍 stall 位全 0（adv）⇒ 拿到的就是最终值 ⇒
 //  判定、当拍异常标记一律照常出，不再挂 hazard 门。
+//★ 落点表 tag 截断（10 位）会带来假命中：分支的假落点不像 jalr 那样本来就有人比。
+//  少了这一项，假命中 ⇒ pc 一路跑错路、bju 却认为预测对了 ⇒ 永不改向（静默错，不卡死）。
+//★ jal 也要判"预测跳了没有"：改向搬到取指落点表之后，pc 只在【表命中】时按 jal 的落点跳，
+//  而表要等这条 jal 第一次被交付才写进去 ⇒ 第一次执行必然顺下去。老 pc 是"译码即跳"，
+//  所以这里从来不需要这一项；现在不补，冷启动的 jal 会静默走错路（实测 seed21：0x350 的
+//  `jal x20,+160` 不跳，整条后序全错）。命中之后 judged_branch_prediction=1，这一项自然不再触发。
     always @(*) begin
         exception_branch_misalign = success_now & judged_branch_offset[1];
         exception_jump_link_register_misalign = is_jump_link_register & (jump_link_register_low2 != 2'd0);
         exception_branch_unit = exception_branch_misalign | exception_jump_link_register_misalign | exception_jump_link_misalign;
         branch_stage2_now = success_now & ~judged_branch_prediction;
         branch_stage3_now = branch_failure_now & judged_branch_prediction;
-//★ 落点表 tag 截断（10 位）会带来假命中：分支的假落点不像 jalr 那样本来就有人比。
-//  少了这一项，假命中 ⇒ pc 一路跑错路、bju 却认为预测对了 ⇒ 永不改向（静默错，不卡死）。
         branch_target_failure_now = success_now & judged_branch_prediction &
                           ((judged_pc_plus4 + judged_branch_offset) != judged_jump_link_register_predicted_target);
-//★ jal 也要判"预测跳了没有"：改向搬到取指落点表之后，pc 只在【表命中】时按 jal 的落点跳，
-//  而表要等这条 jal 第一次被交付才写进去 ⇒ 第一次执行必然顺下去。老 pc 是"译码即跳"，
-//  所以这里从来不需要这一项；现在不补，冷启动的 jal 会静默走错路（实测 seed21：0x350 的
-//  `jal x20,+160` 不跳，整条后序全错）。命中之后 judged_branch_prediction=1，这一项自然不再触发。
         jump_link_no_prediction_now = is_jump_link & ~judged_branch_prediction;
         if (branch_stage2_now | branch_target_failure_now | exception_branch_misalign)
             jump_target_now = judged_pc_plus4 + judged_branch_offset;
@@ -392,6 +392,11 @@ module bju(
 //回报 ⇒ ROB 里 ent_wr=1/ent_jmp=1/ent_jdg=0 的项卡在队头 ⇒ 等 rob_empty 的重定向自锁。
 //回报是 1 拍脉冲，被杀集作废的项由 ROB 的 ent_v/ent_gen 过滤，不会误伤。
 //停顿拍不清：操作数被冻住时判定值不变。
+//★ jump_link_no_prediction_now 必须在册：它是"这条 jal 没有被取指落点表预测到"的唯一凭证。
+//  改向前 pc 是"译码即跳"，jal 从不需要改向；现在冷启动的 jal 靠这一位把 pc 拉回来。
+//训练载荷与 branch_pc_registered 同沿：写口三件套（pc / 是否训 / 落点）必须描述【同一条】指令。
+//输入级异常位延迟一级：index_registered / exception_pc_registered 是无条件跟随输入级的，所以事件命中那一拍
+//它们正好还是同一条指令的号与地址。
     always @(posedge clk) begin
         if (reset_registered) begin
             success <= 1'b0;
@@ -458,16 +463,11 @@ module bju(
             index_registered <= judged_index;
             generation_registered <= judged_generation;
             judged_registered <= advance_delayed;
-//★ jump_link_no_prediction_now 必须在册：它是"这条 jal 没有被取指落点表预测到"的唯一凭证。
-//  改向前 pc 是"译码即跳"，jal 从不需要改向；现在冷启动的 jal 靠这一位把 pc 拉回来。
             redirect_registered <= advance_delayed & (branch_stage2_now | branch_stage3_now | jump_link_register_failure_now | jump_link_no_prediction_now);
-//训练载荷与 branch_pc_registered 同沿：写口三件套（pc / 是否训 / 落点）必须描述【同一条】指令。
             branch_unit_kind  <= advance_delayed ? branch_unit_kind_now  : 2'd0;
             branch_unit_taken <= advance_delayed ? branch_unit_taken_now : 1'b0;
             branch_unit_pc    <= advance_delayed ? (judged_pc_plus4 - 32'd4) : 32'd0;
             branch_unit_target   <= advance_delayed ? branch_unit_target_now   : 32'd0;
-//输入级异常位延迟一级：index_registered / exception_pc_registered 是无条件跟随输入级的，所以事件命中那一拍
-//它们正好还是同一条指令的号与地址。
             exception_ecall_registered   <= exception_ecall_judged   & advance_delayed;
             exception_ebreak_registered  <= exception_ebreak_judged  & advance_delayed;
             exception_illegal_registered <= exception_illegal_judged & advance_delayed;

@@ -38,6 +38,9 @@ module dpu(
     input      [31:0] bus_data_in,
     input      [3:0]  bus_be_in,
     input             bus_we_in,
+    input      [3:0]  i2c_tx_used,
+    input             i2c_busy,
+    input             i2c_err,
     output reg [31:0] bus_data_out,
     output reg        ld_ready,
     // 到 i2c 的侧带
@@ -47,9 +50,6 @@ module dpu(
     output reg        i2c_ctrl_start,
     output reg        i2c_ctrl_stop,
     output reg [7:0]  i2c_ctrl_len,
-    input      [3:0]  i2c_tx_used,
-    input             i2c_busy,
-    input             i2c_err,
     output reg            dpu_irq
     );
 
@@ -213,6 +213,7 @@ module dpu(
     end
 
     // ---------------- 主状态机 ----------------
+                // 这一页已经在线上刷过了
     always @(posedge clk) begin
         if (rst) begin
             state              <= DPU_IDLE;
@@ -380,7 +381,6 @@ module dpu(
             //------------------------------------------------ 下一个槽 / 收尾
             DPU_NEXT: begin
                 dirty_clear        <= 1'b1;
-                // 这一页已经在线上刷过了
                 dirty_clear_screen <= scan_screen;
                 dirty_clear_page   <= scan_page;
                 if (scan_index == 4'd15) begin
@@ -418,6 +418,7 @@ module dpu(
                       (reg_sel == R_STATUS) && bus_data_in[2];
     end
 
+            // 状态位：引擎置、总线写清（同拍写清赢）
     always @(posedge clk) begin
         if (rst) begin
             start_request      <= 1'b0;
@@ -437,7 +438,6 @@ module dpu(
             full_request  <= 1'b0;
             clear_request <= 1'b0;
 
-            // 状态位：引擎置、总线写清（同拍写清赢）
             status_done  <= (status_done  | done_set)  & ~done_clear;
             status_error <= (status_error | error_set) & ~error_clear;
 

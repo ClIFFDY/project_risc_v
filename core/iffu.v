@@ -142,14 +142,14 @@ module iffu(
         push_data_1 = {instruction_effective_1, push_address_1, push_branch_prediction_1, push_jump_link_register_prediction_1};
     end
 
+//★ 本拍还能收几条，并且永远留一格不进（上界 DEPTH-1）：
+//  一旦让 wp 追平 rp，"满"和"空"就没法用指针比较区分了（stage0_valid 正是靠它）。
+//  不变量：count_in_use <= DEPTH-1 由下面的 room_available 逐拍保证。
     always @(*) begin
 //★ 占用按 PTR_W 位算，不能取低 IDX_W 位：DEPTH 本身必须可表示。
 //  取低 IDX_W 位时"满 DEPTH 条"会读成 0（D=8 时 8 的低 3 位 = 0）⇒ 满队看着是空队 ⇒
 //  继续猛推、覆盖还没交付的指令。IFFU_DEPTH=8 下 rand seed1 当场复现（wp=8 rp=0 读成 0）。
         count_in_use  = write_pointer - read_pointer;
-//★ 本拍还能收几条，并且永远留一格不进（上界 DEPTH-1）：
-//  一旦让 wp 追平 rp，"满"和"空"就没法用指针比较区分了（stage0_valid 正是靠它）。
-//  不变量：count_in_use <= DEPTH-1 由下面的 room_available 逐拍保证。
         room_available = (DEPTH - 1) - count_in_use;
     end
 
@@ -174,14 +174,14 @@ module iffu(
                                 + {{(PTR_W-1){1'b0}}, lane_valid_1};
     end
 
+//★ 落点按【已推入的条数】压紧，不按 lane 序号：块内可能既有 block_offset 之前的、
+//  也可能中间夹着空泡（指令字全 0 不推），留洞会让出队格读到没写过的格子。
+//  lane_valid_* 已经吸收了 block_offset（inst_valid_* 里就带），所以这里只数前缀。
     always @(*) begin
 //★ 整块要么全收、要么一条不收：pc/icache 每拍推进一整块，收一半就等于把块尾那几条扔了。
 //  所以容量判据按【本块条数】算，不做逐条削。
         write_back_0 = fetch_request & lane_valid_0;
         write_back_1 = fetch_request & lane_valid_1;
-//★ 落点按【已推入的条数】压紧，不按 lane 序号：块内可能既有 block_offset 之前的、
-//  也可能中间夹着空泡（指令字全 0 不推），留洞会让出队格读到没写过的格子。
-//  lane_valid_* 已经吸收了 block_offset（inst_valid_* 里就带），所以这里只数前缀。
         slot_0 = write_pointer;
         slot_1 = write_pointer + {{(PTR_W-1){1'b0}}, lane_valid_0};
     end

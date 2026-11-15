@@ -19,6 +19,11 @@ module lsu_ahb_master(
     input      [3:0]  bus_be_in,
     input             bus_we_in,
     input             bus_valid_in,
+    input      [31:0] hrdata,
+    input             hready,
+    input             hresp,
+    input             rd_valid,
+    input             hgrant,
     output reg [31:0] bus_data_out,
     output reg        bus_ready_out,
     output reg        bus_hold_out,
@@ -30,12 +35,7 @@ module lsu_ahb_master(
     output reg [3:0]  hprot,
     output reg        hmastlock,
     output reg [31:0] hwdata,
-    output reg [3:0]  hwstrb,
-    input      [31:0] hrdata,
-    input             hready,
-    input             hresp,
-    input             rd_valid,
-    input             hgrant
+    output reg [3:0]  hwstrb
     );
 
     localparam [1:0] HTRANS_IDLE   = 2'b00;
@@ -81,19 +81,9 @@ module lsu_ahb_master(
         end
     end
 
-    always @(*) begin
-        haddr  = lat_addr;
-        htrans = pend ? HTRANS_NONSEQ : HTRANS_IDLE;
-        hwrite = lat_we;
-        hsize  = 3'b010;
-        hburst = 3'b000;
 //HPROT 按 ARM IHI 0033A §3.7 的推荐值：非缓存、非缓冲、特权、数据访问。
 //本核没有用户态，也不产生取指（取指走 L2 的 I 口），所以恒这个值。
-        hprot  = 4'b0011;
 //HMASTLOCK：RV32I 没有 SWP、也没有 A 扩展，本核从不发锁传输 ⇒ 恒 0。
-        hmastlock = 1'b0;
-        hwstrb = lat_be;
-        hwdata = lat_data;
 //★ 2026-11-13：没应答就把数据口清 0。LSU 把"外部总线 / dcache / 定时器"三路读数据
 //  按【位或】合成一个 bus_data_in（core/lsu.v:147），那条合流的前提是"非本路的源每拍给 0"
 //  （dcache 的 out_sel_q、tim_in 都是这么写的）。这里原来直接送 hrdata —— 而 hrdata
@@ -101,12 +91,22 @@ module lsu_ahb_master(
 //  实测（app_npu_dma，CPU 一边轮询 DMA STAT 一边跑可缓存 load）：dcache 命中给出
 //  0x20001000，hrdata 残留 0x00000002，或成 0x20001002 ⇒ 当成了 NPU 窗口的 store 地址
 //  ⇒ 非对齐陷阱、整任务卡死在异常处理里。
-        bus_data_out  = rd_valid ? hrdata : 32'd0;
-        bus_ready_out = rd_valid;
 //★ 2026-11-12：在飞期间反压上游。LSU 的请求是【一拍脉冲】，本模块却要 2 拍才把它
 //  送上总线；总线被 L2/DMA 占住时 pend 会挂很久，这期间来的脉冲本来会被直接丢掉
 //  （实测：FreeRTOS 配 PLIC 时 UART 的 'S' 就这么没了 —— 总线被 L2 回填占了 25 拍）。
 //  这一根就是那个"别发"信号：LSU 拿它挡 store 排空（见 lsu.v 的 store_queue_drain）。
+    always @(*) begin
+        haddr  = lat_addr;
+        htrans = pend ? HTRANS_NONSEQ : HTRANS_IDLE;
+        hwrite = lat_we;
+        hsize  = 3'b010;
+        hburst = 3'b000;
+        hprot  = 4'b0011;
+        hmastlock = 1'b0;
+        hwstrb = lat_be;
+        hwdata = lat_data;
+        bus_data_out  = rd_valid ? hrdata : 32'd0;
+        bus_ready_out = rd_valid;
         bus_hold_out  = pend;
     end
 

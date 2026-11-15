@@ -34,14 +34,18 @@ module npu_top(
     input [3:0]  req_byte_en,
     input        req_we,
     input        req_valid,
+    // 来自 tile_controller
+    input        core_busy,
+    input        core_done,
+    input [31:0] a_rdata_cpu, bt_rdata_cpu, c_rdata_cpu,
     // 地址译码结果与读数据回给 ahb_lite_slave
     output reg        sel_ctrl,
     output reg        sel_status,
     output reg        sel_a_buf,
     output reg        sel_bt_buf,
     output reg        sel_c_buf,
-    output reg        sel_wgt,        // 0x4000-0x7FFF 权重块
-    output reg        sel_wgt_cfg,    // 0x0800-0x080F 权重块配置
+    output reg        sel_wgt, // 0x4000-0x7FFF 权重块
+    output reg        sel_wgt_cfg, // 0x0800-0x080F 权重块配置
     output reg [31:0] control_rdata,
     output reg [31:0] status_rdata,
     output reg [31:0] buffer_rdata,
@@ -51,10 +55,7 @@ module npu_top(
     output reg [`NPU_TK_W-1:0]   cfg_tk,
     output reg [`NPU_QS_W-1:0]   cfg_qshift,
     output reg        cfg_accumulate,
-    output reg        core_bank,      // 本任务读哪一组 A/BT（双缓冲）
-    // 来自 tile_controller
-    input        core_busy,
-    input        core_done,
+    output reg        core_bank, // 本任务读哪一组 A/BT（双缓冲）
     // CPU 侧 RAM 端口（到 npu_buffer）
     output reg        cpu_a_we,  cpu_a_re,
     output reg        cpu_bt_we, cpu_bt_re,
@@ -68,8 +69,7 @@ module npu_top(
     output reg [31:0] cpu_wgt_wdata,
     // 权重块配置直通（只在任务之间变化，不必像 m/n/k 那样锁存）
     output [`NPU_WGT_AW-1:0] wgt_base,
-    output                   wgt_en,
-    input [31:0] a_rdata_cpu, bt_rdata_cpu, c_rdata_cpu
+    output                   wgt_en
 );
 
     // ---- 内部连线：译码出的本地字地址 ----
@@ -105,21 +105,21 @@ module npu_top(
     wire [31:0] cpu_wgt_wdata_w;
 
     // ---- MMIO 地址译码：req_addr 由 ahb_lite_slave 在数据阶段给出 ----
-    always @(*) begin
-        sel_ctrl    = (req_addr[31:5] == 27'd0);
         // 0x0000-0x001F
-        sel_status  = (req_addr[31:4] == 28'h0000002);
         // 0x0020-0x002F
         // ★ 双缓冲：bank0 在 0x1000/0x2000，bank1 在 0x1800/0x2800，
         //   页内偏移仍是 [7:2]，bit[11] 选 bank（0x1400 这种中间页不认，保持原有空洞语义）。
+        // 0x3000-0x33FF
+        // 0x4000-0x7FFF
+        // 0x0800-0x080F
+    always @(*) begin
+        sel_ctrl    = (req_addr[31:5] == 27'd0);
+        sel_status  = (req_addr[31:4] == 28'h0000002);
         sel_a_buf   = (req_addr[31:12] == 20'h00001) && (req_addr[10:8] == 3'd0);
         sel_bt_buf  = (req_addr[31:12] == 20'h00002) && (req_addr[10:8] == 3'd0);
         sel_c_buf   = (req_addr[31:10] == 22'h00000C);
-        // 0x3000-0x33FF
         sel_wgt     = (req_addr[31:15] == 17'd0) && req_addr[14];
-        // 0x4000-0x7FFF
         sel_wgt_cfg = (req_addr[31:4] == 28'h00000080);
-        // 0x0800-0x080F
         a_local_addr  = {req_addr[11], req_addr[7:2]};
         bt_local_addr = {req_addr[11], req_addr[7:2]};
         c_local_addr  = req_addr[9:2];
@@ -197,11 +197,11 @@ module npu_top(
             core_bank <= cr_bank;
     end
 
+        // 对 tile_controller 输出锁存后的任务参数：运行期间软件改动不影响当前任务。
     always @(*) begin
         control_rdata   = control_rdata_w;
         buffer_rdata    = buffer_rdata_w;
         start_pulse     = start_pulse_w;
-        // 对 tile_controller 输出锁存后的任务参数：运行期间软件改动不影响当前任务。
         cfg_m           = m_l;
         cfg_n           = n_l;
         cfg_k           = k_l;

@@ -30,6 +30,11 @@ module boot_loader #(
     parameter [31:0] LOAD_BASE = 32'h0000_0000    // 镜像落到 STCM 的哪里
 )(
     input clk, rst,
+    input      [31:0] hrdata,
+    input             hready,
+    input             hresp,
+    input             hgrant,
+    input             rd_valid,
 
 //---- AHB-Lite 主设备口（m3）----
     output reg [31:0] haddr,
@@ -41,11 +46,6 @@ module boot_loader #(
     output reg        hmastlock,
     output reg [31:0] hwdata,
     output reg [3:0]  hwstrb,
-    input      [31:0] hrdata,
-    input             hready,
-    input             hresp,
-    input             hgrant,
-    input             rd_valid,
 
 //---- 状态（给 pmem_spi 的 BOOT 寄存器展示）----
     output reg        boot_done,
@@ -215,6 +215,10 @@ module boot_loader #(
     reg [3:0]  op_strb;
     reg        op_we, op_go;
 
+            // bit0=0：flash 选中；bit1=1：SD 不选
+            // bit0=start
+            // 两路 CS 都拉高
+            // 两路 CS 都拉高
     always @(*) begin
         op_addr  = 32'd0;
         op_wdata = 32'd0;
@@ -225,7 +229,6 @@ module boot_loader #(
         S_SEL: begin
             op_addr  = R_CS;
             op_wdata = 32'h0000_0002;
-            // bit0=0：flash 选中；bit1=1：SD 不选
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
@@ -238,7 +241,6 @@ module boot_loader #(
         S_GO: begin
             op_addr  = R_CTRL;
             op_wdata = 32'h0000_0001;
-            // bit0=start
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
@@ -262,14 +264,12 @@ module boot_loader #(
         S_DESEL: begin
             op_addr  = R_CS;
             op_wdata = 32'h0000_0003;
-            // 两路 CS 都拉高
             op_we    = 1'b1;
             op_go    = 1'b1;
         end
         S_FIN: begin
             op_addr  = R_CS;
             op_wdata = 32'h0000_0003;
-            // 两路 CS 都拉高
             op_we    = 1'b1;
             op_go    = ~boot_done;       // ★ 抬起 CS 只发一次：done 之后就闭嘴，
                                          //   否则状态机停在 S_FIN 会一直重发这笔写，
@@ -288,6 +288,9 @@ module boot_loader #(
             issue = 1'b1;
     end
 
+                // READ 命令
+                    // ★ 超时是"这一个字节"的超时，不能跨字节累加
+                        // ★ 换段后第一个字节是命令，不是数据
     always @(posedge clk) begin
         if (reset_registered) begin
             st <= S_IDLE;
@@ -336,7 +339,6 @@ module boot_loader #(
                 acc <= 32'd0;
                 byte_idx <= 2'd0;
                 tx_byte <= 32'h0000_0003;
-                // READ 命令
                 poll_cnt <= 32'd0;
                 data_byte <= 1'b0;
                 st <= S_SEL;
@@ -355,7 +357,6 @@ module boot_loader #(
             S_GO: begin
                 if (bus_done) begin
                     poll_cnt <= 32'd0;
-                    // ★ 超时是"这一个字节"的超时，不能跨字节累加
                     st <= S_POLL;
                 end
             end
@@ -447,7 +448,6 @@ module boot_loader #(
                         byte_idx <= 2'd0;
                         tx_byte <= 32'h0000_0003;
                         data_byte <= 1'b0;
-                        // ★ 换段后第一个字节是命令，不是数据
                         st <= S_DESEL;
                     end
                 end

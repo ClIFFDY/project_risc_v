@@ -30,27 +30,27 @@ module i2c(
     //   事务结束后不撤（主设备 lat_addr 不清零）⇒ 只用"地址 + !we"判读会把 FIFO
     //   一路抽干。这里跟 uart_top / spi 一样，读副作用只在被选中那一拍发生。
     input bus_sel,
-    output reg [31:0] bus_data_out,
-    output reg ld_ready,
-    output reg i2c_irq,
-
-    output reg scl_oe,
     input scl_in,
-    output reg sda_oe,
     input sda_in,
-    output reg busy,
 
 //★ 2026-11-13（D2）：给同层的 DPU（9 号槽）留一条侧带 —— 它不进总线，
 //  直接把字节塞进 TX FIFO、直接拨 START/STOP/长度，等于替 CPU 干那三件事。
 //  ★ 为什么不是"流式字节源 + 握手"：FIFO 本来就是字节队列，复用 8 深 + 计数
 //    比另开一套握手省得多，而且 CPU 那条路径一个门都不动。
-    input             dpu_push,          // 一字节入队（DPU 负责不溢出）
+    input             dpu_push, // 一字节入队（DPU 负责不溢出）
     input      [7:0]  dpu_push_data,
-    input             dpu_ctrl_we,       // 一字节的"写 CTRL"，与 CPU 写 CTRL 同一条路
+    input             dpu_ctrl_we, // 一字节的"写 CTRL"，与 CPU 写 CTRL 同一条路
     input             dpu_ctrl_start,
     input             dpu_ctrl_stop,
     input      [7:0]  dpu_ctrl_len,
-    output reg     [3:0]  dpu_tx_used,       // 队列占用：DPU 靠它停手，留一格余量
+    output reg [31:0] bus_data_out,
+    output reg ld_ready,
+    output reg i2c_irq,
+
+    output reg scl_oe,
+    output reg sda_oe,
+    output reg busy,
+    output reg     [3:0]  dpu_tx_used, // 队列占用：DPU 靠它停手，留一格余量
     output reg        dpu_err            // NACK 中止脉冲（不是粘滞位）
     );
 
@@ -177,18 +177,18 @@ module i2c(
     end
 
 //分频：按 cfg[2:1] 给出 SCL 低/高相位拍数（见文件上方的 Q* 常量）
+        // 100 kHz
+        // 400 kHz
     always @(*) begin
         case (cfg_reg[2:1])
         2'd0: begin
             cnt_l = Q100_L;
             cnt_h = Q100_H;
         end
-        // 100 kHz
         2'd1: begin
             cnt_l = Q400_L;
             cnt_h = Q400_H;
         end
-        // 400 kHz
         2'd2: begin
             cnt_l = Q1M;
             cnt_h = Q1M;
@@ -400,6 +400,8 @@ module i2c(
     end
 
 //主机 FSM：自计时推进，SCL 由 scl_oe 开漏拉低
+            // 一拍脉冲：上一拍置起、这一拍倒 FIFO
+                            // 这笔事务到此为止，软件那次 STOP 请求一并吃掉
     always @(posedge clk) begin
         if (rst) begin
             m_state <= M_IDLE;
@@ -423,7 +425,6 @@ module i2c(
             dpu_err <= 1'b0;
             m_done <= 1'b0;
             m_flush <= 1'b0;
-            // 一拍脉冲：上一拍置起、这一拍倒 FIFO
             m_start_clr <= 1'b0;
             m_stop_clr <= 1'b0;
 //★ 2026-11-13（D1/O4）：该放开 SCL 的那一半里，如果 SCL 还没真的起来（别的从机
@@ -499,7 +500,6 @@ module i2c(
                             dpu_err   <= 1'b1;
                             m_flush <= 1'b1;
                             m_stop_clr <= 1'b1;
-                            // 这笔事务到此为止，软件那次 STOP 请求一并吃掉
                             m_state <= M_STOP;
                         end
 //★ 2026-11-13（D1/O3）：长度数完自动 STOP，软件不用自己数最后一条、也不用拨 stop。

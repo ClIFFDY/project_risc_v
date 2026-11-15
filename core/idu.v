@@ -19,6 +19,8 @@ module idu(
     input        dqm_valid, input [132:0] dqm_data, output dqm_pop,
 //---- lane0 / lane1 交付给 isq ----
     input        accept_in_0, accept_in_1,
+//---- LSU FIFO 队头（给 isq 的访存站）----
+    input         lsu_pop_in,
     output reg   lane_valid_0, lane_valid_1,
     output reg [31:0] instruction_out_0, auxiliary_address_out_0,
     output reg        branch_prediction_taken_out_0,
@@ -66,8 +68,6 @@ module idu(
     output reg [3:0]  dec_bjuf4_1,
     output reg        dec_r1_imm_1, dec_r2_imm_1,
     output reg [31:0] dec_r1_immv_1, dec_r2_immv_1,
-//---- LSU FIFO 队头（给 isq 的访存站）----
-    input         lsu_pop_in,
     output reg [31:0] lsu_instruction_out, lsu_auxiliary_address_out, lsu_immediate_out,
     output reg [4:0]  lsu_source_a_out, lsu_source_b_out, lsu_destination_register_out,
     output reg [2:0]  lsu_load_store_function3_out,
@@ -306,16 +306,16 @@ module idu(
             end
         endcase
     end
+//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
     always @(*) begin
         csr_is_access_dec_s0 = (p0_inst[14:12] != 3'b000) && (p0_inst[14:12] != 3'b100);
-//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
         csr_wr_dec_s0        = (p0_inst[14:12] == 3'b001) | (p0_inst[14:12] == 3'b101) |
                             (p0_inst[19:15] != 5'd0);
         csr_ro_dec_s0        = (p0_inst[31:30] == 2'b11);
         csr_exists_dec_s0    = 1'b0;
         case (p0_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_s0 = 1'b1;
             default: csr_exists_dec_s0 = 1'b0;
@@ -415,6 +415,7 @@ module idu(
             endcase
         end
     end
+//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
     always @(*) begin
         class_decoded_s0      = CLS_ALU;
         write_enable_decoded_s0         = 1'b0;
@@ -505,7 +506,6 @@ module idu(
                         csr_write_enable_decoded_s0 = 1'b0;
                     end
                 endcase
-//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
                 csr_address_decoded_s0 = (p0_inst[14:12] != 3'b000) ? p0_inst[31:20] : 12'd0;
             end
             default: ;
@@ -623,16 +623,16 @@ module idu(
             end
         endcase
     end
+//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
     always @(*) begin
         csr_is_access_dec_s1 = (p1_inst[14:12] != 3'b000) && (p1_inst[14:12] != 3'b100);
-//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
         csr_wr_dec_s1        = (p1_inst[14:12] == 3'b001) | (p1_inst[14:12] == 3'b101) |
                             (p1_inst[19:15] != 5'd0);
         csr_ro_dec_s1        = (p1_inst[31:30] == 2'b11);
         csr_exists_dec_s1    = 1'b0;
         case (p1_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_s1 = 1'b1;
             default: csr_exists_dec_s1 = 1'b0;
@@ -732,6 +732,7 @@ module idu(
             endcase
         end
     end
+//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
     always @(*) begin
         class_decoded_s1      = CLS_ALU;
         write_enable_decoded_s1         = 1'b0;
@@ -822,7 +823,6 @@ module idu(
                         csr_write_enable_decoded_s1 = 1'b0;
                     end
                 endcase
-//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
                 csr_address_decoded_s1 = (p1_inst[14:12] != 3'b000) ? p1_inst[31:20] : 12'd0;
             end
             default: ;
@@ -940,16 +940,16 @@ module idu(
             end
         endcase
     end
+//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
+//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
     always @(*) begin
         csr_is_access_dec_sm = (pm_inst[14:12] != 3'b000) && (pm_inst[14:12] != 3'b100);
-//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
         csr_wr_dec_sm        = (pm_inst[14:12] == 3'b001) | (pm_inst[14:12] == 3'b101) |
                             (pm_inst[19:15] != 5'd0);
         csr_ro_dec_sm        = (pm_inst[31:30] == 2'b11);
         csr_exists_dec_sm    = 1'b0;
         case (pm_inst[31:20])
             12'h300, 12'h301, 12'h304, 12'h305, 12'h340, 12'h341,
-//★ 2026-11-13：0x7C0 = 自定义"三层缓存全失效"。软件原语，见 rename 的 alloc_barrier（编码 3）
             12'h342, 12'h343, 12'h344, 12'hB00, 12'hB02, 12'hF14,
             12'h7C0: csr_exists_dec_sm = 1'b1;
             default: csr_exists_dec_sm = 1'b0;
@@ -1049,6 +1049,7 @@ module idu(
             endcase
         end
     end
+//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
     always @(*) begin
         class_decoded_sm      = CLS_ALU;
         write_enable_decoded_sm         = 1'b0;
@@ -1139,7 +1140,6 @@ module idu(
                         csr_write_enable_decoded_sm = 1'b0;
                     end
                 endcase
-//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
                 csr_address_decoded_sm = (pm_inst[14:12] != 3'b000) ? pm_inst[31:20] : 12'd0;
             end
             default: ;

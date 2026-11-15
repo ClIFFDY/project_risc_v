@@ -34,11 +34,6 @@ module ahb_interconnect(
     input             m0_hmastlock,
     input      [31:0] m0_hwdata,
     input      [3:0]  m0_hwstrb,
-    output reg [31:0] m0_hrdata,
-    output reg        m0_hready,
-    output reg        m0_hresp,
-    output reg        m0_rd_valid,
-    output reg        m0_hgrant,
 
 //---- m1：L2 ----
     input      [31:0] m1_haddr,
@@ -50,11 +45,6 @@ module ahb_interconnect(
     input             m1_hmastlock,
     input      [31:0] m1_hwdata,
     input      [3:0]  m1_hwstrb,
-    output reg [31:0] m1_hrdata,
-    output reg        m1_hready,
-    output reg        m1_hresp,
-    output reg        m1_rd_valid,
-    output reg        m1_hgrant,
 
 //---- m2：DMA ----
     input      [31:0] m2_haddr,
@@ -66,6 +56,43 @@ module ahb_interconnect(
     input             m2_hmastlock,
     input      [31:0] m2_hwdata,
     input      [3:0]  m2_hwstrb,
+    input      [31:0] s0_hrdata,
+    input             s0_hreadyout,
+    input             s0_hresp,
+    input             s0_rd_valid,
+    input      [31:0] s1_hrdata,
+    input             s1_hreadyout,
+    input             s1_hresp,
+    input             s1_rd_valid,
+
+//---- m3：boot 搬运引擎（只在上电搬运时说话）----
+    input      [31:0] m3_haddr,
+    input      [1:0]  m3_htrans,
+    input             m3_hwrite,
+    input      [2:0]  m3_hsize,
+    input      [2:0]  m3_hburst,
+    input      [3:0]  m3_hprot,
+    input             m3_hmastlock,
+    input      [31:0] m3_hwdata,
+    input      [3:0]  m3_hwstrb,
+    input      [31:0] s2_hrdata,
+    input             s2_hreadyout,
+    input             s2_hresp,
+    input             s2_rd_valid,
+    input      [31:0] s3_hrdata,
+    input             s3_hreadyout,
+    input             s3_hresp,
+    input             s3_rd_valid,
+    output reg [31:0] m0_hrdata,
+    output reg        m0_hready,
+    output reg        m0_hresp,
+    output reg        m0_rd_valid,
+    output reg        m0_hgrant,
+    output reg [31:0] m1_hrdata,
+    output reg        m1_hready,
+    output reg        m1_hresp,
+    output reg        m1_rd_valid,
+    output reg        m1_hgrant,
     output reg [31:0] m2_hrdata,
     output reg        m2_hready,
     output reg        m2_hresp,
@@ -82,10 +109,6 @@ module ahb_interconnect(
     output reg        s0_hmastlock,
     output reg [31:0] s0_hwdata,
     output reg [3:0]  s0_hwstrb,
-    input      [31:0] s0_hrdata,
-    input             s0_hreadyout,
-    input             s0_hresp,
-    input             s0_rd_valid,
 
 //---- s1：STCM ----
     output reg [31:0] s1_haddr,
@@ -97,21 +120,6 @@ module ahb_interconnect(
     output reg        s1_hmastlock,
     output reg [31:0] s1_hwdata,
     output reg [3:0]  s1_hwstrb,
-    input      [31:0] s1_hrdata,
-    input             s1_hreadyout,
-    input             s1_hresp,
-    input             s1_rd_valid,
-
-//---- m3：boot 搬运引擎（只在上电搬运时说话）----
-    input      [31:0] m3_haddr,
-    input      [1:0]  m3_htrans,
-    input             m3_hwrite,
-    input      [2:0]  m3_hsize,
-    input      [2:0]  m3_hburst,
-    input      [3:0]  m3_hprot,
-    input             m3_hmastlock,
-    input      [31:0] m3_hwdata,
-    input      [3:0]  m3_hwstrb,
     output reg [31:0] m3_hrdata,
     output reg        m3_hready,
     output reg        m3_hresp,
@@ -125,10 +133,6 @@ module ahb_interconnect(
     output reg [2:0]  s2_hsize,
     output reg [31:0] s2_hwdata,
     output reg        s2_hsel,
-    input      [31:0] s2_hrdata,
-    input             s2_hreadyout,
-    input             s2_hresp,
-    input             s2_rd_valid,
 
 //---- s3：DDR/AXI 桥（slot 32 = 0x8000_0000，AXI 往返几十拍 ⇒ 同样走直达通路）----
     output reg [31:0] s3_haddr,
@@ -138,11 +142,7 @@ module ahb_interconnect(
     output reg [3:0]  s3_hprot,
     output reg [31:0] s3_hwdata,
     output reg [3:0]  s3_hwstrb,
-    output reg        s3_hsel,
-    input      [31:0] s3_hrdata,
-    input             s3_hreadyout,
-    input             s3_hresp,
-    input             s3_rd_valid
+    output reg        s3_hsel
     );
 
     localparam [1:0] M_LSU = 2'd0, M_L2 = 2'd1, M_DMA = 2'd2, M_BOOT = 2'd3;
@@ -331,6 +331,7 @@ module ahb_interconnect(
         htrans_gated = read_hold ? 2'b00 : htrans;
     end
 
+//没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
     always @(*) begin
         s0_haddr = haddr;
         s0_htrans = htrans_gated;
@@ -350,7 +351,6 @@ module ahb_interconnect(
         s1_hmastlock = hmastlock;
         s1_hwdata = hwdata;
         s1_hwstrb = hwstrb;
-//没被选中的从设备看不到地址 —— 否则它的读状态机会被无端触发
         s2_haddr = haddr;
         s2_htrans = htrans_gated;
         s2_hwrite = hwrite;

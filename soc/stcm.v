@@ -43,6 +43,9 @@ module stcm #(
 
 //复位就地打一拍（与其它模块同款：全核各模块零相位差）
     reg reset_registered;
+//上板时的启动镜像（平铺：代码 @0，.data 跟在后面按它自己的 VMA 落位）。
+//★ 仿真台会在自己的 initial 里整幅覆盖（台子声明在例化之后 ⇒ Verilator 后执行），
+//  这里读不到文件只会报一个 warning，不影响仿真。
     always @(posedge clk) reset_registered <= rst;
 
 //数据阵列。★ 必须"单一地址表达式 + 输出寄存器"才推得出 BRAM（见 dtcm.v 头注释）
@@ -52,9 +55,6 @@ module stcm #(
     initial begin
         for (i = 0; i < WORDS; i = i + 1)
             mem[i] = 32'd0;
-//上板时的启动镜像（平铺：代码 @0，.data 跟在后面按它自己的 VMA 落位）。
-//★ 仿真台会在自己的 initial 里整幅覆盖（台子声明在例化之后 ⇒ Verilator 后执行），
-//  这里读不到文件只会报一个 warning，不影响仿真。
         $readmemh("e:/Vivado_Projects/project_risc_v/tools/hex/image.hex", mem);
     end
 

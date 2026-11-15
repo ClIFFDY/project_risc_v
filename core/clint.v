@@ -53,7 +53,7 @@ module clint(
 //队空（重定向落地条件）
     input [31:0] slot_above_head,
 //异常交付口（ROB 队头交付陷阱那一拍 + 载荷）：透传给 csr，由它在【队头那一拍】锁 mepc/mcause/mtval
-    input [1:0]  redir_cause,          // 与 redir_backend_0 同拍：0=分支 1=陷阱 2=mret
+    input [1:0]  redir_cause, // 与 redir_backend_0 同拍：0=分支 1=陷阱 2=mret
     input [1:0]  rob_ret_step,
     input [3:0]  trap_cause,
     input [31:0] trap_pc, trap_value,
@@ -73,8 +73,11 @@ module clint(
     input [31:0] csr_commit_source,
     input [31:0] pc_address_in,
     input        exti, timi, softi,
+// mret 搬到提交口：判定拍不再报标签（标签随分配从 idu 的译码位进 ROB），
+//  队头那一拍由 ROB 拉 mret_valid 回来。落点也不从这里出 —— pc 直接用 csr 的 mepc 锁存器。
+    input             mret_valid,
 //流水线状态（寄存输出）
-    output reg       irq_kill,          // 中断受理（受理判据打一拍再发）
+    output reg       irq_kill, // 中断受理（受理判据打一拍再发）
     output reg [4:0] flush_index,
 //异常报告口 ×3：lane0 / lane1 / lsu。各带各的槽号，直接进 ROB 的三个标记口，本模块不做仲裁。
     output reg        exc0_en,
@@ -89,9 +92,6 @@ module clint(
     output reg [4:0]  exception_selected_index,
     output reg [3:0]  exception_selected_cause,
     output reg [31:0] exception_selected_pc, exception_selected_trap_value,
-// mret 搬到提交口：判定拍不再报标签（标签随分配从 idu 的译码位进 ROB），
-//  队头那一拍由 ROB 拉 mret_valid 回来。落点也不从这里出 —— pc 直接用 csr 的 mepc 锁存器。
-    input             mret_valid,
 //判定延迟拍那一套（success/br_fail/jalr 落点/预测表索引/落点）该取哪条 lane：1 = `_1`
 //csr 的对外口（例化输出在本模块内对齐后送出）
     output reg [31:0] interrupt_service_address_2, mcause,
@@ -261,6 +261,12 @@ module clint(
             csr_write_value = {csr_write_intent[31:2], 2'b00};
     end
 
+//全局使能设定
+//三类型中断分别使能：规范位序 bit3=MSIE(软件)、bit7=MTIE(定时器)、bit11=MEIE(外部)
+//★ 本核原来把外部/软件写反了（eirq@3、sirq@11），与自家 mcause_judged 的中断码（外部=11/定时器=7/
+//  软件=3，规范）自相矛盾 ⇒ 按规范对调。定时器那条本来就对。
+//isr跳转目标设定
+//isr返回目标设定
     always @(posedge clk) begin
         if (reset_registered) begin
             exception_interrupt_enable_registered <= 1'b0;
@@ -296,20 +302,15 @@ module clint(
 //  这条指令在上一拍已经退休，它的写必须落地；同拍发生的任何冲刷都属于比它年轻的项。
             if (csr_commit_valid) begin
                 case (csr_commit_address)
-//全局使能设定
                 12'h300: begin
                     exception_interrupt_enable_registered <= csr_write_value[3];
                     exception_interrupt_enable_post_registered <= csr_write_value[7];
                 end
-//三类型中断分别使能：规范位序 bit3=MSIE(软件)、bit7=MTIE(定时器)、bit11=MEIE(外部)
-//★ 本核原来把外部/软件写反了（eirq@3、sirq@11），与自家 mcause_judged 的中断码（外部=11/定时器=7/
-//  软件=3，规范）自相矛盾 ⇒ 按规范对调。定时器那条本来就对。
                 12'h304: begin
                     exception_external_interrupt_enable <= csr_write_value[11];
                     exception_timer_interrupt_enable <= csr_write_value[7];
                     exception_software_interrupt_enable <= csr_write_value[3];
                 end
-//isr跳转目标设定
                 12'h305: begin
                     isr_addr_reg1 <= csr_write_value;
                     isr_addr_reg2 <= csr_write_value;
@@ -317,7 +318,6 @@ module clint(
                 12'h340: begin
                     mscratch_registered <= csr_write_value;
                 end
-//isr返回目标设定
                 12'h341: begin
                     interrupt_return_address_1 <= {csr_write_value[31:2], 2'b00};
                     iret_addr2_i <= {csr_write_value[31:2], 2'b00};
@@ -401,6 +401,13 @@ module clint(
     end
 
 //csr读操作逻辑
+//★ 同拍只要有任何异常在交付路径上，中断一律让位：redir_backend_0 已经把
+//  ecall/ebreak/illegal（经 bju 输入级）与访存非对齐（经 lsu 寄存拍）全含进来，
+//  所以不必在这里逐个列 —— 靠 else-if 优先级兜正确性是脆的。
+//★ S3：这里原本用 bju 的判定拍三根（jump_link_register_failure|br2|br3）表达"本拍有一次改向"——
+//  旧设计判定拍就是改向拍，成立；改向搬到提交拍后它们先到、改向后到 ⇒
+//  判定拍白挡一次中断，真正改向那一拍反倒没人挡（中断与分支改向可能同拍打架）。
+//  改成用【真正改向那一拍的事件】redir_backend_0（= 提交口改向）。
     always @(*) begin
         if (reset_registered) begin
             exception_global_pending = 1'b0;
@@ -414,13 +421,6 @@ module clint(
             exception_timer_interrupt_pending = timi;
             exception_external_interrupt_pending = exti;
             exception_global_pending = (exception_external_interrupt_pending && exception_external_interrupt_enable) | (exception_timer_interrupt_pending && exception_timer_interrupt_enable) | (exception_software_interrupt_pending && exception_software_interrupt_enable);
-//★ 同拍只要有任何异常在交付路径上，中断一律让位：redir_backend_0 已经把
-//  ecall/ebreak/illegal（经 bju 输入级）与访存非对齐（经 lsu 寄存拍）全含进来，
-//  所以不必在这里逐个列 —— 靠 else-if 优先级兜正确性是脆的。
-//★ S3：这里原本用 bju 的判定拍三根（jump_link_register_failure|br2|br3）表达"本拍有一次改向"——
-//  旧设计判定拍就是改向拍，成立；改向搬到提交拍后它们先到、改向后到 ⇒
-//  判定拍白挡一次中断，真正改向那一拍反倒没人挡（中断与分支改向可能同拍打架）。
-//  改成用【真正改向那一拍的事件】redir_backend_0（= 提交口改向）。
             exc_irq_act_i = exception_interrupt_enable_registered && exception_global_pending && !exception_interrupt_process &&
                           !(exception_interrupt_return_ok | redir_backend_0) && interrupt_head_valid;
             mcause_judged = mcause_registered;

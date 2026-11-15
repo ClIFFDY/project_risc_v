@@ -35,6 +35,8 @@ module io_block_top #(
     input             bus_we_in,
     input      [31:0] bus_sel_in,
     input             spi_miso,
+//配置 flash（Q64）专用那组：CS/DI/DO/CLK 都走专用配置脚，和上面那组 GPIO 复用脚无关
+    input             cfg_miso,
 //boot 引擎的状态（只读展示在 pmem_spi 的 BOOT 寄存器里）
     input             boot_done,
     input             boot_err,
@@ -63,6 +65,11 @@ module io_block_top #(
     output            spi_cs_sd,
     output            spi_sck,
     output            spi_mosi,
+//配置 flash 的四根线 + 软复位（cfg_reset_out 要一路拉到 rst_buf 的复位或树里）
+    output            cfg_cs_n,
+    output            cfg_sck,
+    output            cfg_mosi,
+    output            cfg_reset_out,
 //9 号槽：DPU（显示引擎，0x2400_0000）。它和 5 号槽的 i2c 有一条侧带直连，
 //  不经过总线；中断在块内部直接进 PLIC 的 9 号源，不用穿端口。
     output     [31:0] dpu_data,
@@ -94,15 +101,15 @@ module io_block_top #(
 //   ★ 位选是 [15:14] 不是 [17:16]：bus_addr_in 是【字】地址（haddr>>2），
 //     64 KB 的字节偏移 0x1_0000 落到字地址上就是 0x4000 = bit14。
     reg [1:0] spi_sub;
-    reg spi_sel_pmem, spi_sel_user;
+    reg spi_sel_pmem, spi_sel_user, spi_sel_cfg;
 
     wire uart_rx_w, uart_tx_w;
     wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq_w, dpu_irq;
     wire i2c_scl_oe, i2c_sda_oe, i2c_scl_in, i2c_sda_in;
     wire pwm1_w, pwm2_w, pwm3_w, pwm4_w;
 
-    wire [31:0] spi_pmem_data, spi_user_data;
-    wire        spi_pmem_ready, spi_user_ready;
+    wire [31:0] spi_pmem_data, spi_user_data, spi_cfg_data;
+    wire        spi_pmem_ready, spi_user_ready, spi_cfg_ready;
     wire        spi_pmem_irq, spi_user_irq;
     wire        spi_user_cs_w, spi_user_sck_w, spi_user_mosi_w, spi_user_miso_w;
 
@@ -110,17 +117,20 @@ module io_block_top #(
         spi_sub = bus_addr_in[15:14];
         spi_sel_pmem = bus_sel_in[PER_SPI] & (spi_sub == 2'd0);
         spi_sel_user = bus_sel_in[PER_SPI] & (spi_sub == 2'd1);
+        spi_sel_cfg  = bus_sel_in[PER_SPI] & (spi_sub == 2'd2);
     end
 
 //spi_data / spi_ready 是【两个生产者合流】到同一个输出口：sub0 的 pmem_spi 与 sub1 的
 //  spi 各出一份，按 spi_sub 选。合流必须留在本层（下层各自只认识自己的口），所以保留 assign。
     assign spi_data  = (spi_sub == 2'd0) ? spi_pmem_data :
-                       (spi_sub == 2'd1) ? spi_user_data : 32'd0;
+                       (spi_sub == 2'd1) ? spi_user_data :
+                       (spi_sub == 2'd2) ? spi_cfg_data : 32'd0;
     // ★ 2026-11-14（总线审计）：sub2/sub3 是保留窗口，原来 ready 恒 0 ⇒ 读这两个窗口
     //   桥永远不出 rd_valid ⇒ 一条 load 不完成 ⇒ 整核挂死（还会把 owner FIFO 顶死）。
     //   保留窗口一律"应答 0"。
     assign spi_ready = (spi_sub == 2'd0) ? spi_pmem_ready :
-                       (spi_sub == 2'd1) ? spi_user_ready : 1'b1;
+                       (spi_sub == 2'd1) ? spi_user_ready :
+                       (spi_sub == 2'd2) ? spi_cfg_ready : 1'b1;
 
     always @(*) begin
         bus_we_uart = bus_we_in & bus_sel_in[PER_UART];
@@ -267,6 +277,31 @@ module io_block_top #(
         .boot_done(boot_done),
         .boot_err(boot_err),
         .boot_count(boot_count)
+    );
+
+//配置 flash 的 MISO：台子上这几根脚没接时是 z/x，按空闲高处理，别把 z 传进状态机
+    wire cfg_miso_safe;
+    assign cfg_miso_safe = (cfg_miso === 1'b0) ? 1'b0 : 1'b1;
+
+//7 号槽 sub2：配置 flash（Q64）专用控制器。引脚是 FPGA 的专用配置脚，
+//  和上面那组 GPIO 复用脚无关；CLK 要从顶层 STARTUPE2 的 USRCCLKO 出去。
+    cfg_spi #(
+        .CLK_MHZ(CLK_MHZ)
+    ) u_cfg_spi (
+        .clk(clk),
+        .rst(rst_cpu),
+        .bus_sel_in(spi_sel_cfg),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_in),
+        .cfg_miso(cfg_miso_safe),
+        .bus_data_out(spi_cfg_data),
+        .ld_ready(spi_cfg_ready),
+        .cfg_cs_n(cfg_cs_n),
+        .cfg_sck(cfg_sck),
+        .cfg_mosi(cfg_mosi),
+        .cfg_reset_out(cfg_reset_out)
     );
 
     spi #(

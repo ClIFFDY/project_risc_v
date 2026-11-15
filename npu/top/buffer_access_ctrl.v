@@ -25,7 +25,11 @@ module buffer_access_ctrl(
     input [31:0] req_wdata,
     // NPU 状态
     input        core_busy,
-    input        core_bank,          // 核正在读的那一组 A/BT
+    input        core_bank, // 核正在读的那一组 A/BT
+    // Buffer 读数据返回(CPU 侧)
+    input [31:0] a_rdata_cpu,
+    input [31:0] bt_rdata_cpu,
+    input [31:0] c_rdata_cpu,
     // 到 Buffer RAM(仅 core_busy=0 时放行)
     output reg        cpu_a_we,  cpu_a_re,
     output reg        cpu_bt_we, cpu_bt_re,
@@ -40,10 +44,6 @@ module buffer_access_ctrl(
     output reg        cpu_wgt_we,
     output reg [`NPU_WGT_AW-1:0] cpu_wgt_addr,
     output reg [31:0] cpu_wgt_wdata,
-    // Buffer 读数据返回(CPU 侧)
-    input [31:0] a_rdata_cpu,
-    input [31:0] bt_rdata_cpu,
-    input [31:0] c_rdata_cpu,
     output reg [31:0] buffer_rdata
 );
 
@@ -51,10 +51,11 @@ module buffer_access_ctrl(
     reg cpu_wr_ok;      // ★ 双缓冲：忙的时候仍允许写"核没在读"的那一组
     reg [31:0] byte_mask;
 
+        // 写：空闲随便写；忙的时候只能写另一组（地址里的 bank 位 != 核正在读的 bank）。
+        // req_addr 由 ahb_lite_slave 锁存，所以 sel_* 在整个 Buffer 读等待期间保持稳定。
     always @(*) begin
         // Buffer_READY 与 cpu_ok 同源；状态寄存器 bit3 用它告诉软件当前能否装载/读取数据。
         cpu_ok    = !core_busy;
-        // 写：空闲随便写；忙的时候只能写另一组（地址里的 bank 位 != 核正在读的 bank）。
         cpu_wr_ok = cpu_ok | (a_local_addr[`NPU_ABUF_REG_AW-1] != core_bank);
         cpu_a_we  = req_valid && req_we  && sel_a_buf  && cpu_wr_ok;
         cpu_a_re  = req_valid && !req_we && sel_a_buf  && cpu_ok;
@@ -74,7 +75,6 @@ module buffer_access_ctrl(
         cpu_wgt_addr  = wgt_local_addr;
         cpu_wgt_wdata = req_wdata & byte_mask;
 
-        // req_addr 由 ahb_lite_slave 锁存，所以 sel_* 在整个 Buffer 读等待期间保持稳定。
         buffer_rdata = sel_a_buf  ? a_rdata_cpu  :
                        sel_bt_buf ? bt_rdata_cpu : c_rdata_cpu;
     end

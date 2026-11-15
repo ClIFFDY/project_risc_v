@@ -98,11 +98,11 @@ module bpu(
 //  训练源拆解
 //==============================================================================
     reg is_branch, is_jump_link, is_jump_link_register, training_target;
+//落点表：taken 的一切跳转都训（条件分支没跳时没有落点可存 ⇒ 不许进来）
     always @(*) begin
         is_branch        = (branch_unit_kind == 2'd1);
         is_jump_link       = (branch_unit_kind == 2'd2);
         is_jump_link_register      = (branch_unit_kind == 2'd3);
-//落点表：taken 的一切跳转都训（条件分支没跳时没有落点可存 ⇒ 不许进来）
         training_target    = (branch_unit_kind != 2'd0) & branch_unit_taken;
     end
 
@@ -545,6 +545,9 @@ module bpu(
         end
     end
 
+//★ 晚一拍：本拍读出来的计数/出口结果，下一拍才落表（写口只有一个，判定侧的出口复位优先）。
+//训练包整体打一拍（lane 选择留在下一拍做）
+//"上一拍被问的地址"，用来判"这是不是新的一次取指"
     always @(posedge clk) begin
         if (!reset_registered) begin
 //局部历史表：按指令自己的地址把真实方向移入（晚一拍更新不改变正确性）。
@@ -588,8 +591,6 @@ module bpu(
                 loop_count_tab_a[count_upd_index] <= {1'b1, count_upd_exit, count_upd_tag, count_upd_value};
                 loop_count_tab_c[count_upd_index] <= {1'b1, count_upd_exit, count_upd_tag, count_upd_value};
             end
-//★ 晚一拍：本拍读出来的计数/出口结果，下一拍才落表（写口只有一个，判定侧的出口复位优先）。
-//训练包整体打一拍（lane 选择留在下一拍做）
             q_valid  <= lane0_count | lane1_count;
             q_count1 <= lane1_count;
             q_index0 <= lindex_0;
@@ -600,7 +601,6 @@ module bpu(
             q_exit1 <= loop_exit_1;
             q_val0   <= lcnt_val_0;
             q_val1  <= lcnt_val_1;
-//"上一拍被问的地址"，用来判"这是不是新的一次取指"
             fetch_pc_prev_0 <= pc_addr_0;
             fetch_pc_prev_1 <= pc_addr_1;
         end

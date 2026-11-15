@@ -51,12 +51,6 @@ module prf #(
     input  [PHYS_BITS-1:0] read_a_m_phys, read_b_m_phys,
 //★ 2026-11-04（CSR 步骤 C）：第 7 个读口 = 提交拍的 CSR 源操作数。地址是 ROB 提交口那级触发器。
     input  [PHYS_BITS-1:0] read_c_phys,
-    output reg [31:0] read_a_0_data, read_b_0_data,
-    output reg [31:0] read_a_1_data, read_b_1_data,
-    output reg [31:0] read_a_m_data, read_b_m_data,
-    output reg [31:0] read_c_data,
-    output reg                load_write,
-    output reg [PHYS_BITS-1:0] load_write_phys,
 
 //---- 分配口：这一拍新分配的物理号 + 它将来走哪个写口（owner 表就靠它写）----
     input                 alloc_write_0, input [PHYS_BITS-1:0] alloc_phys_0, input [2:0] alloc_owner_0,
@@ -80,7 +74,13 @@ module prf #(
     input  [PHYS_BITS-1:0] write_phys_4, input [31:0] write_data_4,
 //---- 写口 5：ALU lane1 早口 ----
     input                 write_en_5, input write_live_5,
-    input  [PHYS_BITS-1:0] write_phys_5, input [31:0] write_data_5
+    input  [PHYS_BITS-1:0] write_phys_5, input [31:0] write_data_5,
+    output reg [31:0] read_a_0_data, read_b_0_data,
+    output reg [31:0] read_a_1_data, read_b_1_data,
+    output reg [31:0] read_a_m_data, read_b_m_data,
+    output reg [31:0] read_c_data,
+    output reg                load_write,
+    output reg [PHYS_BITS-1:0] load_write_phys
     );
 
 //---- owner 编码：必须与 idu.v 里 ALLOC_OWNER_* 一致 ----

@@ -31,17 +31,6 @@ module ahb_apb_bridge(
     input             hmastlock,
     input      [31:0] hwdata,
     input      [3:0]  hwstrb,
-    output reg [31:0] hrdata,
-//标准 AHB-Lite 从设备口。rd_valid 是本仓自己的完成脉冲（非标准），
-//第一期先和 HREADYOUT 并存，等三个主设备都改认 HREADY/HRESP 之后再删。
-    output reg            hreadyout,
-    output reg            hresp,
-    output reg        rd_valid,
-    output reg [31:0] bus_addr_out,
-    output reg [31:0] bus_data_out,
-    output reg [3:0]  bus_be_out,
-    output reg        bus_we_out,
-    output reg [31:0] bus_sel_out,
     input      [31:0] uart_data,
     input             uart_ready,
     input      [31:0] plic_data,
@@ -64,7 +53,18 @@ module ahb_apb_bridge(
 //★ 2026-11-13：DPU（显示引擎）挂 9 号槽（0x2400_0000）。8 号槽是 NPU（直连互联，
 //  不走 APB），所以槽位译码从 1..7 放开到 1..9，中间那格空着不占。
     input      [31:0] dpu_data,
-    input             dpu_ready
+    input             dpu_ready,
+    output reg [31:0] hrdata,
+//标准 AHB-Lite 从设备口。rd_valid 是本仓自己的完成脉冲（非标准），
+//第一期先和 HREADYOUT 并存，等三个主设备都改认 HREADY/HRESP 之后再删。
+    output reg            hreadyout,
+    output reg            hresp,
+    output reg        rd_valid,
+    output reg [31:0] bus_addr_out,
+    output reg [31:0] bus_data_out,
+    output reg [3:0]  bus_be_out,
+    output reg        bus_we_out,
+    output reg [31:0] bus_sel_out
     );
 
     localparam [5:0]

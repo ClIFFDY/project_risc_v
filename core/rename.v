@@ -7,28 +7,19 @@ module rename #(
     parameter integer PHYS_BITS  = 6
 )(
     input clk, rst,
-    input        redir_frontend,     // 前端重定向（rob 判定拍出的那根）
-    input        redir_backend_0, redir_backend_1,  
-    input        irq_kill,           // 中断受理（clint 自己判的）
+    input        redir_frontend, // 前端重定向（rob 判定拍出的那根）
+    input        redir_backend_0, redir_backend_1,
+    input        irq_kill, // 中断受理（clint 自己判的）
 //后端域（清表 / 异常 / 中断）：回滚 rename 与空闲表、挡住本拍落盘与入队，不清输入 lane。
-    input       exec_in,            // 流水线推进使能
-    input       stall_rob_full_in,  // ROB 满
+    input       exec_in, // 流水线推进使能
+    input       stall_rob_full_in, // ROB 满
 //后端域的寄存版（晚一拍）：只给访存 FIFO 清零用。
     input [1:0]  store_pop,
     input [3:0]  store_flush_pop,
-    output reg   credit_stall_out,
-//给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
-//给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
-//★ 2026-11-12 试过寄存一拍再送：rand 0/200、CoreMark 0 字符。
-//  因为 advance 与 iffu 的弹出是【同一拍的 1:1 契约】（我这一拍从你那几格收 N 条，你走 N 格），
-//  晚一拍就重复/漏发。要断这条环得改契约本身，不是插一个寄存器。
-    output reg [3:0] advance,
 input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_data,    output reg        push1_valid, output [132:0] push1_data,    output reg        push2_valid, output [132:0] push2_data,
 //★ 保留站的空位（isq 出口）：站满就把本 lane 的分配门关掉。
     input        station_room_0_valid,
     input        station_room_1_valid,
-//本拍 lane0 装没装：lane1 到底拿出队格的第二格(h1)还是队头(h0)由它定 ⇒ 寄存器堆读口的
-    output reg   lane0_load_o,
 
 //============================== lane0 ==============================
     input [31:0] instruction_in_0,
@@ -42,6 +33,52 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
 //操作数就绪（rob 按冻结生产者槽现算）与发射拍被接收（isq 把"就绪 + FU 空闲"合成这一根）。
     input        ready1_in_0, ready2_in_0,
     input        accept_in_0,
+
+//============================== lane1 ==============================
+    input [31:0] instruction_in_1,
+    input [31:0] address_in_1,
+    input        branch_prediction_in_1,
+    input [31:0] jump_link_register_prediction_in_1,
+    input [4:0]  index_in_1,
+    input        generation_in_1,
+    input        instruction_valid_1,
+//★ 2026-11-09 三宽分配：iffu 的第三格（docs/SPEC_alloc3.md）
+    input [31:0] instruction_in_2,
+    input [31:0] address_in_2,
+    input        branch_prediction_in_2,
+    input [31:0] jump_link_register_prediction_in_2,
+    input [4:0]  index_in_2,
+    input        generation_in_2,
+    input        instruction_valid_2,
+    input        ready1_in_1, ready2_in_1,
+    input        accept_in_1,
+
+//==============================================================================
+// 访存专用流（LSU FIFO）
+    input         lsu_pop_in,
+//---- 提交口（rename 的架构映射定格 / 空闲表回收）----
+    input         write_enable_a_in, write_enable_b_in,
+    input  [4:0]  commit_rd0_in, commit_rd1_in,
+//★ 2026-11-04 真 PRF：提交项的物理号
+    input  [5:0]  commit_phys0_in, commit_phys1_in,
+//★ 2026-11-04 精确冲刷：rat 回滚值（每架构号最老被杀项的 old_phys）+ 幸存在飞项掩码
+    input  [31:0]  squash_arch_hit_in,
+    input  [191:0] squash_arch_phys_in,
+    input  [31:0]  squash_survive_hit_in,
+    input          alloc_stop_in,
+//★ ROB 满：rename 的分配必须和 rob 的分配口【逐字同门】，否则发了号而 ROB 没接 ⇒ 漏号
+    input         rob_full_in,
+//★ 2026-11-09 三宽：ROB 还放得下第 3 条吗（occupancy + 2 < DEPTH）。与 rob 的 alloc_take_2 逐字同门。
+    input         rob_room_2_in,
+    output reg   credit_stall_out,
+//给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
+//给 fifo 的推进量 = 本拍真正装了几条（0/1/2/3/4）。iffu 按自己手上有效条数截断后移动指针。
+//★ 2026-11-12 试过寄存一拍再送：rand 0/200、CoreMark 0 字符。
+//  因为 advance 与 iffu 的弹出是【同一拍的 1:1 契约】（我这一拍从你那几格收 N 条，你走 N 格），
+//  晚一拍就重复/漏发。要断这条环得改契约本身，不是插一个寄存器。
+    output reg [3:0] advance,
+//本拍 lane0 装没装：lane1 到底拿出队格的第二格(h1)还是队头(h0)由它定 ⇒ 寄存器堆读口的
+    output reg   lane0_load_o,
 //给发射级：寄存器里有指令、且这条还没发出去。
     output reg   lane_valid_0,
 //载荷（rd / func10 / imm + 随行号）
@@ -98,25 +135,6 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
     output reg        dec_r2_imm_0,
     output reg [31:0] dec_r1_immv_0,
     output reg [31:0] dec_r2_immv_0,
-
-//============================== lane1 ==============================
-    input [31:0] instruction_in_1,
-    input [31:0] address_in_1,
-    input        branch_prediction_in_1,
-    input [31:0] jump_link_register_prediction_in_1,
-    input [4:0]  index_in_1,
-    input        generation_in_1,
-    input        instruction_valid_1,
-//★ 2026-11-09 三宽分配：iffu 的第三格（docs/SPEC_alloc3.md）
-    input [31:0] instruction_in_2,
-    input [31:0] address_in_2,
-    input        branch_prediction_in_2,
-    input [31:0] jump_link_register_prediction_in_2,
-    input [4:0]  index_in_2,
-    input        generation_in_2,
-    input        instruction_valid_2,
-    input        ready1_in_1, ready2_in_1,
-    input        accept_in_1,
     output reg   lane_valid_1,
     output reg [31:0] instruction_out_1,
     output reg [31:0] auxiliary_address_out_1,
@@ -172,24 +190,6 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
     output reg        dec_r2_imm_1,
     output reg [31:0] dec_r1_immv_1,
     output reg [31:0] dec_r2_immv_1,
-
-//==============================================================================
-// 访存专用流（LSU FIFO）
-    input         lsu_pop_in,
-//---- 提交口（rename 的架构映射定格 / 空闲表回收）----
-    input         write_enable_a_in, write_enable_b_in,
-    input  [4:0]  commit_rd0_in, commit_rd1_in,
-//★ 2026-11-04 真 PRF：提交项的物理号
-    input  [5:0]  commit_phys0_in, commit_phys1_in,
-//★ 2026-11-04 精确冲刷：rat 回滚值（每架构号最老被杀项的 old_phys）+ 幸存在飞项掩码
-    input  [31:0]  squash_arch_hit_in,
-    input  [191:0] squash_arch_phys_in,
-    input  [31:0]  squash_survive_hit_in,
-    input          alloc_stop_in,
-//★ ROB 满：rename 的分配必须和 rob 的分配口【逐字同门】，否则发了号而 ROB 没接 ⇒ 漏号
-    input         rob_full_in,
-//★ 2026-11-09 三宽：ROB 还放得下第 3 条吗（occupancy + 2 < DEPTH）。与 rob 的 alloc_take_2 逐字同门。
-    input         rob_room_2_in,
 //---- 队头（出队侧）----
     output [31:0] lsu_instruction_out, lsu_auxiliary_address_out, lsu_immediate_out,
     output [4:0]  lsu_source_a_out, lsu_source_b_out, lsu_destination_register_out,
@@ -338,8 +338,8 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
 //==============================================================================
 // 访存 FIFO 的队头译码 + 时序
 //★ 2026-11-04 真 PRF：进队条目带的是两个源的【物理号】，在进队这一拍由 rename 查出。
-  wire [4:0] lsu_push_source_a, lsu_push_source_b;
   reg [4:0] push1_source_a, push1_source_b;
+  wire [4:0] lsu_push_source_a, lsu_push_source_b;
 //★ 冲刷：按击杀掩码【截断】尾部，不再整条清（rob 的 flush_partial 恒 0 那一套已经不成立了）。
 
     always @(posedge clk) reset_registered <= rst;
@@ -373,70 +373,76 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
 
   reg  alloc_block;
     (* max_fanout = 32 *) reg [3:0] lsu_queue_count;
-    always @(*) begin
-        exec    = exec_in;
 //★ 2026-11-11：不再吃 isq 的 station_room —— 本地空位就是背压。
 //  三个口各自的"第几条"必须与 dsq 的格数逐条对齐：alloc 一旦成立，ROB 就发槽、
 //  条目就必须真的推得进 dsq。少挡一条 ⇒ 条目被静默丢掉、ROB 那槽永远等不到完成。
 //★ 2026-11-12：dsq 的三条队列各报一根 full，和 ROB 满【或】起来直接背压。
 //  room 只可能是 0/2（见 dsq），所以 lane0/lane1 同门；三宽（lane2）不再开。
-        alloc_block = (dsq_room == 2'd0) | stall_rob_full_in;
-        lane0_free = ~alloc_block;
-        lane1_free = ~alloc_block;
-        lane2_free = 1'b0;
 //★ 2026-11-11：分配门必须与 rob.v 的 alloc_take_* 逐字同门（`~(redir_backend_0 | irq_kill)`）。
 //  rob 那一拍不分配、rename 却把条目推进 dsq ⇒ 条目带着一个没被分配出去的槽号，
 //  下一拍同一槽号被别的指令正经分配 ⇒ ROB 项的 rd/jump 与指令对不上（实测 CoreMark 231 字符处卡死）。
-        go    = exec & ~stall_rob_full_in & ~(irq_kill | redir_backend_0);
-        is_mem_0 = (instruction_in_0[6:0] == OPCODE_LOAD) | (instruction_in_0[6:0] == OPCODE_STORE);
 //三宽分配。
-        h1_is_mem = (instruction_in_1[6:0] == OPCODE_LOAD) | (instruction_in_1[6:0] == OPCODE_STORE);
-        is_mem_2  = (instruction_in_2[6:0] == OPCODE_LOAD) | (instruction_in_2[6:0] == OPCODE_STORE);
-        h1_store  = (instruction_in_1[6:0] == OPCODE_STORE);
-        h2_store  = (instruction_in_2[6:0] == OPCODE_STORE);
 //访存条的字段位置固定（store/load 的 rs1[19:15]、rd[11:7] 同一位置）；store 不读 rs2 的"假源"给 0。
-        h2_rs1 = instruction_in_2[19:15];
-        h2_rs2 = h2_store ? instruction_in_2[24:20] : 5'd0;
-        h2_rd  = h2_store ? 5'd0 : instruction_in_2[11:7];
 //★ 只看本地计数器：不许再依赖 isq 当拍弹不弹（那会把 lsu 的 stage_free 拉进 iffu 的推进锥）
-        lsu_room = 4'd8;
         //★ 2026-11-11：LSU FIFO 已搬到后半段，这里恒给满额；真正的限制是 dsq 空位
 //★ 2026-11-05：改向一经判定，分配冻结到那条分支提交。冻结住 alloc_lane0 就把
 //★ lane0_free（dsq 有空位）对所有类别都必须门：访存条原来只查 lsu_room（拆环后恒 8），
 //  dsq 满的时候照样分配 ⇒ 条目推不进去、ROB 那槽永远等不到完成。
+//★ 2026-11-09：口 1 描述【h1 这条访存】的前提是 alloc_lane0 也成立。
+//冲刷门挂在【落盘】上，不挂在推进上。
+//2 深载荷的下一态判据（组合，只在本级寄存器上）。
+//lane1 这一拍拿的是哪一格：lane0 吃了 h0 且 h1 是访存 ⇒ 顺延到 h2；lane0 没吃 ⇒ 拿 h0 顶。
+//h1 自己是访存 ⇒ 直接进 LSU 口 1（不占 lane1）
+//lane1 拿哪条：h1 非访存拿 h1；h1 是访存就顺延到 h2（且 h2 必须非访存 —— 两条访存挤在同拍就走不动）
+//  ★ h1 是访存时 lane1 这一条是【第三条】，要 lane2_free；其余情形是第二条（或 lane0 没吃时的第一条）。
+//★ 2026-11-11：lane1 只在 lane0 也分配时才成立。
+//  口 0 = lane0 = alu0 阵列、口 1 = lane1 = alu1 阵列，这条对应关系必须硬绑：
+//  PRF 读靠分配期写下的 owner 表选阵列，叉着走（口 1 的号却落在 lane0 执行）
+//  就会"值写进 alu0、读却查 alu1" ⇒ 读到旧值（seed13：x2/x10/x13/x14 全错）。
+//★ 2026-11-09：队列加了第三个写口 ⇒ h2 是访存时不再要求前两条都非访存。
+//★ 2026-11-11：额度（credit）。iffu 按 advance 弹，本模块必须【全收】——
+//  所以判据只能吃寄存器量：尾队占用 / LSU 队列 / ROB 余量 / 两个 bank 的剩余号，
+//  不许有任何一项来自"这一拍收到的指令长什么样"。advance 本身打一拍再送出去。
+//给 fifo 的推进量 = 本拍真正消费了几格（0..3）：指针按它走，不是"成对就 +2"。
+//进队条目：口 0 = h0（最老，源用无旁路的 lookup_a/b），口 1 = h1，口 2 = h2。
+    always @(*) begin
+        exec    = exec_in;
+        alloc_block = (dsq_room == 2'd0) | stall_rob_full_in;
+        lane0_free = ~alloc_block;
+        lane1_free = ~alloc_block;
+        lane2_free = 1'b0;
+        go    = exec & ~stall_rob_full_in & ~(irq_kill | redir_backend_0);
+        is_mem_0 = (instruction_in_0[6:0] == OPCODE_LOAD) | (instruction_in_0[6:0] == OPCODE_STORE);
+        h1_is_mem = (instruction_in_1[6:0] == OPCODE_LOAD) | (instruction_in_1[6:0] == OPCODE_STORE);
+        is_mem_2  = (instruction_in_2[6:0] == OPCODE_LOAD) | (instruction_in_2[6:0] == OPCODE_STORE);
+        h1_store  = (instruction_in_1[6:0] == OPCODE_STORE);
+        h2_store  = (instruction_in_2[6:0] == OPCODE_STORE);
+        h2_rs1 = instruction_in_2[19:15];
+        h2_rs2 = h2_store ? instruction_in_2[24:20] : 5'd0;
+        h2_rd  = h2_store ? 5'd0 : instruction_in_2[11:7];
+        lsu_room = 4'd8;
         alloc_lane0 = go & instruction_valid_0 & ~alloc_stop_in & lane0_free
                     & (is_mem_0 ? (lsu_room != 4'd0) : 1'b1)
                     & ~(bank_empty_0 & (destination_decoded != 5'd0));
-//★ 2026-11-09：口 1 描述【h1 这条访存】的前提是 alloc_lane0 也成立。
         pick_mem = alloc_lane0 & h1_is_mem;
         pick_from_h2 = pick_mem;
 
-//冲刷门挂在【落盘】上，不挂在推进上。
         lane0_store = alloc_lane0 & ~is_mem_0 & ~(irq_kill | redir_frontend | redir_backend_0);
         lsu_push_0  = alloc_lane0 &  is_mem_0 & ~(irq_kill | redir_frontend | redir_backend_0);
-//2 深载荷的下一态判据（组合，只在本级寄存器上）。
         lane0_head_after_pop = (accept_in_0 & payload_valid_out_0) ? skid_valid_0 : payload_valid_out_0;
         lane1_head_after_pop = (accept_in_1 & payload_valid_out_1) ? skid_valid_1 : payload_valid_out_1;
         lane0_push = lane0_store & (address_in_0 != 32'd0);
-//lane1 这一拍拿的是哪一格：lane0 吃了 h0 且 h1 是访存 ⇒ 顺延到 h2；lane0 没吃 ⇒ 拿 h0 顶。
         instruction_pick = alloc_lane0 ? (h1_is_mem ? instruction_in_2 : instruction_in_1)
                                        : instruction_in_0;
         address_pick     = alloc_lane0 ? (h1_is_mem ? address_in_2 : address_in_1) : address_in_0;
         index_pick       = alloc_lane0 ? (h1_is_mem ? index_in_2   : index_in_1)   : index_in_0;
         generation_pick  = alloc_lane0 ? (h1_is_mem ? generation_in_2 : generation_in_1) : generation_in_0;
         is_mem_1 = (instruction_pick[6:0] == OPCODE_LOAD) | (instruction_pick[6:0] == OPCODE_STORE);
-//h1 自己是访存 ⇒ 直接进 LSU 口 1（不占 lane1）
         lsu_push_1  = alloc_lane0 & instruction_valid_1 & h1_is_mem & ~(irq_kill | redir_frontend | redir_backend_0)
                     & (lsu_room >= (lsu_push_0 ? 4'd2 : 4'd1))
                     & lane1_free
                     & ~(bank_empty_1 & ((h1_store ? 5'd0 : instruction_in_1[11:7]) != 5'd0));
-//lane1 拿哪条：h1 非访存拿 h1；h1 是访存就顺延到 h2（且 h2 必须非访存 —— 两条访存挤在同拍就走不动）
-//  ★ h1 是访存时 lane1 这一条是【第三条】，要 lane2_free；其余情形是第二条（或 lane0 没吃时的第一条）。
         pick_bank_empty = pick_mem ? bank_empty_3 : bank_empty_1;
-//★ 2026-11-11：lane1 只在 lane0 也分配时才成立。
-//  口 0 = lane0 = alu0 阵列、口 1 = lane1 = alu1 阵列，这条对应关系必须硬绑：
-//  PRF 读靠分配期写下的 owner 表选阵列，叉着走（口 1 的号却落在 lane0 执行）
-//  就会"值写进 alu0、读却查 alu1" ⇒ 读到旧值（seed13：x2/x10/x13/x14 全错）。
         alloc_lane1 = (LANES == 1) ? 1'b0 :
                       (go & ~alloc_stop_in & alloc_lane0
                        & (h1_is_mem ? (lsu_push_1 & instruction_valid_2 & ~is_mem_1 & rob_room_2_in)
@@ -445,23 +451,17 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
                        & ~(pick_bank_empty & (destination_decoded_1 != 5'd0)));
 
         lane1_store = alloc_lane1 & ~is_mem_1 & ~(irq_kill | redir_frontend | redir_backend_0);
-//★ 2026-11-09：队列加了第三个写口 ⇒ h2 是访存时不再要求前两条都非访存。
         lsu_h1_taken = h1_is_mem ? lsu_push_1 : alloc_lane1;
         lsu_push_2  = alloc_lane0 & lsu_h1_taken & instruction_valid_2 & is_mem_2
                     & ~(irq_kill | redir_frontend | redir_backend_0)
                     & (lsu_room >= ({2'd0, lsu_push_0} + {2'd0, lsu_push_1} + 4'd1))
                     & lane2_free
                     & ~(bank_empty_2 & (h2_rd != 5'd0)) & rob_room_2_in;
-//★ 2026-11-11：额度（credit）。iffu 按 advance 弹，本模块必须【全收】——
-//  所以判据只能吃寄存器量：尾队占用 / LSU 队列 / ROB 余量 / 两个 bank 的剩余号，
-//  不许有任何一项来自"这一拍收到的指令长什么样"。advance 本身打一拍再送出去。
-//给 fifo 的推进量 = 本拍真正消费了几格（0..3）：指针按它走，不是"成对就 +2"。
         grant = 4'd0;
         advance = {1'b0, alloc_lane0}
                 + {1'b0, (alloc_lane0 ? (h1_is_mem ? lsu_push_1 : alloc_lane1) : alloc_lane1)}
                 + {1'b0, (alloc_lane0 & h1_is_mem & alloc_lane1) | lsu_push_2};
         lane0_load_o = alloc_lane0;
-//进队条目：口 0 = h0（最老，源用无旁路的 lookup_a/b），口 1 = h1，口 2 = h2。
         lsu_entry_0 = {phys_rd_0,
                        instruction_in_0[19:15], instruction_in_0[24:20],
                        instruction_in_0, address_in_0, index_in_0, generation_in_0,
@@ -553,6 +553,7 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
     end
 
 //---- 源寄存器号（2026-10-31 从 iffu 搬过来）----
+//★ 2026-11-09 三宽分配：源字段跟【lane1 真正拿到的那一条】走，不跟 h1 走。
     always @(*) begin
         source_a_dec_0 = 5'd0;
         source_b_dec_0 = 5'd0;
@@ -568,7 +569,6 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
         case (instruction_in_0[6:0])
             OPCODE_OP, OPCODE_BRANCH, OPCODE_STORE: source_b_dec_0 = instruction_in_0[24:20];
         endcase
-//★ 2026-11-09 三宽分配：源字段跟【lane1 真正拿到的那一条】走，不跟 h1 走。
         source_a_dec_1 = 5'd0;
         source_b_dec_1 = 5'd0;
         case (instruction_stage1[6:0])
@@ -585,9 +585,9 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
         endcase
     end
 
+//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
     always @(*) begin
         csr_is_access_dec = (instruction_in_0[14:12] != 3'b000) && (instruction_in_0[14:12] != 3'b100);
-//★ "写"的规范口径：CSRRW/CSRRWI 恒写；CSRRS/CSRRC/CSRRSI/CSRRCI 只有源（rs1 或 uimm）非 0 才写。
         csr_wr_dec        = (instruction_in_0[14:12] == 3'b001) | (instruction_in_0[14:12] == 3'b101) |
                             (instruction_in_0[19:15] != 5'd0);
         csr_ro_dec        = (instruction_in_0[31:30] == 2'b11);
@@ -694,6 +694,7 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
         end
     end
 
+//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
     always @(*) begin
         class_decoded      = CLS_ALU;
         write_enable_decoded         = 1'b0;
@@ -784,7 +785,6 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
                         csr_write_enable_decoded = 1'b0;
                     end
                 endcase
-//★ csr 地址【不写也照给】：地址供 csr.v 的读口用，写不写只决定"锁不锁"。
                 csr_address_decoded = (instruction_in_0[14:12] != 3'b000) ? instruction_in_0[31:20] : 12'd0;
             end
             default: ;
@@ -1199,10 +1199,10 @@ input  [1:0]  dsq_room,    output reg        push0_valid, output [132:0] push0_d
             branch_jump_function4_decoded_1 = BJU_JALR;
     end
 
+//★ h1 自己是访存时，口 1 描述的是 h1（不是 pick）；它的跳转/CSR/系统位恒 0。
     always @(*) begin
 //★ 2026-11-09 三宽：口 1 = 第二格（h1：访存走 LSU、非访存走 lane1）；
         alloc_en_1   = (alloc_lane0 ? (h1_is_mem ? lsu_push_1 : alloc_lane1) : alloc_lane1);
-//★ h1 自己是访存时，口 1 描述的是 h1（不是 pick）；它的跳转/CSR/系统位恒 0。
         alloc_rd_1   = pick_mem ? instruction_in_1[11:7] : destination_decoded_1;
         alloc_we_1   = pick_mem ? (~h1_store & (instruction_in_1[11:7] != 5'd0)) : (destination_decoded_1 != 5'd0);
         alloc_jmp_1  = pick_mem ? 1'b0 : jump_decoded_1;

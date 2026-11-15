@@ -22,28 +22,19 @@
 
 module bus_con_top #(
 //DDR_PRESENT=0：下游没有存储器，桥对任何访问直接回 ERROR（AXI 口闭嘴，留着给 MIG）
-    parameter integer DDR_PRESENT = 0
+    parameter integer DDR_PRESENT = 0,
+//BOOT_FROM_CFG=0：系统镜像从数据盘（Q128，pmem_spi）搬 —— 现状，上板能开机的那条
+//BOOT_FROM_CFG=1：从配置盘（Q64，cfg_spi）搬 —— 台子走这条，两条路都留着可用
+    parameter integer BOOT_FROM_CFG = 0
 ) (
     input clk, rst,
+//配置 flash 控制器给出的软复位：和上电复位并列，一起把 CPU / APB 侧压住
+    input soft_reset,
     input      [31:0] bus_addr_f_cpu,
     input      [31:0] bus_data_f_cpu,
     input      [3:0]  bus_be_f_cpu,
     input             bus_we_f_cpu,
     input             bus_valid_f_cpu,
-    output reg        rst_cpu,        // CPU / DMA 域：上电搬运期间一直压着
-    output reg        rst_sys,        // 总线 / STCM / APB 桥 / SPI 域：复位一放开就活
-//---- boot 引擎状态（给 pmem_spi 的 BOOT 寄存器展示）----
-    output reg        boot_done_out,
-    output reg        boot_err_out,
-    output reg [16:0] boot_count_out,
-    output     [31:0] bus_data_b_cpu,
-    output            bus_loaded_out,
-    output            bus_hold_out,
-    output     [31:0] bus_addr_out,
-    output     [31:0] bus_data_out,
-    output     [3:0]  bus_be_out,
-    output            bus_we_out,
-    output     [31:0] bus_sel_out,
     input      [31:0] uart_data,
     input             uart_ready,
     input      [31:0] plic_data,
@@ -69,6 +60,37 @@ module bus_con_top #(
     input             m1_hmastlock,
     input      [31:0] m1_hwdata,
     input      [3:0]  m1_hwstrb,
+    input             err_clear,
+//---- s3：DDR/AXI 主设备口（下游就是 MIG 7 系列的 AXI4 从口）----
+//  ★ 2026-11-12：桥已经挂上（s3，0x8000_0000-0xBFFF_FFFF），MIG 还没进来。
+//    现在这组口在 mcu_top 外面空着：任何访问 DDR 的总线操作都会一直等，
+//    ddr_mem_ready 拉低可以把它挡在 S_WAIT_MEM 里（同样是等）。
+    input             ddr_mem_ready,
+    input             ddr_axi_awready,
+    input             ddr_axi_wready,
+    input      [3:0]  ddr_axi_bid,
+    input      [1:0]  ddr_axi_bresp,
+    input             ddr_axi_bvalid,
+    input             ddr_axi_arready,
+    input      [3:0]  ddr_axi_rid,
+    input      [127:0] ddr_axi_rdata,
+    input      [1:0]  ddr_axi_rresp,
+    input             ddr_axi_rlast,
+    input             ddr_axi_rvalid,
+    output reg        rst_cpu, // CPU / DMA 域：上电搬运期间一直压着
+    output reg        rst_sys, // 总线 / STCM / APB 桥 / SPI 域：复位一放开就活
+//---- boot 引擎状态（给 pmem_spi 的 BOOT 寄存器展示）----
+    output reg        boot_done_out,
+    output reg        boot_err_out,
+    output reg [16:0] boot_count_out,
+    output     [31:0] bus_data_b_cpu,
+    output            bus_loaded_out,
+    output            bus_hold_out,
+    output     [31:0] bus_addr_out,
+    output     [31:0] bus_data_out,
+    output     [3:0]  bus_be_out,
+    output            bus_we_out,
+    output     [31:0] bus_sel_out,
     output     [31:0] m1_hrdata,
     output            m1_hready,
     output            m1_hresp,
@@ -80,12 +102,6 @@ module bus_con_top #(
     output reg            err_write,
     output reg     [1:0]  err_owner,
     output reg     [31:0] err_addr,
-    input             err_clear,
-//---- s3：DDR/AXI 主设备口（下游就是 MIG 7 系列的 AXI4 从口）----
-//  ★ 2026-11-12：桥已经挂上（s3，0x8000_0000-0xBFFF_FFFF），MIG 还没进来。
-//    现在这组口在 mcu_top 外面空着：任何访问 DDR 的总线操作都会一直等，
-//    ddr_mem_ready 拉低可以把它挡在 S_WAIT_MEM 里（同样是等）。
-    input             ddr_mem_ready,
     output     [3:0]  ddr_axi_awid,
     output     [31:0] ddr_axi_awaddr,
     output     [7:0]  ddr_axi_awlen,
@@ -96,15 +112,10 @@ module bus_con_top #(
     output     [2:0]  ddr_axi_awprot,
     output     [3:0]  ddr_axi_awqos,
     output            ddr_axi_awvalid,
-    input             ddr_axi_awready,
     output     [127:0] ddr_axi_wdata,
     output     [15:0] ddr_axi_wstrb,
     output            ddr_axi_wlast,
     output            ddr_axi_wvalid,
-    input             ddr_axi_wready,
-    input      [3:0]  ddr_axi_bid,
-    input      [1:0]  ddr_axi_bresp,
-    input             ddr_axi_bvalid,
     output            ddr_axi_bready,
     output     [3:0]  ddr_axi_arid,
     output     [31:0] ddr_axi_araddr,
@@ -116,16 +127,11 @@ module bus_con_top #(
     output     [2:0]  ddr_axi_arprot,
     output     [3:0]  ddr_axi_arqos,
     output            ddr_axi_arvalid,
-    input             ddr_axi_arready,
-    input      [3:0]  ddr_axi_rid,
-    input      [127:0] ddr_axi_rdata,
-    input      [1:0]  ddr_axi_rresp,
-    input             ddr_axi_rlast,
-    input             ddr_axi_rvalid,
     output            ddr_axi_rready
     );
 
 //---- m0：LSU ----
+    reg         s2_hresp;
     wire [31:0] m0_haddr, m0_hwdata, m0_hrdata;
     wire [1:0]  m0_htrans;
     wire        m0_hwrite, m0_hready, m0_rd_valid, m0_hgrant, m0_hresp, m0_hmastlock;
@@ -162,7 +168,6 @@ module bus_con_top #(
     wire [31:0] s2_haddr, s2_hwdata, s2_hrdata;
     wire [1:0]  s2_htrans;
     wire        s2_hwrite, s2_hreadyout, s2_rd_valid, s2_hsel;
-    reg         s2_hresp;
     always @(*) begin
         s2_hresp = npu_hresp[0];
     end
@@ -242,9 +247,12 @@ module bus_con_top #(
             boot_done_q <= boot_done_q;
     end
 
+//软复位源可能是悬空的（老的台子没接这根线）⇒ 只有确定是高才算复位，别把 z 或进复位树
+    reg soft_reset_safe;
     always @(*) begin
-        rst_sys = rst_stable;
-        rst_cpu = rst_stable | ~boot_done_q;
+        soft_reset_safe = (soft_reset === 1'b1);
+        rst_sys = rst_stable | soft_reset_safe;
+        rst_cpu = rst_stable | ~boot_done_q | soft_reset_safe;
     end
 
 //==============================================================================
@@ -449,19 +457,43 @@ module bus_con_top #(
 //==============================================================================
 //  三之二、boot 搬运引擎：上电把镜像从 SPI flash 搬进 STCM，搬完放开 CPU
 //==============================================================================
-    boot_loader #(
-        .SPI_BASE(32'h1C00_0000),
-        .LOAD_BASE(32'h0000_0000)
-    ) u_boot_loader (
-        .clk(clk),
-        .rst(rst_sys),
-        .haddr(m3_haddr), .htrans(m3_htrans), .hwrite(m3_hwrite), .hsize(m3_hsize),
-        .hburst(m3_hburst), .hprot(m3_hprot), .hmastlock(m3_hmastlock),
-        .hwdata(m3_hwdata), .hwstrb(m3_hwstrb),
-        .hrdata(m3_hrdata), .hready(m3_hready), .hresp(m3_hresp),
-        .hgrant(m3_hgrant), .rd_valid(m3_rd_valid),
-        .boot_done(boot_done_w), .boot_err(boot_err_w), .boot_count(boot_count_w)
-    );
+//★ 系统镜像默认仍然从【数据盘（Q128，pmem_spi）】搬。
+//  BOOT_FROM_CFG=1 时换成 boot_loader_cfg（从配置盘 Q64 的 0x70_0000 搬），
+//  两条各有台子：tb_boot（数据盘）、tb_bootcfg（配置盘）。
+//  上板选哪条由 k7_board_top 的参数决定，默认仍是能开机的那条。
+    generate
+    if (BOOT_FROM_CFG != 0) begin : g_boot_cfg
+        boot_loader_cfg #(
+            .SPI_BASE  (32'h1C02_0000),
+            .IMAGE_BASE(32'h0070_0000),
+            .LOAD_BASE (32'h0000_0000)
+        ) u_boot_loader (
+            .clk(clk),
+            .rst(rst_sys),
+            .haddr(m3_haddr), .htrans(m3_htrans), .hwrite(m3_hwrite), .hsize(m3_hsize),
+            .hburst(m3_hburst), .hprot(m3_hprot), .hmastlock(m3_hmastlock),
+            .hwdata(m3_hwdata), .hwstrb(m3_hwstrb),
+            .hrdata(m3_hrdata), .hready(m3_hready), .hresp(m3_hresp),
+            .hgrant(m3_hgrant), .rd_valid(m3_rd_valid),
+            .boot_done(boot_done_w), .boot_err(boot_err_w), .boot_count(boot_count_w)
+        );
+    end
+    else begin : g_boot_pmem
+        boot_loader #(
+            .SPI_BASE(32'h1C00_0000),
+            .LOAD_BASE(32'h0000_0000)
+        ) u_boot_loader (
+            .clk(clk),
+            .rst(rst_sys),
+            .haddr(m3_haddr), .htrans(m3_htrans), .hwrite(m3_hwrite), .hsize(m3_hsize),
+            .hburst(m3_hburst), .hprot(m3_hprot), .hmastlock(m3_hmastlock),
+            .hwdata(m3_hwdata), .hwstrb(m3_hwstrb),
+            .hrdata(m3_hrdata), .hready(m3_hready), .hresp(m3_hresp),
+            .hgrant(m3_hgrant), .rd_valid(m3_rd_valid),
+            .boot_done(boot_done_w), .boot_err(boot_err_w), .boot_count(boot_count_w)
+        );
+    end
+    endgenerate
 
     always @(*) begin
         boot_done_out = boot_done_q;

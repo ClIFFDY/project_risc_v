@@ -36,8 +36,6 @@ module l2cache(
 //---- I 口 ----
     input             i_req,
     input      [31:0] i_addr,
-    output reg     [31:0] i_data,
-    output reg            i_valid,
 
 //---- D 口 ----
     input             d_req,
@@ -45,20 +43,27 @@ module l2cache(
     input      [31:0] d_addr,
     input      [31:0] d_wdata,
     input      [3:0]  d_be,
-    output reg     [31:0] d_data,
-    output reg            d_valid,
-    output reg            d_ready,
 
 //---- 维护 ----
     input      [1:0]  maint,
-    output reg        maint_done,
-//★ 2026-11-13（fence 排空判据）：4 深写队列里没有排队项 ⇒ 已收下的缓存写全部落到后端了。
-//  只喂 ROB 提交口，不进访存通路（见 docs/SPEC_fence_i_and_cache_range_2026-11-13.txt §2.3）。
-    output reg       write_queue_empty,
 
 //---- 非缓存窗口 ----
     input      [31:0] unc_base,
     input      [31:0] unc_mask,
+    input      [31:0] m_hrdata,
+    input             m_hready,
+    input             m_hgrant,
+    input             m_hresp,
+    input             m_rd_valid,
+    output reg     [31:0] i_data,
+    output reg            i_valid,
+    output reg     [31:0] d_data,
+    output reg            d_valid,
+    output reg            d_ready,
+    output reg        maint_done,
+//★ 2026-11-13（fence 排空判据）：4 深写队列里没有排队项 ⇒ 已收下的缓存写全部落到后端了。
+//  只喂 ROB 提交口，不进访存通路（见 docs/SPEC_fence_i_and_cache_range_2026-11-13.txt §2.3）。
+    output reg       write_queue_empty,
 
 //---- AHB 主口 ----
     output reg [31:0] m_haddr,
@@ -70,11 +75,6 @@ module l2cache(
     output reg        m_hmastlock,
     output reg [31:0] m_hwdata,
     output reg [3:0]  m_hwstrb,
-    input      [31:0] m_hrdata,
-    input             m_hready,
-    input             m_hgrant,
-    input             m_hresp,
-    input             m_rd_valid,
     output reg            m_busy
     );
 
@@ -277,21 +277,21 @@ module l2cache(
     end
 
 //AHB 地址相位
+//HPROT/HMASTLOCK：按 ARM IHI 0033A §3.7 的推荐值 4'b0011；L2 不发锁传输 ⇒ 0。
+//★ 整行发完必须拉 IDLE：地址挂在总线上时从设备每拍都会当成一次新传输接受，
+//  会多读一个相邻字、并让互联的"事务未结束"永远不落。
     always @(*) begin
         m_haddr  = 32'd0;
         m_htrans = HTRANS_IDLE;
         m_hwrite = 1'b0;
         m_hsize  = 3'b010;
         m_hburst = 3'b001;
-//HPROT/HMASTLOCK：按 ARM IHI 0033A §3.7 的推荐值 4'b0011；L2 不发锁传输 ⇒ 0。
         m_hprot  = 4'b0011;
         m_hmastlock = 1'b0;
         m_hwdata = 32'd0;
         m_hwstrb = 4'b0000;
         if (state == S_FILL) begin
             m_haddr  = fill_base + {fill_issue, 2'b00};
-//★ 整行发完必须拉 IDLE：地址挂在总线上时从设备每拍都会当成一次新传输接受，
-//  会多读一个相邻字、并让互联的"事务未结束"永远不落。
             m_htrans = (fill_issue == 6'd0)       ? HTRANS_NOSEQ :
                        (fill_issue >= 6'd32)      ? HTRANS_IDLE  : HTRANS_SEQ;
         end

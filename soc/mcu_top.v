@@ -33,6 +33,9 @@ module mcu_top #(
     parameter integer DC_SETS_B         = 8,    // 16KB（9=32KB / 8=16KB / 7=8KB）；与 cpu_top 默认一致
     parameter integer ITCM_AW           = 14,
     parameter integer ADDER_AT_D        = 0,
+//★ 系统镜像从哪块 flash 搬：0 = 数据盘 Q128（现状），1 = 配置盘 Q64 的 0x70_0000。
+//  两条硬件通路都已验证过（台子 tb_boot / tb_bootcfg），默认保持能开机的那条。
+    parameter integer BOOT_FROM_CFG     = 0,
 //★ 7 号槽 SPI 的分频由这两个频率算出来（见 IO_block/pmem_spi.v 头注释）：
 //  换核时钟只改 CLK_MHZ，SCK 目标频率保持不变。
     parameter integer CLK_MHZ           = 120,
@@ -43,13 +46,21 @@ module mcu_top #(
 ) (
     input clk, rst,
     input  spi_miso,
+//---- 配置 flash（Q64）那组专用脚：只做直通，引脚约束在顶层 ----
+    input  cfg_miso,
 //---- SPI 主机（7 号槽）：接板上的 SPI NOR flash，直出、不经 gpio ----
     output spi_cs_n,
     output spi_cs_sd,
     output spi_sck,
     output spi_mosi,
+    output cfg_cs_n,
+    output cfg_sck,
+    output cfg_mosi,
     inout wire [31:0] gpio_pin_bus
     );
+
+//配置 flash 控制器的软复位：不出顶层，直接进 bus_con_top 的复位或树
+    wire cfg_reset_w;
 
 //L2 维护与"非缓存窗口"（走总线的 DMA 缓冲区用）。
 //★ 现在没有任何软件通路去写它们：maint 恒 0（不失效），非缓存窗口设成永不命中。
@@ -124,10 +135,12 @@ module mcu_top #(
     );
 
     bus_con_top #(
-        .DDR_PRESENT(DDR_PRESENT)
+        .DDR_PRESENT(DDR_PRESENT),
+        .BOOT_FROM_CFG(BOOT_FROM_CFG)
     ) u_bus_con (
         .clk(clk),
         .rst(rst),
+        .soft_reset(cfg_reset_w),
         .bus_addr_f_cpu(bus_addr_f_cpu),
         .bus_data_f_cpu(bus_data_f_cpu),
         .bus_be_f_cpu(bus_be_f_cpu),
@@ -212,6 +225,11 @@ module mcu_top #(
         .spi_sck(spi_sck),
         .spi_mosi(spi_mosi),
         .spi_miso(spi_miso),
+        .cfg_miso(cfg_miso),
+        .cfg_cs_n(cfg_cs_n),
+        .cfg_sck(cfg_sck),
+        .cfg_mosi(cfg_mosi),
+        .cfg_reset_out(cfg_reset_w),
         .boot_done(boot_done_w),
         .boot_err(boot_err_w),
         .boot_count(boot_count_w),

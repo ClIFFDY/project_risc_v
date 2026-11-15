@@ -24,7 +24,6 @@ module plic(
     input clk,
     input rst,
     input [31:0] irq_sources,
-    output reg exti,
     //
     input [31:0] bus_addr_in,
     input [31:0] bus_data_in,
@@ -35,8 +34,6 @@ module plic(
     input bus_sel,
     input [3:0] bus_be_in,
     input bus_we_in,
-    output reg [31:0] bus_data_out,
-    output reg ld_ready,
 //---- 总线错误日志（厂商扩展，不是 PLIC 标准寄存器）----
 //  实体在 soc/bus_con_top.v（它才看得见各主设备的 hresp），这里只负责
 //  把这四个量摆到 0x0900_0000 窗口上，并给出"写 1 清"的清除脉冲。
@@ -44,6 +41,9 @@ module plic(
     input             err_write,
     input      [1:0]  err_owner,
     input      [31:0] err_addr,
+    output reg exti,
+    output reg [31:0] bus_data_out,
+    output reg ld_ready,
     output reg        err_clear
     );
 
@@ -85,6 +85,8 @@ module plic(
             exti <= irq_valid;
     end
 
+                        // 越界 id：应答 0，不挂死
+                        // 子区 4 的其余偏移：应答 0
     always @(posedge clk) begin
         if (rst) begin
             pending <= 31'd0;
@@ -150,7 +152,6 @@ module plic(
                     end
                     else if (!bus_we_in) begin
                         bus_data_out <= 32'd0;
-                        // 越界 id：应答 0，不挂死
                         ld_ready <= 1'b1;
                     end
                 end
@@ -183,7 +184,6 @@ module plic(
                     end
                     else if (!bus_we_in) begin
                         bus_data_out <= 32'd0;
-                        // 子区 4 的其余偏移：应答 0
                         ld_ready <= 1'b1;
                     end
                 end

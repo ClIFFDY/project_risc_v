@@ -31,14 +31,17 @@ module tile_controller(
     input [`NPU_DIM_W-1:0]  cfg_m, cfg_n, cfg_k,
     input [`NPU_TK_W-1:0]   cfg_tk,
     input [`NPU_QS_W-1:0]   cfg_qshift,
+    // 预取 FIFO 接口
+    input [31:0] a_fifo_rdata, bt_fifo_rdata,
+    input [`NPU_FIFO_AW:0] a_fifo_count, bt_fifo_count,
+    input [`NPU_PE_NUM*`NPU_ACC_W-1:0] acc_flat_in,
+    input        drain_done,
+    input        cwr_ready, cwr_empty, c_wr_pulse,
     // A/BT RAM 读请求（npu_buffer 内部同步读，数据下一次返回）
     output reg [`NPU_ABUF_AW-1:0] a_addr,
     output reg   a_re,
     output reg [`NPU_BBUF_AW-1:0] bt_addr,
     output reg   bt_re,
-    // 预取 FIFO 接口
-    input [31:0] a_fifo_rdata, bt_fifo_rdata,
-    input [`NPU_FIFO_AW:0] a_fifo_count, bt_fifo_count,
     output reg   fifo_pair_pop,
     // 到 npu_mac
     output reg   acc_clear,
@@ -47,13 +50,10 @@ module tile_controller(
     output reg   stream_valid,
     output reg [31:0] a_stream_data, bt_stream_data,
     output reg [3:0]  a_lane_en, bt_lane_en,
-    input [`NPU_PE_NUM*`NPU_ACC_W-1:0] acc_flat_in,
-    input        drain_done,
     // C 写回（到 npu_buffer.c_write_fifo）
     output reg   cwr_valid,
     output reg [`NPU_CBUF_AW-1:0] cwr_addr,
     output reg [31:0] cwr_data,
-    input        cwr_ready, cwr_empty, c_wr_pulse,
     // 状态（到 npu_top / systolic_fsm）
     output reg   core_busy,
     output reg   core_done
@@ -275,13 +275,15 @@ module tile_controller(
         end
     end
 
+        // 预取突发：第一个 tile 由 pf_start 启动（前面没有排空可遮），之后每个 tile
+        // 由 pf_next 在**上一块的排空期间**启动，基址用上面预测的下一块值。
+        // 边界 Tile：valid_tm 行 / valid_tn 列以内的 lane 才有效，
+        // 越界 lane 在 npu_mac 侧被补零，越界的 C 元素不会被写回。
     always @(*) begin
         // 成对送数：两个 FIFO 都非空才出队
         pair_fire     = feed_go && (a_fifo_count != 0) && (bt_fifo_count != 0);
         fifo_pair_pop = pair_fire;
 
-        // 预取突发：第一个 tile 由 pf_start 启动（前面没有排空可遮），之后每个 tile
-        // 由 pf_next 在**上一块的排空期间**启动，基址用上面预测的下一块值。
         stream_start = pf_start || pf_next;
         a_pf_base    = pf_next ? a_base_next  : a_base;
         bt_pf_base   = pf_next ? bt_base_next : bt_base;
@@ -305,8 +307,6 @@ module tile_controller(
         cwr_data       = cwr_data_w;
         core_done      = core_done_w;
 
-        // 边界 Tile：valid_tm 行 / valid_tn 列以内的 lane 才有效，
-        // 越界 lane 在 npu_mac 侧被补零，越界的 C 元素不会被写回。
         a_lane_en  = {4{1'b0}};
         bt_lane_en = {4{1'b0}};
         for (b = 0; b < `NPU_P; b = b + 1)

@@ -161,6 +161,8 @@ module alu(
         alu_source_b = op_bypass_load_b ? load_data_forward : op_r2;
     end
 
+//组合出口：就是驱动 result 寄存器的那个值，不加逻辑（给"同 lane 背靠背"用）
+//前送口：冲刷由操作数级保持接住，这里不再需要 mux
     always @(*) begin
         if (op_write_enable && op_cs_wr) begin
             write_enable_next = op_write_enable;
@@ -192,9 +194,7 @@ module alu(
             result_next       = 32'd0;
             write_enable_next = 1'b0;
         end
-//组合出口：就是驱动 result 寄存器的那个值，不加逻辑（给"同 lane 背靠背"用）
         result_now = result_next;
-//前送口：冲刷由操作数级保持接住，这里不再需要 mux
         result_early       = result_next;
         write_enable_early = op_write_enable;
         index_early        = op_index;

@@ -52,6 +52,7 @@ module spi #(
     input [31:0] bus_data_in,
     input [3:0]  bus_be_in,
     input        bus_we_in,
+    input       spi_miso,
     output reg [31:0] bus_data_out,
     output reg        ld_ready,
 
@@ -59,7 +60,6 @@ module spi #(
     output reg  spi_cs_n,
     output reg      spi_sck,
     output reg      spi_mosi,
-    input       spi_miso,
 
     output reg  spi_irq
     );

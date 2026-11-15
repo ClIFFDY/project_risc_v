@@ -17,23 +17,20 @@
 //     UART 用的就是 J1-1（AD21，bit0 = TX）与 J1-2（AB21，bit1 = RX）。
 //////////////////////////////////////////////////////////////////////////////////
 
-module k7_board_top(
+module k7_board_top #(
+//★ 系统镜像从哪块 flash 搬：0 = 数据盘 Q128（现状，上板在用的那条），
+//  1 = 配置盘 Q64 的 0x70_0000。切 1 之前必须先把镜像烧进 Q64，否则不开机。
+    parameter integer BOOT_FROM_CFG = 0
+)(
     input  sys_clk_p,
     input  sys_clk_n,
+//---- 板载配置 flash（25Q064A）的专用配置脚 ----
+//   CS/DI/DO 是普通 IO，走约束；CLK 是 CCLK_0 专用脚，必须从 STARTUPE2 出，
+//   所以没有 cfg_sck 这个顶层端口。
+    input  cfg_miso,
+    output cfg_cs_n,
+    output cfg_mosi,
     inout  wire [14:0] j1
-    );
-
-//--------------------------------------------------------------- 时钟
-    wire clk_50;
-    wire [31:0] gpio_bus;
-
-    IBUFDS #(
-        .DIFF_TERM   ("TRUE"),
-        .IOSTANDARD  ("LVDS_25")
-    ) u_sys_clk_ibuf (
-        .I  (sys_clk_p),
-        .IB (sys_clk_n),
-        .O  (clk_50)
     );
 
 //--------------------------------------------------------------- 上电复位
@@ -45,6 +42,20 @@ module k7_board_top(
     reg [15:0] power_on_count = 16'd0;
     reg [1:0]  power_on_state = 2'd0;
     reg        rst_por        = 1'b1;
+//--------------------------------------------------------------- 时钟
+    wire clk_50;
+    wire [31:0] gpio_bus;
+    wire cfg_sck_int;
+
+    IBUFDS #(
+        .DIFF_TERM   ("TRUE"),
+        .IOSTANDARD  ("LVDS_25")
+    ) u_sys_clk_ibuf (
+        .I  (sys_clk_p),
+        .IB (sys_clk_n),
+        .O  (clk_50)
+    );
+
 
     always @(posedge clk_50) begin
         case (power_on_state)
@@ -101,11 +112,42 @@ module k7_board_top(
 // ★ 2026-11-13：板子不挂 PLL，IBUFDS 出来的就是 50 MHz ⇒ 核时钟参数必须是 50。
 //   这个参数是 UART 波特率 / I2C SCL / SPI 分频的唯一来源，漏掉它会全偏 2.4 倍
 //   （mcu_top 的默认值是 120）。
-        .CLK_MHZ(50)
+        .CLK_MHZ(50),
+        .BOOT_FROM_CFG(BOOT_FROM_CFG)
     ) u_mcu (
         .clk           (clk_50),
         .rst           (rst_por),
+        .cfg_miso      (cfg_miso),
+        .cfg_cs_n      (cfg_cs_n),
+        .cfg_sck       (cfg_sck_int),
+        .cfg_mosi      (cfg_mosi),
         .gpio_pin_bus  (gpio_bus)
     );
+
+//--------------------------------------------------------------- 配置 flash 的时钟脚
+//CCLK_0 是专用配置脚，普通 ODDR/OBUF 驱动不了，只能从 STARTUPE2 的 USRCCLKO 出去。
+//  KEYCLEARB 拉高、USRCCLKTS 拉低 = 把 CCLK 的控制权彻底交给用户逻辑。
+//仿真里没有这个原语，用 SYNTHESIS 包起来；cfg_sck_int 在仿真里就悬着，不影响功能。
+`ifdef SYNTHESIS
+    STARTUPE2 #(
+        .PROG_USR     ("FALSE"),
+        .SIM_CCLK_FREQ(0.0)
+    ) u_startup (
+        .CFGCLK    (),
+        .CFGMCLK   (),
+        .EOS       (),
+        .PREQ      (),
+        .CLK       (1'b0),
+        .GSR       (1'b0),
+        .GTS       (1'b0),
+        .KEYCLEARB (1'b1),
+        .PACK      (1'b0),
+        .USRCCLKO  (cfg_sck_int),
+        .USRCCLKI  (1'b0),
+        .USRCCLKTS (1'b0),
+        .USRDONEO  (1'b1),
+        .USRDONETS (1'b1)
+    );
+`endif
 
 endmodule

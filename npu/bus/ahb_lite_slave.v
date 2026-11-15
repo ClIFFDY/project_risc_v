@@ -67,20 +67,9 @@ module ahb_lite_slave #(
     input       [2:0]  HSIZE,
     input       [31:0] HWDATA,
     input              HREADY_in,
-    output reg  [31:0] HRDATA,
-    output reg         HREADYOUT,
-    output reg  [1:0]  HRESP,
-    // ★ 本仓互联约定的完成脉冲：读数据有效的这一拍为 1（与 stcm/ahb_apb_bridge 同口径）
-    output reg             rd_valid,      // 连续赋值（本仓互联约定的读完成脉冲）
     // ---- NPU 运行状态 ----
     input              core_busy,
-    input              core_bank,      // 核正在读的那一组 A/BT
-    // ---- 下游原生请求(定义与旧 mmio_if 输出一致) ----
-    output reg  [31:0] req_addr,
-    output reg  [31:0] req_wdata,
-    output reg  [3:0]  req_byte_en,
-    output reg         req_we,
-    output reg         req_valid,
+    input              core_bank, // 核正在读的那一组 A/BT
     // ---- 来自 npu_top 的译码与读数据 ----
     input              sel_ctrl,
     input              sel_status,
@@ -91,7 +80,18 @@ module ahb_lite_slave #(
     input              sel_wgt_cfg,
     input       [31:0] control_rdata,
     input       [31:0] status_rdata,
-    input       [31:0] buffer_rdata
+    input       [31:0] buffer_rdata,
+    output reg  [31:0] HRDATA,
+    output reg         HREADYOUT,
+    output reg  [1:0]  HRESP,
+    // ★ 本仓互联约定的完成脉冲：读数据有效的这一拍为 1（与 stcm/ahb_apb_bridge 同口径）
+    output reg             rd_valid, // 连续赋值（本仓互联约定的读完成脉冲）
+    // ---- 下游原生请求(定义与旧 mmio_if 输出一致) ----
+    output reg  [31:0] req_addr,
+    output reg  [31:0] req_wdata,
+    output reg  [3:0]  req_byte_en,
+    output reg         req_we,
+    output reg         req_valid
 );
 
     // HTRANS 与 HRESP 的协议编码(ARM AHB-Lite)。HTRANS_IDLE/HTRANS_BUSY 都不算
@@ -138,26 +138,14 @@ module ahb_lite_slave #(
     reg        err_now;     // 本笔访问需要回 ERROR
     reg        idle_bank_wr; // 本笔是往另一组 A/BT 预装（忙时也放行）
 
-    always @(*) begin
-        addr_off  = HADDR - ADDR_BASE;
-        bus_phase = HSEL && ((HTRANS == HTRANS_NONSEQ) || (HTRANS == HTRANS_SEQ))
-                    && HREADY_in;
         // 接受下一笔地址的条件：本拍自己的传输已经完成(HREADYOUT=1)且总线上是
         // 有效地址阶段。S_IDLE 下没有在途传输，同样成立。漏掉"完成拍就地锁存"
         // 会让背靠背访问只执行第 1、3、5… 笔，这是自己写 AHB 从机最常见的错。
-        cap_now   = bus_phase && HREADYOUT;
-
         // ★ 双缓冲：忙的时候【仍然允许】往核没在读的那一组 A/BT 写（预装下一块）。
         //   核正在读的那一组、以及 C，忙时一律 ERROR —— 这是数据一致性的最后一道防线。
-        is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf || sel_wgt;
-        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || is_buf;
-        idle_bank_wr = write_q && (sel_a_buf || sel_bt_buf) && (addr_q[11] != core_bank);
-        err_now = !mapped || !size_ok_q || (core_busy && is_buf && !idle_bank_wr);
-
         // ---- 下游原生请求 ----
         // Only legal DATA transactions may reach the core. An ERROR response
         // must suppress register, RAM, and CTRL.START side effects.
-        req_addr    = addr_q;
 //★ 2026-11-13：写数据用【地址拍锁存下来的】wdata_q，不再直接用当拍的 HWDATA。
 //  理由：ARM AHB 规定写数据比地址晚一拍，可本 SoC 里 LSU 主口、DMA 主口、
 //  STCM 从口全都是"地址与数据同拍"的约定（lsu_ahb_master.v:84/99、
@@ -165,17 +153,29 @@ module ahb_lite_slave #(
 //  两种约定看到的是同一个值，所以一直没暴露；而 DMA 是流水地每拍换数据，
 //  用当拍 HWDATA 就会让第 k 个地址拿到第 k+1 拍的数据（实测 NPU[3] 收到 0）。
 //  在地址拍锁存之后，本模块和其余模块对齐；CPU 那条路径行为逐拍不变。
+        // An ERROR response must never issue a register write, RAM access or START.
+        // ---- AHB 应答 ----
+        // HREADYOUT=0 只在两种场合：Buffer 读等同步 RAM 数据、错误响应的第 1 拍。
+        // 空闲(S_IDLE)必须是 1，否则总线上永远不出现有效地址阶段。
+    always @(*) begin
+        addr_off  = HADDR - ADDR_BASE;
+        bus_phase = HSEL && ((HTRANS == HTRANS_NONSEQ) || (HTRANS == HTRANS_SEQ))
+                    && HREADY_in;
+        cap_now   = bus_phase && HREADYOUT;
+
+        is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf || sel_wgt;
+        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || is_buf;
+        idle_bank_wr = write_q && (sel_a_buf || sel_bt_buf) && (addr_q[11] != core_bank);
+        err_now = !mapped || !size_ok_q || (core_busy && is_buf && !idle_bank_wr);
+
+        req_addr    = addr_q;
         req_wdata   = wdata_q;
         req_we      = write_q;
         req_byte_en = write_q ? 4'hF : 4'h0;
-        // An ERROR response must never issue a register write, RAM access or START.
         req_valid   = (state == S_DATA) && !err_now;
 
-        // ---- AHB 应答 ----
         HRDATA    = sel_ctrl   ? control_rdata :
                     sel_status ? status_rdata  : buffer_rdata;
-        // HREADYOUT=0 只在两种场合：Buffer 读等同步 RAM 数据、错误响应的第 1 拍。
-        // 空闲(S_IDLE)必须是 1，否则总线上永远不出现有效地址阶段。
         HREADYOUT = ((state == S_DATA) && (err_now || (is_buf && !write_q))) ? 1'b0 :
                     (state == S_ERR1) ? 1'b0 : 1'b1;
         HRESP     = ((state == S_ERR1) || (state == S_ERR2)) ? HRESP_ERROR : HRESP_OKAY;

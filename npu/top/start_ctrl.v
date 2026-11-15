@@ -81,6 +81,7 @@ module start_ctrl(
         error_status = (state == ST_ERROR);
     end
 
+                // ST_DONE 也接受新任务：启动即进入 ST_RUN，DONE 随之清除。
     always @(posedge clk) begin
         if (rst) begin
             state        <= ST_IDLE;
@@ -95,7 +96,6 @@ module start_ctrl(
         else begin
             start_pulse <= 1'b0;
             case (state)
-                // ST_DONE 也接受新任务：启动即进入 ST_RUN，DONE 随之清除。
                 ST_IDLE, ST_DONE: begin
                     if (start_req) begin
                         if (cfg_ok) begin

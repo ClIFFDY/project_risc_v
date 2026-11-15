@@ -31,7 +31,6 @@ module uart_top #(
 ) (
     input clk, rst,
     input rx,
-    output tx,
     input [31:0] bus_addr_in,
     input [31:0] bus_data_in,
     input [3:0] bus_be_in,
@@ -42,6 +41,7 @@ module uart_top #(
     //   会一直成立。RX 弹出就是被这个反复触发的。这里把选择线单独引进来，
     //   读副作用只在被选中的那一拍（或一笔事务的第一拍）发生。
     input bus_sel,
+    output tx,
     output reg [31:0] bus_data_out,
     output reg ld_ready,
     output reg rx_irq
@@ -96,28 +96,36 @@ module uart_top #(
   reg  tx_en, rx_read, tx_busy, rx_cont;
   wire  rx_done, busy;
 
-  reg [7:0] rx_buf [0:31];
+//★ 2026-11-15：RX 环 32 → 256 格。
+//  原因：IDE 的二进制帧一帧动辄几十上百字节，32 格（可用 31）连一个 INFO 请求
+//  都勉强，WRITE 更是一帧都收不全 —— 核是按 10 ms 节拍轮询的，1 Mbps 下 10 ms
+//  就是 100 个字节，31 格根本兜不住。
+//  256 格 ⇒ 一帧总长封顶 252 字节（留 4 格给"任务还没醒"的窗口）。
+//  TX 环不动：往外发的节奏是设备自己排的，没有这个问题。
+  reg [7:0] rx_buf [0:255];
   reg [7:0] tx_buf [0:31];
-  reg [4:0] wr_ptr_rx, rd_ptr_rx, wr_ptr_tx, rd_ptr_tx;
+  reg [7:0] wr_ptr_rx, rd_ptr_rx;
+  reg [4:0] wr_ptr_tx, rd_ptr_tx;
     integer i;
     initial begin
-        for (i = 0; i < 32; i = i + 1) begin
+        for (i = 0; i < 256; i = i + 1)
             rx_buf[i] = 8'b0;
+        for (i = 0; i < 32; i = i + 1)
             tx_buf[i] = 8'b0;
-        end
     end
 
     always @(posedge clk) begin
         if (rst) begin
-            wr_ptr_rx <= 5'd1;
-            rd_ptr_rx <= 5'd0;
+            wr_ptr_rx <= 8'd1;
+            rd_ptr_rx <= 8'd0;
             wr_ptr_tx <= 5'd1;
             rd_ptr_tx <= 5'd0;
             rx_irq <= 1'd0;
-            for (i = 0; i < 32; i = i + 1) begin
-                rx_buf[i] = 8'b0;
+            for (i = 0; i < 32; i = i + 1)
                 tx_buf[i] = 8'b0;
-            end
+            //★ rx_buf 在复位里【不清】：指针已经复位，旧数据永远读不到。
+            //  清一遍是 2048 位同步复位，会把整块从 LUTRAM（32 个 LUT6）变成
+            //  2048 个触发器 —— 为了一个没人读的状态付这个价不值。
         end
         else begin
             rx_irq <= 1'd0;

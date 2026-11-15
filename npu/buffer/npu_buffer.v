@@ -12,14 +12,14 @@ module npu_buffer(
     input        clk,
     input        rst,
     input        core_busy,
-    input        core_bank,          // 核正在读的那一组 A/BT（双缓冲）
+    input        core_bank, // 核正在读的那一组 A/BT（双缓冲）
     // 权重块（16KB）：WGT_EN=1 时 A 侧读的是它，地址 = WGT_BASE + a_addr
     input        cpu_wgt_we,
     input [`NPU_WGT_AW-1:0] cpu_wgt_addr,
     input [31:0] cpu_wgt_wdata,
     input [`NPU_WGT_AW-1:0] wgt_base,
     input        wgt_en,
-    input        accumulate,        // 跨任务累加：C 写回做读-改-写
+    input        accumulate, // 跨任务累加：C 写回做读-改-写
     // CPU 侧端口(来自 npu_top.buffer_access_ctrl)
     input        cpu_a_we,  cpu_a_re,
     input [`NPU_ABUF_REG_AW-1:0] cpu_a_addr,
@@ -35,18 +35,18 @@ module npu_buffer(
     input        npu_a_re,
     input [`NPU_BBUF_AW-1:0] npu_bt_addr,
     input        npu_bt_re,
+    input        fifo_pair_pop,
+    // C 写回(来自 tile_controller.c_tile_write_ctrl)
+    input        cwr_valid,
+    input [`NPU_CBUF_AW-1:0] cwr_addr,
+    input [31:0] cwr_data,
     // CPU 读数据返回
     output reg [31:0] a_rdata_cpu, bt_rdata_cpu, c_rdata_cpu,
     // 预取 FIFO 接口(到 tile_controller)
     output reg [31:0] a_fifo_rdata,
     output reg [`NPU_FIFO_AW:0] a_fifo_count,
-    input        fifo_pair_pop,
     output reg [31:0] bt_fifo_rdata,
     output reg [`NPU_FIFO_AW:0] bt_fifo_count,
-    // C 写回(来自 tile_controller.c_tile_write_ctrl)
-    input        cwr_valid,
-    input [`NPU_CBUF_AW-1:0] cwr_addr,
-    input [31:0] cwr_data,
     output reg        cwr_ready, cwr_empty, c_wr_pulse
 );
 

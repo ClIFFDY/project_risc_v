@@ -68,13 +68,13 @@ module a_bt_skew_pipeline(
         end
     end
 
+        // lane 0 旁路，lane l 取自己的第 l 级。
     always @(*) begin
         a_out       = {`NPU_P*8{1'b0}};
         a_out_valid = {`NPU_P{1'b0}};
         bt_out       = {`NPU_Q*8{1'b0}};
         bt_out_valid = {`NPU_Q{1'b0}};
 
-        // lane 0 旁路，lane l 取自己的第 l 级。
         a_out[7:0]       = a_in[7:0];
         a_out_valid[0]   = a_in_valid;
         bt_out[7:0]      = bt_in[7:0];

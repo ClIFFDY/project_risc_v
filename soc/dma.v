@@ -43,6 +43,11 @@ module dma(
     input      [31:0] reg_wdata,
     input             reg_we,
     input             reg_re,
+    input      [31:0] m_hrdata,
+    input             m_hready,
+    input             m_hgrant,
+    input             m_hresp,
+    input             m_rd_valid,
     output reg [31:0] reg_rdata,
 
 //---- 中断 ----
@@ -58,11 +63,6 @@ module dma(
     output reg        m_hmastlock,
     output reg [31:0] m_hwdata,
     output reg [3:0]  m_hwstrb,
-    input      [31:0] m_hrdata,
-    input             m_hready,
-    input             m_hgrant,
-    input             m_hresp,
-    input             m_rd_valid,
     output reg            m_busy
     );
 
@@ -167,23 +167,23 @@ module dma(
         chunk_now = (words_left > burst_now) ? burst_now : words_left;
     end
 
+        // INCR
+//HPROT/HMASTLOCK：按 ARM IHI 0033A §3.7 的推荐值 4'b0011；DMA 不发锁传输 ⇒ 0。
+//★ 本块发完就必须把 HTRANS 拉成 IDLE：地址还挂在总线上时，从设备每拍都会把它
+//  当成一次新传输接受（踩过：整块发完后连续多拍重复读同一个地址，读数据
+//  被冲成 0/1 交替，块长直接算错）。
     always @(*) begin
         m_haddr  = 32'd0;
         m_htrans = HTRANS_IDLE;
         m_hwrite = 1'b0;
         m_hsize  = 3'b010;
         m_hburst = 3'b001;
-        // INCR
-//HPROT/HMASTLOCK：按 ARM IHI 0033A §3.7 的推荐值 4'b0011；DMA 不发锁传输 ⇒ 0。
         m_hprot  = 4'b0011;
         m_hmastlock = 1'b0;
         m_hwdata = 32'd0;
         m_hwstrb = 4'b0000;
         if (state == S_RD) begin
             m_haddr  = src_addr + {issue_cnt, 2'b00};
-//★ 本块发完就必须把 HTRANS 拉成 IDLE：地址还挂在总线上时，从设备每拍都会把它
-//  当成一次新传输接受（踩过：整块发完后连续多拍重复读同一个地址，读数据
-//  被冲成 0/1 交替，块长直接算错）。
             m_htrans = (issue_cnt == 5'd0)        ? HTRANS_NOSEQ :
                        (issue_cnt >= chunk_now)   ? HTRANS_IDLE  : HTRANS_SEQ;
         end
@@ -206,6 +206,10 @@ module dma(
     end
 
 
+                    // busy
+                // busy 清
+                // done
+                // 清 start
     always @(posedge clk) begin
         if (reset_registered) begin
             state     <= S_IDLE;
@@ -246,7 +250,6 @@ module dma(
                     recv_cnt  <= 5'd0;
                     wr_cnt    <= 5'd0;
                     ch_stat[pick][0] <= 1'b1;
-                    // busy
                     state     <= S_RD;
                 end
             end
@@ -291,11 +294,8 @@ module dma(
             S_FIN: begin
                 m_busy <= 1'b0;
                 ch_stat[act][0] <= 1'b0;
-                // busy 清
                 ch_stat[act][1] <= 1'b1;
-                // done
                 ch_ctrl[act][0] <= 1'b0;
-                // 清 start
                 state <= S_IDLE;
             end
             default: state <= S_IDLE;

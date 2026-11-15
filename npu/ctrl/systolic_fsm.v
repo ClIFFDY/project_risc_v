@@ -84,21 +84,23 @@ module systolic_fsm(
         is_beat_done = (state == S_FEED) && feed_beat_done;
     end
 
-    always @(*) begin
-        core_busy    = (state != S_IDLE);
-        fsm_done     = (state == S_DONE);
         // drain_en 由状态组合给出：寄存输出会晚一拍，实测每块 tile 多等 1 拍。
-        drain_en     = (state == S_DRAIN);
-        array_enable = feed_go || drain_en;
         // next_k_req 必须是组合脉冲（完成当拍推进 tile_k 计数器），不能改成寄存：
         // K Tile 背靠背喂数时（例如 TK=1，每拍喂完一个 K Tile），寄存脉冲会让
         // tile_k 晚一拍更新，于是本模块在下一拍读到的 last_k_tile 还是旧值，
         // 最后一个 K Tile 会被漏判、tile_k 冲过边界后卡在 S_FEED。
         // 旧实现每个 K Tile 都回 S_PREFETCH 绕一圈，正好把这一拍让给计数器，
         // 所以当时用寄存脉冲看不出问题。
+    always @(*) begin
+        core_busy    = (state != S_IDLE);
+        fsm_done     = (state == S_DONE);
+        drain_en     = (state == S_DRAIN);
+        array_enable = feed_go || drain_en;
         next_k_req   = is_beat_done && !last_k_tile;
     end
 
+                    // 任务开始时必须清一次累加器：合并掉 S_CLEAR_ACC 之后，第一个
+                    // 输出 Tile 前面没有排空，不在这里清就会带上一个任务的残留值。
     always @(posedge clk) begin
         if (rst) begin
             state         <= S_IDLE;
@@ -131,8 +133,6 @@ module systolic_fsm(
                     sched_init <= 1'b1;
                     feed_cnt   <= 6'd0;
                     pf_done_q  <= 1'b0;
-                    // 任务开始时必须清一次累加器：合并掉 S_CLEAR_ACC 之后，第一个
-                    // 输出 Tile 前面没有排空，不在这里清就会带上一个任务的残留值。
                     acc_clear  <= 1'b1;
                     state      <= S_PREFETCH;
                 end

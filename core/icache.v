@@ -243,6 +243,7 @@ module icache(
         mem_byte_enable = 4'd0;
     end
 //第 0R 级：tag 阵列 Q 端打一拍。这一刀切在【阵列读之后、比较之前】。
+//★ 2026-11-11 取指回 2 宽：块 = 8B。[1] 选 16B 行的哪一半，[0] 是块内偏移（交给 iffu）。
     always @(posedge clk) begin
         if (reset_registered) begin
             fetch_tag_registered_0 <= 0;
@@ -271,7 +272,6 @@ module icache(
             way2_tag_registered_0 <= way2_tag[index_0];
             index_registered_0  <= index_0;
             word_q0 <= word_0;
-//★ 2026-11-11 取指回 2 宽：块 = 8B。[1] 选 16B 行的哪一半，[0] 是块内偏移（交给 iffu）。
             block_offset_q <= pc_address_0[3:2];
             r0_valid <= 1'b1;
         end
@@ -286,15 +286,15 @@ module icache(
         end
     end
 //第 1 级：拼回取指地址、比较、选 way、出 iram 地址。两路对称：路号直接由命中项给出。
+//★ 16B 块恒在一条行内 ⇒ 命中判定只有一次（老版本是两个字各比一次、两个都要中）。
+// 命中路号直接进 iram 地址：0 = way0(way1_tag)，1 = way1(way2_tag)
+//★ 半选位 block_offset_q[1]（= pc[3]）进地址：这决定读 16B 行的前半还是后半。
     always @(*) begin
         fetch_address_0 = {fetch_tag_registered_0[IC_FOLD-1:0], index_registered_0,
                            word_q0[IC_WORD_B-1:2], 4'd0};
         hit_way_0[0] = (way1_tag_registered_0 == {ipvalid, 1'b1, fetch_tag_registered_0});
         hit_way_0[1] = (way2_tag_registered_0 == {ipvalid, 1'b1, fetch_tag_registered_0});
-//★ 16B 块恒在一条行内 ⇒ 命中判定只有一次（老版本是两个字各比一次、两个都要中）。
         hit_0 = hit_way_0[0] | hit_way_0[1];
-// 命中路号直接进 iram 地址：0 = way0(way1_tag)，1 = way1(way2_tag)
-//★ 半选位 block_offset_q[1]（= pc[3]）进地址：这决定读 16B 行的前半还是后半。
         read_address  = {hit_way_0[1], index_registered_0, word_q0[IC_WORD_B-1:2], block_offset_q[1]};
     end
 //缺失检测拍（组合直送 pc，不走 flag_bus）：与 busy 的第三个加项逐字同门。
@@ -313,6 +313,10 @@ module icache(
 //★ 交付寄存器：四条指令 + 四个地址 + 四份预测 + 块内偏移，一个沿、一个门。
 //  冲刷（irq_kill / redir_frontend）：整组清；
 //  队满：整组保持；缺失/回填：出 NOP；其余：装这一块。
+//★ 预测就是这一块指令的延长位：同一个沿、同一个门、同一个地址。
+//★ 块内起始偏移：比它老的几条永远不出去。
+//  ★ 用 block_offset_q（随 R0 那一块锁进来的偏移），不是当拍的 pc_address_0 ——
+//    当拍 pc 已经是下一块了，用它会错一整块。
     always @(posedge clk) begin
         if (reset_registered) begin
             instruction_0 <= 32'd0;
@@ -347,14 +351,10 @@ module icache(
             instruction_1 <= iram_word_high[read_address];
             instruction_address_0 <= fetch_address_0 + (block_offset_q[1] ? 32'd8 : 32'd0);
             instruction_address_1 <= fetch_address_0 + (block_offset_q[1] ? 32'd8 : 32'd0) + 32'd4;
-//★ 预测就是这一块指令的延长位：同一个沿、同一个门、同一个地址。
             prediction_taken_0  <= btb_take_0;
             prediction_taken_1  <= btb_take_1;
             prediction_jump_target_0 <= btb_take_0 ? btb_target_0 : 32'd0;
             prediction_jump_target_1 <= btb_take_1 ? btb_target_1 : 32'd0;
-//★ 块内起始偏移：比它老的几条永远不出去。
-//  ★ 用 block_offset_q（随 R0 那一块锁进来的偏移），不是当拍的 pc_address_0 ——
-//    当拍 pc 已经是下一块了，用它会错一整块。
             block_offset <= {1'b0, block_offset_q[0]};
             instruction_valid_0 <= r0_valid & hit_0 & (block_offset_q[0] == 1'b0);
             instruction_valid_1 <= r0_valid & hit_0;
@@ -400,6 +400,7 @@ module icache(
         else
             reset_period_flag <= 1'b0;
     end
+//填完这一路 ⇒ 下次该换另一路。
     always @(posedge clk) begin
         if (reset_registered) begin
             stage <= 1'b0;
@@ -441,7 +442,6 @@ module icache(
                         way1_tag[fill_index] <= {fill_ipvalid, 1'b1, fill_tag};
                     else
                         way2_tag[fill_index] <= {fill_ipvalid, 1'b1, fill_tag};
-//填完这一路 ⇒ 下次该换另一路。
                     lru[fill_index] <= ~fill_way;
                     stage <= 1'b0;
                     fill_end <= 1'b0;

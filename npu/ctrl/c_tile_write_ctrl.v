@@ -107,6 +107,13 @@ module c_tile_write_ctrl(
     reg [`NPU_CBASE_W+1:0] c_addr;
     wire [31:0] quant_word;
 
+        // 有效项在 FIFO 有空间时入队并前进；无效项直接跳过。
+        // ---- bank 管理 ----
+        // 优先用 bank0 作为新快照的落点，扫描优先取 bank0。
+        // 捕获受 any_free 门控，因此 cap_bank 只在有空闲 bank 时被使用。
+        // bank_busy 的下一拍值：置忙与置闲在这里合并成一次赋值，避免同一信号在
+        // 时序块内被多次赋值（编码规范 4.2）。同一拍捕获与扫完必然不是同一个
+        // bank：捕获只能落在空闲 bank，而扫完的 bank 本拍仍然是忙的。
     always @(*) begin
         // 赋值顺序 = 数据依赖顺序。组合块用阻塞赋值，后面的语句能读到前面刚算出的
         // 结果，但反过来会读到"上一拍的值"。bank_clr/bank_busy_d 依赖 scan_done，
@@ -119,22 +126,15 @@ module c_tile_write_ctrl(
         lane_ok = (idx_q < 5'd16) &&
                   ({1'b0, r_idx} < valid_tm_q[scan_bank_q]) &&
                   ({1'b0, c_idx} < valid_tn_q[scan_bank_q]);
-        // 有效项在 FIFO 有空间时入队并前进；无效项直接跳过。
         advance    = active_q && (idx_q < 5'd16) && (lane_ok ? cwr_ready_in : 1'b1);
         scan_done  = advance && (idx_q == 5'd15);
 
-        // ---- bank 管理 ----
-        // 优先用 bank0 作为新快照的落点，扫描优先取 bank0。
-        // 捕获受 any_free 门控，因此 cap_bank 只在有空闲 bank 时被使用。
         any_free      = (bank_busy_q != {BANK_NUM{1'b1}});
         cap_bank      = bank_busy_q[0] ? 1'b1 : 1'b0;
         cap_fire      = snap_valid_in && !snap_level_q && any_free;
         scan_bank_sel = bank_busy_q[0] ? 1'b0 : 1'b1;
         scan_start    = !active_q && (bank_busy_q != {BANK_NUM{1'b0}});
 
-        // bank_busy 的下一拍值：置忙与置闲在这里合并成一次赋值，避免同一信号在
-        // 时序块内被多次赋值（编码规范 4.2）。同一拍捕获与扫完必然不是同一个
-        // bank：捕获只能落在空闲 bank，而扫完的 bank 本拍仍然是忙的。
         bank_set    = cap_fire ? ({{(BANK_NUM-1){1'b0}}, 1'b1} << cap_bank) : {BANK_NUM{1'b0}};
         bank_clr    = scan_done ? ({{(BANK_NUM-1){1'b0}}, 1'b1} << scan_bank_q) : {BANK_NUM{1'b0}};
         bank_busy_d = (bank_busy_q | bank_set) & ~bank_clr;
@@ -189,12 +189,12 @@ module c_tile_write_ctrl(
         end
     end
 
+        // 只有"没有扫描在跑、没有 bank 待扫、写 FIFO 也空了"才算真正写完。
     always @(*) begin
         // cwr_valid_out 与 cwr_ready_in 相与，表示本拍一定能完成一次 FIFO 入队。
         cwr_valid_out = active_q && lane_ok && cwr_ready_in;
         cwr_addr_out  = c_addr[`NPU_CBUF_AW-1:0];
         cwr_data_out  = quant_word;
-        // 只有"没有扫描在跑、没有 bank 待扫、写 FIFO 也空了"才算真正写完。
         idle_out      = !active_q && (bank_busy_q == {BANK_NUM{1'b0}}) && cwr_empty_in;
         snap_ready_out = any_free;
     end

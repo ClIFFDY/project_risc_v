@@ -18,31 +18,31 @@ module c_write_fifo(
     input        clk,
     input        rst,
     input        core_busy,
-    input        accumulate,          // 1：把入队值加到 C RAM 原值上
+    input        accumulate, // 1：把入队值加到 C RAM 原值上
     // 来自 c_tile_write_ctrl
     input        push,
     input [`NPU_CBUF_AW-1:0] waddr,
     input [31:0] wdata,
-    output reg        ready,          // !full
+    input [31:0] ram_rdata, // C RAM 读数据（读请求后一拍）
+    output reg        ready, // !full
     output reg        empty,
     // 到 npu_buffer 内部的 C RAM
     output reg        ram_we,
     output reg [`NPU_CBUF_AW-1:0] ram_addr,
     output reg [31:0] ram_wdata,
-    output reg        ram_re,         // 累加模式下读原值
+    output reg        ram_re, // 累加模式下读原值
     output reg [`NPU_CBUF_AW-1:0] ram_raddr,
-    input [31:0] ram_rdata,           // C RAM 读数据（读请求后一拍）
     // 到 tile_controller：真正写入 C RAM 的脉冲
     output reg        c_wr_pulse
 );
 
+    reg         rmw_q;      // 累加模式的读-改-写相位：0=发读，1=写回
+    reg [`NPU_CBUF_AW-1:0] head_addr;
+    reg [31:0] head_data;
     wire [39:0] rdata;
     wire        full;
     wire        empty_w;
-    reg         rmw_q;      // 累加模式的读-改-写相位：0=发读，1=写回
 
-    reg [`NPU_CBUF_AW-1:0] head_addr;
-    reg [31:0] head_data;
     always @(*) begin
         head_addr = rdata[39:32];
         head_data = rdata[31:0];

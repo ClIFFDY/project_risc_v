@@ -52,9 +52,9 @@
 module isq(
     input clk, rst,
 //★ 只接本模块真正用到的位。
-    input        redir_backend_0,   // 后端重定向（rob 队头那一拍出的那根）
-    input        redir_backend_1,   // 同一笔的寄存版，晚一拍
-    input        irq_kill,           // 中断受理（clint 自己判的）
+    input        redir_backend_0, // 后端重定向（rob 队头那一拍出的那根）
+    input        redir_backend_1, // 同一笔的寄存版，晚一拍
+    input        irq_kill, // 中断受理（clint 自己判的）
 //前端：本 lane 的 D 有指令、且还没被收
     input        stage_advance,
     input        stage_advance_lane1,
@@ -120,7 +120,6 @@ module isq(
     input [2:0]  mem_load_store_function3_in,
     input        mem_valid_in,
     input [5:0]  mem_phys_a_in, mem_phys_b_in,
-    output reg   mem_pop_out,
 
 //---- 结果口（寄存值）----
     input [31:0] data_alu_early,
@@ -149,10 +148,6 @@ module isq(
     input [5:0]  phys_d_in, phys_d_in_lane1, lsu_phys_d_in,
 //  除法：串行除法的源唤醒本来就比写口早一拍，唤醒再往前提一拍 ⇒ 由 mdu 的提交链给号。
     input        divide_wake_valid, input [5:0] divide_wake_phys,
-//---- 真 PRF：读口地址出去，数据与就绪回来 ----
-    output reg [5:0] prf_read_a_0_phys, prf_read_b_0_phys,
-    output reg [5:0] prf_read_a_1_phys, prf_read_b_1_phys,
-    output reg [5:0] prf_read_a_m_phys, prf_read_b_m_phys,
     input [31:0] prf_data_a_0, prf_data_b_0, prf_data_a_1, prf_data_b_1, prf_data_a_mem, prf_data_b_mem,
 //★ 在飞表的置位源：rename 本拍发出去的物理号（表按【发号】置位，不按入站）
     input [63:0] alloc_onehot_in,
@@ -165,9 +160,14 @@ module isq(
     input [31:0] head_one_hot_registered,
 //---- 单元就绪 ----
     input        lsu_full,
-    output reg   bypass_load_a_0, bypass_load_b_0, bypass_load_a_1, bypass_load_b_1,
     input        mdu_mul_ok_0, mdu_div_ok_0, mdu_mul_ok_1, mdu_div_ok_1,
     input        bju_ok_0, bju_ok_1,
+    output reg   mem_pop_out,
+//---- 真 PRF：读口地址出去，数据与就绪回来 ----
+    output reg [5:0] prf_read_a_0_phys, prf_read_b_0_phys,
+    output reg [5:0] prf_read_a_1_phys, prf_read_b_1_phys,
+    output reg [5:0] prf_read_a_m_phys, prf_read_b_m_phys,
+    output reg   bypass_load_a_0, bypass_load_b_0, bypass_load_a_1, bypass_load_b_1,
 //---- 给 idu 的推进门：本 lane 的站还有空位 ----
     output reg       station_room_0_valid,
     output reg       station_room_1_valid,
@@ -576,6 +576,9 @@ module isq(
         ld_fwd_ok = write_enable_ld_early         & (|ld_phys_early);
     end
 
+//★ 2026-11-08：单元就绪这一项只留【除法】那一路 —— multiply_ready 恒 1（pipe_stall 恒 0），
+//  综合时那一支自己会折成常数；除法是真门（口上现在只剩"接受缓冲空不空"这一位）。
+//  "选进来再等"不行：MDU 项占了 Q 一格就把本 lane 别的项挡住了。
     always @(*) begin
         : blk_rs_ready
         reg [5:0] entry_phys_a, entry_phys_b;
@@ -610,9 +613,6 @@ module isq(
                              | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == entry_phys_b));
             entry_csr_block = entry_csrw
                             & (~head_one_hot_registered[entry_index] | csr_write_landing);
-//★ 2026-11-08：单元就绪这一项只留【除法】那一路 —— multiply_ready 恒 1（pipe_stall 恒 0），
-//  综合时那一支自己会折成常数；除法是真门（口上现在只剩"接受缓冲空不空"这一位）。
-//  "选进来再等"不行：MDU 项占了 Q 一格就把本 lane 别的项挡住了。
             pickable_0[i] = rs_valid_0[i] & entry_ready_a_0[i] & entry_ready_b_0[i] & ~entry_csr_block
                           & ((entry_class != CLS_MUL) | (entry_div ? mdu_div_ok_0 : mdu_mul_ok_0));
         end
@@ -709,11 +709,11 @@ module isq(
 //==============================================================================
 // 七、选优：每条 lane 各自从自己的 rs_head 起转一圈，取最老的可发项
 //==============================================================================
+//指针式：从 head 起转一圈取第一个可发项（孔自动跳过，pickable 对孔恒 0）。
     always @(*) begin
         : blk_select
         reg [RS_AW-1:0] scan_slot_0, scan_slot_1;
         integer j;
-//指针式：从 head 起转一圈取第一个可发项（孔自动跳过，pickable 对孔恒 0）。
         pe0_found = 1'b0;
         pe0_idx   = {RS_AW{1'b0}};
         for (j = RS_DEPTH-1; j >= 0; j = j - 1) begin
@@ -892,6 +892,7 @@ module isq(
         csr_payload_0 = {(q_data_0[RS_CSRWR_LO +: 1]), (q_data_0[RS_CSRA_LO  +: 12]), (q_data_0[RS_CSRF3_LO +: 3]), (q_data_0[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_0[4:0]} : (q_data_0[RS_PHYSA_LO +: 6])};
         csr_payload_1 = {(q_data_1[RS_CSRWR_LO +: 1]), (q_data_1[RS_CSRA_LO  +: 12]), (q_data_1[RS_CSRF3_LO +: 3]), (q_data_1[RS_IMMA_LO  +: 1]) ? {1'b0, q_immediate_value_a_1[4:0]} : (q_data_1[RS_PHYSA_LO +: 6])};
     end
+//档位顺序：load 前送紧贴 PRF（它的数据到得最晚）。各档互斥，换顺序不改行为。
     always @(*) begin
         load_forward_a_0 = ld_fwd_ok & (ld_phys_early == (q_data_0[RS_PHYSA_LO +: 6]));
         load_forward_b_0 = ld_fwd_ok & (ld_phys_early == (q_data_0[RS_PHYSB_LO +: 6]));
@@ -905,7 +906,6 @@ module isq(
         alu_lane1_forward_a_1 = alu_fwd_ok_1 & (phys_alu_early_1 == (q_data_1[RS_PHYSA_LO +: 6]));
         alu_lane0_forward_b_1 = alu_fwd_ok_0 & (phys_alu_early_0 == (q_data_1[RS_PHYSB_LO +: 6]));
         alu_lane1_forward_b_1 = alu_fwd_ok_1 & (phys_alu_early_1 == (q_data_1[RS_PHYSB_LO +: 6]));
-//档位顺序：load 前送紧贴 PRF（它的数据到得最晚）。各档互斥，换顺序不改行为。
         operand_a_0 = (q_data_0[RS_IMMA_LO  +: 1]) ? q_immediate_value_a_0 :
                       alu_lane0_forward_a_0 ? data_alu_early :
                       alu_lane1_forward_a_0 ? data_alu_lane1_early :
@@ -967,6 +967,7 @@ module isq(
                        | (q_take_1 & (pe1_idx == rs_head_1[RS_AW-1:0])));
     end
 
+//两个操作数都写成 RS_AW 位，结果才是 RS_AW 位 ⇒ 7+1 回卷到 0。
     always @(posedge clk) begin
         if (reset_registered | (redir_backend_0 | redir_backend_1)) begin
             rs_valid_0 <= {RS_DEPTH{1'b0}};
@@ -996,7 +997,6 @@ module isq(
                     rs_valid_1[i] <= 1'b0;
                 end
             end
-//两个操作数都写成 RS_AW 位，结果才是 RS_AW 位 ⇒ 7+1 回卷到 0。
             rs_tail_0  <= {1'b0, rs_tail_0[RS_AW-1:0] + {{(RS_AW-1){1'b0}}, load_0}};
             rs_tail_1  <= {1'b0, rs_tail_1[RS_AW-1:0] + {{(RS_AW-1){1'b0}}, load_1}};
             rs_head_0  <= {1'b0, rs_head_0[RS_AW-1:0] + {{(RS_AW-1){1'b0}}, head_move_0}};
@@ -1007,6 +1007,7 @@ module isq(
     end
 
 //---- 出站寄存器：t0 选优落进来，t1 发出去或被杀掉 ----
+//发出去腾出来；压着等单元的那一拍保持（那一拍 q_take 必为 0）。
     always @(posedge clk) begin
         if (reset_registered) begin
             q_valid_0 <= 1'b0;
@@ -1023,7 +1024,6 @@ module isq(
                 q_data_0 <= rs_data_0[pe0_idx];
             if (q_take_1)
                 q_data_1 <= rs_data_1[pe1_idx];
-//发出去腾出来；压着等单元的那一拍保持（那一拍 q_take 必为 0）。
             q_valid_0 <= q_take_0 | (q_valid_0 & ~q_issue_0);
             q_valid_1 <= q_take_1 | (q_valid_1 & ~q_issue_1);
         end
@@ -1039,12 +1039,30 @@ module isq(
 //       · load 不许越过站里更老的 store —— 那条 store 的地址还没算，LSU 无从比较，
 //         放过去就只能读到旧值。
 //==============================================================================
+//站里最老的 store 的槽号；没有 store 时 = DEPTH（不挡任何 load）
+//★ 2026-11-12：只留 load 那一项。实测（CoreMark 327,706 条访存发射）fwd-only 的
+//  55,433 条 **全部**来自 load 项，ALU 那两项贡献精确为 0 —— 因为 ALU 生产者在发射拍
+//  就叫醒了（alu_issue_0/1 进就绪列表），下一拍值上旁路时常驻位已经置好。
+//  load 不一样：它的早唤醒 load_wake_valid 根本没接进站（isq 里引用数 0），
+//  只有晚一拍的 load_write，所以这一项必须留。
+//  删掉 ALU 两项 = 把 ALU 的物理号从访存站选优锥上摘掉。
+//★ 2026-11-12：前送不再进 pickable。唤醒是静态的 —— 醒了就一定可发，前送只决定【值从哪来】。
+//  原来这里挂着 mem_fwd_a/b（"没醒但旁路有货也发"），那条判据把 ALU 的物理号
+//  (phys_alu_early) 拉进了选优锥 ⇒ 选优 → PRF 读地址 → store 基址 → lsu 一条 13 级链。
+//★ 2026-11-12：与两条 lane 站同构 —— pickable 吃【活的】ready（常驻位 | 当拍唤醒），
+//  不是只吃常驻位。原来只吃 mem_rdy_a_m，看不见当拍唤醒，于是拿 mem_fwd（"旁路有货就算能发"）
+//  补那一拍；那条判据把 ALU 的物理号拉进了选优锥（选优 → PRF 读地址 → store 基址 → lsu）。
+//★ 2026-11-12：这里【不能】照抄 lane 站吃活的 entry_ready —— 访存站没有 Q 阶段，
+//  选中和读操作数同一拍，唤醒那一拍值还没上总线（实测照抄后 rand 63/200）。
+//  所以只能用 mem_fwd（"上一拍的结果已经在旁路上"）来补，这是结构差异不是冗余。
+//★ B 侧只有 store 才要：load 的 B 就是立即数位域译出来的"假 rs2"，
+//  lsu 那条路上 source_b 只在 store_stage_write_data 用（lsu.v:276/593）。
+//  等它 = 干等一个没人要的物理号（而且那个号可能正好在飞）——这一条白送。
     always @(*) begin
         : blk_mem_pick
         reg [5:0] entry_phys_a, entry_phys_b;
         reg       entry_is_store;
         integer k;
-//站里最老的 store 的槽号；没有 store 时 = DEPTH（不挡任何 load）
         mem_store_barrier = MEM_ST_DEPTH[2:0];
         for (k = MEM_ST_DEPTH-1; k >= 0; k = k - 1)
             if (mem_valid_m[k] & mem_data_m[k][MEM_ISST_LO])
@@ -1053,12 +1071,6 @@ module isq(
             entry_phys_a   = mem_data_m[k][MEM_PHYSA_LO +: 6];
             entry_phys_b   = mem_data_m[k][MEM_PHYSB_LO +: 6];
             entry_is_store = mem_data_m[k][MEM_ISST_LO];
-//★ 2026-11-12：只留 load 那一项。实测（CoreMark 327,706 条访存发射）fwd-only 的
-//  55,433 条 **全部**来自 load 项，ALU 那两项贡献精确为 0 —— 因为 ALU 生产者在发射拍
-//  就叫醒了（alu_issue_0/1 进就绪列表），下一拍值上旁路时常驻位已经置好。
-//  load 不一样：它的早唤醒 load_wake_valid 根本没接进站（isq 里引用数 0），
-//  只有晚一拍的 load_write，所以这一项必须留。
-//  删掉 ALU 两项 = 把 ALU 的物理号从访存站选优锥上摘掉。
             mem_fwd_a[k] = (ld_fwd_ok & (ld_phys_early == entry_phys_a));
             mem_fwd_b[k] = (ld_fwd_ok & (ld_phys_early == entry_phys_b));
             mem_entry_ready_a[k] = mem_rdy_a_m[k]
@@ -1077,20 +1089,8 @@ module isq(
                              | (load_write     & (load_write_phys     == entry_phys_b))
                              | (multiply_wake_valid_q_0[1] & (multiply_wake_phys_q_0[1] == entry_phys_b))
                              | (multiply_wake_valid_q_1[1] & (multiply_wake_phys_q_1[1] == entry_phys_b));
-//★ 2026-11-12：前送不再进 pickable。唤醒是静态的 —— 醒了就一定可发，前送只决定【值从哪来】。
-//  原来这里挂着 mem_fwd_a/b（"没醒但旁路有货也发"），那条判据把 ALU 的物理号
-//  (phys_alu_early) 拉进了选优锥 ⇒ 选优 → PRF 读地址 → store 基址 → lsu 一条 13 级链。
-//★ 2026-11-12：与两条 lane 站同构 —— pickable 吃【活的】ready（常驻位 | 当拍唤醒），
-//  不是只吃常驻位。原来只吃 mem_rdy_a_m，看不见当拍唤醒，于是拿 mem_fwd（"旁路有货就算能发"）
-//  补那一拍；那条判据把 ALU 的物理号拉进了选优锥（选优 → PRF 读地址 → store 基址 → lsu）。
-//★ 2026-11-12：这里【不能】照抄 lane 站吃活的 entry_ready —— 访存站没有 Q 阶段，
-//  选中和读操作数同一拍，唤醒那一拍值还没上总线（实测照抄后 rand 63/200）。
-//  所以只能用 mem_fwd（"上一拍的结果已经在旁路上"）来补，这是结构差异不是冗余。
             mem_pickable[k] = mem_valid_m[k]
                             & (mem_rdy_a_m[k] | mem_fwd_a[k])
-//★ B 侧只有 store 才要：load 的 B 就是立即数位域译出来的"假 rs2"，
-//  lsu 那条路上 source_b 只在 store_stage_write_data 用（lsu.v:276/593）。
-//  等它 = 干等一个没人要的物理号（而且那个号可能正好在飞）——这一条白送。
                             & (~entry_is_store | mem_rdy_b_m[k] | mem_fwd_b[k])
                             & (entry_is_store ? (k == 0) : (k[2:0] <= mem_store_barrier));
         end
@@ -1240,17 +1240,19 @@ module isq(
 //==============================================================================
 // 十五、出站字段
 //==============================================================================
+//we 必须被 issue_v 门控：alu 的"登记判据"就是 we_in，Q 空着或没发时把它送出去，
+//地址不乘 issue_valid：它是 csr.v 那个 12:1 case 的输入，乘进去等于把扇出拖进 CSR 锥。
+//---- LSU 口：只由访存站的选中项驱动 ----
+//载荷里存的是 auxiliary 约定（= 指令地址 + 4），这里减回真 pc。
     always @(*) begin
         sel_class_0 = (q_data_0[RS_CLASS_LO +: 2]);
         issue_index_0 = (q_data_0[RS_IDX_LO   +: 5]);
         issue_generation_0 = (q_data_0[RS_GEN_LO   +: 1]);
-//we 必须被 issue_v 门控：alu 的"登记判据"就是 we_in，Q 空着或没发时把它送出去，
         write_enable_0        = issue_valid_0 & (q_data_0[RS_WE_LO    +: 1]);
         alu_function4_0 = (q_data_0[RS_FUNC4_LO +: 4]);
         csr_func3_0 = (q_data_0[RS_CSRF3_LO +: 3]);
         csr_write_enable_0 = issue_valid_0 & (q_data_0[RS_CSRWE_LO +: 1]);
         csr_write_action_0 = issue_valid_0 & (q_data_0[RS_CSRWR_LO +: 1]);
-//地址不乘 issue_valid：它是 csr.v 那个 12:1 case 的输入，乘进去等于把扇出拖进 CSR 锥。
         csr_address_0  = (q_data_0[RS_CSRA_LO  +: 12]);
         auxiliary_address_0  = (q_data_0[RS_AUX_LO   +: 32]);
         off_mem_0   = (q_data_0[RS_JV_LO    +: 32]);
@@ -1308,7 +1310,6 @@ module isq(
             function10_1 = {7'b0000001, (q_data_1[RS_MULOP_LO +: 3])};
         end
 
-//---- LSU 口：只由访存站的选中项驱动 ----
         lsu_a = operand_a_mem;
         lsu_imm = mem_data_m[mem_sel][MEM_IMM_LO +: 32];
         lsu_b = operand_b_mem;
@@ -1319,7 +1320,6 @@ module isq(
         lsu_index = mem_data_m[mem_sel][MEM_IDX_LO +: 5];
         lsu_phys_d = mem_data_m[mem_sel][MEM_PHYSD_LO +: 6];
         lsu_generation = mem_data_m[mem_sel][MEM_GEN_LO +: 1];
-//载荷里存的是 auxiliary 约定（= 指令地址 + 4），这里减回真 pc。
         lsu_pc = mem_data_m[mem_sel][MEM_AUX_LO +: 32] - 32'd4;
     end
 

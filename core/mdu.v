@@ -250,19 +250,19 @@ module mdu(
 //乘法口：两级流水只要不被冻结就收（站一拍只出一条，容量天然够）。
 //★ 把 wb_conflict 也算进来：冲突拍乘法两级原地冻住，此时若还收新的乘法，
 //  推进 multiply_stage_valid 那一拍会把冻着的那条冲掉 —— "收了就必须推进"是这条契约的另一半。
+//除法口：只看接受缓冲空不空（见上面的块注释）。
     always @(*) begin
         multiply_ready = ~pipe_stall;
-//除法口：只看接受缓冲空不空（见上面的块注释）。
         divide_ready = ~divide_buffer_valid & ~pipe_stall;
     end
 
 //发起 / 存缓冲：FSM 真能起的判据还是原来那四项，只是不再拿去门控站侧。
+//缓冲里有货 ⇒ 一起来就发起；缓冲空 ⇒ 这一拍来的这一笔直接发起（直通，不加拍数）。
+//收下的那一笔这一拍发起不了 ⇒ 进缓冲。缓冲满（valid）时 divide_ready 已经是 0，不会覆盖。
     always @(*) begin
         divide_fsm_idle = ~divide_state_issued & ~divide_state_busy & ~divide_state_done & ~divide_state_pending & ~pipe_stall;
-//缓冲里有货 ⇒ 一起来就发起；缓冲空 ⇒ 这一拍来的这一笔直接发起（直通，不加拍数）。
         divide_start      = divide_buffer_valid ? divide_fsm_idle
                                                 : (divide_go & divide_ready & divide_fsm_idle);
-//收下的那一笔这一拍发起不了 ⇒ 进缓冲。缓冲满（valid）时 divide_ready 已经是 0，不会覆盖。
         divide_buffer_push = divide_go & divide_ready & ~divide_fsm_idle;
     end
 
@@ -375,6 +375,7 @@ module mdu(
     end
 
 //除法迭代
+//★ 只锁原码：取绝对值在下一拍的 Q 侧做（见上面 divide_state_busy 分支）。
     always @(posedge clk) begin
         if (reset_registered) begin
             divide_state_busy <= 1'b0;
@@ -448,7 +449,6 @@ module mdu(
             divide_state_sign    <= (divide_start_function10[0] == 1'b0);
             divide_state_dividend    <= divide_start_source_a;
             divide_state_sign_b <= divide_start_r2[31];
-//★ 只锁原码：取绝对值在下一拍的 Q 侧做（见上面 divide_state_busy 分支）。
             divide_state_a     <= divide_start_source_a;
             divide_state_b     <= divide_start_r2;
             divide_state_prepared <= 1'b0;
@@ -503,6 +503,7 @@ module mdu(
 // 提交链（divide_state_done+3 写口）与输出保持
 //===============================================================
 //除法结果提交延迟链 + 输出保持（对应 lsu 的 ld_hold）
+//载荷也要复位：D 端（divide_data_early）每拍都往外送，不复位就会把 X 灌进前送表
     always @(posedge clk) begin
 //【只由 rst 清】这条提交延迟链是"除法已经算完、结果在链上往外走"的那一段，它没有身份判断，
 //  也不作废：错路的那一笔照样会送到 ROB / 值阵列，由收端按 {slot, generation} 判掉。
@@ -510,7 +511,6 @@ module mdu(
 //  （multiply_stage*_kill），这里不清的理由不来自"更老所以必须提交"，只来自"这一级没有作废的抓手"。
         if (reset_registered) begin
             divide_state_commit_registered <= 3'd0;
-//载荷也要复位：D 端（divide_data_early）每拍都往外送，不复位就会把 X 灌进前送表
             divide_state_commit_index <= 5'd0;
             divide_state_commit_generation <= 1'b0;
             divide_state_commit_data <= 32'd0;
@@ -552,22 +552,24 @@ module mdu(
 //  实测 12.5ns 下 `−2.041 / 1691 端点`（改之前 `−0.744 / 242`），失败端点铺到 mdu/iffu/idu/csr 四处。
 //  代价：乘法结果晚一拍 —— 现在乘法早口和晚口是同一份（都从 multiply_data_out 出）。
 //  早口的那几项在下面"乘法口"那个 always 块里跟着赋，避免跨块读。
-    always @(*) begin
-        divide_data_early = divide_state_commit_data;
 //身份 D 端：冻结拍那几个寄存器不装载，要跟着保持
 //★ 写使能【只取触发器】，不再乘 ~kill。kill 是 rob 的组合链（slot_above_head_registered → redirect_index → kill_arc），
 //  乘进 we 就等于把它拉进值阵列每个 entry D 端那个 5 口优先级 mux —— 实测最差路 16 级、78% 是布线。
 //★ 解耦之后错路那一笔最多多写【一拍】：写进的是它自己那个槽，而该槽的 valid 在它分配那一拍就被清成 0；
 //  重新分配至少还要 5 拍才到 isq-D，到那时 valid 又被清一次 ⇒ 这一拍设起来的 valid 活不过下一次分配。
 //★ kill 本身不动：乘/除各级 valid 的清仍按年龄那个式子来，kill 只出现在寄存器的 D 端，不在这条路上。
+    always @(*) begin
+        divide_data_early = divide_state_commit_data;
         divide_write_enable_early = pipe_stall ? divide_state_commit_registered[2] : divide_state_commit_registered[1];
         divide_index_early = divide_state_commit_index;
         divide_generation_early = divide_state_commit_generation;
     end
+//---- 乘法口 ----
+//★ 2026-11-04：乘法早口就是晚口那一份（都从 MDU 结果寄存器出），不再有"早一拍"的组合乘积。
+//---- 除法口 ----
     always @(*) begin
         divide_state_commit  = divide_state_commit_registered[2];                           // 除法写口脉冲 = divide_state_done+3
         divide_state_pending = divide_state_commit_registered[0] | divide_state_commit_registered[1] | divide_state_commit_registered[2]; // 除法结果前递窗口
-//---- 乘法口 ----
         multiply_write_enable     = multiply_product_valid;
         multiply_loaded = multiply_product_valid | hold;
         if (multiply_product_valid) begin
@@ -585,12 +587,10 @@ module mdu(
             multiply_generation      = 1'b0;
             multiply_data_out = 32'd0;
         end
-//★ 2026-11-04：乘法早口就是晚口那一份（都从 MDU 结果寄存器出），不再有"早一拍"的组合乘积。
         multiply_data_early       = multiply_data_out;
         multiply_write_enable_early = multiply_write_enable;
         multiply_index_early      = multiply_index;
         multiply_generation_early = multiply_generation;
-//---- 除法口 ----
         divide_write_enable       = divide_state_commit;
         divide_loaded   = divide_state_commit;
         divide_index      = divide_state_commit_index;

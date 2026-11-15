@@ -35,6 +35,15 @@ module cpu_top #(
     input clk, rst,
     input [31:0] bus_data_in_ext,
     input bus_loaded_in, bus_hold_in, exti,
+    input      [31:0] l2_hrdata,
+    input             l2_hready,
+    input             l2_rd_valid,
+    input             l2_hgrant,
+    input             l2_hresp,
+//---- L2 维护与非缓存窗口（自举/重装代码时用）----
+    input      [1:0]  l2_maint,
+    input      [31:0] l2_uncached_base,
+    input      [31:0] l2_uncached_mask,
     output reg [31:0] bus_addr_out, bus_data_out,
     output reg [3:0] bus_be_out,
     output reg bus_we_out, bus_valid_out,
@@ -48,22 +57,18 @@ module cpu_top #(
     output            l2_hmastlock,
     output     [31:0] l2_hwdata,
     output     [3:0]  l2_hwstrb,
-    input      [31:0] l2_hrdata,
-    input             l2_hready,
-    input             l2_rd_valid,
-    input             l2_hgrant,
-    input             l2_hresp,
     output            l2_busy,
-//---- L2 维护与非缓存窗口（自举/重装代码时用）----
-    input      [1:0]  l2_maint,
-    output            l2_maint_done,
-    input      [31:0] l2_uncached_base,
-    input      [31:0] l2_uncached_mask
+    output            l2_maint_done
     );
 
 //==============================================================================
 // 前端
 //==============================================================================
+//bju 判定延迟级的训练载荷（btb 的唯一学习源），bju_fe_sel 做年龄二选一
+  reg [1:0] fetch_kind;
+  reg  fetch_taken;
+  reg [31:0] fetch_pc, fetch_target;
+  reg [31:0] current_address_0, current_address_1;
   wire [31:0] pc_address_0_pc;
 //★ 2026-11-08：取指改 16B 块。给 bpu 的是这一块里四个地址（块基址 +0/4/8/12），
 //  给 icache 的仍然是【下一条要执行】的指令地址；块内偏移用来把比它老的那几条挡在仲裁外。
@@ -72,7 +77,6 @@ module cpu_top #(
 //测试台接口：几乎每个 tb 都用 dut.address_pc 当"取指 PC 活动窗口"的判据（这是原 pc 模块的 pc_addr 口，
 //  双 lane 改造后改成了 pc_address_0/pc_address_1）。这里只做一次别名，不进任何逻辑；综合时无人读会被自动裁掉。
   wire [31:0] address_pc = pc_address_0_pc;
-  reg [31:0] current_address_0, current_address_1;
   wire [31:0] instruction_0_icache, instruction_1_icache;
   wire [31:0] instruction_addr0_icache, instruction_addr1_icache;
   wire  instruction_valid0_icache, instruction_valid1_icache;
@@ -99,10 +103,6 @@ module cpu_top #(
 //  （这几根由下面的 clint / rob 例化驱动，提前的只是【名字】，不影响谁驱动。）
   wire  irq_kill;
   wire [1:0] redir_cause;  // 与 redir_frontend / redir_backend_0 同拍：0=分支 1=陷阱 2=mret
-//bju 判定延迟级的训练载荷（btb 的唯一学习源），bju_fe_sel 做年龄二选一
-  reg [1:0] fetch_kind;
-  reg  fetch_taken;
-  reg [31:0] fetch_pc, fetch_target;
 
 //★ 随指令记进队列的"预测跳 / 预测落点 / 补位"必须跟着【这一对指令】走。三条相位口径：
 //  ① 这些量的 D 端（pc_take / btb_tgt）描述的是【这一拍压在第 1 级里的那一对】；
@@ -508,18 +508,9 @@ module cpu_top #(
         end
     end
 
-    always @(*) begin
-//★ 必须跟训练包用【同一个】选择器：bpu 里 branch_stage2/3 是
-//     is_branch & branch_unit_taken & ~branch_prediction_taken_in
-//  —— 一边是"训练包里的 taken"、另一边是"随指令记下的预测"。两边来自不同 lane 时这个比较是垃圾。
-        fetch_bpred      = (train_sel == 2'd0) ? train_buf_bpred :
-                           (train_sel == 2'd1) ? branch_prediction_taken_registered_0_exu
-                                               : branch_prediction_taken_registered_1_exu;
 //★ 落点按 redir_cause 选（A 域那一拍，三根 rob 信号同拍）：
 //  分支 = 随项存的落点（rob_redir_pc）；mret = csr 的 mepc；陷阱 = csr 的 mtvec。
 //  mret 的 mepc 直接从 csr 取：让 ROB 把它搬进 kill_redirect_target 只是多一级寄存器、还错相位。
-        fetch_jump_target     = (redir_cause == 2'd2) ? interrupt_return_address_2_clint :
-                                (redir_cause == 2'd1) ? isr_addr2  : kill_redirect_target_rob;
 //训练载荷同一条指令的年龄选择：必须在同一拍整体走一侧，不能一个吃 lane0、一个吃 lane1
 //★★ 2026-10-29：训练包的选法与"前端回报包"分开。回报包按 branch_event（success/br_fail/jalr_fail/
 //   异常）选，训练包按【谁真的带训练载荷】选（bju_kind != 0）。
@@ -529,6 +520,16 @@ module cpu_top #(
 //   ⇒ 这两条 `j` 的落点表永远写不进去 ⇒ 恒判 not-taken ⇒ 100% 漏跳（各 ~300 次判错）。
 //   改成按 kind 选之后，lane0 没有训练载荷时 lane1 的训练才拿得到那一个写口。
 //   ★ 2026-10-30：训练口仍然是【一个】，但撞拍时 lane1 那条不再丢 —— 见上面的 1 深训练缓冲。
+//CSR 读口（执行级）：地址选本拍要发的那条（两条同拍都是 CSR 指令时只落 lane0，并发 CSR 写不在本核口径内）
+    always @(*) begin
+//★ 必须跟训练包用【同一个】选择器：bpu 里 branch_stage2/3 是
+//     is_branch & branch_unit_taken & ~branch_prediction_taken_in
+//  —— 一边是"训练包里的 taken"、另一边是"随指令记下的预测"。两边来自不同 lane 时这个比较是垃圾。
+        fetch_bpred      = (train_sel == 2'd0) ? train_buf_bpred :
+                           (train_sel == 2'd1) ? branch_prediction_taken_registered_0_exu
+                                               : branch_prediction_taken_registered_1_exu;
+        fetch_jump_target     = (redir_cause == 2'd2) ? interrupt_return_address_2_clint :
+                                (redir_cause == 2'd1) ? isr_addr2  : kill_redirect_target_rob;
         fetch_kind       = (train_sel == 2'd0) ? train_buf_kind :
                            (train_sel == 2'd1) ? branch_unit_kind_0_exu     : branch_unit_kind_1_exu;
         fetch_taken      = (train_sel == 2'd0) ? train_buf_taken :
@@ -537,7 +538,6 @@ module cpu_top #(
                            (train_sel == 2'd1) ? branch_unit_pc_0_exu     : branch_unit_pc_1_exu;
         fetch_target     = (train_sel == 2'd0) ? train_buf_target :
                            (train_sel == 2'd1) ? branch_unit_target_0_exu     : branch_unit_target_1_exu;
-//CSR 读口（执行级）：地址选本拍要发的那条（两条同拍都是 CSR 指令时只落 lane0，并发 CSR 写不在本核口径内）
         csr_address_m   = csr_write_enable_1_isq ? csr_address_1_isq : csr_address_0_isq;
     end
 
