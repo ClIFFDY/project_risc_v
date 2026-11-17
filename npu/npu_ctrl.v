@@ -39,6 +39,8 @@ module tile_controller(
     input        drain_done,
     input        cwr_ready, cwr_empty, c_wr_pulse,
     // per-channel 量化参数（来自 npu_top 的三张小表，2026-11-17）
+    input        cfg_accumulate,      // 本任务是否跨任务累加
+    input        cfg_final_seg,       // 本任务是不是 K 链最后一段
     input        qc_per_channel,
     input        qc_round,
     input [7:0]  qc_zp,
@@ -48,6 +50,10 @@ module tile_controller(
     input [31:0] qc_mult,
     input [5:0]  qc_shift,
     output reg [5:0] qc_chan,       // 当前扫描行的绝对输出通道号
+    // 最后一段：扫描要向 C RAM 借一拍读口取旧值（K 链累加后的再量化）
+    output reg        c_scan_re,
+    output reg [`NPU_CBUF_AW-1:0] c_scan_addr,
+    input      [31:0] c_scan_rdata,
     // A/BT RAM 读请求（npu_buffer 内部同步读，数据下一次返回）
     output reg [`NPU_ABUF_AW-1:0] a_addr,
     output reg   a_re,
@@ -273,6 +279,35 @@ module tile_controller(
     end
     wire qc_wait = qc_per_channel && !param_ok;
 
+    // ---- 最后一段的"读旧值再量化"（2026-11-17）----
+    // K 分成多段跑时，前面几段把 raw int32 累加进 C RAM；最后一段要
+    //   out8 = requant( C_RAM[addr] + 本段acc )
+    // 所以扫描在这个模式下变成两拍一个元素：第 1 拍向 C RAM 发读，
+    // 第 2 拍拿到旧值、加上本段、走同一套量化式、当普通写推给 FIFO。
+    // 这样量化器全仓只有一份（就在下面），FIFO 也不用加宽。
+    wire two_phase = cfg_accumulate && cfg_final_seg;
+    reg  scan_phase;             // 0 = 发读，1 = 收值并写出
+    reg  signed [31:0] acc_in;   // 累加器输入（最后一段要把 C RAM 旧值加进来）
+
+    always @(posedge clk) begin
+        if (rst)
+            scan_phase <= 1'b0;
+        else if (!active_q || advance)
+            scan_phase <= 1'b0;      // 每个元素从发读开始
+        else if (two_phase && lane_ok && (idx_q < 5'd16) && !qc_wait)
+            // ★ 必须和 c_scan_re 用同一个条件：换行那一拍 qc_wait=1，读根本没发出去，
+            //   这时候把相位推到 1，第 2 拍就会拿上一行的 C 旧值去加（实测 split 结果
+            //   只有一趟的量，就是因为这个）。
+            scan_phase <= 1'b1;
+    end
+
+    always @(*) begin
+        acc_in = $signed(acc_sel) +
+                 ((two_phase && scan_phase) ? $signed(c_scan_rdata) : 32'sd0);
+        c_scan_re   = active_q && two_phase && lane_ok && (idx_q < 5'd16) && !scan_phase && !qc_wait;
+        c_scan_addr = c_addr[`NPU_CBUF_AW-1:0];
+    end
+
     always @(*) begin
         // 赋值顺序 = 数据依赖顺序。bank_clr/bank_busy_d 依赖 scan_done，
         // 所以扫描数据通路必须写在它们前面：写反了会让 bank 清位晚一拍，扫描结束后
@@ -283,7 +318,9 @@ module tile_controller(
         lane_ok = (idx_q < 5'd16) &&
                   ({1'b0, r_idx} < valid_tm_q[scan_bank_q]) &&
                   ({1'b0, c_idx} < valid_tn_q[scan_bank_q]);
-        advance   = active_q && (idx_q < 5'd16) && (lane_ok ? (cwr_ready && !qc_wait) : 1'b1);
+        advance   = active_q && (idx_q < 5'd16) &&
+                    (lane_ok ? (cwr_ready && !qc_wait && (!two_phase || scan_phase))
+                             : (!two_phase || !scan_phase));
         scan_done = advance && (idx_q == 5'd15);
 
         any_free      = (bank_busy_q != {BANK_NUM{1'b1}});
@@ -315,8 +352,14 @@ module tile_controller(
     reg signed [31:0] qc_sum, qc_val, qc_clamped;
 
     always @(*) begin
-        if (qc_per_channel) begin
-            qc_sum  = $signed(acc_sel) + $signed(bias_q);
+        if (cfg_accumulate && !cfg_final_seg) begin
+            // ★ K 链的中间段：必须推**原始 int32**，让写回 FIFO 做 C_RAM += 本段。
+            //   这一段不能量化 —— 量化了就是把每段单独截断再相加，结果全错。
+            //   （踩过：两边都量化，split 的结果正好只有一趟的量。）
+            quant_word = acc_sel;
+        end
+        else if (qc_per_channel) begin
+            qc_sum  = acc_in + $signed(bias_q);
             qc_prod = $signed(qc_sum) * $signed(mult_q);
             if (qc_round && (shift_q != 6'd0))
                 qc_prod = qc_prod + (64'sd1 << (shift_q - 6'd1));
@@ -331,10 +374,10 @@ module tile_controller(
             quant_word = {{24{qc_clamped[7]}}, qc_clamped[7:0]};
         end
         else if (lb_qs == 5'd0) begin
-            quant_word = acc_sel;
+            quant_word = acc_in;
         end
         else begin
-            quant_t = $signed(acc_sel);
+            quant_t = $signed(acc_in);
             quant_t = (quant_t + (64'sd1 << (lb_qs - 1))) >>> lb_qs;
             if (quant_t > 64'sd2147483647)
                 quant_word = 32'h7FFF_FFFF;
@@ -391,7 +434,11 @@ module tile_controller(
 
     always @(*) begin
         // cwr_valid 与 cwr_ready 相与，表示本拍一定能完成一次 FIFO 入队。
-        cwr_valid_w = active_q && lane_ok && cwr_ready;
+        // ★ 必须同时被 qc_wait 挡住，否则换行那一拍会带着上一行的量化参数发出去；
+        //   vquant 最初每个通道参数都一样，测不出来 —— 改成真 per-channel 才会暴露。
+        // ★ 两拍模式（最后一段）只在第 2 拍才发。
+        cwr_valid_w = active_q && lane_ok && cwr_ready && !qc_wait &&
+                      (!two_phase || scan_phase);
         cwr_addr_w  = c_addr[`NPU_CBUF_AW-1:0];
         cwr_data_w  = quant_word;
         // 只有"没有扫描在跑、没有 bank 待扫、写 FIFO 也空了"才算真正写完。

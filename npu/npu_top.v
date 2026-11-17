@@ -78,6 +78,7 @@ module npu_top(
     output reg [`NPU_TK_W-1:0]   cfg_tk,
     output reg [`NPU_QS_W-1:0]   cfg_qshift,
     output reg        cfg_accumulate,
+    output reg        cfg_final_seg,   // 本任务是 K 链的最后一段（要做量化）
     output reg        core_bank, // 本任务读哪一组 A/BT（双缓冲）
     // CPU 侧 RAM 端口（到 npu_buffer）
     output reg        cpu_a_we,  cpu_a_re,
@@ -119,6 +120,7 @@ module npu_top(
     reg [`NPU_TK_W-1:0]   tk_l;
     reg [`NPU_QS_W-1:0]   qs_l;
     reg        accumulate_l;
+    reg        final_seg_l;
     reg        done_status, error_status;
     reg        start_req, clear_done_req;
     reg        start_pulse_w;
@@ -171,6 +173,7 @@ module npu_top(
     reg [`NPU_TK_W-1:0]   cr_tk;
     reg [`NPU_QS_W-1:0]   cr_qs;
     reg                   cr_accumulate;
+    reg                   cr_final_seg;
     reg                   cr_bank;
 
     reg wr, byte0_wr, wgt_wr;
@@ -195,6 +198,7 @@ module npu_top(
             cr_tk          <= 5'd4;
             cr_qs          <= 5'd0;
             cr_accumulate  <= 1'b0;
+            cr_final_seg   <= 1'b0;
             cr_bank        <= 1'b0;
             wgt_base       <= {`NPU_WGT_AW{1'b0}};
             wgt_en         <= 1'b0;
@@ -211,7 +215,7 @@ module npu_top(
                 3'd1: cr_m          <= req_wdata[`NPU_DIM_W-1:0];
                 3'd2: cr_n          <= req_wdata[`NPU_DIM_W-1:0];
                 3'd3: cr_k          <= req_wdata[`NPU_DIM_W-1:0];
-                3'd4: cr_accumulate <= req_wdata[0];
+                3'd4: begin cr_accumulate <= req_wdata[0]; cr_final_seg <= req_wdata[1]; end
                 3'd5: cr_bank       <= req_wdata[0];
                 3'd6: cr_tk         <= req_wdata[`NPU_TK_W-1:0];
                 3'd7: cr_qs         <= req_wdata[`NPU_QS_W-1:0];
@@ -227,7 +231,7 @@ module npu_top(
             (ctrl_reg_off == 3'd1) ? {26'd0, cr_m}           :
             (ctrl_reg_off == 3'd2) ? {26'd0, cr_n}           :
             (ctrl_reg_off == 3'd3) ? {26'd0, cr_k}           :
-            (ctrl_reg_off == 3'd4) ? {31'd0, cr_accumulate}  :
+            (ctrl_reg_off == 3'd4) ? {30'd0, cr_final_seg, cr_accumulate} :
             (ctrl_reg_off == 3'd5) ? {31'd0, cr_bank}        :
             (ctrl_reg_off == 3'd6) ? {27'd0, cr_tk}          :
             (ctrl_reg_off == 3'd7) ? {27'd0, cr_qs}          :
@@ -403,6 +407,7 @@ module npu_top(
             tk_l         <= 5'd0;
             qs_l         <= 5'd0;
             accumulate_l <= 1'b0;
+            final_seg_l  <= 1'b0;
         end
         else begin
             start_pulse_w <= 1'b0;
@@ -417,6 +422,7 @@ module npu_top(
                             tk_l         <= cr_tk;
                             qs_l         <= cr_qs;
                             accumulate_l <= cr_accumulate;
+                            final_seg_l  <= cr_final_seg;
                             start_pulse_w <= 1'b1;
                             start_state  <= ST_RUN;
                         end
@@ -505,6 +511,7 @@ module npu_top(
         cfg_tk         = tk_l;
         cfg_qshift     = qs_l;
         cfg_accumulate = accumulate_l;
+        cfg_final_seg  = final_seg_l;
     end
 
 endmodule

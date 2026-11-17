@@ -74,6 +74,10 @@ module npu_system #(
     wire [7:0]  qc_zp, qc_lo, qc_hi;
     wire [31:0] qc_bias, qc_mult;
     wire [5:0]  qc_shift, qc_chan;
+    wire        cfg_final_seg;
+    wire        c_scan_re;
+    wire [`NPU_CBUF_AW-1:0] c_scan_addr;
+    wire [31:0] c_scan_rdata;
 
     // ---- 搬运引擎 ----
     wire        dma_busy, dma_done, dma_error;
@@ -185,6 +189,7 @@ module npu_system #(
         .start_pulse(start_pulse),
         .cfg_m(cfg_m), .cfg_n(cfg_n), .cfg_k(cfg_k),
         .cfg_tk(cfg_tk), .cfg_qshift(cfg_qshift), .cfg_accumulate(cfg_accumulate),
+        .cfg_final_seg(cfg_final_seg),
         .core_busy(core_busy), .core_done(core_done),
         .cpu_a_we(cpu_a_we), .cpu_a_re(cpu_a_re),
         .cpu_bt_we(cpu_bt_we), .cpu_bt_re(cpu_bt_re),
@@ -277,6 +282,8 @@ module npu_system #(
         .qc_zp(qc_zp), .qc_lo(qc_lo), .qc_hi(qc_hi),
         .qc_bias(qc_bias), .qc_mult(qc_mult), .qc_shift(qc_shift),
         .qc_chan(qc_chan),
+        .cfg_accumulate(cfg_accumulate), .cfg_final_seg(cfg_final_seg),
+        .c_scan_re(c_scan_re), .c_scan_addr(c_scan_addr), .c_scan_rdata(c_scan_rdata),
         .core_busy(core_busy), .core_done(core_done)
     );
 
@@ -286,7 +293,8 @@ module npu_system #(
         .clk(HCLK), .rst(rst), .core_busy(core_busy), .core_bank(core_bank),
         .cpu_wgt_we(host_wgt_we), .cpu_wgt_addr(host_wgt_addr), .cpu_wgt_wdata(host_wgt_wdata),
         .wgt_base(wgt_base), .wgt_en(wgt_en),
-        .accumulate(cfg_accumulate),
+        .accumulate(cfg_accumulate), .final_seg(cfg_final_seg),
+        .c_scan_re(c_scan_re), .c_scan_addr(c_scan_addr), .c_scan_rdata(c_scan_rdata),
         .cpu_a_we(host_a_we), .cpu_a_re(host_a_re), .cpu_a_addr(host_a_addr),
         .cpu_a_wdata(host_a_wdata),
         .cpu_bt_we(host_bt_we), .cpu_bt_re(host_bt_re), .cpu_bt_addr(host_bt_addr),

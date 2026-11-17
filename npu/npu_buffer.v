@@ -23,6 +23,11 @@ module npu_buffer(
     input [`NPU_WGT_AW-1:0] wgt_base,
     input        wgt_en,
     input        accumulate, // 跨任务累加：C 写回做读-改-写
+    input        final_seg,   // 本任务是 K 链最后一段：旧值由扫描侧读走再量化
+    // 最后一段的扫描读口（向 C RAM 借一拍读端口取"K 链累加值"）
+    input        c_scan_re,
+    input [`NPU_CBUF_AW-1:0] c_scan_addr,
+    output reg [31:0] c_scan_rdata,
     // 主机侧端口(来自 npu_top.buffer_access_ctrl 与搬运引擎的二选一)
     input        cpu_a_we,  cpu_a_re,
     input [`NPU_ABUF_REG_AW-1:0] cpu_a_addr,
@@ -142,10 +147,12 @@ module npu_buffer(
 
     // 非累加模式只走写相位；累加模式先读原值再写和。队头在写回那一拍才出队，
     // 读相位期间队头保持不变，地址和数据都稳定。
+    // 最后一段的累加改由扫描侧做，这里退回"普通写"（2026-11-17）
+    wire cwf_acc = accumulate && !final_seg;
     reg cwf_do_read, cwf_do_write;
     always @(*) begin
-        cwf_do_read  = !cwf_empty && core_busy && accumulate && !cwf_rmw_q;
-        cwf_do_write = !cwf_empty && core_busy && (!accumulate || cwf_rmw_q);
+        cwf_do_read  = !cwf_empty && core_busy && cwf_acc && !cwf_rmw_q;
+        cwf_do_write = !cwf_empty && core_busy && (!cwf_acc || cwf_rmw_q);
     end
 
     npu_sync_fifo #(.AW(`NPU_CWF_AW), .DW(40)) u_c_write_fifo(
@@ -159,7 +166,7 @@ module npu_buffer(
             cwf_rmw_q <= 1'b0;
         else if (!core_busy || cwf_empty)
             cwf_rmw_q <= 1'b0;      // 空闲或队头处理完，下一个队头从读相位开始
-        else if (accumulate)
+        else if (cwf_acc)
             cwf_rmw_q <= !cwf_rmw_q;
     end
 
@@ -174,7 +181,7 @@ module npu_buffer(
         cwf_we    = cwf_do_write;
         cwf_addr  = cwf_head_addr;
         // 累加模式下累加的是**未量化**的原值；量化在写回扫描那一侧已经做过。
-        cwf_wdata = (accumulate && cwf_rmw_q) ? (c_ram_rdata + cwf_head_data) : cwf_head_data;
+        cwf_wdata = (cwf_acc && cwf_rmw_q) ? (c_ram_rdata + cwf_head_data) : cwf_head_data;
     end
 
     //====================================================================
@@ -189,13 +196,14 @@ module npu_buffer(
     reg  [31:0] c_ram_wdata;
     reg  [`NPU_CBUF_REG_AW-1:0] c_ram_raddr;
     reg  c_ram_re;
-    wire c_rmw = core_busy && accumulate;
+    wire c_rmw = core_busy && cwf_acc;
     always @(*) begin
         c_ram_waddr = core_busy ? {core_bank, cwf_addr}  : cpu_c_addr;
         c_ram_we    = core_busy ? cwf_we                 : cpu_c_we;
         c_ram_wdata = core_busy ? cwf_wdata              : cpu_c_wdata;
-        c_ram_raddr = c_rmw     ? {core_bank, cwf_raddr} : cpu_c_addr;
-        c_ram_re    = c_rmw     ? cwf_re                 : cpu_c_re;
+        c_ram_raddr = c_scan_re ? {core_bank, c_scan_addr} :
+                      (c_rmw ? {core_bank, cwf_raddr} : cpu_c_addr);
+        c_ram_re    = c_scan_re ? 1'b1 : (c_rmw ? cwf_re : cpu_c_re);
     end
 
     npu_ram #(.AW(`NPU_CBUF_REG_AW)) u_c_buffer(
@@ -251,6 +259,7 @@ module npu_buffer(
         a_rdata_cpu   = a_ram_rdata;
         bt_rdata_cpu  = bt_ram_rdata;
         c_rdata_cpu   = c_ram_rdata;
+        c_scan_rdata  = c_ram_rdata;
         a_fifo_rdata  = a_fifo_rdata_w;
         a_fifo_count  = a_fifo_count_w;
         bt_fifo_rdata = bt_fifo_rdata_w;
