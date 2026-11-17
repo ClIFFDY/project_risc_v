@@ -247,26 +247,40 @@ module tile_controller(
     reg snap_ready;
 
     // ---- per-channel 量化参数的取数与对齐（2026-11-17）----
-    // 参数表是同步读（地址给出去，下一拍数据才回来）。扫描是每拍一个元素，
-    // 而 r_idx（=输出通道组）每 4 个元素才换一次，所以这里用"记住上一拍 r_idx"
-    // 的办法判断参数是否已经跟上：换行那一拍参数还没回来 ⇒ 停一拍。
-    // 每个输出 Tile 只有 TM(=4) 行，所以每个 C Tile 最多多花 4 拍。
+    // 参数表是同步读（地址给出去，下一拍数据才回来），而参数又是"当拍拿到、下一拍
+    // 才进 bias_q"。两级下来：周期 C 的 bias_q 对应的是 scan_bank 上 C-2 那一拍
+    // 的 r_idx。所以要判"参数跟上了没有"，必须要求 r_idx **连续两拍不变**。
+    //
+    // ★ 只判一拍是错的（2026-11-17 实测）：那样每个 4 行 C Tile 里第 0 行对、
+    //   第 1~3 行用的都是上一行的 bias/mult/shift。整型算子测试里表现为
+    //   "单段 K 全对、逐通道参数一换就散"，而 vquant 的 Q 组给 16 个通道写的
+    //   是同一套参数，所以一直没暴露。
+    //   代价：每个 C Tile 多停 3 拍（原来每换行停 1 拍，现在停 2 拍）。
     reg [5:0] chan_base_q [0:BANK_NUM-1];   // 本块第一行的绝对通道号
-    reg [1:0]  param_idx_q;      // bias_q/mult_q/shift_q 属于哪一组行
+    reg [1:0]  param_idx_q;      // C-1 拍的 r_idx
+    reg [1:0]  param_idx_q2;     // C-2 拍的 r_idx（bias_q 真正对应的那一组）
     reg [31:0] bias_q, mult_q;
     reg [5:0]  shift_q;
     reg        param_ok;
 
     always @(posedge clk) begin
         if (rst) begin
-            param_idx_q <= 2'd0;
+            // 2'd1 是"占位值"：扫描总是从 r_idx=0 起步，占位保证起点至少停两拍，
+            // 否则上一趟残留的 param_idx_q 正好等于 0 时会直接把陈参数当新参数用。
+            param_idx_q  <= 2'd1;
+            param_idx_q2 <= 2'd1;
             bias_q      <= 32'd0;
             mult_q      <= 32'd0;
             shift_q     <= 6'd0;
         end
+        else if (!active_q) begin
+            param_idx_q  <= 2'd1;
+            param_idx_q2 <= 2'd1;
+        end
         else begin
             // 本拍的 qc_chan 已经送到 RAM 上，下一拍回来的就是它的参数
-            param_idx_q <= r_idx;
+            param_idx_q  <= r_idx;
+            param_idx_q2 <= param_idx_q;
             bias_q      <= qc_bias;
             mult_q      <= qc_mult;
             shift_q     <= qc_shift;
@@ -275,7 +289,7 @@ module tile_controller(
 
     always @(*) begin
         qc_chan  = chan_base_q[scan_bank_q] + {4'd0, r_idx};
-        param_ok = (param_idx_q == r_idx);
+        param_ok = (param_idx_q == r_idx) && (param_idx_q2 == r_idx);
     end
     wire qc_wait = qc_per_channel && !param_ok;
 
