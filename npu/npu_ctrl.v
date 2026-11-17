@@ -38,6 +38,16 @@ module tile_controller(
     input [`NPU_PE_NUM*`NPU_ACC_W-1:0] acc_flat_in,
     input        drain_done,
     input        cwr_ready, cwr_empty, c_wr_pulse,
+    // per-channel 量化参数（来自 npu_top 的三张小表，2026-11-17）
+    input        qc_per_channel,
+    input        qc_round,
+    input [7:0]  qc_zp,
+    input [7:0]  qc_lo,
+    input [7:0]  qc_hi,
+    input [31:0] qc_bias,
+    input [31:0] qc_mult,
+    input [5:0]  qc_shift,
+    output reg [5:0] qc_chan,       // 当前扫描行的绝对输出通道号
     // A/BT RAM 读请求（npu_buffer 内部同步读，数据下一次返回）
     output reg [`NPU_ABUF_AW-1:0] a_addr,
     output reg   a_re,
@@ -230,6 +240,39 @@ module tile_controller(
     reg [31:0] cwr_data_w;
     reg snap_ready;
 
+    // ---- per-channel 量化参数的取数与对齐（2026-11-17）----
+    // 参数表是同步读（地址给出去，下一拍数据才回来）。扫描是每拍一个元素，
+    // 而 r_idx（=输出通道组）每 4 个元素才换一次，所以这里用"记住上一拍 r_idx"
+    // 的办法判断参数是否已经跟上：换行那一拍参数还没回来 ⇒ 停一拍。
+    // 每个输出 Tile 只有 TM(=4) 行，所以每个 C Tile 最多多花 4 拍。
+    reg [5:0] chan_base_q [0:BANK_NUM-1];   // 本块第一行的绝对通道号
+    reg [1:0]  param_idx_q;      // bias_q/mult_q/shift_q 属于哪一组行
+    reg [31:0] bias_q, mult_q;
+    reg [5:0]  shift_q;
+    reg        param_ok;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            param_idx_q <= 2'd0;
+            bias_q      <= 32'd0;
+            mult_q      <= 32'd0;
+            shift_q     <= 6'd0;
+        end
+        else begin
+            // 本拍的 qc_chan 已经送到 RAM 上，下一拍回来的就是它的参数
+            param_idx_q <= r_idx;
+            bias_q      <= qc_bias;
+            mult_q      <= qc_mult;
+            shift_q     <= qc_shift;
+        end
+    end
+
+    always @(*) begin
+        qc_chan  = chan_base_q[scan_bank_q] + {4'd0, r_idx};
+        param_ok = (param_idx_q == r_idx);
+    end
+    wire qc_wait = qc_per_channel && !param_ok;
+
     always @(*) begin
         // 赋值顺序 = 数据依赖顺序。bank_clr/bank_busy_d 依赖 scan_done，
         // 所以扫描数据通路必须写在它们前面：写反了会让 bank 清位晚一拍，扫描结束后
@@ -240,7 +283,7 @@ module tile_controller(
         lane_ok = (idx_q < 5'd16) &&
                   ({1'b0, r_idx} < valid_tm_q[scan_bank_q]) &&
                   ({1'b0, c_idx} < valid_tn_q[scan_bank_q]);
-        advance   = active_q && (idx_q < 5'd16) && (lane_ok ? cwr_ready : 1'b1);
+        advance   = active_q && (idx_q < 5'd16) && (lane_ok ? (cwr_ready && !qc_wait) : 1'b1);
         scan_done = advance && (idx_q == 5'd15);
 
         any_free      = (bank_busy_q != {BANK_NUM{1'b1}});
@@ -258,11 +301,36 @@ module tile_controller(
     end
 
     // ---- 量化（原 result_quantizer）----
-    // qshift=0 时直通；qshift>0 时先加 2^(qshift-1) 做四舍五入，再算术右移，
-    // 最后饱和到有符号 32 位范围。64 位中间量为舍入加法和负数右移提供符号位。
+    // 两种契约，由 qc_per_channel 选：
+    //   0（默认，向后兼容）：qshift>0 时加 2^(q-1) 四舍五入、算术右移、饱和到 int32；
+    //                        qshift=0 直通。
+    //   1（per-channel，2026-11-17）：
+    //        out8 = clamp( ((acc + bias[ch]) * mult[ch]) >> shift[ch] + zp, lo, hi )
+    //        mult 是有符号 int32；round=1 时右移前加 2^(shift-1)；结果按 int8 符号扩展。
+    //        这是业界 int8 推理的标准量化式（TFLite/CMSIS-NN 同构），
+    //        差别只在于我们把"定点乘子+移位"直接写成一对 (mult, shift)，
+    //        由软件用同一套算法算出来，所以两侧可以逐位对上。
     reg signed [63:0] quant_t;
+    reg signed [63:0] qc_prod;
+    reg signed [31:0] qc_sum, qc_val, qc_clamped;
+
     always @(*) begin
-        if (lb_qs == 5'd0) begin
+        if (qc_per_channel) begin
+            qc_sum  = $signed(acc_sel) + $signed(bias_q);
+            qc_prod = $signed(qc_sum) * $signed(mult_q);
+            if (qc_round && (shift_q != 6'd0))
+                qc_prod = qc_prod + (64'sd1 << (shift_q - 6'd1));
+            qc_val  = (qc_prod >>> shift_q);
+            qc_val  = qc_val + $signed({{24{qc_zp[7]}}, qc_zp});
+            if (qc_val > $signed({{24{qc_hi[7]}}, qc_hi}))
+                qc_clamped = $signed({{24{qc_hi[7]}}, qc_hi});
+            else if (qc_val < $signed({{24{qc_lo[7]}}, qc_lo}))
+                qc_clamped = $signed({{24{qc_lo[7]}}, qc_lo});
+            else
+                qc_clamped = qc_val;
+            quant_word = {{24{qc_clamped[7]}}, qc_clamped[7:0]};
+        end
+        else if (lb_qs == 5'd0) begin
             quant_word = acc_sel;
         end
         else begin
@@ -290,6 +358,7 @@ module tile_controller(
                 n_dim_q[b]    <= {`NPU_DIM_W{1'b0}};
                 valid_tm_q[b] <= {`NPU_TILE_W{1'b0}};
                 valid_tn_q[b] <= {`NPU_TILE_W{1'b0}};
+                chan_base_q[b] <= 6'd0;
             end
         end
         else begin
@@ -303,6 +372,8 @@ module tile_controller(
                 n_dim_q[cap_bank]    <= lb_n;
                 valid_tm_q[cap_bank] <= valid_tm;
                 valid_tn_q[cap_bank] <= valid_tn;
+                // 本块第一个输出通道的绝对编号：tile_i*TM（此时 tile 计数器还没推进）
+                chan_base_q[cap_bank] <= tile_i * lp_tm;
             end
 
             if (scan_start) begin

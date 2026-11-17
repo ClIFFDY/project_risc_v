@@ -64,11 +64,13 @@ module npu_top(
     output reg        sel_c_buf,
     output reg        sel_wgt,     // 0x4000-0x7FFF 权重块
     output reg        sel_wgt_cfg, // 0x0800-0x080F 权重块配置
+    output reg        sel_qparam,  // 0x0900-0x09FF 量化参数表
     output reg [2:0]  dma_reg_off,
     output reg [1:0]  bank_reg_off,
     output reg [31:0] control_rdata,
     output reg [31:0] status_rdata,
     output reg [31:0] bank_rdata,
+    output reg [31:0] qparam_rdata,
     output reg [31:0] buffer_rdata,
     // 到 tile_controller（启动脉冲 + 锁存后的任务参数）
     output reg        start_pulse,
@@ -90,7 +92,18 @@ module npu_top(
     output reg [31:0] cpu_wgt_wdata,
     // 权重块配置直通（只在任务之间变化，不必像 m/n/k 那样锁存）
     output reg [`NPU_WGT_AW-1:0] wgt_base,
-    output reg                   wgt_en
+    output reg                   wgt_en,
+    // ---- 量化参数表（per-channel requant，2026-11-17）----
+    // 读口给 tile_controller 的写回扫描用；写口是下面 CPU 的那条路。
+    input      [5:0]  qc_ram_addr,
+    output     [31:0] qc_ram_bias,
+    output     [31:0] qc_ram_mult,
+    output     [5:0]  qc_ram_shift,
+    output reg        qc_per_channel,   // 0 = 走旧的 qshift 路径（向后兼容）
+    output reg        qc_round,         // 1 = 右移前加 2^(s-1) 做四舍五入
+    output reg  [7:0] qc_zp,            // 输出 zero-point（按有符号解释）
+    output reg  [7:0] qc_lo,            // 激活下界
+    output reg  [7:0] qc_hi             // 激活上界
 );
 
     // ---- 译码出的本地字地址与寄存器偏移 ----
@@ -135,6 +148,9 @@ module npu_top(
         sel_c_buf   = (req_addr[31:11] == 21'd6);
         sel_wgt     = (req_addr[31:15] == 17'd0) && req_addr[14];
         sel_wgt_cfg = (req_addr[31:4] == 28'h00000080);
+        // 0x0900-0x0FFF 量化参数表：bank=addr[9:8]（0=BIAS 1=MULT 2=SHIFT 3=QCFG）
+        //            idx=addr[7:2]（按字索引，不是按字节）
+        sel_qparam  = (req_addr[31:12] == 20'd0) && (req_addr[11:8] >= 4'd9);
         a_local_addr   = {req_addr[11], req_addr[7:2]};
         bt_local_addr  = {req_addr[11], req_addr[7:2]};
         c_local_addr   = {req_addr[10], req_addr[9:2]};
@@ -246,6 +262,77 @@ module npu_top(
             2'd2:    bank_rdata = {27'd0, error_status, !core_busy, 1'b0, done_status, core_busy};
             default: bank_rdata = 32'd0;
         endcase
+    end
+
+    //====================================================================
+    //  三之一、量化参数表（per-channel requant，2026-11-17）
+    //
+    //  写回扫描每拍处理一个输出元素，需要"它属于哪个输出通道"的 bias / 乘子 / 移位。
+    //  这里给三张 64 深的小表，读口交给 tile_controller（地址由它给，见 npu_ctrl 的
+    //  行切换停顿说明）。写口就是 CPU 那条路。
+    //
+    //  地址：0x0900-0x093F BIAS[0..63] / 0x0940-0x097F MULT[0..63]
+    //        0x0980-0x09BF SHIFT[0..63] / 0x09C0 QCFG / 0x09C4 QOUT
+    //====================================================================
+    wire        qparam_wr   = req_valid && req_we && sel_qparam;
+    // 表基址 0x0900，用"减去基址后的第 [9:8] 位"分表，第 [7:2] 位当字索引
+    wire [11:0] qparam_off  = req_addr[11:0] - 12'h900;
+    wire [1:0]  qparam_bank = qparam_off[9:8];
+    wire [5:0]  qparam_idx  = qparam_off[7:2];
+
+    wire [31:0] qc_bias_raw, qc_mult_raw, qc_shift_raw;
+
+    npu_ram #(.AW(6)) u_qc_bias(
+        .clk(clk), .we(qparam_wr && (qparam_bank == 2'd0)), .waddr(qparam_idx),
+        .wdata(req_wdata), .re(1'b1), .raddr(qc_ram_addr), .rdata(qc_bias_raw)
+    );
+    npu_ram #(.AW(6)) u_qc_mult(
+        .clk(clk), .we(qparam_wr && (qparam_bank == 2'd1)), .waddr(qparam_idx),
+        .wdata(req_wdata), .re(1'b1), .raddr(qc_ram_addr), .rdata(qc_mult_raw)
+    );
+    npu_ram #(.AW(6)) u_qc_shift(
+        .clk(clk), .we(qparam_wr && (qparam_bank == 2'd2)), .waddr(qparam_idx),
+        .wdata(req_wdata), .re(1'b1), .raddr(qc_ram_addr), .rdata(qc_shift_raw)
+    );
+
+    always @(*) begin
+        qc_ram_bias  = qc_bias_raw;
+        qc_ram_mult  = qc_mult_raw;
+        qc_ram_shift = qc_shift_raw[5:0];
+    end
+
+    wire qcfg_wr = qparam_wr && (qparam_bank == 2'd3) && (qparam_idx == 6'd0);
+    wire qout_wr = qparam_wr && (qparam_bank == 2'd3) && (qparam_idx == 6'd1);
+
+    always @(posedge clk) begin
+        if (rst) begin
+            qc_per_channel <= 1'b0;      // 默认走旧的 qshift 路径，旧软件不受影响
+            qc_round       <= 1'b0;
+            qc_zp          <= 8'd0;
+            qc_lo          <= 8'h80;     // -128
+            qc_hi          <= 8'h7F;     //  127
+        end
+        else begin
+            if (qcfg_wr) begin
+                qc_per_channel <= req_wdata[0];
+                qc_round       <= req_wdata[1];
+            end
+            if (qout_wr) begin
+                qc_zp <= req_wdata[7:0];
+                qc_lo <= req_wdata[15:8];
+                qc_hi <= req_wdata[23:16];
+            end
+        end
+    end
+
+    // 回读只保证 QCFG/QOUT（RAM 那三张表是只写，读回 0 —— 它们的内容本来就由软件掌握）
+    always @(*) begin
+        if (qparam_bank == 2'd3 && qparam_idx == 6'd0)
+            qparam_rdata = {30'd0, qc_round, qc_per_channel};
+        else if (qparam_bank == 2'd3 && qparam_idx == 6'd1)
+            qparam_rdata = {8'd0, qc_hi, qc_lo, qc_zp};
+        else
+            qparam_rdata = 32'd0;
     end
 
     //====================================================================

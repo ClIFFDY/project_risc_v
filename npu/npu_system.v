@@ -67,6 +67,14 @@ module npu_system #(
     wire [1:0]  bank_reg_off;
     wire [31:0] control_rdata, status_rdata, buffer_rdata, dma_rdata, bank_rdata;
 
+    // ---- per-channel 量化参数（npu_top 存表，tile_controller 取数）----
+    wire        sel_qparam;
+    wire [31:0] qparam_rdata;
+    wire        qc_per_channel, qc_round;
+    wire [7:0]  qc_zp, qc_lo, qc_hi;
+    wire [31:0] qc_bias, qc_mult;
+    wire [5:0]  qc_shift, qc_chan;
+
     // ---- 搬运引擎 ----
     wire        dma_busy, dma_done, dma_error;
     wire        dma_local_valid, dma_local_we;
@@ -146,7 +154,8 @@ module npu_system #(
         .sel_wgt(sel_wgt), .sel_wgt_cfg(sel_wgt_cfg),
         .sel_dma(sel_dma), .sel_bank(sel_bank),
         .control_rdata(control_rdata), .status_rdata(status_rdata),
-        .buffer_rdata(buffer_rdata), .dma_rdata(dma_rdata), .bank_rdata(bank_rdata)
+        .buffer_rdata(buffer_rdata), .dma_rdata(dma_rdata), .bank_rdata(bank_rdata),
+        .sel_qparam(sel_qparam), .qparam_rdata(qparam_rdata)
     );
 
     always @(*) begin
@@ -165,6 +174,11 @@ module npu_system #(
         .sel_dma(sel_dma), .sel_bank(sel_bank),
         .dma_reg_off(dma_reg_off), .bank_reg_off(bank_reg_off),
         .dma_busy(dma_busy), .dma_rdata(dma_rdata),
+        .sel_qparam(sel_qparam), .qparam_rdata(qparam_rdata),
+        .qc_ram_addr(qc_chan),
+        .qc_ram_bias(qc_bias), .qc_ram_mult(qc_mult), .qc_ram_shift(qc_shift),
+        .qc_per_channel(qc_per_channel), .qc_round(qc_round),
+        .qc_zp(qc_zp), .qc_lo(qc_lo), .qc_hi(qc_hi),
         .control_rdata(control_rdata), .status_rdata(status_rdata),
         .bank_rdata(bank_rdata),
         .buffer_rdata(buffer_rdata),
@@ -259,6 +273,10 @@ module npu_system #(
         .acc_flat_in(acc_flat), .drain_done(drain_done),
         .cwr_valid(cwr_valid), .cwr_addr(cwr_addr), .cwr_data(cwr_data),
         .cwr_ready(cwr_ready), .cwr_empty(cwr_empty), .c_wr_pulse(c_wr_pulse),
+        .qc_per_channel(qc_per_channel), .qc_round(qc_round),
+        .qc_zp(qc_zp), .qc_lo(qc_lo), .qc_hi(qc_hi),
+        .qc_bias(qc_bias), .qc_mult(qc_mult), .qc_shift(qc_shift),
+        .qc_chan(qc_chan),
         .core_busy(core_busy), .core_done(core_done)
     );
 

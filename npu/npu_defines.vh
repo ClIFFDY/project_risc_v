@@ -81,6 +81,14 @@
 `define NPU_ADDR_CBUF_BASE 32'h0000_3000  // 0x3000-0x33FF / 0x3400-0x37FF C Buffer
 `define NPU_ADDR_WGT_BASE  32'h0000_4000  // 0x4000-0x7FFF 权重块 16KB（4096 字）
 `define NPU_ADDR_WGCFG_BASE 32'h0000_0800 // 0x0800-0x080F 权重块配置寄存器
+// ---- 量化参数（2026-11-17，per-channel requant）----
+// 0x0900 + i*4  BIAS[i]   int32，已经缩放到累加器域的偏置（i=0..63）
+// 0x0A00 + i*4  MULT[i]   int32 有符号定点乘子
+// 0x0B00 + i*4  SHIFT[i]  低 6 位，右移位数
+// 0x0C00 QCFG / 0x0C04 QOUT  模式与输出范围（与上面的表配合）
+`define NPU_ADDR_QPARAM_BASE 32'h0000_0900
+`define NPU_ADDR_QCFG_BASE   32'h0000_0030
+`define NPU_QCHAN_MAX 64          // 量化参数表的深度 = 输出通道数上界
 
 // ---- 搬运引擎的容量约束 ----
 // 一次描述符最多搬 4096 个字（16 KB）。这是"DMA_WORDS 的合法上界"，

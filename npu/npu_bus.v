@@ -92,11 +92,13 @@ module ahb_lite_slave #(
     input              sel_wgt_cfg,
     input              sel_dma,
     input              sel_bank,
+    input              sel_qparam,
     input       [31:0] control_rdata,
     input       [31:0] status_rdata,
     input       [31:0] buffer_rdata,
     input       [31:0] dma_rdata,
     input       [31:0] bank_rdata,
+    input       [31:0] qparam_rdata,
     output reg  [31:0] HRDATA,
     output reg         HREADYOUT,
     output reg  [1:0]  HRESP,
@@ -180,7 +182,7 @@ module ahb_lite_slave #(
         cap_now   = bus_phase && HREADYOUT;
 
         is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf || sel_wgt;
-        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || sel_dma || sel_bank || is_buf;
+        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || sel_dma || sel_bank || sel_qparam || is_buf;
         idle_bank_wr = write_q && (sel_a_buf || sel_bt_buf) && (addr_q[11] != core_bank);
         err_now = !mapped || !size_ok_q ||
                   (is_buf && (dma_busy || (core_busy && !idle_bank_wr)));
@@ -194,6 +196,7 @@ module ahb_lite_slave #(
         HRDATA    = sel_ctrl   ? control_rdata :
                     sel_status ? status_rdata  :
                     sel_dma    ? dma_rdata     :
+                    sel_qparam ? qparam_rdata  :
                     sel_bank   ? bank_rdata    : buffer_rdata;
         HREADYOUT = ((state == S_DATA) && (err_now || (is_buf && !write_q))) ? 1'b0 :
                     (state == S_ERR1) ? 1'b0 : 1'b1;
