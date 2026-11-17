@@ -75,6 +75,19 @@ module ahb_interconnect(
     input             m3_hmastlock,
     input      [31:0] m3_hwdata,
     input      [3:0]  m3_hwstrb,
+
+//---- m4：NPU 自带的搬运引擎（2026-11-17）----
+//  ★ 它和 m2（3 号槽那块通用 DMA）是两块完全不同的东西：m4 只搬 NPU 的
+//    A/BT/C/权重块，主口出在 npu_system 上。仲裁里排在最后，并且自带防饿死计数。
+    input      [31:0] m4_haddr,
+    input      [1:0]  m4_htrans,
+    input             m4_hwrite,
+    input      [2:0]  m4_hsize,
+    input      [2:0]  m4_hburst,
+    input      [3:0]  m4_hprot,
+    input             m4_hmastlock,
+    input      [31:0] m4_hwdata,
+    input      [3:0]  m4_hwstrb,
     input      [31:0] s2_hrdata,
     input             s2_hreadyout,
     input             s2_hresp,
@@ -98,6 +111,11 @@ module ahb_interconnect(
     output reg        m2_hresp,
     output reg        m2_rd_valid,
     output reg        m2_hgrant,
+    output reg [31:0] m4_hrdata,
+    output reg        m4_hready,
+    output reg        m4_hresp,
+    output reg        m4_rd_valid,
+    output reg        m4_hgrant,
 
 //---- s0：APB 外设桥 ----
     output reg [31:0] s0_haddr,
@@ -145,7 +163,7 @@ module ahb_interconnect(
     output reg        s3_hsel
     );
 
-    localparam [1:0] M_LSU = 2'd0, M_L2 = 2'd1, M_DMA = 2'd2, M_BOOT = 2'd3;
+    localparam [2:0] M_LSU = 3'd0, M_L2 = 3'd1, M_DMA = 3'd2, M_BOOT = 3'd3, M_CDMA = 3'd4;
 
     reg reset_registered;
     always @(posedge clk) reset_registered <= rst;
@@ -153,34 +171,45 @@ module ahb_interconnect(
 //==============================================================================
 //  一、授权
 //==============================================================================
-    reg [1:0] grant;
-    reg [6:0] dma_wait;
+    reg [2:0] grant;
+    reg [6:0] dma_wait;      // m2（通用 DMA）的防饿死计数
+    reg [6:0] cdma_wait;     // m4（NPU 搬运引擎）的防饿死计数
 
-    reg m0_req, m1_req, m2_req, m3_req;
+    reg m0_req, m1_req, m2_req, m3_req, m4_req;
     always @(*) begin
         m0_req = (m0_htrans != 2'b00);
         m1_req = (m1_htrans != 2'b00);
         m2_req = (m2_htrans != 2'b00);
         m3_req = (m3_htrans != 2'b00);
+        m4_req = (m4_htrans != 2'b00);
     end
 
 //当前授权主设备还在事务中（它还有节拍要发）⇒ 不换手
     reg grant_busy;
     always @(*) begin
-        grant_busy = (grant == M_LSU)  ? m0_req : (grant == M_L2)   ? m1_req : (grant == M_DMA)  ? m2_req : m3_req;
+        grant_busy = (grant == M_LSU)  ? m0_req :
+                     (grant == M_L2)   ? m1_req :
+                     (grant == M_DMA)  ? m2_req :
+                     (grant == M_BOOT) ? m3_req : m4_req;
     end
 
     always @(posedge clk) begin
         if (reset_registered) begin
-            grant    <= M_LSU;
-            dma_wait <= 7'd0;
+            grant     <= M_LSU;
+            dma_wait  <= 7'd0;
+            cdma_wait <= 7'd0;
         end
         else begin
             if (!grant_busy) begin
 //★ boot 引擎优先级最高：它只在"其他主设备全在复位里"的那段时间说话，
 //  给它最高优先级是为了不被 DMA 的 64 拍插队拖慢上电。
+//★ m4（NPU 搬运引擎，2026-11-17）排在最后，但和 m2 一样带防饿死：
+//  连续等够 64 拍插一次队。它自己每 8 笔插一拍 IDLE，正常情况下能周期性放开，
+//  这个计数只是兜底。
                 if (m3_req)
                     grant <= M_BOOT;
+                else if (m4_req && (cdma_wait >= 7'd64))
+                    grant <= M_CDMA;
                 else if (m2_req && (dma_wait >= 7'd64))
                     grant <= M_DMA;
                 else if (m0_req)
@@ -189,6 +218,8 @@ module ahb_interconnect(
                     grant <= M_L2;
                 else if (m2_req)
                     grant <= M_DMA;
+                else if (m4_req)
+                    grant <= M_CDMA;
             end
             if (m2_req && (grant != M_DMA) && grant_busy) begin
                 if (dma_wait != 7'd127)
@@ -196,15 +227,23 @@ module ahb_interconnect(
             end
             else if (grant == M_DMA)
                 dma_wait <= 7'd0;
+
+            if (m4_req && (grant != M_CDMA) && grant_busy) begin
+                if (cdma_wait != 7'd127)
+                    cdma_wait <= cdma_wait + 7'd1;
+            end
+            else if (grant == M_CDMA)
+                cdma_wait <= 7'd0;
         end
     end
 
-    reg g0, g1, g2, g3;
+    reg g0, g1, g2, g3, g4;
     always @(*) begin
         g0 = (grant == M_LSU);
         g1 = (grant == M_L2);
         g2 = (grant == M_DMA);
         g3 = (grant == M_BOOT);
+        g4 = (grant == M_CDMA);
     end
 
 //==============================================================================
@@ -273,6 +312,17 @@ module ahb_interconnect(
                            hwdata = m3_hwdata;
                            hwstrb = m3_hwstrb;
                            end
+        else if (g4) begin
+            haddr = m4_haddr;
+            htrans = m4_htrans;
+            hwrite = m4_hwrite;
+                           hsize = m4_hsize;
+                           hburst = m4_hburst;
+                           hprot = m4_hprot;
+                           hmastlock = m4_hmastlock;
+                           hwdata = m4_hwdata;
+                           hwstrb = m4_hwstrb;
+                           end
     end
 
 //==============================================================================
@@ -303,7 +353,7 @@ module ahb_interconnect(
 //  否则从设备照样执行、多吐一个没人认领的应答），也不回 HREADY。
 //  ★ 只压"要进 FIFO 的读"：写不记账、NPU/DDR 走直达，都不压。
 //  ★ 指针在这里提前声明（原来在下面 owner FIFO 那一节），否则压不住从设备侧。
-    reg [3:0] owner_mem [0:7];                // {sel[1:0], owner[1:0]}
+    reg [4:0] owner_mem [0:7];                // {sel[1:0], owner[2:0]}
     reg  [2:0] owner_wr, owner_rd;
     reg owner_empty;
     reg [2:0] owner_count;
@@ -320,7 +370,7 @@ module ahb_interconnect(
     reg fifo_same;
     always @(*) begin
         new_sel = sel_stcm ? 2'd1 : 2'd0;
-        fifo_same = owner_empty || (owner_mem[owner_rd][3:2] == new_sel);
+        fifo_same = owner_empty || (owner_mem[owner_rd][4:3] == new_sel);
     end
     reg read_hold;
     always @(*) begin
@@ -446,10 +496,20 @@ module ahb_interconnect(
 //  icache 等不到数据，整核冻死。实测现象就是"写过一次 NPU 之后核卡死"。
 //  NPU 的 rd_valid 至少比地址被接受晚一拍（npu/bus/ahb_lite_slave.v 在 S_DATA
 //  才回），所以一深寄存器够用，不存在"接受与应答同拍"的冲突。
-//  ★ DDR 桥不走这条：它在 S_DONE 同拍给 HREADYOUT 和 rd_valid，而且整笔传输
-//    期间压着 HREADYOUT ⇒ 授权与地址都不换手，按当拍 sel_ddr 判是对的。
+//  ★ DDR 桥同理，但判据要换成 s3_rd_valid，不能是 sel_ddr（2026-11-16 实测踩到）：
+//    sel_ddr 是拿【当拍地址】算的，而 LSU 主设备的 lat_addr 在请求被接受后会一直
+//    挂着旧值。CPU 的上一笔 APB 读（例如轮询 DMA 的 STAT）应答要等 2 拍，这 2 拍里
+//    CPU 已经发出下一笔 DDR 读、lat_addr 指向 0x8000_xxxx ⇒ 应答回来那一拍 sel_ddr=1，
+//    于是这一笔 APB 读的应答被当成 DDR 的、resp_rd_valid 取成 s3_rd_valid=0 ⇒
+//    数据丢了、owner FIFO 里那一项还留着。之后队头一直是 APB 的 tag，STCM 的读
+//    全被 fifo_same 挡住 ⇒ 核永久冻死；APB 读也整体错位一格（拿到上一笔的数）。
+//    实测轨迹：DMA 读 DDR 的同时 CPU 轮询 STAT，fifo wr=1 rd=0 卡到超时。
+//    ★ 用 s3_rd_valid 是安全的：DDR 的应答只有在桥上真的回来那一拍才算，其余时刻
+//      一律按 owner FIFO 走 ⇒ APB/STCM 的应答不会在 DDR 传输期间被吞掉。
+//    ★ 反过来也不会撞车：owner FIFO 的应答是"接受后第 2 拍"，而 DDR 应答最早也得
+//      在它被接受后第 5 拍；DDR 一生效就压着 HREADYOUT，别的读根本进不来。
     reg        npu_read_pending;
-    reg [1:0]  npu_read_owner;
+    reg [2:0]  npu_read_owner;
 
     always @(posedge clk) begin
         if (reset_registered) begin
@@ -474,20 +534,23 @@ module ahb_interconnect(
                 owner_mem[owner_wr] <= {sel_stcm ? 2'd1 : 2'd0, grant};
                 owner_wr <= owner_wr + 3'd1;
             end
-            if (resp_rd_valid && !npu_read_pending && !owner_empty)
+            //★ 2026-11-16：判据是 s3_rd_valid，不是 sel_ddr。DDR 的读从不进 owner FIFO，
+            //  它自己的应答由 resp_sel 的 s3_rd_valid 分支送出去；其余任何一拍回来的
+            //  应答都属于队头那一项，必须弹掉。见上面那段"为什么不能用 sel_ddr"。
+            if (resp_rd_valid && !npu_read_pending && !s3_rd_valid && !owner_empty)
                 owner_rd <= owner_rd + 3'd1;
         end
     end
 
-    reg [3:0] resp_tag;
+    reg [4:0] resp_tag;
     reg [1:0] resp_sel;
     always @(*) begin
         resp_tag = owner_mem[owner_rd];
-        resp_sel = npu_read_pending ? 2'd2 : sel_ddr ? 2'd3 : resp_tag[3:2];
+        resp_sel = npu_read_pending ? 2'd2 : s3_rd_valid ? 2'd3 : resp_tag[4:3];
     end
-    reg [1:0] resp_owner;
+    reg [2:0] resp_owner;
     always @(*) begin
-        resp_owner = npu_read_pending ? npu_read_owner : (sel_ddr ? grant : resp_tag[1:0]);
+        resp_owner = npu_read_pending ? npu_read_owner : (s3_rd_valid ? grant : resp_tag[2:0]);
     end
     reg [31:0] resp_hrdata;
     always @(*) begin
@@ -522,6 +585,11 @@ module ahb_interconnect(
         m3_rd_valid = 1'b0;
         m3_hgrant = g3;
         m3_hresp = 1'b0;
+        m4_hrdata = 32'd0;
+        m4_hready = 1'b0;
+        m4_rd_valid = 1'b0;
+        m4_hgrant = g4;
+        m4_hresp = 1'b0;
 //HREADY = 从设备 HREADYOUT & 被授权（标准做法）
 //★ 2026-11-15：owner FIFO 快满时【反压主设备】，不许"照收但丢项"。
 //  原来那句 `(owner_count != 3'd7)` 只是不记账，HREADY 照样放行 ⇒ 主设备以为这笔读
@@ -539,6 +607,8 @@ module ahb_interconnect(
             m2_hready = s_hreadyout && !read_hold;
         if (g3)
             m3_hready = s_hreadyout && !read_hold;
+        if (g4)
+            m4_hready = s_hreadyout && !read_hold;
 //HRESP 送给【当前被授权】的主设备，不走 FIFO：错误是在被按住的那笔传输里
 //  举两拍，那两拍授权不会换手（grant_busy 看的就是它的 htrans），所以按 grant 选
 //  是准的。数据/应答才必须按 FIFO 里记的从设备号选（见上面那段注释）。
@@ -550,6 +620,8 @@ module ahb_interconnect(
             m2_hresp = s_hresp;
         if (g3)
             m3_hresp = s_hresp;
+        if (g4)
+            m4_hresp = s_hresp;
         case (resp_owner)
         M_LSU: begin
             m0_hrdata = resp_hrdata;
@@ -563,9 +635,13 @@ module ahb_interconnect(
             m2_hrdata = resp_hrdata;
             m2_rd_valid = resp_rd_valid;
         end
-        default: begin
+        M_BOOT: begin
             m3_hrdata = resp_hrdata;
             m3_rd_valid = resp_rd_valid;
+        end
+        default: begin
+            m4_hrdata = resp_hrdata;
+            m4_rd_valid = resp_rd_valid;
         end
         endcase
     end

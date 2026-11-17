@@ -50,6 +50,13 @@ module bus_con_top #(
 //9 号槽：DPU（显示引擎）。和别的 APB 外设一样：字节地址>>2 广播 + 槽号认领。
     input      [31:0] dpu_data,
     input             dpu_ready,
+//10 号槽：看门狗。它和别的外设两点不同：
+//  · 出一根 wdt_reset，要进复位树（和上电复位、软复位并列）
+//  · 它自己【不能】吃到 wdt_reset，所以另给一根 rst_wdt = rst_stable | soft_reset
+    input      [31:0] wdt_data,
+    input             wdt_ready,
+    input             wdt_reset,
+    output reg        rst_wdt,
 //---- m1：L2（cpu_top 里的 64KB 统一二级缓存）----
     input      [31:0] m1_haddr,
     input      [1:0]  m1_htrans,
@@ -157,6 +164,14 @@ module bus_con_top #(
     wire        boot_done_w, boot_err_w;
     wire [16:0] boot_count_w;
 
+//---- m4：NPU 自带的搬运引擎（2026-11-17）----
+//  这不是 3 号槽那块通用 DMA。它的主口长在 npu_system 上，只搬 A/BT/C/权重块。
+    wire [31:0] m4_haddr, m4_hwdata, m4_hrdata;
+    wire [1:0]  m4_htrans;
+    wire        m4_hwrite, m4_hready, m4_rd_valid, m4_hgrant, m4_hresp, m4_hmastlock;
+    wire [2:0]  m4_hsize, m4_hburst;
+    wire [3:0]  m4_hwstrb, m4_hprot;
+
 //---- s0：APB 外设桥 ----
     wire [31:0] s0_haddr, s0_hwdata, s0_hrdata;
     wire [1:0]  s0_htrans;
@@ -249,10 +264,17 @@ module bus_con_top #(
 
 //软复位源可能是悬空的（老的台子没接这根线）⇒ 只有确定是高才算复位，别把 z 或进复位树
     reg soft_reset_safe;
+//★ 2026-11-15：看门狗复位。同样按"确定是高才算"处理（旧台子没接这根线）。
+//  ★ 它【不进】rst_wdt —— 看门狗自己的复位不能包含它自己，否则脉冲只剩一两拍。
+//  ★ boot_done_q 只被 rst_stable 清，所以看门狗复位之后不再重搬镜像，
+//    CPU 直接从 STCM 里的镜像重新起（这才是看门狗想要的快速恢复）。
+    reg wdt_reset_safe;
     always @(*) begin
         soft_reset_safe = (soft_reset === 1'b1);
-        rst_sys = rst_stable | soft_reset_safe;
-        rst_cpu = rst_stable | ~boot_done_q | soft_reset_safe;
+        wdt_reset_safe  = (wdt_reset  === 1'b1);
+        rst_sys = rst_stable | soft_reset_safe | wdt_reset_safe;
+        rst_cpu = rst_stable | ~boot_done_q | soft_reset_safe | wdt_reset_safe;
+        rst_wdt = rst_stable | soft_reset_safe;
     end
 
 //==============================================================================
@@ -360,6 +382,11 @@ module bus_con_top #(
         .s2_hsize(s2_hsize), .s2_hwdata(s2_hwdata), .s2_hsel(s2_hsel),
         .s2_hrdata(s2_hrdata), .s2_hreadyout(s2_hreadyout),
         .s2_hresp(s2_hresp), .s2_rd_valid(s2_rd_valid),
+        .m4_haddr(m4_haddr), .m4_htrans(m4_htrans), .m4_hwrite(m4_hwrite), .m4_hsize(m4_hsize),
+        .m4_hburst(m4_hburst), .m4_hprot(m4_hprot), .m4_hmastlock(m4_hmastlock),
+        .m4_hwdata(m4_hwdata), .m4_hwstrb(m4_hwstrb),
+        .m4_hrdata(m4_hrdata), .m4_hready(m4_hready), .m4_hresp(m4_hresp),
+        .m4_rd_valid(m4_rd_valid), .m4_hgrant(m4_hgrant),
         .s3_haddr(s3_haddr), .s3_htrans(s3_htrans), .s3_hwrite(s3_hwrite),
         .s3_hsize(s3_hsize), .s3_hprot(s3_hprot), .s3_hwdata(s3_hwdata),
         .s3_hwstrb(s3_hwstrb), .s3_hsel(s3_hsel),
@@ -379,7 +406,12 @@ module bus_con_top #(
         .HSEL(s2_hsel), .HADDR(s2_haddr), .HTRANS(s2_htrans), .HWRITE(s2_hwrite),
         .HSIZE(s2_hsize), .HWDATA(s2_hwdata), .HREADY(s2_hreadyout),
         .HRDATA(s2_hrdata), .HREADYOUT(s2_hreadyout), .HRESP(npu_hresp),
-        .rd_valid(s2_rd_valid)
+        .rd_valid(s2_rd_valid),
+        .M_HADDR(m4_haddr), .M_HTRANS(m4_htrans), .M_HWRITE(m4_hwrite),
+        .M_HSIZE(m4_hsize), .M_HBURST(m4_hburst), .M_HPROT(m4_hprot),
+        .M_HWDATA(m4_hwdata), .M_HWSTRB(m4_hwstrb),
+        .M_HRDATA(m4_hrdata), .M_HREADY(m4_hready), .M_HRESP(m4_hresp),
+        .M_RD_VALID(m4_rd_valid)
     );
 
 //==============================================================================
@@ -539,6 +571,8 @@ module bus_con_top #(
         .spi_ready(spi_ready),
         .dpu_data(dpu_data),
         .dpu_ready(dpu_ready),
+        .wdt_data(wdt_data),
+        .wdt_ready(wdt_ready),
         .dma_data(dma_data_q),
         .dma_ready(1'b1)
     );

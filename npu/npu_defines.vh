@@ -32,6 +32,11 @@
 `define NPU_BBUF_REG_AW 7
 `define NPU_BBUF_WORDS 64
 `define NPU_CBUF_WORDS 256
+// ---- C 双缓冲（2026-11-17）：和 A/BT 同一套做法，物理地址比逻辑地址多一位 ----
+//   bit[AW] = bank。核在算 bank b 的时候，主机(CPU/DMA)可以搬 bank ~b 的 C。
+//   这比"再例化一份 npu_buffer"省一整套端口，代价是 C 的读口在 accumulate=1
+//   （读-改-写）期间必须归还给写回 FIFO —— 见 npu_buffer 里的端口归属说明。
+`define NPU_CBUF_REG_AW 9
 // ---- 权重块（2026-11-12 新增）----
 //   A 侧权重驻留：WGT_EN=1 时阵列读的是这块 RAM，不再每个输出 Tile 重搬一遍权重。
 //   全模型（x4）权重 15,992 B，16KB 装得下；换层只改 WGT_BASE。
@@ -69,10 +74,17 @@
 // ---- MMIO 地址映射(npu_top 内联译码使用，均为相对基址的偏移) ----
 `define NPU_ADDR_CTRL_BASE 32'h0000_0000  // 0x0000-0x001F 控制寄存器
 `define NPU_ADDR_STAT_BASE 32'h0000_0020  // 0x0020-0x002F 状态寄存器
+`define NPU_ADDR_DMA_BASE  32'h0000_0040  // 0x0040-0x005F 搬运引擎寄存器
+`define NPU_ADDR_BANK_BASE 32'h0000_0060  // 0x0060-0x006F bank 所有权
 `define NPU_ADDR_ABUF_BASE 32'h0000_1000  // 0x1000-0x10FF A Buffer
 `define NPU_ADDR_BBUF_BASE 32'h0000_2000  // 0x2000-0x20FF BT Buffer
-`define NPU_ADDR_CBUF_BASE 32'h0000_3000  // 0x3000-0x33FF C Buffer
+`define NPU_ADDR_CBUF_BASE 32'h0000_3000  // 0x3000-0x33FF / 0x3400-0x37FF C Buffer
 `define NPU_ADDR_WGT_BASE  32'h0000_4000  // 0x4000-0x7FFF 权重块 16KB（4096 字）
 `define NPU_ADDR_WGCFG_BASE 32'h0000_0800 // 0x0800-0x080F 权重块配置寄存器
+
+// ---- 搬运引擎的容量约束 ----
+// 一次描述符最多搬 4096 个字（16 KB）。这是"DMA_WORDS 的合法上界"，
+// 不是缓冲容量 —— 缓冲各自的容量由上面那几个 WORDS 宏说了算。
+`define NPU_DMA_WORDS_MAX 4096
 
 `endif

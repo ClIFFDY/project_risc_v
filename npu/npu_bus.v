@@ -1,3 +1,11 @@
+// ============================================================================
+//  npu_bus.v —— 由 bus/ 目录下的文件合并而成（2026-11-17，扁平化）
+//  源文件：ahb_lite_slave.v 
+//  合并方式：原样拼接，模块名/端口一个字没改。
+// ============================================================================
+
+// --------------------------------------------------------------- ahb_lite_slave.v
+
 `timescale 1ns / 1ps
 // ahb_lite_slave — ARM AHB-Lite 从机接口（NPU 唯一的 CPU 总线入口）
 //
@@ -70,6 +78,10 @@ module ahb_lite_slave #(
     // ---- NPU 运行状态 ----
     input              core_busy,
     input              core_bank, // 核正在读的那一组 A/BT
+    // ★ 2026-11-17：搬运引擎忙的时候，CPU 一律不许碰 Buffer。
+    //   引擎走的是和 CPU 同一组 RAM 端口（在 npu_system 里二选一），
+    //   放行一次就是两方写同一块 RAM，软件还看不出来。寄存器/状态口不受影响。
+    input              dma_busy,
     // ---- 来自 npu_top 的译码与读数据 ----
     input              sel_ctrl,
     input              sel_status,
@@ -78,9 +90,13 @@ module ahb_lite_slave #(
     input              sel_c_buf,
     input              sel_wgt,
     input              sel_wgt_cfg,
+    input              sel_dma,
+    input              sel_bank,
     input       [31:0] control_rdata,
     input       [31:0] status_rdata,
     input       [31:0] buffer_rdata,
+    input       [31:0] dma_rdata,
+    input       [31:0] bank_rdata,
     output reg  [31:0] HRDATA,
     output reg         HREADYOUT,
     output reg  [1:0]  HRESP,
@@ -164,9 +180,10 @@ module ahb_lite_slave #(
         cap_now   = bus_phase && HREADYOUT;
 
         is_buf  = sel_a_buf || sel_bt_buf || sel_c_buf || sel_wgt;
-        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || is_buf;
+        mapped  = sel_ctrl || sel_status || sel_wgt_cfg || sel_dma || sel_bank || is_buf;
         idle_bank_wr = write_q && (sel_a_buf || sel_bt_buf) && (addr_q[11] != core_bank);
-        err_now = !mapped || !size_ok_q || (core_busy && is_buf && !idle_bank_wr);
+        err_now = !mapped || !size_ok_q ||
+                  (is_buf && (dma_busy || (core_busy && !idle_bank_wr)));
 
         req_addr    = addr_q;
         req_wdata   = wdata_q;
@@ -175,7 +192,9 @@ module ahb_lite_slave #(
         req_valid   = (state == S_DATA) && !err_now;
 
         HRDATA    = sel_ctrl   ? control_rdata :
-                    sel_status ? status_rdata  : buffer_rdata;
+                    sel_status ? status_rdata  :
+                    sel_dma    ? dma_rdata     :
+                    sel_bank   ? bank_rdata    : buffer_rdata;
         HREADYOUT = ((state == S_DATA) && (err_now || (is_buf && !write_q))) ? 1'b0 :
                     (state == S_ERR1) ? 1'b0 : 1'b1;
         HRESP     = ((state == S_ERR1) || (state == S_ERR2)) ? HRESP_ERROR : HRESP_OKAY;
