@@ -293,7 +293,10 @@ module boot_loader_cfg #(
                             left    <= 17'd0;
                         end
                         else begin
-                            left <= hdr_next[63:32][16:0];
+                            //★ 不许写 hdr_next[63:32][16:0]：Vivado 报 Synth 8-2599
+                            //  "range is not allowed in a prefix"。Verilator 吃，Vivado 不吃。
+                            //  要的是 length 域的低 17 位 = hdr_next[48:32]。
+                            left <= hdr_next[48:32];
                         end
                     end
                     else begin

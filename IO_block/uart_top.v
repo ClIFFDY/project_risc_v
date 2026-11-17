@@ -25,7 +25,7 @@ module uart_top #(
 //  波特率会整体乘 2.4（9600 变 23040），对端必然收错。改核频率只改 CLK_MHZ。
 //  mcnt 是 14 位：CLK/BPS_LOW 最大 16383 ⇒ 9600 只支持到 CLK_MHZ ≤ 157
 //  （120 MHz 时 12500，余量够；再往上要么加宽 mcnt、要么降 BPS_LOW）。
-    parameter integer CLK_MHZ  = 120,
+    parameter integer CLK_MHZ  = 100,
     parameter integer BPS_LOW  = 9600,
     parameter integer BPS_HIGH = 115200
 ) (
@@ -121,9 +121,13 @@ module uart_top #(
             wr_ptr_tx <= 5'd1;
             rd_ptr_tx <= 5'd0;
             rx_irq <= 1'd0;
-            for (i = 0; i < 32; i = i + 1)
-                tx_buf[i] = 8'b0;
-            //★ rx_buf 在复位里【不清】：指针已经复位，旧数据永远读不到。
+            //★ 2026-11-16：tx_buf 的复位清零也删了，理由和下面 rx_buf 那段一样。
+            //  原来这里有一句 `for (i...) tx_buf[i] = 8'b0;`，于是 32×8 = 256 位被
+            //  推成 256 个带同步复位的触发器，复位网扇出 256 —— 接上 MIG 之后这条
+            //  复位路径成了整颗核最差的一条（tx_buf_reg[6][4]/R，WNS -0.897）。
+            //  tx_buf 读的是 rd_ptr_tx、写的是 wr_ptr_tx，复位后两者都回 1，
+            //  缓冲是空的 ⇒ 旧数据永远读不到，清它没有意义。
+            //  (rx_buf 在复位里【不清】：指针已经复位，旧数据永远读不到。
             //  清一遍是 2048 位同步复位，会把整块从 LUTRAM（32 个 LUT6）变成
             //  2048 个触发器 —— 为了一个没人读的状态付这个价不值。
         end

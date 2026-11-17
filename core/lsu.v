@@ -148,7 +148,10 @@ module lsu(
     function lsuv_cacheable;
         input [31:0] word_address;
         begin
-            lsuv_cacheable = (word_address[31:16] == 16'd0);
+            /* ★ 2026-11-17：把 DDR 窗口也算成可缓存（原来是"只有低 64 KB"）。
+             *     比 STCM（几拍）慢一个量级。适合"大程序"，不适合"跳转密集"。 */
+            lsuv_cacheable = (word_address[31:16] == 16'd0) ||
+                             (word_address[31:30] == 2'b10);
         end
     endfunction
 

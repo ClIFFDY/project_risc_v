@@ -42,7 +42,7 @@
 module spi #(
 //★ 分频的复位值由"核时钟 + 目标 SCK"算出来，不写死。向上取整是故意的：
 //  宁可慢一点也不许超过目标频率（SD 卡初始化对频率有上限）。
-    parameter integer CLK_MHZ = 120,
+    parameter integer CLK_MHZ = 100,
     parameter integer SCK_KHZ = 1000
 )(
     input clk, rst,

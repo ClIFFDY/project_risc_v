@@ -46,7 +46,7 @@ module pmem_spi #(
 //  换时钟（50 / 100 / 120 MHz）只改 CLK_MHZ，SCK 目标频率保持不变。
 //  手算过的坑：原来按 50 MHz 写死 9 / 99，核改 120 MHz 之后 SCK 悄悄变成
 //  6 MHz / 600 kHz —— 后者已经超出 SD 卡上电初始化 100~400 kHz 的硬要求。
-    parameter integer CLK_MHZ       = 120,
+    parameter integer CLK_MHZ       = 100,
     parameter integer FLASH_SCK_KHZ = 2500,
     parameter integer SD_SCK_KHZ    = 300
 )(

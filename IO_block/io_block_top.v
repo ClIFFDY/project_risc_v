@@ -23,12 +23,15 @@
 module io_block_top #(
 //★ CLK_MHZ = 核时钟频率（MHz）：UART 波特率、I2C SCL、SPI 分频全都由它算出来，
 //  换核时钟只改这一处（子模块各自按目标频率反解自己的分频）。
-    parameter integer CLK_MHZ       = 120,
+    parameter integer CLK_MHZ       = 100,
     parameter integer FLASH_SCK_KHZ = 2500,
     parameter integer SD_SCK_KHZ    = 300,
     parameter integer USER_SCK_KHZ  = 1000   // 7 号槽 sub1 用户 SPI 的复位分频目标
 )(
     input clk, rst_cpu,
+    //★ 看门狗专用的复位：不含它自己的 wdt_reset 输出（见 soc/bus_con_top.v）。
+    //  别的外设吃 rst_cpu（= rst_sys，已经含看门狗复位）。
+    input             rst_wdt,
     input      [31:0] bus_addr_in,
     input      [31:0] bus_data_in,
     input      [3:0]  bus_be_in,
@@ -74,6 +77,11 @@ module io_block_top #(
 //  不经过总线；中断在块内部直接进 PLIC 的 9 号源，不用穿端口。
     output     [31:0] dpu_data,
     output            dpu_ready,
+//10 号槽：看门狗（0x2800_0000）。它有一根复位输出要走 soc 的复位树，
+//  所以这一级只把数据口和中断交出去，wdt_reset 由 mcu_top 单独接。
+    output     [31:0] wdt_data,
+    output            wdt_ready,
+    output            wdt_reset,        // 直接进 soc 的复位树（见 mcu_top / bus_con_top）
     output            plic_exti,
     output            err_clear,
     inout wire [31:0] gpio_pin_bus
@@ -86,10 +94,11 @@ module io_block_top #(
     PER_I2C  = 5,
     PER_TIM  = 6,
     PER_SPI  = 7,
-    PER_DPU  = 9;      // 桥的译码从 1..7 放开到 1..9（8 号槽是 NPU，不走 APB）
+    PER_DPU  = 9,      // 桥的译码从 1..7 放开到 1..9（8 号槽是 NPU，不走 APB）
+    PER_WDT  = 10;     // 10 号槽：看门狗（桥的译码已放开到 1..10）
 
     reg bus_we_uart, bus_we_plic, bus_we_gpio, bus_we_i2c, bus_we_tim;
-    reg bus_we_spi_pmem, bus_we_spi_user, bus_we_dpu;
+    reg bus_we_spi_pmem, bus_we_spi_user, bus_we_dpu, bus_we_wdt;
 
 //★ 2026-11-13：7 号槽切成 4 个 64 KB 窗口，用 bus_addr_in[17:16] 选子外设。
 //  槽号只有 1..7 可用（桥的译码写死），已经占掉 1/2/4/5/6/7，再开新槽没地方。
@@ -104,7 +113,7 @@ module io_block_top #(
     reg spi_sel_pmem, spi_sel_user, spi_sel_cfg;
 
     wire uart_rx_w, uart_tx_w;
-    wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq_w, dpu_irq;
+    wire uart_rx_irq, gpio_irq, i2c_irq, tim_irq_w, dpu_irq, wdt_irq_w;
     wire i2c_scl_oe, i2c_sda_oe, i2c_scl_in, i2c_sda_in;
     wire pwm1_w, pwm2_w, pwm3_w, pwm4_w;
 
@@ -141,6 +150,7 @@ module io_block_top #(
         bus_we_spi_pmem = bus_we_in & spi_sel_pmem;
         bus_we_spi_user = bus_we_in & spi_sel_user;
         bus_we_dpu      = bus_we_in & bus_sel_in[PER_DPU];
+        bus_we_wdt      = bus_we_in & bus_sel_in[PER_WDT];
     end
 
     uart_top #(.CLK_MHZ(CLK_MHZ)) u_uart (
@@ -324,11 +334,27 @@ module io_block_top #(
         .spi_irq(spi_user_irq)
     );
 
+//10 号槽：看门狗。★ 复位用 rst_wdt（不含它自己的输出），不是 rst_cpu。
+    wdt #(.CLK_MHZ(CLK_MHZ)) u_wdt (
+        .clk(clk),
+        .rst(rst_wdt),
+        .bus_addr_in(bus_addr_in),
+        .bus_data_in(bus_data_in),
+        .bus_be_in(bus_be_in),
+        .bus_we_in(bus_we_wdt),
+        .bus_sel(bus_sel_in[PER_WDT]),
+        .ld_ready(wdt_ready),
+        .bus_data_out(wdt_data),
+        .wdt_irq(wdt_irq_w),
+        .wdt_reset(wdt_reset)
+    );
+
     plic u_plic (
         .clk(clk),
         .rst(rst_cpu),
-        //源号：1=uart_rx 2=dma 3=gpio 4=i2c 5=总线错误 6=定时器 7=spi(flash/SD) 8=spi(用户) 9=DPU
-        .irq_sources({22'd0, dpu_irq, spi_user_irq, spi_pmem_irq,
+        //源号：1=uart_rx 2=dma 3=gpio 4=i2c 5=总线错误 6=定时器 7=spi(flash/SD)
+        //      8=spi(用户) 9=DPU 10=看门狗
+        .irq_sources({21'd0, wdt_irq_w, dpu_irq, spi_user_irq, spi_pmem_irq,
                       tim_irq_w, err_valid, i2c_irq, gpio_irq, dma_irq, uart_rx_irq, 1'b0}),
         .exti(plic_exti),
         .bus_addr_in(bus_addr_in),

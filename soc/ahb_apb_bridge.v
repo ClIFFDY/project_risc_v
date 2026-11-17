@@ -54,6 +54,9 @@ module ahb_apb_bridge(
 //  不走 APB），所以槽位译码从 1..7 放开到 1..9，中间那格空着不占。
     input      [31:0] dpu_data,
     input             dpu_ready,
+//★ 2026-11-15：看门狗挂 10 号槽（0x2800_0000）。接法和其它 APB 外设一样。
+    input      [31:0] wdt_data,
+    input             wdt_ready,
     output reg [31:0] hrdata,
 //标准 AHB-Lite 从设备口。rd_valid 是本仓自己的完成脉冲（非标准），
 //第一期先和 HREADYOUT 并存，等三个主设备都改认 HREADY/HRESP 之后再删。
@@ -76,11 +79,13 @@ module ahb_apb_bridge(
     SLOT_I2C  = 6'd5,
     SLOT_TIM  = 6'd6,
     SLOT_SPI  = 6'd7,
-    SLOT_DPU  = 6'd9;
+    SLOT_DPU  = 6'd9,
+    SLOT_WDT  = 6'd10;
 
     reg [5:0] slot;
     always @(*) begin
-        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd9)
+        //★ 2026-11-15：10 号槽给了看门狗，译码从 1..9 放开到 1..10（8 号槽仍是 NPU，不走 APB）
+        if (haddr[31:26] >= 6'd1 && haddr[31:26] <= 6'd10)
             slot = haddr[31:26];
         else
             slot = SLOT_NONE;
@@ -122,6 +127,7 @@ module ahb_apb_bridge(
         SLOT_TIM:  sel_ld_ready = tim_ready;
         SLOT_SPI:  sel_ld_ready = spi_ready;
         SLOT_DPU:  sel_ld_ready = dpu_ready;
+        SLOT_WDT:  sel_ld_ready = wdt_ready;
         default:   sel_ld_ready = 1'b1;
         endcase
     end
@@ -187,6 +193,7 @@ module ahb_apb_bridge(
         SLOT_TIM:  hrdata_c = tim_data;
         SLOT_SPI:  hrdata_c = spi_data;
         SLOT_DPU:  hrdata_c = dpu_data;
+        SLOT_WDT:  hrdata_c = wdt_data;
         default:   hrdata_c = 32'd0;
         endcase
         rd_valid_c = (pend_v && !pend_we && (sel_pend != SLOT_NONE) && sel_ld_ready)

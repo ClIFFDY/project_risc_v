@@ -141,8 +141,10 @@ module ahb_axi_bridge #(
         S_DONE     = 4'd6,   // 完成拍：HREADYOUT=1，读给 rd_valid
         S_TAIL     = 4'd7,   // 主设备撤请求的那一拍（不许就地再接受一笔）
         S_ERR1     = 4'd8,   // 错误响应第 1 拍：HRESP=1, HREADYOUT=0
-        S_ERR2     = 4'd9;
+        S_ERR2     = 4'd9,
+        S_LINE     = 4'd10;
         // 错误响应第 2 拍：HRESP=1, HREADYOUT=1
+        // S_LINE：读命中拍缓冲（不做 AXI 往返）
 
     reg [3:0]  state;
     reg [31:0] offset_q;      // 相对 DDR_BASE 的字节偏移（AHB 侧算一次）
@@ -153,6 +155,18 @@ module ahb_axi_bridge #(
     reg [3:0]  strb_q;
     reg        aw_done, w_done;
     reg        read_bad;
+
+    //---- 读拍缓冲（一拍 = AXI_DATA_WIDTH 位，128 位时是 16 字节）----
+    //  ★ 2026-11-16：一次 AXI 读回来的是整拍，原来只用 4 字节就扔掉。
+    //    现在把整拍留下来，同一拍里的后续读直接从这里出，不再走 AXI。
+    //    判据：DMA 做 16 拍（64 B）的块拷贝 = 4 次 AXI 读，而不是 16 次。
+    //  ★ 命中路径【仍然压一拍 HREADYOUT】再进 S_DONE，形状和一次真读一样：
+    //    互联层是按"当拍 sel_ddr"把应答送回主设备的（那条路依赖桥整笔压着
+    //    HREADYOUT），所以这里绝不能做成"当拍给 HREADYOUT 和 rd_valid"的
+    //    零等待从设备，否则应答会打到别的主设备身上。
+    reg [AXI_DATA_WIDTH-1:0] line_data;
+    reg [31:0]               line_addr;    // 已对齐到拍边界的 AXI 字节地址
+    reg                      line_valid;
 
     reg selected_phase;
     reg [32:0] offset;
@@ -176,6 +190,17 @@ module ahb_axi_bridge #(
     always @(*) begin
         beat_addr = AXI_BASE_ADDR + ((offset_q >> LANE_BITS) << LANE_BITS);
         word_shift = ((offset_q & (AXI_BYTES - 1)) & 32'hFFFF_FFFC) * 8;
+    end
+    //★ 接受那一拍用的版本：用【当拍】offset，不是 offset_q（那一刻还没锁进去）
+    reg [31:0] beat_addr_c;
+    always @(*) begin
+        beat_addr_c = AXI_BASE_ADDR + ((offset >> LANE_BITS) << LANE_BITS);
+    end
+    //命中：读、地址落在同一个拍里、缓冲区有效、下游在
+    reg line_hit;
+    always @(*) begin
+        line_hit = DDR_ON && selected_phase && !HWRITE && !bad_addr && !bad_size &&
+                   line_valid && (beat_addr_c == line_addr);
     end
     //整拍读回来，把目标那个 32 位字挪到低位（截到 32 位是故意的）
     reg [31:0] rdata_word;
@@ -247,8 +272,14 @@ module ahb_axi_bridge #(
             aw_done   <= 1'b0;
             w_done    <= 1'b0;
             read_bad  <= 1'b0;
+            line_valid <= 1'b0;
+            line_addr  <= 32'd0;
+            line_data  <= {AXI_DATA_WIDTH{1'b0}};
         end
         else begin
+            //下游掉出就绪（MIG 重新标定）⇒ 拍缓冲里的数据不一定还成立
+            if (!MEM_READY)
+                line_valid <= 1'b0;
             case (state)
 //------------------------------------------------------------------ 地址相位
             S_IDLE: begin
@@ -262,14 +293,25 @@ module ahb_axi_bridge #(
                     read_bad <= 1'b0;
                     aw_done  <= 1'b0;
                     w_done   <= 1'b0;
+                    //★ 写会让拍缓冲失效：别的设备刚写过的拍，缓存里那份就是旧的
+                    if (HWRITE)
+                        line_valid <= 1'b0;
                     //下游不在 ⇒ 窗口判不判都是错，直接走错误响应
                     if (!DDR_ON || bad_addr || bad_size)
                         state <= S_ERR1;
+                    else if (line_hit)
+                        state <= S_LINE;     // 命中拍缓冲，不走 AXI
                     else if (MEM_READY)
                         state <= HWRITE ? S_WRITE : S_ARADDR;
                     else
                         state <= S_WAIT_MEM;
                 end
+            end
+//------------------------------------------------------------------ 读命中拍缓冲
+//  ★ 故意做成一拍：HREADYOUT 在整笔传输期间压着，形状和一次真读相同
+            S_LINE: begin
+                read_q <= line_data[word_shift +: 32];
+                state  <= S_DONE;
             end
 //------------------------------------------------------------------ 等下游
             S_WAIT_MEM: if (MEM_READY) state <= write_q ? S_WRITE : S_ARADDR;
@@ -301,7 +343,11 @@ module ahb_axi_bridge #(
                     end
                     else begin
                         read_q <= rdata_word;
-                        state  <= S_DONE;
+                        //整拍留下来给后续读用（上面 S_LINE 那条路）
+                        line_data  <= M_AXI_RDATA;
+                        line_addr  <= beat_addr;
+                        line_valid <= 1'b1;
+                        state      <= S_DONE;
                     end
                 end
             end
